@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.1-blue">
   <img alt="Tests" src="https://img.shields.io/badge/tests-610%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
@@ -51,6 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
+| **Version** | 0.0.1 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, ledger |
