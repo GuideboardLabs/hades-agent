@@ -42,11 +42,33 @@
 //! ever become a string here, whatever a server claimed or streamed, so the cap holds on both
 //! shapes even where the message differs. Both are before the text is returned; nothing buffers a
 //! whole oversized body.
+//!
+//! Three things this module owns that curl cannot be asked to own.
+//!
+//! **The clock.** One `Instant` deadline is taken per fetch, not per hop, and each hop is handed
+//! the whole seconds left in it (at least one); a hop that would start after the deadline is
+//! refused instead. Six hops therefore spend at most the one deadline, not six of them.
+//! `getaddrinfo` itself carries no deadline: the resolver this module calls before the hop is a
+//! blocking call that this module cannot interrupt, so a resolver that never answers holds the
+//! thread past the deadline. The deadline bounds curl's transfer, not the lookup.
+//!
+//! **The scratch it writes.** One directory per call, created `0700`, holds both the header file
+//! and the body file, and a `Drop` guard removes the whole directory on every exit path - a page,
+//! an oversize refusal, a non-zero exit, a panic. A failure that leaves a page's headers in a shared
+//! temp directory is a failure that wrote on its way out.
+//!
+//! **The TLS gap, named rather than papered over.** An end-to-end HTTPS fixture needs a TLS server
+//! and therefore a dependency this tree does not take, so a live TLS fixture is not part of this
+//! suite. What is asserted is the part this module owns: `https` parses to port 443, and curl is
+//! handed `https` in both `--proto` and `--proto-redir`. A live HTTPS request is not tested.
+//!
+//! Only `301`, `302`, `303`, `307` and `308` are followed. Any other 3xx carrying a `Location` is a
+//! response, not an invitation, and its body is what the call answers.
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The tool's own name, so `agent.rs` dispatches to this module without spelling it twice.
 pub const NAME: &str = "fetch";
@@ -65,17 +87,78 @@ const READ_CAP: u64 = BODY_CAP;
 /// How many redirect hops may be followed.
 const MAX_REDIRECTS: usize = 5;
 
-/// Scratch paths unique per call, under the OS temp directory. Five hops on one thread or five
-/// fetches on five threads never share a header file.
-fn scratch(suffix: &str) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "hades-fetch-{}-{stamp}.{suffix}",
-        std::process::id()
-    ))
+/// The whole fetch's clock: every hop of one chain is spent out of this one deadline, not given a
+/// fresh one.
+const FETCH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The refusal a hop gets when the fetch's clock has run out before it can start.
+const DEADLINE_PASSED: &str =
+    "refused: the fetch's 30-second deadline passed before this hop could start";
+
+/// One per-call scratch directory, `0700`, holding that call's header file and body file. It is
+/// made here and removed by `Drop` here, so every exit path - a page, an oversize refusal, a
+/// non-zero exit, a panic - leaves the shared temp directory as it found it. The mode is set at
+/// creation, so there is no window in which another user could open what curl is about to write.
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn new() -> Result<Scratch, String> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("hades-fetch-{}-{stamp}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(|error| {
+            format!("could not make a scratch directory for the fetch: {error}")
+        })?;
+        #[cfg(test)]
+        record_scratch(&path);
+        Ok(Scratch { path })
+    }
+
+    /// One file inside this call's directory. Both files share the directory's lifetime, so no
+    /// path outlives the call that made it.
+    fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+// The scratch directories this thread made, oldest first. Only tests read this: the failure paths
+// a test can reach (oversize, a non-zero exit) must be shown to leave nothing behind, and the
+// directory's name is otherwise private to `Scratch`.
+#[cfg(test)]
+thread_local! {
+    static SCRATCH_MADE: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_scratch(path: &Path) {
+    SCRATCH_MADE.with(|made| made.borrow_mut().push(path.to_path_buf()));
+}
+
+#[cfg(test)]
+fn scratch_made() -> Vec<PathBuf> {
+    SCRATCH_MADE.with(|made| made.borrow().clone())
+}
+
+#[cfg(test)]
+fn forget_scratch() {
+    SCRATCH_MADE.with(|made| made.borrow_mut().clear());
 }
 
 /// What one URL is, parsed off its text. No URL crate is wanted here: the parts this policy judges -
@@ -169,6 +252,13 @@ impl Target {
         // for the same reason - a host may not carry a hidden second spelling.
         if host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
             return Err("refused: the host carries whitespace or control characters".to_string());
+        }
+        // curl normalises an internationalised name to punycode before it looks anything up, so
+        // `--resolve <the name as written>` would never match, curl would resolve the punycode
+        // itself, and the address this module classified would not be the address connected to.
+        // The name is refused instead of being judged twice.
+        if !host.is_ascii() {
+            return Err("refused: a non-ASCII host is not a host this fetch can judge".to_string());
         }
         if host.contains('%') {
             return Err(
@@ -280,17 +370,20 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
         || (o[0] == 192 && o[1] == 168)         // 192.168/16
         || (o[0] == 169 && o[1] == 254)         // link-local 169.254/16
         || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT 100.64/10
+        || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18/15
         || (o[0] & 0xf0) == 224                 // multicast 224/4
         || (o[0] & 0xf0) == 240 // reserved and broadcast 240/4
 }
 
 fn is_private_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    // The two shapes an IPv6 address uses to carry an IPv4 one, each judged as the v4 it holds.
+    // The shapes an IPv6 address uses to carry an IPv4 one, each judged as the v4 it holds.
     // ::ffff:a.b.c.d is the mapped shape; ::a.b.c.d is the deprecated compatible shape, anything
-    // in it but the unspecified address itself.
+    // in it but the unspecified address itself; 64:ff9b::a.b.c.d is the NAT64 well-known prefix,
+    // whose embedded address is the one a translator would dial.
     let embedded: Option<Ipv4Addr> = if s[0..5] == [0, 0, 0, 0, 0] && s[5] == 0xffff
         || (s[0..6] == [0, 0, 0, 0, 0, 0] && !(s[6] == 0 && s[7] == 0))
+        || s[0..6] == [0x0064, 0xff9b, 0, 0, 0, 0]
     {
         Some(v4_from_segments(s[6], s[7]))
     } else {
@@ -302,6 +395,7 @@ fn is_private_v6(ip: Ipv6Addr) -> bool {
     ip.is_loopback()                                    // ::1
         || s == [0, 0, 0, 0, 0, 0, 0, 0]                // the unspecified address
         || (s[0] & 0xffc0) == 0xfe80                    // link-local fe80::/10
+        || (s[0] & 0xffc0) == 0xfec0                    // deprecated site-local fec0::/10
         || (s[0] & 0xfe00) == 0xfc00                    // unique-local fc00::/7
         || (s[0] & 0xff00) == 0xff00                    // multicast
         || (s[0] == 0x2001 && s[1] == 0x0000)           // Teredo 2001::/32
@@ -371,12 +465,16 @@ pub fn run(url: &str, limit: usize, allow_private: bool) -> String {
 /// from the header file, resolved against the URL that produced it, and pushed through the same
 /// parse, classify and pin the first URL went through.
 fn chase(url: &str, allow_private: bool) -> Result<String, String> {
+    let deadline = Instant::now() + FETCH_DEADLINE;
     let mut current = url.to_string();
     let mut followed = 0usize;
     loop {
+        // The clock is read before the hop, not inside curl: a hop that has no time left is
+        // refused here rather than started with a zero or negative `--max-time`.
+        let max_time = remaining_seconds(deadline)?;
         let target = Target::parse(&current)?;
         let address = resolve(&target, allow_private)?;
-        match call(&target, &current, address)? {
+        match call(&target, &current, address, max_time)? {
             Outcome::Page(bytes) => return Ok(String::from_utf8_lossy(&bytes).to_string()),
             Outcome::Oversize => {
                 return Err(
@@ -399,6 +497,17 @@ fn chase(url: &str, allow_private: bool) -> Result<String, String> {
     }
 }
 
+/// The whole seconds one hop may spend out of the fetch's single deadline. A partial second left
+/// is one second, the smallest `--max-time` curl takes; a deadline that has passed - or has no
+/// time left at all - is a refusal, so no hop is ever started with a zero clock.
+fn remaining_seconds(deadline: Instant) -> Result<u64, String> {
+    match deadline.checked_duration_since(Instant::now()) {
+        None => Err(DEADLINE_PASSED.to_string()),
+        Some(left) if left.is_zero() => Err(DEADLINE_PASSED.to_string()),
+        Some(left) => Ok(left.as_secs().max(1)),
+    }
+}
+
 /// The three ways one curl call can end, decided from its exit code and its header file.
 enum Outcome {
     /// A terminal response (2xx, 4xx, 5xx): the body file is what matters.
@@ -411,45 +520,19 @@ enum Outcome {
 
 /// One curl call: no `-L`, protocols restricted on both the primary and the redirects, redirect
 /// following off (`--max-redirs 0`, curl's own counter agreeing with the driver), the body capped
-/// before transfer, headers to a file this module reads and deletes. The URL travels as it was
-/// given or resolved: no reassembly, because a second parser is a second chance to be wrong.
-fn call(target: &Target, url: &str, address: IpAddr) -> Result<Outcome, String> {
-    let headers = scratch("hdr");
-    let body = scratch("body");
-    let _ = std::fs::remove_file(&headers);
-    let _ = std::fs::remove_file(&body);
-    // The pin is `--resolve host:port:addr`, host spelled as the URL spelled it (bracketed for a
-    // v6 literal, which curl also cannot parse - but a literal needs no pin, because there is no
-    // lookup for a literal to race).
-    let can_pin = target.host.parse::<IpAddr>().is_err();
+/// before transfer, both files inside one `0700` directory that `Drop` removes however the call
+/// ends. The URL travels as it was given or resolved: no reassembly, because a second parser is a
+/// second chance to be wrong.
+fn call(target: &Target, url: &str, address: IpAddr, max_time: u64) -> Result<Outcome, String> {
+    let scratch = Scratch::new()?;
+    let headers = scratch.file("hdr");
+    let body = scratch.file("body");
+    let args = curl_args(target, url, address, max_time, &headers, &body);
     let mut command = std::process::Command::new("curl");
     command
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("30")
-        .arg("--proto")
-        .arg("=http,https")
-        .arg("--proto-redir")
-        .arg("=http,https")
-        .arg("--max-redirs")
-        .arg("0")
-        .arg("--max-filesize")
-        .arg(BODY_CAP.to_string())
-        .arg("-A")
-        .arg("Mozilla/5.0 (compatible; Hades/0.21)")
-        .arg("-D")
-        .arg(&headers)
-        .arg("-o")
-        .arg(&body)
-        .arg(url);
-    if can_pin {
-        command
-            .arg("--resolve")
-            .arg(format!("{}:{}:{}", target.host, target.port, address));
-    }
-    command
+        .args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     // A proxy variable would re-route a drive that pins addresses, so every spelling of one goes.
     for variable in [
         "ALL_PROXY",
@@ -467,28 +550,74 @@ fn call(target: &Target, url: &str, address: IpAddr) -> Result<Outcome, String> 
         .output()
         .map_err(|error| format!("could not run curl: {error}"))?;
     let code = output.status.code().unwrap_or(-1);
+    // `-sS` means stderr carries curl's own sentence for a failure. It is kept and quoted rather
+    // than discarded: "curl failed with exit 7" alone does not say what went wrong, and the
+    // sentence is the one thing the model can act on.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
     // 63 is `--max-filesize` exceeded with a known size; 56 and the like is the same trip with a
     // close-delimited body. Both mean the cap fired, and the message says so rather than guessing.
     if code == 63 {
         return Ok(Outcome::Oversize);
     }
     if code != 0 {
-        return Err(format!("curl failed with exit {code}"));
+        return Err(if stderr.is_empty() {
+            format!("curl failed with exit {code}")
+        } else {
+            format!("curl failed with exit {code}: {}", clip_ref(stderr, 300))
+        });
     }
     let location = read_location(&headers)?;
-    let outcome = if let Some(value) = location {
-        Outcome::Redirect(value)
-    } else {
-        Outcome::Page(read_capped(&body)?)
-    };
-    let _ = std::fs::remove_file(&headers);
-    let _ = std::fs::remove_file(&body);
-    Ok(outcome)
+    Ok(match location {
+        Some(value) => Outcome::Redirect(value),
+        None => Outcome::Page(read_capped(&body)?),
+    })
 }
 
-/// What the header file says about continuing. `Some` is a 3xx with a `Location` read clean; `None`
-/// is every other shape, including a 3xx with no `Location`, which is terminal because curl has
-/// nothing to continue with either.
+/// The argument vector one hop runs with, split out so a test can read exactly what curl is handed
+/// without a server. The protocol walls, the redirects-off switch, the clock, the two scratch files
+/// and the pin are all here; `call` adds only the process's environment.
+fn curl_args(
+    target: &Target,
+    url: &str,
+    address: IpAddr,
+    max_time: u64,
+    headers: &Path,
+    body: &Path,
+) -> Vec<String> {
+    // The pin is `--resolve host:port:addr`, host spelled as the URL spelled it (bracketed for a
+    // v6 literal, which curl also cannot parse - but a literal needs no pin, because there is no
+    // lookup for a literal to race).
+    let mut args: Vec<String> = vec![
+        "-sS".to_string(),
+        "--max-time".to_string(),
+        max_time.to_string(),
+        "--proto".to_string(),
+        "=http,https".to_string(),
+        "--proto-redir".to_string(),
+        "=http,https".to_string(),
+        "--max-redirs".to_string(),
+        "0".to_string(),
+        "--max-filesize".to_string(),
+        BODY_CAP.to_string(),
+        "-A".to_string(),
+        "Mozilla/5.0 (compatible; Hades/0.21)".to_string(),
+        "-D".to_string(),
+        headers.display().to_string(),
+        "-o".to_string(),
+        body.display().to_string(),
+        url.to_string(),
+    ];
+    if target.host.parse::<IpAddr>().is_err() {
+        args.push("--resolve".to_string());
+        args.push(format!("{}:{}:{}", target.host, target.port, address));
+    }
+    args
+}
+
+/// What the header file says about continuing. `Some` is one of the five followed 3xx codes with a
+/// `Location` read clean; `None` is every other shape, including any other 3xx - with or without a
+/// `Location` - which is terminal because the method and body have nothing left to say.
 fn read_location(headers: &Path) -> Result<Option<String>, String> {
     let text = std::fs::read_to_string(headers)
         .map_err(|error| format!("could not read curl's headers: {error}"))?;
@@ -506,7 +635,9 @@ fn read_location(headers: &Path) -> Result<Option<String>, String> {
                 .nth(1)
                 .and_then(|code| code.parse::<u16>().ok())
                 .unwrap_or(0);
-            redirected = (300..400).contains(&code);
+            // Only the codes a client actually follows. A 300, a 304 or any other 3xx carrying a
+            // `Location` is a response, not an invitation; it keeps its body and ends the chain.
+            redirected = matches!(code, 301 | 302 | 303 | 307 | 308);
             // A new block wipes a `Location` read before it: that value belonged to a response the
             // status line has now replaced.
             location = None;
@@ -523,9 +654,10 @@ fn read_location(headers: &Path) -> Result<Option<String>, String> {
 }
 
 /// Resolve a `Location` against the URL it came from. The shapes that matter, in the order they are
-/// asked: an absolute URL stays; `//host` gets the original scheme; `/path` gets the original
-/// authority; a relative name gets the original directory; an empty value is the current URL back,
-/// which the caller judges as a hop and declines if it cannot parse.
+/// asked: an empty value is the current URL back; a fragment-only value replaces the current
+/// fragment and a query-only value replaces the current query, neither of them the path; an
+/// absolute URL stays; `//host` gets the original scheme; `/path` gets the original authority; a
+/// relative name gets the original directory. Each result is judged by the caller as its own hop.
 fn resolve_location(current: &str, location: &str) -> String {
     let location = location.trim();
     if location.is_empty() {
@@ -539,16 +671,29 @@ fn resolve_location(current: &str, location: &str) -> String {
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
+    let path = &rest[authority_end..];
+    // `#x` against `/page?q=1#old` is `/page?q=1#x`, and `?a=1` against `/search?q=old` is
+    // `/search?a=1`: a reference that starts with `?` or `#` names the part it replaces. Treating
+    // either as a relative path would append it to the current path instead.
+    if let Some(fragment) = location.strip_prefix('#') {
+        let base = current.split('#').next().unwrap_or(current);
+        return format!("{base}#{fragment}");
+    }
+    if let Some(query) = location.strip_prefix('?') {
+        let base = current.split('#').next().unwrap_or(current);
+        let base = base.split('?').next().unwrap_or(base);
+        return format!("{base}?{query}");
+    }
     if let Some(without) = location.strip_prefix("//") {
         return format!("{scheme}://{without}");
     }
     if location.starts_with('/') {
         return format!("{scheme}://{authority}{location}");
     }
-    let path = &rest[authority_end..];
-    // The base is the current path's directory. A path of `/` has no directory but the root, and
-    // the root is the empty string, not the slash: keeping the slash gives `//rel`, which a server
-    // reads as another path from the first one.
+    // The base is the current path's directory, read from the path alone. A path of `/` has no
+    // directory but the root, and the root is the empty string, not the slash: keeping the slash
+    // gives `//rel`, which a server reads as another path from the first one.
+    let path = path.split(['?', '#']).next().unwrap_or(path);
     let base = path
         .rsplit_once('/')
         .map(|(directory, _)| directory)
@@ -609,6 +754,10 @@ mod tests {
             ("http://example.com:0/", "port"),
             ("http://example.com:letters/", "port"),
             ("http://[fe80::1%25eth0]/", "percent"),
+            // curl would IDNA-normalise this to punycode before looking it up, so `--resolve` on
+            // the spelling above would not match and the pinned address would not be the one
+            // connected to. The name is refused rather than judged twice.
+            ("http://exämple.test/", "non-ASCII host"),
         ] {
             let said = Target::parse(url).expect_err(url);
             assert!(said.starts_with("refused:"), "{url}: {said}");
@@ -654,13 +803,18 @@ mod tests {
             "172.31.255.255",
             "100.64.0.1",
             "100.127.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
             "fc00::1",
             "fd12:3456::1",
             "fe80::1",
+            "fec0::1",
             "224.0.0.1",
             "239.255.255.255",
             "::ffff:127.0.0.1",
             "::ffff:10.1.2.3",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::10.0.0.1",
             "2001:0:db8::1",
             "2002:102:304::1",
         ];
@@ -674,10 +828,12 @@ mod tests {
         let public = [
             "8.8.8.8",
             "1.2.3.4",
+            "198.20.0.1",
             "2606:4700::1111",
             "::ffff:8.8.4.4",
             "::102:304",
             "::ffff:1.2.3.4",
+            "64:ff9b::8.8.8.8",
         ];
         for text in public {
             let address: IpAddr = text.parse().expect(text);
@@ -754,11 +910,11 @@ mod tests {
     #[test]
     fn a_redirect_chain_longer_than_five_is_refused() {
         let fixture = site(&[]);
-        let said = run(&fixture.url("/loop-6"), 12_000, true);
-        assert!(said.starts_with("refused:"), "{said}");
-        assert!(
-            said.contains("redirect chain") && said.contains('5'),
-            "{said}"
+        let url = fixture.url("/loop-6");
+        let said = run(&url, 12_000, true);
+        assert_eq!(
+            said,
+            format!("refused: the redirect chain from `{url}` passed 5 hops")
         );
         // Inside the bound, the same chain answers: the bound is the only difference.
         let within = run(&fixture.url("/loop-5"), 12_000, true);
@@ -804,6 +960,264 @@ mod tests {
             resolve_location("http://example.com/dir", "https://example.com/x"),
             "https://example.com/x"
         );
+        // A query-only or fragment-only reference names the part it replaces, not a path.
+        assert_eq!(
+            resolve_location("http://example.com/search?q=old", "?a=1"),
+            "http://example.com/search?a=1"
+        );
+        assert_eq!(
+            resolve_location("http://example.com/page#old", "#x"),
+            "http://example.com/page#x"
+        );
+        assert_eq!(
+            resolve_location("http://example.com/page?q=1#old", "#x"),
+            "http://example.com/page?q=1#x"
+        );
+    }
+
+    /// A query-only `Location` replaces the query of the URL that carried it, and the result is
+    /// fetched as its own hop: the fixture answers `/find?page=2` with a page, so a `?page=2` sent
+    /// after `/find?page=1` lands there rather than being appended to the path.
+    #[test]
+    fn a_query_only_location_replaces_the_query() {
+        let fixture = site(&[
+            (
+                b"/find?page=1",
+                b"HTTP/1.1 302 Found\r\nLocation: ?page=2\r\nContent-Length: 0\r\n\r\n",
+            ),
+            (
+                b"/find?page=2",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nsecond page",
+            ),
+        ]);
+        assert_eq!(
+            run(&fixture.url("/find?page=1"), 12_000, true),
+            "second page\n"
+        );
+    }
+
+    /// One deadline for the whole fetch: the helper hands a hop the seconds it has left, at least
+    /// one, and refuses a hop whose deadline has already passed rather than running curl with a
+    /// zero clock. `Instant::now()` is the zero case: the check's own clock read is never earlier
+    /// than the argument.
+    #[test]
+    fn a_hop_that_starts_after_the_deadline_is_refused() {
+        let said = remaining_seconds(Instant::now()).expect_err("no time left refuses");
+        assert_eq!(said, DEADLINE_PASSED);
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a monotonic instant one second ago");
+        assert_eq!(
+            remaining_seconds(past).expect_err("a passed deadline refuses"),
+            DEADLINE_PASSED
+        );
+        let ahead = Instant::now() + Duration::from_secs(31);
+        assert_eq!(remaining_seconds(ahead).expect("time left"), 30);
+        // A partial second is one second, never zero.
+        let almost = Instant::now()
+            .checked_add(Duration::from_millis(250))
+            .expect("a quarter second ahead");
+        assert_eq!(remaining_seconds(almost).expect("a partial second"), 1);
+    }
+
+    /// The scratch directory is `0700`, and `Drop` removes it: the same guard every exit path in
+    /// `call` gets, exercised on its own first.
+    #[test]
+    fn a_scratched_call_leaves_no_directory_behind() {
+        let scratch = Scratch::new().expect("a scratch directory");
+        let path = scratch.path.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("the directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{mode:o}");
+        }
+        drop(scratch);
+        assert!(!path.exists(), "the guard left {} behind", path.display());
+    }
+
+    /// The two failure paths that used to leak: an oversized body and a non-zero curl exit. Each
+    /// names its own reason, and each leaves no scratch directory - the `Drop` guard runs on the
+    /// return that carries the error, not only on the one that carries a page.
+    #[test]
+    fn a_failed_call_leaves_no_scratch_directory_behind() {
+        // Oversize: curl exits 63 with the header and body files already in place.
+        let big = (BODY_CAP * 4) as usize;
+        let fixture = site_owned(
+            vec![owned(
+                "/",
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {big}\r\n\r\n{}",
+                    "x".repeat(big)
+                ),
+            )],
+            &[],
+        );
+        forget_scratch();
+        let said = run(&fixture.url("/"), 12_000, true);
+        assert!(said.contains("cap"), "{said}");
+        let made = scratch_made();
+        assert!(
+            !made.is_empty(),
+            "the oversize call made a scratch directory"
+        );
+        for path in made {
+            assert!(
+                !path.exists(),
+                "the oversize path left {} behind",
+                path.display()
+            );
+        }
+
+        // A non-zero exit: a connection that closes before answering is curl exit 52, and its
+        // files still exist when the call returns.
+        let empty = site_owned(vec![owned("/", String::new())], &[]);
+        forget_scratch();
+        let said = run(&empty.url("/"), 12_000, true);
+        assert!(said.contains("curl failed with exit"), "{said}");
+        // `-sS`'s own sentence is in the message, not discarded (M4).
+        assert!(said.contains("curl: ("), "curl's stderr is missing: {said}");
+        let made = scratch_made();
+        assert!(
+            !made.is_empty(),
+            "the failing call made a scratch directory"
+        );
+        for path in made {
+            assert!(
+                !path.exists(),
+                "the failure path left {} behind",
+                path.display()
+            );
+        }
+    }
+
+    /// `https` through the gate, and through curl's own walls. A live TLS fixture would need a TLS
+    /// server and therefore a dependency this tree does not take; the module doc says so, and what
+    /// this module owns is asserted here: the scheme's port and both protocol lists.
+    #[test]
+    fn https_is_admitted_by_the_gate_and_by_curls_protocol_walls() {
+        let target = Target::parse("https://example.test/x").expect("https parses");
+        assert_eq!(target.scheme, "https");
+        assert_eq!(target.port, 443);
+        let args = curl_args(
+            &target,
+            "https://example.test/x",
+            IpAddr::from([93, 184, 216, 34]),
+            30,
+            Path::new("/scratch/hdr"),
+            Path::new("/scratch/body"),
+        );
+        for wall in ["--proto", "--proto-redir"] {
+            let at = args
+                .iter()
+                .position(|arg| arg == wall)
+                .unwrap_or_else(|| panic!("{wall} is not in {args:?}"));
+            assert_eq!(args[at + 1], "=http,https", "{wall}: {args:?}");
+            assert!(args[at + 1].contains("https"), "{wall}: {args:?}");
+        }
+        let clock = args
+            .iter()
+            .position(|arg| arg == "--max-time")
+            .expect("a clock is present");
+        assert_eq!(args[clock + 1], "30");
+        // A name is pinned; a literal is not.
+        assert!(args.contains(&"--resolve".to_string()), "{args:?}");
+        let literal = Target::parse("https://127.0.0.1/x").expect("a literal parses");
+        let args = curl_args(
+            &literal,
+            "https://127.0.0.1/x",
+            IpAddr::from([127, 0, 0, 1]),
+            30,
+            Path::new("/scratch/hdr"),
+            Path::new("/scratch/body"),
+        );
+        assert!(!args.contains(&"--resolve".to_string()), "{args:?}");
+    }
+
+    /// The absolute-`Location` hop, judged on the header the fixture actually sent rather than on
+    /// a string this test retyped. The fixture answers 302 with `Location: http://127.0.0.1:<its own
+    /// port>/inner`, which is loopback: `allow_private=true` reaches the fixture, and the hop the
+    /// header names is then judged closed as refused and open as 127.0.0.1. One flag cannot both
+    /// reach a loopback fixture and refuse a loopback hop, so the header is what is put on trial.
+    #[test]
+    fn a_302_to_an_absolute_private_location_is_judged_at_the_hop() {
+        let fixture = site_owned(
+            vec![
+                owned(
+                    "/out",
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{{PORT}}/inner\r\n\
+                     Content-Length: 0\r\n\r\n"
+                        .to_string(),
+                ),
+                owned(
+                    "/inner",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntunnelled".to_string(),
+                ),
+            ],
+            &[],
+        );
+        let location = location_of(&raw_get(fixture.port, "/out"));
+        assert_eq!(location, format!("http://127.0.0.1:{}/inner", fixture.port));
+        let hop = Target::parse(&location).expect("the absolute Location parses");
+        assert_eq!(hop.scheme, "http");
+        assert_eq!(hop.port, fixture.port);
+        assert_eq!(resolve(&hop, true), Ok(IpAddr::from([127, 0, 0, 1])));
+        let closed = resolve(&hop, false);
+        assert!(
+            matches!(&closed, Err(said) if said.contains("private address")),
+            "{closed:?}"
+        );
+        // It is already absolute: resolving it against the URL that carried it changes nothing.
+        assert_eq!(resolve_location(&fixture.url("/out"), &location), location);
+        // And followed end to end when the hole is open: the body is the tunnel's page.
+        assert_eq!(run(&fixture.url("/out"), 12_000, true), "tunnelled\n");
+    }
+
+    /// Only 301, 302, 303, 307 and 308 are followed. Any other 3xx carrying a `Location` is a
+    /// response whose body ends the call - the fixture's `/t300` and `/t399` say `plain` and that
+    /// is what comes back, while the five followed codes reach `/inner`.
+    #[test]
+    fn only_the_five_followed_3xx_codes_redirect() {
+        let mut answers = Vec::new();
+        for code in [301u16, 302, 303, 307, 308] {
+            answers.push(owned(
+                &format!("/r{code}"),
+                format!(
+                    "HTTP/1.1 {code} Redirect\r\nLocation: /inner\r\nContent-Length: 0\r\n\r\n"
+                ),
+            ));
+        }
+        for code in [300u16, 399] {
+            answers.push(owned(
+                &format!("/t{code}"),
+                format!(
+                    "HTTP/1.1 {code} Not Followed\r\nLocation: /inner\r\nContent-Length: 5\r\n\r\nplain"
+                ),
+            ));
+        }
+        answers.push(owned(
+            "/inner",
+            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntunnelled".to_string(),
+        ));
+        let fixture = site_owned(answers, &[]);
+        for code in [301u16, 302, 303, 307, 308] {
+            assert_eq!(
+                run(&fixture.url(&format!("/r{code}")), 12_000, true),
+                "tunnelled\n",
+                "{code} must be followed"
+            );
+        }
+        for code in [300u16, 399] {
+            assert_eq!(
+                run(&fixture.url(&format!("/t{code}")), 12_000, true),
+                "plain\n",
+                "{code} must be terminal"
+            );
+        }
     }
 
     /// The bound is real in both walls: an oversized body is refused, and the refusal is about the
@@ -914,14 +1328,15 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("a nonblocking fixture");
+        let port_text = port.to_string();
         let mut addresses: Vec<(String, Arc<Vec<u8>>)> = owned_answers
             .into_iter()
-            .map(|(path, reply)| (path, Arc::new(reply)))
+            .map(|(path, reply)| (path, Arc::new(expand_port(&reply, &port_text))))
             .collect();
         for (path, reply) in static_answers {
             addresses.push((
                 String::from_utf8_lossy(path).to_string(),
-                Arc::new(reply.to_vec()),
+                Arc::new(expand_port(reply, &port_text)),
             ));
         }
         let running = Arc::new(AtomicBool::new(true));
@@ -932,6 +1347,57 @@ mod tests {
             running,
             handle: Some(handle),
         }
+    }
+
+    /// Replace the fixture's `{{PORT}}` token with the port the listener was bound to, so an answer
+    /// can name this site's own address - the shape an absolute `Location` needs, where the port is
+    /// unknown until the listener exists.
+    fn expand_port(reply: &[u8], port: &str) -> Vec<u8> {
+        let token = b"{{PORT}}";
+        let mut out = Vec::with_capacity(reply.len());
+        let mut rest = reply;
+        while let Some(at) = rest.windows(token.len()).position(|window| window == token) {
+            out.extend_from_slice(&rest[..at]);
+            out.extend_from_slice(port.as_bytes());
+            rest = &rest[at + token.len()..];
+        }
+        out.extend_from_slice(rest);
+        out
+    }
+
+    /// Talk to a fixture over a socket and hand back its whole answer, so a test can assert on the
+    /// header the fixture actually sent rather than on the string the test meant to send.
+    fn raw_get(port: u16, path: &str) -> String {
+        use std::io::{Read as _, Write as _};
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("the fixture answers");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("a read timeout");
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("a write timeout");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .expect("a request");
+        stream.flush().expect("a flushed request");
+        let mut text = String::new();
+        stream
+            .read_to_string(&mut text)
+            .expect("the fixture's answer");
+        text
+    }
+
+    /// The one `Location` header out of a raw response.
+    fn location_of(response: &str) -> String {
+        response
+            .lines()
+            .find_map(|line| line.strip_prefix("Location:"))
+            .expect("a Location header")
+            .trim()
+            .to_string()
     }
 
     /// The accept loop, split out so both `site` builders hand the same body their address list.
