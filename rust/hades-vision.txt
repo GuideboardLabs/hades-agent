@@ -1,0 +1,13 @@
+vision: a second model that looks, because the chat model reads
+
+The chat model is text, so a picture is a second call to a second model. vision.rs owns
+Qwen3-VL 8B and its projector on loopback, starts the server on first use, shrinks the
+picture to 768 px, asks one question, and returns text.
+
+The CPU build of llama-server turned one screenshot into 44 seconds. The Vulkan build does
+the same work in 4.1. The binary is a constant with an env override, not a service the
+gateway expects to find running.
+
+A photo sent to the bot is downloaded with getFile into <state>/inbox, described, and given
+to the conversation as what the picture shows. The Update carries a photo file id; the
+transport names and fetches the bytes.

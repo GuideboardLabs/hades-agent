@@ -1,0 +1,15 @@
+cron: work that runs itself, and reports to the chat that asked
+
+A job is a task, a schedule and the chat that receives the result, kept in <state>/cron.json.
+The agent edits that list with the cron tool. The gateway's scheduler runs what is due and
+sends the answer into the chat.
+
+Two schedules, because two are useful and small enough to read: every 30m (measured from the
+last run) and daily 07:30 (local time, named by date).
+
+The last-run stamp is written before the work starts, so a crash delays a job instead of
+repeating it every twenty seconds. A probe with no chat refuses to create a job rather than
+run one silently.
+
+The shell has crontab, and the model reached for it first. The system prompt now says that
+recurring work belongs in the cron tool, where the result comes back to a person.

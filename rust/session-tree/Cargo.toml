@@ -1,0 +1,14 @@
+[package]
+name = "session-tree"
+version = "0.1.0"
+edition = "2024"
+description = "Append-only, forkable session log. Port of the Python spec, same oracle."
+license = "MIT"
+
+[package.metadata.hades]
+port_source = "../hades/session/tree.py"
+port_oracle = "../tests/test_hades_session_tree.py"
+
+[dependencies]
+# JSONL is the storage format, per the design. Nothing else is needed.
+serde_json = "1"

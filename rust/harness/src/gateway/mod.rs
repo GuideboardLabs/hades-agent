@@ -1,0 +1,1710 @@
+//! The gateway: a chat message becomes a daemon op, never a second runtime.
+//!
+//! One daemon owns every session, and this module is one surface attached to it. The transport is a
+//! trait because Telegram's network is not testable here and the loop is: the oracle drives scripted
+//! updates through a fake and the real client is one implementation with no branches of its own.
+//!
+//! A run reports while it works. The status message is sent once and edited as entries arrive, the chat
+//! shows a typing indicator for as long as the run is live, and the run's own steps (the program it
+//! wrote, what the shell returned, the check's verdict) appear in the message a person is watching
+//! rather than in a final summary that hides them. Telegram is the limit: an edit per second is safe,
+//! and an edit that repeats the same text is refused, so the writer throttles and the last line always
+//! wins.
+//!
+//! The trust boundary is the sender's numeric id, checked against `gateway.telegram.allowed_users` in
+//! the config file. Message text never chooses a policy, a root, a profile, a model or a check: those
+//! come from the config, because a stranger's sentence must not be able to set them.
+//!
+//! The token is read from `HADES_TELEGRAM_TOKEN` (the environment, then Hades' own `.env`) and appears
+//! in the Bot API URL, which means it is visible in the curl process's arguments for the length of a
+//! call. That is a limit of the Bot API's shape, recorded here rather than hidden.
+
+pub mod telegram;
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+/// The most characters one chat message may carry. Telegram refuses more, so the gateway cuts first and
+/// says it cut rather than letting the API fail the whole delivery.
+const MESSAGE_LIMIT: usize = 3_800;
+/// How often the status message may be rewritten. An edit per entry turns a long attempt into a flood;
+/// a second between edits keeps the stream readable and stays well inside Telegram's limit.
+const EDIT_EVERY: Duration = Duration::from_millis(1_100);
+/// Lines kept in the live status. Older steps scroll out; the message stays one screen and one edit.
+const LIVE_LINES: usize = 14;
+
+/// What the config file says about the gateway. Read from the same file the daemon reads, because a
+/// second settings file is a second place to be out of date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    pub allowed: Vec<i64>,
+    pub policy: String,
+    /// The check a chat run is judged by. A message cannot name one for itself, and the profile's default
+    /// (`cargo test --quiet`) is wrong outside a Rust tree: every run would fail a check about another
+    /// project. The gateway therefore carries one check per surface, and a config without one refuses.
+    pub verify: String,
+    /// The preset a plain message is answered with. The harness profiles choose a model for work; a chat
+    /// is not work and should not be routed through the fix profile's check and retries.
+    pub model: String,
+    /// Where a chat's tools run. Absent means the process's own directory, which a daemon should never
+    /// rely on, so the config names it and the gateway refuses to guess.
+    pub root: String,
+    /// Hades' own memory, the same vault the governed runs use.
+    pub vault: String,
+    /// The MCP servers a chat may reach, parsed from the same file.
+    pub mcp: crate::mcp::McpConfig,
+}
+
+/// Read `gateway.telegram` from a config file. A missing section, an empty allowlist or an empty check is
+/// a refusal with the key named: an absent allowlist must never mean everyone, and a run with no check
+/// can only end in `could_not_run`.
+pub fn settings(path: &Path) -> Result<Settings, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let telegram = value
+        .get("gateway")
+        .and_then(|gateway| gateway.get("telegram"))
+        .ok_or_else(|| {
+            format!(
+                "{}: there is no `gateway.telegram` section; the gateway will not start without one",
+                path.display()
+            )
+        })?;
+    let allowed: Vec<i64> = telegram
+        .get("allowed_users")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    if allowed.is_empty() {
+        return Err(format!(
+            "{}: `gateway.telegram.allowed_users` is empty; an empty list is not everyone",
+            path.display()
+        ));
+    }
+    let verify = telegram
+        .get("verify")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if verify.trim().is_empty() {
+        return Err(format!(
+            "{}: `gateway.telegram.verify` is empty; a chat run needs a check to be judged by",
+            path.display()
+        ));
+    }
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if model.is_empty() {
+        return Err(format!(
+            "{}: no top-level `model`; a chat needs a preset to answer with",
+            path.display()
+        ));
+    }
+    let root = value
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if root.is_empty() {
+        return Err(format!(
+            "{}: no top-level `root`; a chat's tools need a workspace",
+            path.display()
+        ));
+    }
+    let vault = value
+        .get("vault")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if vault.is_empty() {
+        return Err(format!(
+            "{}: no top-level `vault`; a chat's memory needs a vault",
+            path.display()
+        ));
+    }
+    let policy = telegram
+        .get("policy")
+        .and_then(Value::as_str)
+        .unwrap_or("guarded")
+        .to_string();
+    if policy != "guarded" && policy != "open" {
+        return Err(format!(
+            "{}: `gateway.telegram.policy` is {policy:?}; say guarded or open",
+            path.display()
+        ));
+    }
+    Ok(Settings {
+        allowed,
+        policy,
+        verify,
+        model,
+        root,
+        vault,
+        mcp: crate::mcp::McpConfig::from_value(value.get("mcp"), path)?,
+    })
+}
+
+/// One message or one button press, as much of it as this surface reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Update {
+    pub id: i64,
+    pub from: i64,
+    pub chat: i64,
+    pub text: String,
+    pub callback: Option<Callback>,
+    /// The largest size of a photo the person sent, when they sent one. The gateway downloads it, looks at
+    /// it with the vision pair, and gives the chat model the description: the chat model does not see pixels.
+    pub photo: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Callback {
+    pub id: String,
+    pub data: String,
+}
+
+/// One inline button: what a person reads, and the short data Telegram sends back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Button {
+    pub label: String,
+    pub data: String,
+}
+
+/// The network, behind one seam. A clone is a second handle to the same account, which is what lets the
+/// poller keep polling while a worker streams and a heartbeat types.
+pub trait Transport {
+    fn updates(&mut self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>, String>;
+    /// Send a message and hand back its id when the surface has one, so it can be edited afterwards.
+    fn send(&mut self, chat: i64, text: &str, buttons: &[Button]) -> Result<Option<i64>, String>;
+    fn edit(
+        &mut self,
+        chat: i64,
+        message: i64,
+        text: &str,
+        buttons: &[Button],
+    ) -> Result<(), String>;
+    fn typing(&mut self, chat: i64) -> Result<(), String>;
+    fn ack(&mut self, callback: &str, text: &str) -> Result<(), String>;
+    /// Fetch a file the platform holds, by its file id. Surfaces without files keep the default.
+    fn file(&self, _file_id: &str) -> Result<Vec<u8>, String> {
+        Err("this surface cannot fetch files".to_string())
+    }
+}
+
+/// The in-memory half of a stop on this surface. The daemon's `stop` covers a `/run`, because that work is
+/// a daemon session; a plain conversation runs in the gateway process, so it needs a flag the poller can
+/// raise while the answer is streaming. One flag per chat, plus a lock per chat so two messages do not
+/// interleave their histories.
+#[derive(Default)]
+pub struct Signals {
+    flags: Mutex<BTreeMap<i64, Arc<AtomicBool>>>,
+    locks: Mutex<BTreeMap<i64, Arc<Mutex<()>>>>,
+    /// Set by `/shutdown`: the daemon is going, so the poller has no reason to ask it anything else.
+    shutdown: AtomicBool,
+}
+
+impl Signals {
+    /// The lock for one chat. A worker takes it before it registers, and holds it for its life, so two
+    /// messages in one chat do not interleave their histories and the registered flag is always the flag of
+    /// the answer a stop would actually reach.
+    pub fn lock(&self, chat: i64) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|held| held.into_inner());
+        Arc::clone(locks.entry(chat).or_default())
+    }
+
+    /// Register the answer now running in this chat. The caller holds [`Signals::lock`] for this chat, so
+    /// this cannot replace a worker that is still working.
+    pub fn begin(&self, chat: i64) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut flags = self.flags.lock().unwrap_or_else(|held| held.into_inner());
+        flags.insert(chat, Arc::clone(&flag));
+        flag
+    }
+
+    /// Forget a worker, but only its own flag: a newer worker for the same chat must not lose its stop.
+    pub fn leave(&self, chat: i64, flag: &Arc<AtomicBool>) {
+        let mut flags = self.flags.lock().unwrap_or_else(|held| held.into_inner());
+        if flags.get(&chat).is_some_and(|held| Arc::ptr_eq(held, flag)) {
+            flags.remove(&chat);
+        }
+    }
+
+    /// Ask the answer in this chat to stop. False means no answer was registered, which is what a `/stop`
+    /// with nothing running reports rather than pretending it did something.
+    pub fn stop(&self, chat: i64) -> bool {
+        let flags = self.flags.lock().unwrap_or_else(|held| held.into_inner());
+        match flags.get(&chat) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn flag(&self, chat: i64) -> Option<Arc<AtomicBool>> {
+        self.flags
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .get(&chat)
+            .cloned()
+    }
+
+    /// Whether `/shutdown` ended the poller.
+    pub fn stopped(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+}
+
+/// The offset file. One number: the next update id to ask for. Written after a batch is handled, so a
+/// crash replays at most one batch and a replay is dropped by the offset rather than answered twice.
+fn offset_path(state: &Path) -> PathBuf {
+    state.join("gateway").join("telegram.json")
+}
+
+pub fn load_offset(state: &Path) -> Option<i64> {
+    let text = std::fs::read_to_string(offset_path(state)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value.get("offset").and_then(Value::as_i64)
+}
+
+fn save_offset(state: &Path, offset: i64) -> Result<(), String> {
+    let path = offset_path(state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    std::fs::write(&path, json!({ "offset": offset }).to_string())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// A question the gateway is holding: the goal it belongs to, and the session whose standing answer
+/// will let the resumed attempt through.
+#[derive(Debug, Clone)]
+struct Pending {
+    goal: String,
+    session: String,
+}
+
+fn pending_path(state: &Path, id: u64) -> PathBuf {
+    state
+        .join("gateway")
+        .join("pending")
+        .join(format!("{id}.json"))
+}
+
+fn pending_save(state: &Path, id: u64, goal: &str, session: &str) -> Result<(), String> {
+    let path = pending_path(state, id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    std::fs::write(&path, json!({"goal": goal, "session": session}).to_string())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn pending_load(state: &Path, id: u64) -> Option<Pending> {
+    let text = std::fs::read_to_string(pending_path(state, id)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    Some(Pending {
+        goal: value.get("goal")?.as_str()?.to_string(),
+        session: value.get("session")?.as_str()?.to_string(),
+    })
+}
+
+fn pending_remove(state: &Path, id: u64) {
+    let _ = std::fs::remove_file(pending_path(state, id));
+}
+
+/// One request whose answer is one line.
+fn ask(socket: &Path, request: &Value) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| format!("could not reach {}: {error}", socket.display()))?;
+    writeln!(stream, "{request}")
+        .map_err(|error| format!("could not send the request: {error}"))?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| format!("the daemon went away: {error}"))?;
+    serde_json::from_str(line.trim())
+        .map_err(|error| format!("the daemon's answer would not read: {error}"))
+}
+
+/// The start of a long block, for a reasoning excerpt that a person reads rather than greps.
+fn head(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let kept: String = trimmed.chars().take(limit).collect();
+    format!("{kept}...")
+}
+
+fn tail(text: &str, limit: usize) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let skip = trimmed.chars().count() - limit;
+    let kept: String = trimmed.chars().skip(skip).collect();
+    format!("...{kept}")
+}
+
+/// Text that came from a model or a shell is untrusted as HTML: escape it before it goes in a message,
+/// or one `<` from a build log changes the formatting of everything after it.
+fn esc(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn pre(text: &str) -> String {
+    format!("<pre>{}</pre>", esc(text.trim_end()))
+}
+
+/// A tool's name as a heading a person reads.
+fn title(tool: &str) -> &'static str {
+    match tool {
+        "shell" => "Shell",
+        "verify" => "Check",
+        "vault" => "Vault",
+        _ => "Work",
+    }
+}
+
+/// One entry as a block a person can read. The point is not to mirror JSON; it is to show what the run
+/// did while it did it, which is the part a final summary hides. Reasoning, when the endpoint returned
+/// it, comes before the program that followed it, because that is the order it happened in.
+fn describe(entry: &Value) -> Option<String> {
+    let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
+    let payload = entry.get("payload").unwrap_or(&Value::Null);
+    match kind {
+        "tool_call" => {
+            let tool = payload
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let program = payload.get("program").and_then(Value::as_str).unwrap_or("");
+            let mut block = String::new();
+            if let Some(reasoning) = payload.get("reasoning").and_then(Value::as_str) {
+                let said = head(reasoning, 500);
+                if !said.trim().is_empty() {
+                    block.push_str(&format!("<b>Thinking</b>\n<i>{}</i>\n\n", esc(&said)));
+                }
+            }
+            if program.trim().is_empty() {
+                block.push_str(&format!("<b>{}</b>", title(tool)));
+            } else {
+                block.push_str(&format!("<b>{}</b>\n{}", title(tool), pre(program)));
+            }
+            Some(block)
+        }
+        "tool_result" => {
+            let status = payload
+                .get("state")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("status").and_then(Value::as_str))
+                .unwrap_or("");
+            let output = payload.get("output").and_then(Value::as_str).unwrap_or("");
+            let head = format!("<b>Result</b> · exit {}", esc(status));
+            if output.trim().is_empty() {
+                Some(head)
+            } else {
+                Some(format!("{head}\n{}", pre(&tail(output, 360))))
+            }
+        }
+        "approval_request" => Some("<b>Permission</b> · waiting for you".to_string()),
+        "approval_decision" => {
+            let decision = payload
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("decided");
+            Some(format!("<b>Approval</b> · {}", esc(decision)))
+        }
+        "checkpoint" => payload
+            .get("why")
+            .and_then(Value::as_str)
+            .map(|why| format!("<i>{}</i>", esc(why))),
+        "judged" => payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("verdict").and_then(Value::as_str))
+            .map(|said| format!("<b>Judge</b> · {}", esc(said))),
+        _ => None,
+    }
+}
+
+/// The live message: one id, lines that grow, and the throttle that keeps the edits legal.
+struct Status {
+    chat: i64,
+    id: Option<i64>,
+    /// The model's thinking, as it arrives. Only the tail is shown: what a person wants while it works is
+    /// the current thought, not a transcript.
+    reasoning: String,
+    /// The answer being written, before the turn turns it into a program block.
+    content: String,
+    lines: Vec<String>,
+    last: Instant,
+}
+
+impl Status {
+    fn new(chat: i64, id: Option<i64>) -> Status {
+        Status {
+            chat,
+            id,
+            reasoning: String::new(),
+            content: String::new(),
+            lines: Vec::new(),
+            last: Instant::now() - EDIT_EVERY,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        if self.lines.last() == Some(&line) {
+            return;
+        }
+        self.lines.push(line);
+        if self.lines.len() > LIVE_LINES {
+            let drop = self.lines.len() - LIVE_LINES;
+            self.lines.drain(0..drop);
+        }
+    }
+
+    fn feed(&mut self, kind: &str, delta: &str) {
+        match kind {
+            "reasoning" => self.reasoning.push_str(delta),
+            "content" => self.content.push_str(delta),
+            _ => {}
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.reasoning.trim().is_empty() {
+            parts.push(format!(
+                "<b>Thinking</b>\n<i>{}</i>",
+                esc(&tail(&self.reasoning, 900))
+            ));
+        }
+        if !self.content.trim().is_empty() {
+            parts.push(format!(
+                "<b>Writing</b>\n{}",
+                pre(&tail(&self.content, 700))
+            ));
+        }
+        parts.extend(self.lines.iter().cloned());
+        clip(&parts.join("\n"))
+    }
+
+    fn draw(&mut self, transport: &mut dyn Transport, force: bool) -> Result<(), String> {
+        let Some(id) = self.id else {
+            return Ok(());
+        };
+        if !force && self.last.elapsed() < EDIT_EVERY {
+            return Ok(());
+        }
+        self.last = Instant::now();
+        match transport.edit(self.chat, id, &self.text(), &[]) {
+            // Telegram refuses an edit that changes nothing; that is not a failure to report.
+            Err(said) if said.contains("message is not modified") => Ok(()),
+            other => other,
+        }
+    }
+}
+
+/// Send a request whose answer is a stream, and narrate it into one edited message while it happens.
+fn follow<T: Transport + Clone + Send + 'static>(
+    socket: &Path,
+    request: &Value,
+    transport: &mut T,
+    chat: i64,
+    state: &Path,
+) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| format!("could not reach {}: {error}", socket.display()))?;
+    writeln!(stream, "{request}")
+        .map_err(|error| format!("could not send the request: {error}"))?;
+
+    let started = transport.send(chat, "<b>Hades</b> · working", &[])?;
+    let mut status = Status::new(chat, started);
+    let mut asked = false;
+    let stop = Arc::new(AtomicBool::new(false));
+    let heartbeat = {
+        // Typing is a five-second claim; a run that thinks for a minute has to keep making it, or the
+        // chat looks dead exactly when the model is doing the most work.
+        let mut beat = transport.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let _ = beat.typing(chat);
+                for _ in 0..40 {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        })
+    };
+
+    for line in BufReader::new(stream).lines() {
+        let line = line.map_err(|error| format!("the daemon went away: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value
+            .get("started")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let run = value.get("run").and_then(Value::as_u64).unwrap_or(0);
+            let session = value.get("session").and_then(Value::as_str).unwrap_or("?");
+            status.push(format!(
+                "<b>Hades</b> · run {run} · session <code>{}</code>",
+                esc(session)
+            ));
+            status.draw(transport, true)?;
+        } else if let Some(kind) = value.get("progress").and_then(Value::as_str) {
+            status.feed(
+                kind,
+                value.get("delta").and_then(Value::as_str).unwrap_or(""),
+            );
+            status.draw(transport, false)?;
+        } else if let Some(entry) = value.get("entry") {
+            let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
+            if let Some(described) = describe(entry) {
+                if kind == "tool_call" {
+                    // The streamed halves are now the program block; keeping them too would say it twice.
+                    status.reasoning.clear();
+                    status.content.clear();
+                }
+                status.push(described);
+            }
+            if kind == "approval_request" {
+                let payload = entry.get("payload").unwrap_or(&Value::Null);
+                let id = payload.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let action = payload
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("an action");
+                let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
+                let goal = request.get("goal").and_then(Value::as_str).unwrap_or("");
+                let session = request.get("session").and_then(Value::as_str).unwrap_or("");
+                asked = true;
+                match pending_save(state, id, goal, session) {
+                    Ok(()) => {
+                        let text = clip(&format!(
+                            "<b>Permission needed</b>\n{}\n<i>{}</i>",
+                            pre(action),
+                            esc(reason)
+                        ));
+                        let buttons = [
+                            Button {
+                                label: "Allow".to_string(),
+                                data: format!("a:{id}:1"),
+                            },
+                            Button {
+                                label: "Deny".to_string(),
+                                data: format!("a:{id}:0"),
+                            },
+                        ];
+                        transport.send(chat, &text, &buttons)?;
+                        // While a person decides, the run is parked: typing would be a lie.
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    Err(said) => {
+                        let _ = transport.send(
+                            chat,
+                            &clip(&format!(
+                                "this run wants to {action} but I could not remember the question ({said}), so Allow could not continue it. The question stays open in the record."
+                            )),
+                            &[],
+                        );
+                    }
+                }
+            }
+            status.draw(transport, false)?;
+        } else if value
+            .get("finished")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            stop.store(true, Ordering::SeqCst);
+            let ended = value.get("ended").and_then(Value::as_str).unwrap_or("");
+            if ended == "awaiting" && asked {
+                status.push("<i>Waiting for your decision above.</i>".to_string());
+                status.draw(transport, true)?;
+                let _ = heartbeat.join();
+                return Ok(());
+            }
+            let mut text = match value.get("ended").and_then(Value::as_str) {
+                Some(ended) => {
+                    let (head, rest) = ended.split_once(' ').unwrap_or((ended, ""));
+                    let mut head = head.to_string();
+                    if let Some(first) = head.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    format!("<b>{}</b> {}", esc(&head), esc(rest))
+                }
+                None => match value.get("fault").and_then(Value::as_str) {
+                    Some(fault) => format!("<b>Faulted</b>\n{}", pre(fault)),
+                    None => "<b>Ended</b> · the daemon said nothing about how".to_string(),
+                },
+            };
+            if let Some(recorded) = value.get("recorded").and_then(Value::as_str) {
+                text.push_str(&format!("\nRecorded: <code>{}</code>", esc(recorded)));
+            }
+            status.push(text);
+            status.draw(transport, true)?;
+            let _ = heartbeat.join();
+            return Ok(());
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = heartbeat.join();
+    // A stream that closes without `finished` is not a success; say so instead of leaving `working...`.
+    status.push("the daemon closed the stream without saying how the run ended".to_string());
+    status.draw(transport, true)
+}
+
+fn clip(text: &str) -> String {
+    if text.chars().count() <= MESSAGE_LIMIT {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(MESSAGE_LIMIT).collect();
+    format!("{kept}\n[cut: the message was longer than {MESSAGE_LIMIT} characters]")
+}
+
+fn command(text: &str) -> (&str, &str) {
+    let text = text.trim();
+    if !text.starts_with('/') {
+        return ("/run", text);
+    }
+    match text.split_once(char::is_whitespace) {
+        Some((name, rest)) => (name, rest.trim()),
+        None => (text, ""),
+    }
+}
+
+/// How much of a conversation is sent back to the model. Eight exchanges is enough for pronouns and not
+/// enough to pay for yesterday.
+const CHAT_KEEP: usize = 16;
+
+fn chat_path(state: &Path, chat: i64) -> PathBuf {
+    state
+        .join("gateway")
+        .join("chat")
+        .join(format!("{chat}.json"))
+}
+
+fn load_chat(state: &Path, chat: i64) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(chat_path(state, chat)) else {
+        return Vec::new();
+    };
+    let Ok(Value::Array(messages)) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    messages
+}
+
+fn save_chat(state: &Path, chat: i64, messages: &[Value]) {
+    let path = chat_path(state, chat);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let kept: Vec<&Value> = messages
+        .iter()
+        .rev()
+        .take(CHAT_KEEP)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let kept: Vec<Value> = kept.into_iter().cloned().collect();
+    let _ = std::fs::write(&path, Value::Array(kept).to_string());
+}
+
+/// A chat card is prose, not a run card: the answer as it is written, and the thinking only until there is
+/// an answer to read.
+fn render_chat(reasoning: &str, content: &str, activity: &[String]) -> String {
+    if !content.trim().is_empty() {
+        return esc(content.trim());
+    }
+    let mut parts = Vec::new();
+    if !activity.is_empty() {
+        parts.push(
+            activity
+                .iter()
+                .map(|line| format!("<i>· {}</i>", esc(line)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    let thought = tail(reasoning.trim(), 600);
+    if !thought.trim().is_empty() {
+        parts.push(format!("<i>{}</i>", esc(&thought)));
+    }
+    if parts.is_empty() {
+        "<i>…</i>".to_string()
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+/// A plain message is a conversation. It is not a goal, it does not get a program, a check or attempts, and
+/// the person sees the answer while it is written. `/run` is the door to the harness.
+fn chat<T: Transport + Clone + Send + 'static>(
+    update: &Update,
+    settings: &Settings,
+    state: &Path,
+    transport: &mut T,
+    halt: Option<&AtomicBool>,
+    mcp: &Arc<crate::mcp::Mcp>,
+) -> Result<(), String> {
+    let _ = state;
+    let preset = crate::model::preset(&settings.model)
+        .ok_or_else(|| format!("no model preset named `{}`", settings.model))?;
+    let client = crate::model::from_preset(&preset);
+    let mut history = load_chat(state, update.chat);
+    let workspace = PathBuf::from(&settings.root);
+    let world = world_for(
+        settings,
+        state,
+        update.chat,
+        crate::mode::Mode::Act,
+        &format!("chat:{}", update.chat),
+        mcp,
+    );
+    let mut messages = vec![json!({"role": "system", "content": system_prompt(&workspace)})];
+    messages.append(&mut history);
+    let mut asked = update.text.trim().to_string();
+    if let Some(file_id) = &update.photo {
+        let safe: String = file_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = state.join("inbox").join(format!("{safe}.jpg"));
+        let outcome = transport.file(file_id).and_then(|bytes| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&path, bytes).map_err(|error| error.to_string())
+        });
+        match outcome {
+            Ok(()) => match crate::vision::describe(
+                &path,
+                "Describe this image precisely. Transcribe every word of text visible, verbatim.",
+            ) {
+                Ok(said) => {
+                    asked = format!("[the person sent an image. What it shows: {said}]\n\n{asked}");
+                }
+                Err(said) => {
+                    asked = format!(
+                        "[the person sent an image saved at {} but it could not be read: {said}]\n\n{asked}",
+                        path.display()
+                    );
+                }
+            },
+            Err(said) => {
+                asked = format!(
+                    "[the person sent an image that could not be downloaded: {said}]\n\n{asked}"
+                );
+            }
+        }
+        if asked.trim().is_empty() {
+            asked = "[the person sent an image]".to_string();
+        }
+    }
+    messages.push(json!({"role": "user", "content": asked}));
+
+    // A long conversation becomes one summary at the top before it becomes a cost problem. Compression
+    // is the one place the system prompt may change mid-conversation, which is why the summary rides
+    // there instead of posing as a message the person never sent.
+    if let Err(fault) = crate::agent::compress(&client, &mut messages, 8, 12000) {
+        eprintln!("compression: not written, {fault}");
+    }
+    let id = transport.send(update.chat, "<i>…</i>", &[])?;
+    let shared = Arc::new(Mutex::new((
+        String::new(),
+        String::new(),
+        Vec::<String>::new(),
+    )));
+    let stop = Arc::new(AtomicBool::new(false));
+    let ticker = {
+        let mut beat = transport.clone();
+        let shared = Arc::clone(&shared);
+        let stop = Arc::clone(&stop);
+        let chat_id = update.chat;
+        std::thread::spawn(move || {
+            let mut last = Instant::now() - EDIT_EVERY;
+            while !stop.load(Ordering::SeqCst) {
+                let _ = beat.typing(chat_id);
+                if last.elapsed() >= EDIT_EVERY
+                    && let Some(message) = id
+                {
+                    let text = {
+                        let held = shared.lock().expect("the chat buffer");
+                        render_chat(&held.0, &held.1, &held.2)
+                    };
+                    let _ = beat.edit(chat_id, message, &text, &[]);
+                    last = Instant::now();
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        })
+    };
+    let feed = |kind: crate::model::Feed, piece: &str| {
+        if let Ok(mut held) = shared.lock() {
+            match kind {
+                crate::model::Feed::Reasoning => held.0.push_str(piece),
+                crate::model::Feed::Content => held.1.push_str(piece),
+            }
+        }
+    };
+    let activity = |event: crate::agent::Activity, label: &str| {
+        if event == crate::agent::Activity::Start
+            && let Ok(mut held) = shared.lock()
+        {
+            held.2.push(label.to_string());
+            if held.2.len() > 8 {
+                held.2.remove(0);
+            }
+        }
+    };
+    let answer =
+        crate::agent::answer_stoppable(&client, &mut messages, &world, &feed, &activity, 20, halt);
+    stop.store(true, Ordering::SeqCst);
+    let _ = ticker.join();
+
+    match answer {
+        Ok(Some(text)) => {
+            if let Some(message) = id {
+                transport.edit(update.chat, message, &esc(&text), &[])?;
+            } else {
+                transport.send(update.chat, &esc(&text), &[])?;
+            }
+            // The record is the conversation, not the tool traffic: the next message needs the exchange.
+            let kept = vec![
+                json!({"role": "user", "content": asked}),
+                json!({"role": "assistant", "content": text}),
+            ];
+            let mut history = load_chat(state, update.chat);
+            history.extend(kept);
+            save_chat(state, update.chat, &history);
+            Ok(())
+        }
+        Ok(None) => {
+            // A stopped answer is not the assistant's turn: storing it would make the next prompt believe a
+            // refusal was something it said. The person's message stays out too, for the same reason.
+            if let Some(message) = id {
+                transport.edit(
+                    update.chat,
+                    message,
+                    "<b>Stopped.</b> What already ran is not undone.",
+                    &[],
+                )?;
+            }
+            Ok(())
+        }
+        Err(fault) => {
+            let said = fault.detail().to_string();
+            if let Some(message) = id {
+                transport.edit(
+                    update.chat,
+                    message,
+                    &format!("<b>Error</b> {}", esc(&said)),
+                    &[],
+                )?;
+            }
+            Err(said)
+        }
+    }
+}
+
+fn system_prompt(workspace: &Path) -> String {
+    format!(
+        "You are Hades, Seth's agent in a Telegram chat. Answer in prose that reads like a message: \
+short unless the question needs depth, no tables, no headers. Your tools run in {}. Use them when the \
+answer depends on the machine, a file or the web, and then report what matters rather than the tool \
+traffic. For work that has to happen again later, use the cron tool and never the shell's crontab: a job \
+made there reports back into this chat. When a job splits into independent parts, delegate runs them in \
+parallel. Never mention checks, sessions, attempts or routing.",
+        workspace.display()
+    )
+}
+
+/// One update, handled to the end. A submit blocks until its run finishes, which is why `serve` gives
+/// each one a thread: the poller has to stay free to receive the approval that the run is waiting for.
+pub fn handle<T: Transport + Clone + Send + 'static>(
+    update: &Update,
+    settings: &Settings,
+    socket: &Path,
+    state: &Path,
+    transport: &mut T,
+) -> Result<(), String> {
+    handle_with(
+        update,
+        settings,
+        socket,
+        state,
+        transport,
+        &Signals::default(),
+        &Arc::new(crate::mcp::Mcp::empty()),
+    )
+}
+
+/// The same, with the surface's stop flags. A plain message needs this: it runs a model loop in this
+/// process, and a `/stop` that cannot reach that loop is a command that only works when nothing is running.
+pub fn handle_with<T: Transport + Clone + Send + 'static>(
+    update: &Update,
+    settings: &Settings,
+    socket: &Path,
+    state: &Path,
+    transport: &mut T,
+    signals: &Signals,
+    mcp: &Arc<crate::mcp::Mcp>,
+) -> Result<(), String> {
+    if !settings.allowed.contains(&update.from) {
+        return Ok(());
+    }
+    if let Some(callback) = &update.callback {
+        let by = format!("telegram:{}", update.from);
+        let parts: Vec<&str> = callback.data.split(':').collect();
+        let (id, allow) = match parts.as_slice() {
+            ["a", id, allow] if *allow == "1" || *allow == "0" => match id.parse::<u64>() {
+                Ok(id) => (id, *allow == "1"),
+                Err(_) => return transport.ack(&callback.id, "that question id does not read"),
+            },
+            _ => return transport.ack(&callback.id, "that button is not an answer"),
+        };
+        let Some(held) = pending_load(state, id) else {
+            return transport.ack(&callback.id, "that question is not waiting on this machine");
+        };
+        let decision = if allow { "allow" } else { "deny" };
+        // Session scope, not once: the answer has to survive the run that asked ending in `awaiting`, or
+        // the next attempt asks the same question and no answer ever lets work through.
+        let response = ask(
+            socket,
+            &json!({
+                "op": "answer",
+                "id": id,
+                "decision": decision,
+                "scope": "session",
+                "by": by,
+            }),
+        )?;
+        if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let said = response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the daemon refused the answer");
+            return transport.ack(&callback.id, said);
+        }
+        pending_remove(state, id);
+        if !allow {
+            transport.ack(&callback.id, "denied")?;
+            transport.send(update.chat, "<b>Denied.</b> The run stays stopped.", &[])?;
+            return Ok(());
+        }
+        transport.ack(&callback.id, "allowed, continuing")?;
+        let request = json!({
+            "op": "submit",
+            "state": state.display().to_string(),
+            "goal": held.goal,
+            "session": held.session,
+            "policy": settings.policy,
+            "verify": settings.verify,
+        });
+        return follow(socket, &request, transport, update.chat, state);
+    }
+
+    let text = update.text.trim();
+    if !text.starts_with('/') {
+        let halt = signals.flag(update.chat);
+        return chat(update, settings, state, transport, halt.as_deref(), mcp);
+    }
+    match command(text) {
+        ("/help", _) => {
+            transport.send(
+                update.chat,
+                "Send a message to talk to Hades.\n<code>/run &lt;goal&gt;</code> starts work on the machine, with a check and an approval when the policy asks.\n<code>/status</code> shows the sessions.\n<code>/stop</code> stops this chat's work; <code>/stop all</code> stops every run.\n<code>/cancel &lt;job&gt;</code> removes a scheduled job and its pending retry.\n<code>/shutdown</code> stops everything and ends the daemon.",
+                &[],
+            )?;
+            Ok(())
+        }
+        ("/status", _) => {
+            let response = ask(socket, &json!({"op": "status"}))?;
+            let sessions = response
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let waiting = response
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            transport.send(
+                update.chat,
+                &format!("<b>{sessions}</b> session(s), <b>{waiting}</b> question(s) waiting"),
+                &[],
+            )?;
+            Ok(())
+        }
+        ("/stop", what) => {
+            let by = format!("telegram:{}", update.from);
+            let all = what.trim() == "all";
+            let request = if all {
+                json!({"op": "stop", "by": by})
+            } else {
+                json!({
+                    "op": "stop",
+                    "session": format!("tg-{}", update.chat),
+                    "by": by,
+                })
+            };
+            let response = match ask(socket, &request) {
+                Ok(response) => response,
+                Err(said) => {
+                    // A stop with no daemon to stop is not a stop. Say that, not "the answer failed".
+                    transport.send(
+                        update.chat,
+                        &format!("<b>Could not stop.</b> {}", esc(&said)),
+                        &[],
+                    )?;
+                    return Ok(());
+                }
+            };
+            if response.get("ok").and_then(Value::as_bool) != Some(true) {
+                let said = response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the daemon refused the stop");
+                transport.send(
+                    update.chat,
+                    &format!("<b>Could not stop.</b> {}", esc(said)),
+                    &[],
+                )?;
+                return Ok(());
+            }
+            // Only after the daemon accepted the request: a failed stop must not kill the answer in this
+            // chat and then tell the person it could not stop anything.
+            let answered = signals.stop(update.chat);
+            let runs = response
+                .get("stopping")
+                .and_then(Value::as_array)
+                .map(|runs| {
+                    runs.iter()
+                        .map(|run| {
+                            format!(
+                                "run {} in {}",
+                                run.get("run").and_then(Value::as_u64).unwrap_or(0),
+                                run.get("session").and_then(Value::as_str).unwrap_or("?")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let said = match (answered, runs.is_empty()) {
+                (false, true) => {
+                    "<b>Nothing is running.</b> Stopping is not undo: what already ran stays run."
+                        .to_string()
+                }
+                (true, true) => {
+                    "<b>Stopping.</b> The answer in this chat ends at its next step. What already ran is \
+                     not undone."
+                        .to_string()
+                }
+                (_, false) => format!(
+                    "<b>Stopping.</b> {}. What already ran is not undone.",
+                    esc(&runs.join(", "))
+                ),
+            };
+            transport.send(update.chat, &said, &[])?;
+            Ok(())
+        }
+        ("/cancel", job) => {
+            let id = match job.trim().parse::<u64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    transport.send(
+                        update.chat,
+                        "That command needs a job number, as in <code>/cancel 3</code>.",
+                        &[],
+                    )?;
+                    return Ok(());
+                }
+            };
+            let by = format!("telegram:{}", update.from);
+            match crate::cron::cancel(state, id, &by) {
+                Ok(path) => transport.send(
+                    update.chat,
+                    &format!(
+                        "<b>Cancelled job {id}.</b> Its file <code>{}</code> is gone and a pending retry is \
+                         cleared. What it already ran is not undone.",
+                        esc(&path)
+                    ),
+                    &[],
+                )?,
+                Err(said) => transport.send(
+                    update.chat,
+                    &format!("<b>Not cancelled.</b> {}", esc(&said)),
+                    &[],
+                )?,
+            };
+            Ok(())
+        }
+        ("/shutdown", _) => {
+            let by = format!("telegram:{}", update.from);
+            let response = match ask(socket, &json!({"op": "shutdown", "by": by})) {
+                Ok(response) => response,
+                Err(said) => {
+                    transport.send(
+                        update.chat,
+                        &format!("<b>Could not shut down.</b> {}", esc(&said)),
+                        &[],
+                    )?;
+                    return Ok(());
+                }
+            };
+            if response.get("ok").and_then(Value::as_bool) != Some(true) {
+                let said = response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the daemon refused the shutdown");
+                transport.send(
+                    update.chat,
+                    &format!("<b>Could not shut down.</b> {}", esc(said)),
+                    &[],
+                )?;
+                return Ok(());
+            }
+            signals.shutdown.store(true, Ordering::SeqCst);
+            let count = response
+                .get("stopping")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            transport.send(
+                update.chat,
+                &format!(
+                    "<b>Stopping everything.</b> {count} run(s) asked to stop and the daemon is exiting. \
+                     A command already running finishes first."
+                ),
+                &[],
+            )?;
+            Ok(())
+        }
+        ("/run", goal) if !goal.is_empty() => {
+            let request = json!({
+                "op": "submit",
+                "state": state.display().to_string(),
+                "goal": goal,
+                "session": format!("tg-{}", update.chat),
+                "policy": settings.policy,
+                "verify": settings.verify,
+            });
+            follow(socket, &request, transport, update.chat, state)
+        }
+        ("/run", _) => {
+            transport.send(update.chat, "That command needs a goal after it.", &[])?;
+            Ok(())
+        }
+        (unknown, _) => {
+            transport.send(
+                update.chat,
+                &format!("There is no command called {}. Send /help.", esc(unknown)),
+                &[],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// The poll loop. Quick updates are handled here; a run gets a thread so the poller can receive the
+/// approval that run is blocked on. `once` handles one batch and returns, which is what the oracle drives.
+/// Scheduled work lives beside the gateway rather than inside the daemon: the result is a message, and the
+/// gateway is what has a chat to put it in. The last-run stamp is written before the work starts, so a crash
+/// delays a job instead of repeating it forever.
+fn scheduler<T: Transport + Clone + Send + 'static>(
+    mut transport: T,
+    settings: Settings,
+    state: PathBuf,
+    mcp: Arc<crate::mcp::Mcp>,
+) {
+    loop {
+        let now = epoch();
+        let (jobs, _) = crate::cron::load(&state);
+        for job in jobs {
+            let pending = crate::retry::read(&state, job.id);
+            let Some(step) = crate::retry::step(&job, pending.as_ref(), now) else {
+                continue;
+            };
+            // A cancel between the load and this tick removes the file. The first attempt would notice in
+            // `stamp`, but a retry does not stamp, so it is checked here or a cancelled job runs once more.
+            if crate::cron::path_of(&state, job.id).is_err() {
+                crate::retry::done(&state, job.id);
+                continue;
+            }
+            if step.attempt == 1 {
+                // Re-read and stamp that one file before anything runs, so a hand edit made a moment ago
+                // is kept and a crash delays the job instead of repeating it every twenty seconds. If the
+                // stamp cannot be written the job does not run: an unstamped window would run again on
+                // the next tick.
+                if let Err(said) = crate::cron::stamp(&state, job.id, now) {
+                    eprintln!("cron: job {}: not running, {said}", job.id);
+                    continue;
+                }
+            }
+            let headline = esc(&job
+                .goal
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(70)
+                .collect::<String>());
+            let started = now;
+            let result = scheduled(&job, &settings, &state, &step, &mcp);
+            let finished = epoch();
+            let (outcome, detail) = match &result {
+                Ok(_) => ("ok", String::new()),
+                Err(said) => ("failed", said.clone()),
+            };
+            let entry = crate::retry::Entry {
+                window: step.window.clone(),
+                attempt: step.attempt,
+                started,
+                finished,
+                outcome: outcome.to_string(),
+                detail,
+            };
+            if let Err(said) = crate::retry::record(&state, job.id, &entry) {
+                eprintln!("cron: job {}: could not record the attempt: {said}", job.id);
+            }
+            match result {
+                Ok(text) => {
+                    if let Err(said) = transport.send(
+                        job.chat,
+                        &format!("<b>{headline}</b>\n\n{}", esc(&text)),
+                        &[],
+                    ) {
+                        eprintln!("cron: job {}: {said}", job.id);
+                    }
+                    crate::retry::done(&state, job.id);
+                }
+                Err(said) => {
+                    if step.attempt < crate::retry::ATTEMPTS {
+                        // Quiet until the last try: a transient failure is not news, and three messages
+                        // about one occurrence is worse than one.
+                        let at = finished + crate::retry::backoff(step.attempt);
+                        if let Err(error) = crate::retry::again(&state, job.id, &step, at, &said) {
+                            eprintln!("cron: job {}: could not schedule a retry: {error}", job.id);
+                        }
+                    } else {
+                        if let Err(error) = transport.send(
+                            job.chat,
+                            &format!(
+                                "<b>{headline}</b>\n\nAfter {} attempts this job failed: {}",
+                                step.attempt,
+                                esc(&said)
+                            ),
+                            &[],
+                        ) {
+                            eprintln!("cron: job {}: {error}", job.id);
+                        }
+                        crate::retry::done(&state, job.id);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(20));
+    }
+}
+
+/// The epoch second, the one clock the scheduler reads.
+fn epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The one place this surface builds a `World`. The person's chat runs as `act`; a scheduled job carries
+/// the mode it was created with. Two literals drifted once already, and the mode is exactly the kind of
+/// field that goes missing from one of them.
+fn world_for(
+    settings: &Settings,
+    state: &Path,
+    chat: i64,
+    mode: crate::mode::Mode,
+    actor: &str,
+    mcp: &Arc<crate::mcp::Mcp>,
+) -> crate::agent::World {
+    let skills_home = state.join("skills");
+    crate::agent::World {
+        root: PathBuf::from(&settings.root),
+        vault: PathBuf::from(&settings.vault),
+        db: state.join("mneme.db"),
+        skills: vec![skills_home],
+        sessions: vec![state.join("sessions"), state.join("gateway").join("chat")],
+        state: state.to_path_buf(),
+        chat,
+        depth: 0,
+        mode,
+        role: crate::profile::Role::Patch,
+        actor: actor.to_string(),
+        mcp: Arc::clone(mcp),
+        allowance: crate::agent::Allowance::new(64),
+    }
+}
+
+fn scheduled(
+    job: &crate::cron::Job,
+    settings: &Settings,
+    state: &Path,
+    step: &crate::retry::Step,
+    mcp: &Arc<crate::mcp::Mcp>,
+) -> Result<String, String> {
+    let preset = crate::model::preset(&settings.model)
+        .ok_or_else(|| format!("no model preset named `{}`", settings.model))?;
+    let client = crate::model::from_preset(&preset);
+    let workspace = PathBuf::from(&settings.root);
+    let world = world_for(
+        settings,
+        state,
+        job.chat,
+        job.mode,
+        &format!("job:{}", job.id),
+        mcp,
+    );
+    let mut messages = job_messages(job, &workspace, step);
+    let silent = |_: crate::model::Feed, _: &str| {};
+    let nothing = |_: crate::agent::Activity, _: &str| {};
+    crate::agent::answer(&client, &mut messages, &world, &silent, &nothing, 16)
+        .map_err(|fault| format!("{fault:?}"))
+}
+
+/// What a scheduled run is told. Separate from the call so the retry line can be asserted without a
+/// model, and because this is the only place the occurrence key reaches the model.
+fn job_messages(job: &crate::cron::Job, workspace: &Path, step: &crate::retry::Step) -> Vec<Value> {
+    let mode_line = match job.mode {
+        crate::mode::Mode::Read => {
+            "This job is read-only: it has no shell, no file writes, no browser and no scheduling. Read and answer with what you found."
+        }
+        crate::mode::Mode::Act => {
+            "This job may act on the machine. The hard floor still applies: no permanent delete, money movement, credential or permission change, new security access, or message to a person without a person deciding."
+        }
+    };
+    let mut brief = String::new();
+    for (label, value) in [
+        ("Inputs", &job.inputs),
+        ("Outputs", &job.outputs),
+        ("Done when", &job.done_when),
+        ("Stop when", &job.stop_when),
+        ("Never", &job.never),
+    ] {
+        if !value.is_empty() {
+            brief.push_str(&format!("{label}: {value}\n"));
+        }
+    }
+    let brief = if brief.is_empty() {
+        String::new()
+    } else {
+        format!("The standing goal file says:\n{brief}\n")
+    };
+    // A retry is the same occurrence, not a new job. Say so, and carry the failure that caused it: a
+    // model told only "try again" repeats the step that already ran.
+    let retry_line = if step.attempt > 1 {
+        format!(
+            "This is attempt {} of {} for the same scheduled occurrence ({}). The previous attempt failed: {}\nDo not repeat an action that already succeeded; finish what is missing.\n\n",
+            step.attempt,
+            crate::retry::ATTEMPTS,
+            step.window,
+            step.previous
+        )
+    } else {
+        String::new()
+    };
+    vec![
+        json!({"role": "system", "content": system_prompt(workspace)}),
+        json!({
+            "role": "user",
+            "content": format!(
+                "This is a scheduled job you set up earlier. Do it now and answer with the result, not with a plan.\n\n{mode_line}\n\n{retry_line}{brief}{}",
+                job.goal
+            )
+        }),
+    ]
+}
+
+pub fn serve<T: Transport + Clone + Send + 'static>(
+    mut transport: T,
+    socket: PathBuf,
+    state: PathBuf,
+    settings: Settings,
+    once: bool,
+) -> Result<(), String> {
+    let mut offset = load_offset(&state);
+    // The old single-list shape becomes one file per job before anything schedules it.
+    match crate::cron::migrate(&state) {
+        Ok(0) => {}
+        Ok(count) => eprintln!(
+            "cron: imported {count} job(s) into {}",
+            crate::cron::dir(&state).display()
+        ),
+        Err(said) => eprintln!("cron: could not import the old job list: {said}"),
+    }
+    // One registry for the life of the gateway: a server started for one message is the server the next
+    // message reaches, which is what makes an MCP server with state worth configuring.
+    let mcp = Arc::new(crate::mcp::Mcp::new(
+        settings.mcp.clone(),
+        Some(PathBuf::from(&settings.root)),
+    ));
+    {
+        let worker = transport.clone();
+        let settings = settings.clone();
+        let state = state.clone();
+        let mcp = Arc::clone(&mcp);
+        std::thread::spawn(move || scheduler(worker, settings, state, mcp));
+    }
+    let signals = Arc::new(Signals::default());
+    let mut pending: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    loop {
+        if signals.stopped() {
+            return Ok(());
+        }
+        let updates = transport.updates(offset, 50)?;
+        for update in &updates {
+            offset = Some(offset.map_or(update.id + 1, |held| held.max(update.id + 1)));
+            if !settings.allowed.contains(&update.from) {
+                continue;
+            }
+            let (name, goal) = command(&update.text);
+            if update.callback.is_none() && name == "/run" && !goal.is_empty() {
+                let mut worker = transport.clone();
+                let socket = socket.clone();
+                let state = state.clone();
+                let settings = settings.clone();
+                let update = update.clone();
+                let signals = Arc::clone(&signals);
+                let mcp = Arc::clone(&mcp);
+                let handle = std::thread::spawn(move || {
+                    if let Err(said) = handle_with(
+                        &update,
+                        &settings,
+                        &socket,
+                        &state,
+                        &mut worker,
+                        &signals,
+                        &mcp,
+                    ) {
+                        let _ = worker.send(
+                            update.chat,
+                            &clip(&format!("the run failed: {said}")),
+                            &[],
+                        );
+                    }
+                });
+                if once {
+                    pending.push(handle);
+                }
+            } else if update.callback.is_some() {
+                let mut worker = transport.clone();
+                let socket = socket.clone();
+                let state = state.clone();
+                let settings = settings.clone();
+                let update = update.clone();
+                let signals = Arc::clone(&signals);
+                let mcp = Arc::clone(&mcp);
+                let handle = std::thread::spawn(move || {
+                    if let Err(said) = handle_with(
+                        &update,
+                        &settings,
+                        &socket,
+                        &state,
+                        &mut worker,
+                        &signals,
+                        &mcp,
+                    ) {
+                        eprintln!("gateway: {said}");
+                    }
+                });
+                if once {
+                    pending.push(handle);
+                }
+            } else if update.callback.is_none() && !update.text.trim().starts_with('/') {
+                // A conversation is work: it can stream for a minute, and a poller parked inside it cannot
+                // receive the `/stop` that would end it. One thread per chat, serialized by the chat's lock
+                // so two messages do not interleave their history.
+                let mut worker = transport.clone();
+                let socket = socket.clone();
+                let state = state.clone();
+                let settings = settings.clone();
+                let update = update.clone();
+                let signals = Arc::clone(&signals);
+                let mcp = Arc::clone(&mcp);
+                let handle = std::thread::spawn(move || {
+                    let lock = signals.lock(update.chat);
+                    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let flag = signals.begin(update.chat);
+                    if let Err(said) = handle_with(
+                        &update,
+                        &settings,
+                        &socket,
+                        &state,
+                        &mut worker,
+                        &signals,
+                        &mcp,
+                    ) {
+                        let _ = worker.send(
+                            update.chat,
+                            &clip(&format!("the answer failed: {said}")),
+                            &[],
+                        );
+                    }
+                    signals.leave(update.chat, &flag);
+                });
+                if once {
+                    pending.push(handle);
+                }
+            } else if let Err(said) = handle_with(
+                update,
+                &settings,
+                &socket,
+                &state,
+                &mut transport,
+                &signals,
+                &mcp,
+            ) {
+                eprintln!("gateway: {said}");
+            }
+        }
+        if let Some(id) = offset {
+            save_offset(&state, id)?;
+        }
+        if once {
+            // `--once` means the batch is handled to the end, not merely accepted. The workers hold their own
+            // transport clones, so joining them here is what makes a scripted test deterministic.
+            for handle in pending.drain(..) {
+                let _ = handle.join();
+            }
+            return Ok(());
+        }
+        if updates.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> Settings {
+        Settings {
+            allowed: vec![7],
+            policy: "guarded".to_string(),
+            verify: "true".to_string(),
+            model: "none".to_string(),
+            root: "/work".to_string(),
+            vault: "/work/mneme".to_string(),
+            mcp: crate::mcp::McpConfig::default(),
+        }
+    }
+
+    #[test]
+    fn a_scheduled_job_carries_its_mode_into_the_world() {
+        let state = Path::new("/work/state");
+        let mcp = Arc::new(crate::mcp::Mcp::empty());
+        let read = world_for(
+            &settings(),
+            state,
+            7,
+            crate::mode::Mode::Read,
+            "chat:7",
+            &mcp,
+        );
+        assert_eq!(read.mode, crate::mode::Mode::Read);
+        assert_eq!(read.chat, 7);
+        let act = world_for(&settings(), state, 8, crate::mode::Mode::Act, "job:2", &mcp);
+        assert_eq!(act.mode, crate::mode::Mode::Act);
+        assert_eq!(act.actor, "job:2");
+        assert!(act.mode.acts());
+    }
+
+    fn job() -> crate::cron::Job {
+        crate::cron::Job {
+            id: 2,
+            chat: 7,
+            schedule: "every 6h".to_string(),
+            mode: crate::mode::Mode::Read,
+            goal: "Summarise the feed".to_string(),
+            inputs: "the notes under 23".to_string(),
+            outputs: "a digest".to_string(),
+            done_when: "five items".to_string(),
+            stop_when: "one pass".to_string(),
+            until: String::new(),
+            never: "do not post".to_string(),
+            last: 0,
+        }
+    }
+
+    fn prompt(step: &crate::retry::Step) -> String {
+        let messages = job_messages(&job(), Path::new("/work"), step);
+        messages[1]["content"]
+            .as_str()
+            .expect("the user message")
+            .to_string()
+    }
+
+    #[test]
+    fn a_first_attempt_is_not_told_it_is_a_retry() {
+        let said = prompt(&crate::retry::Step {
+            window: "2@1000".to_string(),
+            attempt: 1,
+            previous: String::new(),
+        });
+        assert!(said.contains("Summarise the feed"), "{said}");
+        assert!(said.contains("Inputs: the notes under 23"), "{said}");
+        assert!(said.contains("Never: do not post"), "{said}");
+        assert!(!said.contains("previous attempt failed"), "{said}");
+    }
+
+    #[test]
+    fn a_retry_carries_the_occurrence_and_the_failure() {
+        let said = prompt(&crate::retry::Step {
+            window: "2@1000".to_string(),
+            attempt: 2,
+            previous: "the endpoint refused the request".to_string(),
+        });
+        assert!(said.contains("attempt 2 of 3"), "{said}");
+        assert!(said.contains("2@1000"), "the key reaches the model: {said}");
+        assert!(said.contains("the endpoint refused the request"), "{said}");
+        assert!(
+            said.contains("Do not repeat an action that already succeeded"),
+            "{said}"
+        );
+        assert!(said.contains("Summarise the feed"), "{said}");
+    }
+}
