@@ -798,7 +798,7 @@ fn first_line(text: &str, limit: usize) -> String {
     format!("{cut}...")
 }
 
-/// A named way to reach a model. Not a config file: two paths Seth asked to be able to test, and the CLI
+/// A named way to reach a model. Not a config file: two paths the operator asked to be able to test, and the CLI
 /// can reach anything else with `--endpoint` and `--model`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preset {

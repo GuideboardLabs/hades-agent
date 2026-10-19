@@ -305,7 +305,7 @@ fn a_question_policy_raises_is_pending_rather_than_guessed() {
 
     // The question is answerable while the turn is over: no lock is held anywhere.
     broker
-        .resolve(question.id, Decision::Allow, Scope::Session, "seth")
+        .resolve(question.id, Decision::Allow, Scope::Session, "operator")
         .expect("the question is waiting to be answered");
     assert_eq!(
         broker
@@ -357,7 +357,7 @@ fn a_standing_answer_lets_the_next_turn_run_without_asking() {
     // Another process answers it: a fresh broker over the same file, sharing nothing but the file.
     let other = OnDisk::open(&approvals).expect("the same record");
     other
-        .resolve(question.id, Decision::Allow, Scope::Session, "seth")
+        .resolve(question.id, Decision::Allow, Scope::Session, "operator")
         .expect("answered");
     assert_eq!(other.questions().expect("readable").len(), 1);
 
@@ -382,7 +382,7 @@ fn a_standing_answer_lets_the_next_turn_run_without_asking() {
     let decision = &log.entries()[4];
     assert_eq!(decision.kind, Kind::ApprovalDecision);
     assert_eq!(decision.payload["decision"], "allow");
-    assert_eq!(decision.payload["by"], "seth");
+    assert_eq!(decision.payload["by"], "operator");
     assert_eq!(decision.payload["question"], 0);
 }
 
@@ -412,7 +412,7 @@ fn a_standing_no_refuses_the_next_turn_without_asking_again() {
         panic!("expected a question")
     };
     broker
-        .resolve(question.id, Decision::Deny, Scope::Session, "seth")
+        .resolve(question.id, Decision::Deny, Scope::Session, "operator")
         .expect("answered");
 
     let next = ScriptedModel::one("touch ran");
@@ -422,7 +422,9 @@ fn a_standing_no_refuses_the_next_turn_without_asking_again() {
         .expect("a turn");
 
     match &turn.outcome {
-        Outcome::Refused { reason } => assert!(reason.contains("seth already said no"), "{reason}"),
+        Outcome::Refused { reason } => {
+            assert!(reason.contains("operator already said no"), "{reason}")
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert!(!root.join("ran").exists());
@@ -458,7 +460,7 @@ fn an_answer_for_one_question_only_asks_again() {
         panic!("expected a question")
     };
     broker
-        .resolve(question.id, Decision::Allow, Scope::Once, "seth")
+        .resolve(question.id, Decision::Allow, Scope::Once, "operator")
         .expect("answered");
 
     let second = ScriptedModel::one("echo two");

@@ -627,9 +627,9 @@ mod tests {
         assert_eq!(broker.answer(PendingId(0)).expect("readable"), None);
 
         let answer = broker
-            .resolve(PendingId(0), Decision::Allow, Scope::Session, "seth")
+            .resolve(PendingId(0), Decision::Allow, Scope::Session, "operator")
             .expect("answered");
-        assert_eq!(answer.by, "seth");
+        assert_eq!(answer.by, "operator");
         assert_eq!(answer.scope, Scope::Session);
     }
 
@@ -655,7 +655,7 @@ mod tests {
 
         let once = broker.request("cli", "shell", "asked").expect("asked");
         broker
-            .resolve(once.id, Decision::Allow, Scope::Once, "seth")
+            .resolve(once.id, Decision::Allow, Scope::Once, "operator")
             .expect("answered");
         assert_eq!(
             broker.standing("cli", "shell").expect("readable"),
@@ -667,14 +667,14 @@ mod tests {
             .request("cli", "shell", "asked again")
             .expect("asked");
         broker
-            .resolve(more.id, Decision::Allow, Scope::Session, "seth")
+            .resolve(more.id, Decision::Allow, Scope::Session, "operator")
             .expect("answered");
         let standing = broker
             .standing("cli", "shell")
             .expect("readable")
             .expect("a standing answer");
         assert_eq!(standing.decision, Decision::Allow);
-        assert_eq!(standing.by, "seth");
+        assert_eq!(standing.by, "operator");
         assert_eq!(standing.question, more.id);
 
         // Scoped to the session and the action, and to nothing else.
@@ -689,13 +689,13 @@ mod tests {
 
         let first = broker.request("cli", "shell", "asked").expect("asked");
         broker
-            .resolve(first.id, Decision::Allow, Scope::Session, "seth")
+            .resolve(first.id, Decision::Allow, Scope::Session, "operator")
             .expect("answered");
         let second = broker
             .request("cli", "shell", "asked again")
             .expect("asked");
         broker
-            .resolve(second.id, Decision::Deny, Scope::Session, "seth")
+            .resolve(second.id, Decision::Deny, Scope::Session, "operator")
             .expect("answered");
 
         let standing = broker
@@ -712,7 +712,7 @@ mod tests {
         let broker = OnDisk::opened_with(&path, FixedClock).expect("a broker");
         let asked = broker.request("cli", "shell", "asked").expect("asked");
         broker
-            .resolve(asked.id, Decision::Allow, Scope::Once, "seth")
+            .resolve(asked.id, Decision::Allow, Scope::Once, "operator")
             .expect("answered");
 
         let error = broker
@@ -740,7 +740,7 @@ mod tests {
         let path = record("ghost");
         let broker = OnDisk::opened_with(&path, FixedClock).expect("a broker");
         let error = broker
-            .resolve(PendingId(7), Decision::Allow, Scope::Once, "seth")
+            .resolve(PendingId(7), Decision::Allow, Scope::Once, "operator")
             .expect_err("no such question");
         assert!(
             error.detail().contains("was ever asked"),
@@ -756,13 +756,13 @@ mod tests {
         let broker = InMemory::with_clock(FixedClock);
         let asked = broker.request("cli", "shell", "asked").expect("asked");
         broker
-            .resolve(asked.id, Decision::Allow, Scope::Session, "seth")
+            .resolve(asked.id, Decision::Allow, Scope::Session, "operator")
             .expect("answered");
         assert!(broker.standing("cli", "shell").expect("readable").is_some());
         assert_eq!(broker.questions().expect("readable").len(), 1);
         assert!(
             broker
-                .resolve(asked.id, Decision::Allow, Scope::Once, "seth")
+                .resolve(asked.id, Decision::Allow, Scope::Once, "operator")
                 .is_err(),
             "the in-memory broker refuses a second answer too"
         );
@@ -791,7 +791,7 @@ mod tests {
         let broker = OnDisk::opened_with(&path, FixedClock).expect("a broker");
         let asked = broker.request("cli", "shell", "asked").expect("asked");
         broker
-            .resolve(asked.id, Decision::Deny, Scope::Once, "seth")
+            .resolve(asked.id, Decision::Deny, Scope::Once, "operator")
             .expect("answered");
 
         let text = std::fs::read_to_string(&path).expect("the record");
@@ -805,6 +805,6 @@ mod tests {
         assert_eq!(answered_line["event"], "answered");
         assert_eq!(answered_line["decision"], "deny");
         assert_eq!(answered_line["scope"], "once");
-        assert_eq!(answered_line["by"], "seth");
+        assert_eq!(answered_line["by"], "operator");
     }
 }

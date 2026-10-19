@@ -331,25 +331,25 @@ fn a_question_raised_by_one_invocation_is_answered_by_another() {
 
     // And answers it, attributing the answer to whoever gave it.
     let (code, text) = hades(&[
-        "answer", "0", "allow", "--scope", "session", "--by", "seth", "--state", &state_arg,
+        "answer", "0", "allow", "--scope", "session", "--by", "operator", "--state", &state_arg,
     ]);
     assert_eq!(code, 0, "{text}");
     assert!(
-        text.contains("answered allow for session by seth"),
+        text.contains("answered allow for session by operator"),
         "{text}"
     );
     assert!(text.contains("will not ask again"), "{text}");
 
     let (code, text) = hades(&["approvals", "--state", &state_arg]);
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains("allow session by seth"), "{text}");
+    assert!(text.contains("allow session by operator"), "{text}");
     assert!(!text.contains("waiting"), "{text}");
 
     // Now the same turn runs, and the log records who let it through.
     let (code, text) = asked("echo hello");
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("check passed"), "{text}");
-    assert!(text.contains("by=seth"), "{text}");
+    assert!(text.contains("by=operator"), "{text}");
 
     let entries = log_lines(&state, "guarded");
     let kinds: Vec<&str> = entries
@@ -371,7 +371,7 @@ fn a_question_raised_by_one_invocation_is_answered_by_another() {
             "checkpoint",
         ]
     );
-    assert_eq!(entries[4]["payload"]["by"], "seth");
+    assert_eq!(entries[4]["payload"]["by"], "operator");
     assert_eq!(entries[4]["payload"]["question"], 0);
 
     // A second answer for the same question is refused rather than overwriting the first.

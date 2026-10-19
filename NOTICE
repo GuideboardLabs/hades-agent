@@ -1,7 +1,14 @@
 Hades Agent
-Copyright (c) 2026 Seth Canfield
+Copyright (c) 2026 Guideboard Labs
 
 This product is derived from Hermes Agent, Copyright (c) 2025 Nous Research, licensed under the MIT License.
+
+Hades is a distilled harness. Its direct ancestor is Hermes Agent, and its design is a conscious reduction
+of that harness: the tool loop, skills, session shape, gateway and memory seam, rebuilt in Rust with
+explicit permissions and an evidence trail. The terminal coding-agent pattern it follows was made familiar
+by Claude Code and the Codex CLI; Hades wraps neither and runs its own loop. It also builds on Linux
+Landlock for isolation and SQLite FTS5 for memory. These are design influences and foundations, not
+affiliations.
 
 The upstream Hermes Agent Python source is the reference the Rust runtime was ported from. It is not
 included in this release checkout and is not built, installed, or run by anything under rust/. The four
