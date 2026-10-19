@@ -306,3 +306,5 @@ native/fts5_cjk/*.so
 rust/target/
 # The release tarball is a generated artifact, like target/: built by rust/package.sh, never committed.
 rust/dist/
+# A CARGO_HOME that landed inside the tree during TUI work: a package cache, never a source.
+rust/mnt-ignore/
