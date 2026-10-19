@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
   <img alt="Version" src="https://img.shields.io/badge/version-0.0.1-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-610%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-624%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -59,9 +59,9 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Work profiles** | `survey`, `fix`, `sweep`, `verify`, `record` |
 | **Isolation** | Landlock cage plus a deterministic safety floor |
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
-| **Interfaces** | CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
+| **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 610 passing, 13 ignored live tests |
+| **Tests** | 624 passing, 13 ignored live tests; one TCP-confinement test excluded on the WSL validation host |
 
 ---
 
@@ -266,12 +266,143 @@ Proposals are reviewed before promotion.
 
 ## Interfaces
 
+- **Terminal workspace.** `hades`, `hades tui`, or `hades chat`: streaming chat, framed messages, sessions, jobs, approvals, activity, skills, and usage.
 - **CLI.** `hades chat`, `hades run`, `hades job`, `hades doctor`, and the rest of the command set.
 - **ACP.** `hades acp` serves the Agent Client Protocol over stdio for an editor.
 - **HTTP.** A local read-and-control surface for status, sessions and approvals.
 - **Telegram.** Long polling with a numeric user allowlist and an approval flow. The gateway is opt-in.
 
 There is no Discord transport.
+
+---
+
+## Terminal workspace
+
+![The native Hades terminal workspace, with illustrative offline demo data](assets/tui-preview.png)
+
+[View the animated flame preview](assets/tui-flame.gif).
+
+```sh
+hades                         # open the configured workspace in an interactive terminal
+hades tui --root /path/to/repo
+hades tui --demo               # offline demonstration; no model calls or state writes
+hades tui --no-motion          # static skull, no animated flame
+hades tui --no-mouse           # preserve normal terminal mouse selection
+hades tui --help
+```
+
+The banner shows the resolved workspace path, build version, a read-only comparison with GitHub's
+`main` revision, and the current or most recent task brief. Its centered skull uses the supplied HTML's
+true-color Unicode half-block artwork and blue-flame animation, ported into native Rust. The face stays
+static while the flame colors and outline move at about 24 frames per second. The square artwork scales
+to 32 columns on larger terminals and 24 on smaller ones. `--no-motion` shows the original static colors.
+The artwork's outer black background blends into the surrounding slate banner; enclosed black details
+in the eyes and nose remain intact. The original artwork and its import provenance are in
+`assets/tui-skull.*`; the runtime embeds only
+27 KiB of RGB data and needs no image decoder or browser. Frames throughout the app use filled title
+bars, outward-facing half-block sides, and half-height bottom borders with joined corners. Speaker names
+sit inside the top border: grey for user messages and the composer, deeper blue for Hades, and sky blue
+for tool calls and the other panels. Frames use consistent row and column gutters; the workspace card
+fits its content, and the input follows short conversations with a single-row gap before settling at
+the bottom for longer transcripts. It grows from a single line as you type. The palette uses sky blue accents,
+pale blue text, slate backgrounds, and red, green, and yellow accents for syntax and status.
+Smaller terminals use a compact banner; below 56 columns or 18 rows, the screen asks to be resized.
+
+The seven views are Conversation, Sessions, Jobs, Approvals, Activity, Skills, and Usage. They include
+a searchable command palette, model preset picker, multiline editor, bracketed paste, input history,
+conversation search, expandable tool output, an optional workspace inspector, session branching,
+plain text export, pending approval decisions, and cancellation of scheduled jobs. Jobs and skills
+are inspected from the existing runtime state; their creation and installation remain available
+through the runtime's tools and CLI.
+
+| Key | Action |
+|---|---|
+| Enter | Send a message or open the selected item |
+| Alt+Enter / Ctrl+J | Insert a newline |
+| Ctrl+P | Search commands |
+| F2 | Choose a model preset for this session |
+| Tab / Shift+Tab | Move between views |
+| F3 / F4 / F5 | Sessions / approvals / refresh |
+| Page Up / Page Down | Scroll conversation or overlay |
+| Ctrl+Home / Ctrl+End | Conversation start / follow latest output |
+| Ctrl+F | Highlight matching conversation lines |
+| Ctrl+T / Ctrl+B | Tool details / workspace inspector |
+| Ctrl+N / Ctrl+E | New conversation / export |
+| Esc | Close overlay, clear search, or request cancellation |
+| Ctrl+C | Request cancellation while busy; quit when idle |
+| Ctrl+Q | Save and quit; wait for a running operation's cancellation boundary |
+| F1 | Help; Page Up / Page Down scroll it |
+
+Direct conversation uses Hades' existing tool loop, initially in `act` mode. `/mode read` removes
+mutating tools, and `/mode act` enables them under the runtime's existing checks. `/run GOAL` submits
+a guarded run through an already-running `hades daemon`. Pending decisions appear in Approvals:
+Enter opens the request, `y` allows once, `s` allows for that session, and `n` denies. The current daemon
+parks a run at an approval question; after answering it, resubmit `/run GOAL` in the same conversation
+to continue with the recorded decision. A stop affects that conversation's run. An operation already
+in flight may finish before cancellation is observed. The TUI does not change the executor's isolation
+or approval guarantees.
+
+Conversations and drafts are checkpointed under `STATE/tui/sessions/` at turn start, every five seconds
+while working, on completion, and on exit. Writes use a private temporary file, fsync, and atomic rename.
+Resuming branches into a new session file to avoid two terminals overwriting the same conversation.
+Interrupted checkpoints are marked explicitly. Model context may trim complete older turns when the
+context budget is tight; the visible conversation remains in its saved record. `/clear` hides the old
+messages while preserving that record and model context; `/new` starts fresh. Exports go to
+`STATE/tui/exports/`. The Sessions view lists terminal conversations; governed run trees remain in the
+existing session-tree store and CLI.
+
+Provider detection follows the configured model preset or explicit `--endpoint`. Credentials use the
+existing environment / `HADES_HOME/.env` resolver. A custom provider can be opened with:
+
+```sh
+hades tui --model MODEL --endpoint https://provider.example/v1/chat/completions --key ENV_NAME
+```
+
+The full-width usage strip reads actual account data where supported:
+
+- **Ollama Cloud:** included and purchased credit balances, or legacy session and weekly limits,
+  from the documented [`/api/balance`](https://docs.ollama.com/api/balance) endpoint.
+- **OpenRouter:** the current API key's effective budget or limit and remaining balance from
+  [`/api/v1/key`](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key).
+- **Other providers:** an explicit unavailable state for account quota. Local inference has no
+  remote account quota. Consumer subscription limits are not inferred from API token counts.
+
+Account requests refresh at most once a minute and have bounded network timeouts. Provider-reported
+conversation tokens are shown separately, including usage-bearing delegated chat calls. Missing token
+usage is left unreported; daemon accounting remains in its own run record. Quota, update checks, model
+work, and state discovery run off the render thread. The update check never installs or fetches Git
+changes; `main differs` means the revisions differ, not necessarily that the local branch is behind.
+
+The native TUI adds Ratatui and Crossterm to the existing Rust binary. It requires no web server,
+browser, Python, Node, or consumer integration. Like the existing runtime, it targets Linux; Windows
+users can build and run it inside WSL2. A true-color terminal with a Unicode monospace font works best.
+Keep the runtime state directory on WSL's Linux filesystem, such as `~/.hades`, so Unix sockets work.
+The sandbox tolerates absent default system directories (for example `/lib32` on a 64-bit-only
+installation); explicit workspace and scratch directories still have to exist.
+The handled filesystem rights follow the running
+[Landlock ABI](https://docs.kernel.org/userspace-api/landlock.html). Kernel limitations are included in
+the cage description: TCP restriction requires ABI 4, device ioctl restriction ABI 5, and truncation
+restriction ABI 3. A TUI cannot add restrictions the running kernel does not expose.
+
+### Terminal verification
+
+```sh
+cd rust
+cargo test -p harness tui::tests --lib
+cargo clippy -p harness --all-targets -- -D warnings
+cargo build -p harness --bin hades
+python3 harness/tests/tui_pty.py target/debug/hades  # optional Linux PTY integration test
+target/debug/hades tui --snapshot /tmp/hades.json --width 160 --height 64 --frame 3
+```
+
+The snapshot is the actual renderer's cell buffer, with explicitly labeled offline demo data, suitable
+for reproducible visual checks. The tests cover responsive views, animation, input, quota response
+formats, streamed usage, a real local HTTP/SSE tool-call exchange, private session storage, and resume.
+The PTY check exercises paste, navigation, resizing, clean exit, and terminal restoration.
+See [TUI-VALIDATION.txt](TUI-VALIDATION.txt) for the build's exact checks and kernel limitation.
+To reimport the artwork from its original HTML, run
+`python3 harness/tests/import_tui_skull.py /path/to/index.html` from `rust/` with Pillow installed.
+This development helper extracts the embedded PNG without executing the HTML's JavaScript.
 
 ---
 
@@ -353,7 +484,7 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 | Command | What it does |
 |---|---|
 | `hades init` | Write the home, config and vault skeleton |
-| `hades chat` | A conversation with the tool cage |
+| `hades` / `hades tui` / `hades chat` | Native terminal workspace; `--demo` opens an offline preview |
 | `hades run <goal>` | A governed walk: plan, program, check, attempts, `--branch n` |
 | `hades explain <session>` | A compact turn map: action, state, tokens, decision |
 | `hades distill <session>` | Draft a runbook from a verified run; `--run` proves it |

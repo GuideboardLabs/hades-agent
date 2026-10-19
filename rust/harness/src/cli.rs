@@ -42,6 +42,10 @@ use crate::verify::State;
 const USAGE: &str = "\
 hades — the harness, one turn or a whole graph
 
+  hades tui [--root <dir>] [--state <dir>] [--model <preset>] [--no-motion]
+      native terminal workspace (also: hades chat, or hades with no arguments in a terminal)
+      --demo previews the interface offline; --help lists terminal options and shortcuts
+
   hades profiles
       the profiles this build ships, and their parameters
 
