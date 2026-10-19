@@ -27,6 +27,15 @@
 //! path, not against the story. And `floor::protected` stays a second gate on top: the policy knows
 //! where a write may land, the floor knows which writes would rewrite the thing doing the checking,
 //! and a write has to pass both.
+//!
+//! The lexical fold is the chosen behaviour, and it is a ruling, not an oversight. The fold happens
+//! before the filesystem is asked anything, so `door/../secret.txt` names `<root>/secret.txt` here
+//! even when `door` is a symlink, which is not the kernel's resolution of the string: the kernel walks
+//! `door`, follows it, and looks for `secret.txt` behind it. That difference is closed on the caller's
+//! side of the gate, in one direction only: every caller MUST open the path the policy returns, not
+//! the path it was asked about, because the returned path is the one whose resolution was actually
+//! walked and whose containment was actually decided; to open the requested path instead is to step
+//! around the gate after it has spoken.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -84,7 +93,8 @@ impl PathPolicy {
             workspace.join(path)
         };
         let folded = fold(&requested);
-        let resolved = resolve_through(&folded)?;
+        let mut hops = 0;
+        let resolved = resolve_through(&folded, None, &mut hops)?;
         let permitted = canonical_roots(roots)?;
         if permitted.iter().any(|root| resolved.starts_with(root)) {
             return Ok(resolved);
@@ -177,7 +187,11 @@ fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 /// themselves. They are walked one at a time, and a symlink at any of them is followed to a bound.
 /// Every path this returns is fully resolved, so the containment decision is about a path the kernel
 /// could actually resolve the same way.
-fn resolve_through(path: &Path) -> Result<PathBuf, String> {
+fn resolve_through(
+    path: &Path,
+    requested: Option<&Path>,
+    hops: &mut usize,
+) -> Result<PathBuf, String> {
     // The input is folded, so the components here are the filesystem root and plain names only.
     let components: Vec<Component> = path.components().collect();
     let mut prefix_len = components.len();
@@ -190,8 +204,24 @@ fn resolve_through(path: &Path) -> Result<PathBuf, String> {
         prefix_len -= 1;
     }
     let prefix: PathBuf = components[..prefix_len].iter().collect();
+    let origin = requested.unwrap_or(path);
     let mut current = match std::fs::canonicalize(&prefix) {
         Ok(base) => base,
+        Err(error)
+            if std::fs::symlink_metadata(&prefix)
+                .map(|meta| meta.is_symlink())
+                .unwrap_or(false) =>
+        {
+            // Fail closed: a path whose existing part cannot be resolved cannot be proven contained.
+            // A prefix that exists as a symlink but reads through to nothing is the likeliest face of
+            // that: it hangs, and a hang at the head of the walk is a broken chain, not a plain miss,
+            // so the ledger names it what it is.
+            return Err(format!(
+                "refused by the path policy: the symlink {} could not be resolved for a containment \
+                 check (symlink escape): {error}",
+                prefix.display()
+            ));
+        }
         Err(error) => {
             // Fail closed: a path whose existing part cannot be resolved cannot be proven contained.
             return Err(format!(
@@ -201,70 +231,79 @@ fn resolve_through(path: &Path) -> Result<PathBuf, String> {
             ));
         }
     };
-    let mut hops = 0;
     for component in &components[prefix_len..] {
-        current = follow_leaf(&current.join(component.as_os_str()), &mut hops)?;
+        current = follow_leaf(&current.join(component.as_os_str()), origin, hops)?;
     }
     Ok(current)
 }
 
 /// Follow the last name of a path until it is no longer a symlink, and return where it lands.
 ///
-/// The name may not exist, which is the ordinary case for a file about to be created: then the path is
-/// returned as it stands, and the caller's open will say `ENOENT` with the resolved path in the
-/// message. When a link is followed, the land may exist whole (its own prefix may have carried links
-/// too), so a landed link is canonicalized when it can be rather than rejoined by hand; `canonicalize`
-/// answering for the whole path at once is what keeps an absolute link target from being read back
-/// with its `..` still in the text.
-fn follow_leaf(start: &Path, hops: &mut usize) -> Result<PathBuf, String> {
-    let mut current = start.to_path_buf();
-    loop {
-        match std::fs::symlink_metadata(&current) {
-            // A name that is simply not there is not an error for a gate to raise: the caller's open
-            // will raise a better one.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
-            Err(error) => {
-                return Err(format!(
-                    "refused by the path policy: the status of {} could not be read for a containment \
-                     check: {error}",
-                    current.display()
-                ));
-            }
-            Ok(metadata) if !metadata.is_symlink() => return Ok(current),
-            Ok(_) => {}
-        }
-        *hops += 1;
-        if *hops > MAX_SYMLINK_HOPS {
+/// The name may not exist, which is the ordinary case for a file about to be created. When a link is
+/// followed and its land exists whole, `canonicalize` answers for every link in it at once, which is
+/// what keeps an absolute target from being read back with its `..` still in the text. When the land
+/// hangs, its text is not a resolution, so the walk continues on it the way it continued through the
+/// original name: the same hop budget and the same refused-for, so the whole chain, however deeply it
+/// is chased, can be ended by one bound.
+fn follow_leaf(start: &Path, requested: &Path, hops: &mut usize) -> Result<PathBuf, String> {
+    let current = start.to_path_buf();
+    let metadata = match std::fs::symlink_metadata(&current) {
+        // A name that is simply not there is not an error for a gate to raise: the caller's open
+        // will raise a better one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+        Err(error) => {
             return Err(format!(
-                "refused by the path policy: more than {MAX_SYMLINK_HOPS} symlinks were followed from \
-                 {}, which no open would survive either",
-                start.display()
+                "refused by the path policy: the status of {} could not be read for a containment \
+                 check: {error}",
+                current.display()
             ));
         }
-        let target = std::fs::read_link(&current).map_err(|error| {
-            format!(
-                "refused by the path policy: the symlink {} could not be read for a containment check: \
-                 {error}",
-                current.display()
-            )
-        })?;
-        let joined = if target.is_absolute() {
-            target
-        } else {
-            current
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .join(target)
-        };
-        // A relative target is resolved against the link's own directory, and an absolute one against
-        // itself, but either may textually carry `..`, and `read_link` returns it as text. Folding here
-        // is what the kernel does when it walks the link, and it keeps a `..` out of the path that the
-        // containment check is about to compare.
-        let joined = fold(&joined);
-        if let Ok(landed) = std::fs::canonicalize(&joined) {
-            return Ok(landed);
-        }
-        current = joined;
+        Ok(metadata) => metadata,
+    };
+    if !metadata.is_symlink() {
+        return Ok(current);
+    }
+    *hops += 1;
+    if *hops > MAX_SYMLINK_HOPS {
+        // The bound stands in for the kernel's ELOOP here, and it is named on the path the caller
+        // asked about, not the one the chase happens to be standing on.
+        return Err(format!(
+            "refused by the path policy: more than {MAX_SYMLINK_HOPS} symlinks were followed from \
+             {}, which no open would survive either",
+            requested.display()
+        ));
+    }
+    let target = std::fs::read_link(&current).map_err(|error| {
+        format!(
+            "refused by the path policy: the symlink {} could not be read for a containment check: \
+             {error}",
+            current.display()
+        )
+    })?;
+    let joined = if target.is_absolute() {
+        target
+    } else {
+        current
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(target)
+    };
+    // A relative target is resolved against the link's own directory, and an absolute one against
+    // itself, but either may textually carry `..`, and `read_link` returns it as text. Folding here
+    // is what the kernel does when it walks the link, and it keeps a `..` out of the path that the
+    // containment check is about to compare.
+    let joined = fold(&joined);
+    match std::fs::canonicalize(&joined) {
+        // The land exists whole: `canonicalize` answers for every link in it at once, which is what
+        // keeps an absolute target from being read back with its `..` still in the text.
+        Ok(landed) => Ok(landed),
+        // The land hangs: its text names something that does not exist, so `canonicalize` cannot
+        // answer for it, and its text is not a resolution either. A name inside the text may sit
+        // behind a link of its own, so pasting the text into the answer would hand the containment
+        // check a path the kernel would never arrive at. The land is resolved the way every other
+        // path is, through the same walk; `hops` is carried through so the budget stays one budget
+        // for the whole chain, and the bound, however deep the chase, ends it.
+        Err(_) => resolve_through(&joined, Some(requested), hops),
     }
 }
 
@@ -531,5 +570,90 @@ mod tests {
             root,
             fs::canonicalize(tree.workspace()).expect("the workspace exists")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_that_walks_out_through_another_link_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new("dangle-escape");
+        // A real directory outside every root, so a landing there is an escape and not a missing file.
+        let outside = tree.base.join("outside-esc");
+        fs::create_dir_all(&outside).expect("a real directory outside the workspace");
+        symlink(&outside, tree.workspace().join("b")).expect("the door out of the workspace");
+        // L1 hangs: its target text `b/c` names a `c` that does not exist, so the land cannot be
+        // canonicalized whole.
+        symlink("b/c", tree.workspace().join("L1")).expect("the dangling link");
+        let policy = tree.policy();
+
+        // Walked the way the kernel walks, the chain lands at outside-esc/c: the raw target text reads
+        // like it stays inside, the walk ends up outside. The refusal is about where it lands.
+        let read = policy
+            .read(&tree.workspace().join("L1"))
+            .expect_err("the chain lands outside the root");
+        assert!(read.contains("symlink"), "{read}");
+        assert!(read.contains("outside-esc"), "{read}");
+
+        // And a create behind the same door is refused too, so nothing outside is ever written.
+        let created = policy
+            .create(&tree.workspace().join("L1").join("note.txt"))
+            .expect_err("a create at the landing writes outside the root");
+        assert!(created.contains("symlink"), "{created}");
+        assert!(created.contains("outside-esc"), "{created}");
+        assert!(
+            !outside.join("c").exists(),
+            "nothing was made at the landing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_that_hangs_off_a_link_inside_the_root_is_accepted() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new("dangle-inside");
+        fs::create_dir_all(tree.workspace().join("inner"))
+            .expect("a directory inside the workspace");
+        symlink("inner", tree.workspace().join("b")).expect("an ordinary link to it");
+        symlink("b/c", tree.workspace().join("L1")).expect("the dangling link to it");
+        let policy = tree.policy();
+
+        // L1 dangles off `b`, which resolves to `inner` when the chain is followed: the kernel would
+        // open <root>/inner/c and say ENOENT, so the gate answers with exactly that path, a resolved
+        // prefix plus the missing tail, never the raw target text.
+        let inner =
+            fs::canonicalize(tree.workspace().join("b")).expect("b resolves inside the root");
+        let read = policy
+            .read(&tree.workspace().join("L1"))
+            .expect("the chain lands inside the root");
+        assert_eq!(read, inner.join("c"));
+
+        // A create behind the same link answers with the same shape.
+        let created = policy
+            .create(&tree.workspace().join("L1").join("note.txt"))
+            .expect("the landing stays inside the root");
+        assert_eq!(created, inner.join("c").join("note.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cyclic_dangling_chain_is_refused_on_the_hop_budget() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new("dangle-cycle");
+        // The chase runs d -> e/c/d -> e/c/e/c/d -> ..., always in the walk's own tail, never a
+        // canonicalizable land: the bound, not the kernel's ELOOP, is what has to end it.
+        symlink("e/c", tree.workspace().join("d")).expect("the cycle");
+        symlink("d", tree.workspace().join("e")).expect("the cycle back-edge");
+
+        let error = tree
+            .policy()
+            .read(&tree.workspace().join("d"))
+            .expect_err("the chain never lands");
+        assert!(error.contains("symlinks were followed"), "{error}");
+        // The bound is named on the path the caller asked about, `<workspace>/d`, which a chase path
+        // (assembled from `e/c` and `d`) never contains.
+        assert!(error.contains("work/d"), "{error}");
     }
 }
