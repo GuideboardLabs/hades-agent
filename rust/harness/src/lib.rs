@@ -52,6 +52,7 @@ pub mod distill;
 pub mod doctor;
 pub mod engine;
 pub mod fault;
+pub mod fetch;
 pub mod floor;
 pub mod gateway;
 pub mod graph;
