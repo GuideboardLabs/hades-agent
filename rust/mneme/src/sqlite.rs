@@ -764,6 +764,17 @@ impl NoteStore for SqliteStore {
         }
     }
 
+    fn remove_export(&self, path: &Path) -> Result<(), Fault> {
+        if note_path(&self.root, path).is_none() {
+            return Ok(());
+        }
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io(path, error)),
+        }
+    }
+
     fn list(&self, folder: &Path) -> Result<Vec<PathBuf>, Fault> {
         if let Some(area) = self.area_folder(folder) {
             return self.note_paths(Some(area));
@@ -922,6 +933,27 @@ mod tests {
                 .collect(),
         };
         format!("{}\n{}\n", frontmatter.render(), text.trim())
+    }
+
+    /// A capture is a file as well as a row: the Inbox a person opens holds the note, and the
+    /// index that counts candidates points at files that exist.
+    #[test]
+    fn a_capture_is_exported_to_the_inbox_it_counts() {
+        let (store, root) = fresh("capture-export");
+        let vault = crate::Vault::new(root.clone(), store, crate::SystemClock);
+        let path = vault
+            .capture("first line\nsecond line\n", None, None)
+            .expect("capture");
+        assert!(
+            path.exists(),
+            "the capture must be a file, not only a row: {}",
+            path.display()
+        );
+        let text = fs::read_to_string(&path).expect("the exported file");
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("second line"), "{text}");
+        let index = fs::read_to_string(root.join(crate::INDEX_NAME)).expect("the index");
+        assert!(index.contains("1 candidate"), "{index}");
     }
 
     #[test]

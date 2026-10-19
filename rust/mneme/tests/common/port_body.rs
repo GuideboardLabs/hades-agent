@@ -221,6 +221,7 @@ fn file_moves_and_records_topics_and_projects() {
         .expect("file");
     assert_eq!(filed.parent().expect("parent"), root.join("20 Research"));
     assert!(!path.exists(), "the Inbox copy is gone");
+    assert!(filed.exists(), "the filed note is a file, not only a row");
     let note = vault.read_note(&filed).expect("read");
     assert_eq!(texts(note.topics()), ["agent-memory"]);
     assert_eq!(texts(note.projects()), ["hades-agent"]);

@@ -18,9 +18,14 @@ That is a rule with a guard behind it, not a convention to remember.
 | Thing | Where | Never |
 |---|---|---|
 | state (sessions, approvals, snapshots, map cache) | `~/.hades` | `~/.hermes/**` |
-| Mneme, the vault (notes, charter, index) | `~/.hades/mneme` | `~/Documents/ObsidianVault/**` |
+| Mneme, the memory record (SQLite, FTS5 recall) | `~/.hades/mneme.db` | `~/Documents/ObsidianVault/**` |
+| Mneme's markdown export (notes, `charter.md`, generated `INDEX.md`) | `~/.hades/mneme` | `~/Documents/ObsidianVault/**` |
 | keys | `~/.hades/.env` or the environment | `~/.hermes/.env` |
 | short-lived files | `~/.hades/tmp` | the caller's `TMPDIR` when it belongs to the other system |
+
+The record is the database; the folder is its export, written on capture and on filing and rebuilt with
+`hades mneme export`. Recall reads `mneme.db`, never the tree, so hand edits reach memory only through
+`hades mneme import`. `charter.md` is configuration and `INDEX.md` is a generated view.
 
 A fresh clone plus an empty `~/.hades` is a working install. That is the test: if Hades needs something from
 the first machine to start, it has already moved over.

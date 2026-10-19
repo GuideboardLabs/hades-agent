@@ -38,4 +38,11 @@ pub trait NoteStore {
     fn export(&self, _path: &Path) -> Result<(), Fault> {
         Ok(())
     }
+    /// Remove the file `export` wrote for a note. `remove` is the record's side; this is the tree's,
+    /// and a store that is the disk has already done it there, so the default is nothing. A record
+    /// store that skips this leaves the note's old markdown standing after a move, and the Inbox a
+    /// person reads would hold a copy the record no longer has.
+    fn remove_export(&self, _path: &Path) -> Result<(), Fault> {
+        Ok(())
+    }
 }

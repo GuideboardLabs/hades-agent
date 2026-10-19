@@ -141,6 +141,11 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
 
         let path = self.unique(inbox.join(format!("{stamp}-{}.md", slugify(heading, 6))))?;
         let written = self.write_note(&path, &frontmatter, text)?;
+        // The tree is the export, and the Inbox is the queue a person reads. A row with no file
+        // would leave `INDEX.md` counting candidates that are nowhere to be opened - the drift
+        // SQLite introduced when it became the record, because `write_note` reaches the store and
+        // not the folder. So the export is part of the capture, as it is part of a filing.
+        self.store.export(&written)?;
         self.write_index(None, &[])?;
         Ok(written)
     }
@@ -207,8 +212,14 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
             self.unique(candidate)?
         };
         let written = self.write_note(&destination, &frontmatter, &body)?;
+        // Filing is a write, so the tree gets it now, exactly as `record` does: a note a curator
+        // hands back is a file a person can open.
+        self.store.export(&written)?;
         if !same_path(&written, &path) {
             self.store.remove(&path)?;
+            // The old markdown is an export too. Without this the Inbox keeps the copy the record
+            // just moved away, and the folder contradicts the index.
+            self.store.remove_export(&path)?;
         }
         self.write_index(None, &[])?;
         Ok(written)
