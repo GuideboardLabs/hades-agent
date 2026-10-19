@@ -91,11 +91,21 @@ impl World {
     /// screenshot-then-look loop that is the reason the tool exists. A directory that cannot be
     /// made or resolved is skipped, not fatal: the tools refuse paths under an unresolvable root
     /// all the same, and a chat surface runs fine with no browser at all.
+    ///
+    /// `shots` is admitted only when it is a real directory whose canonical form is a direct child
+    /// of the canonical state directory. A symlink at that name is refused: following it would
+    /// hand a read root to wherever the link points, which is a place the state directory's owner
+    /// did not choose for screenshots.
     pub fn policy(&self) -> crate::path::PathPolicy {
         let mut policy = crate::path::PathPolicy::for_root(&self.root);
         let shots = self.state.join("shots");
         if std::fs::create_dir_all(&shots).is_ok()
+            && let Ok(metadata) = std::fs::symlink_metadata(&shots)
+            && metadata.is_dir()
+            && !metadata.file_type().is_symlink()
             && let Ok(canonical) = std::fs::canonicalize(&shots)
+            && let Ok(state) = std::fs::canonicalize(&self.state)
+            && canonical.parent() == Some(state.as_path())
         {
             policy.read_roots.push(canonical);
         }
@@ -2777,6 +2787,45 @@ mod tests {
         }
         #[cfg(not(unix))]
         assert!(!said.starts_with("Refused:"), "no unix, no link: {said}");
+    }
+
+    /// The shots directory is a read root only when it is the state directory's own child. A
+    /// symlink at `<state>/shots` is not followed: the policy's second root must not be a door to
+    /// wherever the link was pointed.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_shots_directory_is_not_a_read_root() {
+        let (base, world) = world_beside_outside("agent-policy-shots-link");
+        let outside = base.join("away/shots");
+        std::fs::create_dir_all(&outside).expect("a directory outside the state");
+        std::fs::create_dir_all(&world.state).expect("a state directory");
+        std::os::unix::fs::symlink(&outside, world.state.join("shots")).expect("the symlink");
+
+        let policy = world.policy();
+        let outside = std::fs::canonicalize(&outside).expect("the outside directory");
+        assert!(
+            !policy.read_roots.contains(&outside),
+            "the policy followed the symlink: {:?}",
+            policy.read_roots
+        );
+        assert_eq!(
+            policy.read_roots.len(),
+            1,
+            "a symlinked shots adds no read root: {:?}",
+            policy.read_roots
+        );
+
+        // The same name as a real directory is admitted, canonical, as a direct child of state.
+        std::fs::remove_file(world.state.join("shots"))
+            .expect("the link is removed, not its target");
+        std::fs::create_dir_all(world.state.join("shots")).expect("a real shots directory");
+        let policy = world.policy();
+        let expected = std::fs::canonicalize(world.state.join("shots")).expect("the shots dir");
+        assert!(
+            policy.read_roots.contains(&expected),
+            "a real shots directory is a read root: {:?}",
+            policy.read_roots
+        );
     }
 
     #[test]
