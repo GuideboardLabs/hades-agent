@@ -64,6 +64,7 @@ pub mod memory;
 pub mod mode;
 pub mod model;
 pub mod patch;
+pub mod path;
 pub mod policy;
 pub mod profile;
 pub mod repomap;
