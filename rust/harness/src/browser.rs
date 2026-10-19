@@ -2318,7 +2318,10 @@ impl Session {
                     .duration_since(UNIX_EPOCH)
                     .map(|since| since.as_millis())
                     .unwrap_or(0);
-                self.state.join("browser").join(format!("shot-{stamp}.png"))
+                // Under `shots`, not `browser`: the `image` tool reads state/shots by policy and
+                // nothing under state/browser, so the default is the loop that works - save here,
+                // look at it there, with the path the policy itself granted.
+                self.state.join("shots").join(format!("shot-{stamp}.png"))
             });
         let reply = self.page_call(
             "Page.captureScreenshot",

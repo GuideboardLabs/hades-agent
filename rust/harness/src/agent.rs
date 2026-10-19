@@ -80,12 +80,26 @@ impl World {
         MnemeMemory::open(&self.vault, &self.db)
     }
 
-    /// The path policy the file tools answer to: `root` is the only read root and the only write root.
+    /// The path policy the file tools answer to: `root` is the only read root and the only write
+    /// root, with one exception earned by use - the browser's screenshot directory under `state`
+    /// is a read root, so the screenshot a browser tool just wrote is an image this surface can be
+    /// told to look at. Writes stay `[root]` only: the shots directory is where the browser puts
+    /// pictures, and no file tool writes there.
     ///
-    /// The state directory is deliberately not a root of any kind: the browser and Mneme own their own
-    /// paths under it, and no file tool reaches them.
+    /// The directory is created here, on the policy's first build per surface, because a default
+    /// screenshot that lands in a directory the `image` tool may not read dead-ends the
+    /// screenshot-then-look loop that is the reason the tool exists. A directory that cannot be
+    /// made or resolved is skipped, not fatal: the tools refuse paths under an unresolvable root
+    /// all the same, and a chat surface runs fine with no browser at all.
     pub fn policy(&self) -> crate::path::PathPolicy {
-        crate::path::PathPolicy::for_root(&self.root)
+        let mut policy = crate::path::PathPolicy::for_root(&self.root);
+        let shots = self.state.join("shots");
+        if std::fs::create_dir_all(&shots).is_ok()
+            && let Ok(canonical) = std::fs::canonicalize(&shots)
+        {
+            policy.read_roots.push(canonical);
+        }
+        policy
     }
 }
 
@@ -205,7 +219,7 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
             "type": "function",
             "function": {
                 "name": "image",
-                "description": "Look at an image file on this machine and answer a question about it. Use it for screenshots the browser saved, for a photo the person sent, or any picture whose content matters.",
+                "description": "Look at an image file on this machine and answer a question about it. Use it for screenshots the browser saved (in the state directory's shots folder), for a photo the person sent, or any picture whose content matters.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -231,7 +245,7 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
                         "text": {"type": "string", "description": "For click: visible text. For type: the text to enter. For wait: text the page must contain."},
                         "key": {"type": "string", "description": "For press: Enter, Tab, Escape, Backspace, ArrowDown or ArrowUp."},
                         "script": {"type": "string", "description": "For eval: a JavaScript expression."},
-                        "path": {"type": "string", "description": "For screenshot or upload; for cookies, the cookie path."},
+                        "path": {"type": "string", "description": "For screenshot or upload; for cookies, the cookie path. A screenshot with no path is saved under the state directory's shots folder, which the image tool can read."},
                         "timeout_s": {"type": "integer", "description": "For wait: seconds before giving up. Default 20, max 60."},
                         "text_limit": {"type": "integer", "description": "For observe: characters of page text to return. Default 6000, max 50000."},
                         "item_limit": {"type": "integer", "description": "For observe: interactive items to return. Default 60, max 500."},
@@ -257,7 +271,7 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
             "type": "function",
             "function": {
                 "name": "fetch",
-                "description": "Fetch a URL and return it as text (HTML is stripped coarsely).",
+                "description": "Fetch a URL and return it as text (HTML is stripped coarsely). HTTP and HTTPS only: other schemes, URLs with credentials in them, and private or loopback addresses are refused, as is any redirect that points somewhere this rule refuses.",
                 "parameters": {
                     "type": "object",
                     "properties": {"url": {"type": "string"}},
@@ -1463,30 +1477,18 @@ fn search(args: &Value, world: &World) -> String {
     }
 }
 
+/// Fetch a URL and return its text. The policy lives in [`crate::fetch`], which judges the URL
+/// before any process runs and judges every redirect hop the same way; this seam passes the tool's
+/// arguments in and the clip back out. `HADES_FETCH_ALLOW_PRIVATE=1` in the surface's environment
+/// is the one explicit hole for private targets, and it stays an environment read precisely so a
+/// test can exercise both sides of the gate without touching process state.
 fn fetch(args: &Value) -> String {
     let url = args.get("url").and_then(Value::as_str).unwrap_or("");
     if url.is_empty() {
         return "no url given".to_string();
     }
-    match Command::new("curl")
-        .arg("-sSL")
-        .arg("--max-time")
-        .arg("30")
-        .arg("-A")
-        .arg("Mozilla/5.0 (compatible; Hades/0.21)")
-        .arg(url)
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).to_string();
-            clip(&strip_html(&text), 12000)
-        }
-        Ok(output) => format!(
-            "fetch failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => format!("could not run curl: {error}"),
-    }
+    let allow_private = std::env::var("HADES_FETCH_ALLOW_PRIVATE").as_deref() == Ok("1");
+    crate::fetch::run(url, 12_000, allow_private)
 }
 
 fn web_search(args: &Value) -> String {
@@ -1554,7 +1556,7 @@ fn urlencode(text: &str) -> String {
 }
 
 /// Coarse: a person reading a page does not need the tag soup, and the model needs the words.
-fn strip_html(text: &str) -> String {
+pub fn strip_html(text: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
     for ch in text.chars() {
@@ -1886,7 +1888,9 @@ pub fn compress(
     Ok(true)
 }
 
-fn clip(text: &str, max: usize) -> String {
+/// The head, a cut marker with the count, and the tail. The marker is `[... N characters cut ...]`,
+/// which a reader reads as prose and a tally reads as one line.
+pub fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
