@@ -1,6 +1,6 @@
 [package]
 name = "harness"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 description = "The Hades harness: one turn of the loop, typed, with the model behind a seam."
 license = "MIT"

@@ -44,14 +44,14 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "governance"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "mneme",
 ]
 
 [[package]]
 name = "harness"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "governance",
  "mneme",
@@ -102,7 +102,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mneme"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "session-tree"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde_json",
 ]
