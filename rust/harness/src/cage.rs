@@ -80,6 +80,22 @@ const ALL_RIGHTS: u64 = EXECUTE
     | TRUNCATE
     | IOCTL_DEV;
 
+/// Landlock rejects rights introduced after the running kernel's ABI. Match both
+/// the handled mask and every grant to the available ABI, as the kernel API requires.
+fn supported_rights(abi: isize) -> u64 {
+    let mut rights = ALL_RIGHTS;
+    if abi < 5 {
+        rights &= !IOCTL_DEV;
+    }
+    if abi < 3 {
+        rights &= !TRUNCATE;
+    }
+    if abi < 2 {
+        rights &= !REFER;
+    }
+    rights
+}
+
 /// Reading and running: what a program needs to start and to read the system it lives on.
 const READ: u64 = EXECUTE | READ_FILE | READ_DIR;
 
@@ -132,7 +148,14 @@ impl Cage {
     pub fn around(root: impl Into<PathBuf>) -> Cage {
         Cage {
             writable: vec![root.into()],
-            readable: SYSTEM.iter().map(PathBuf::from).collect(),
+            // Multiarch library directories and other default system mounts vary by
+            // distribution. An absent default needs no grant. Explicit workspace and
+            // scratch paths still have to exist when plan() builds their rules.
+            readable: SYSTEM
+                .iter()
+                .map(PathBuf::from)
+                .filter(|path| !matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+                .collect(),
             files: DEVICES
                 .iter()
                 .map(|(path, rights)| (PathBuf::from(path), *rights))
@@ -211,8 +234,15 @@ impl Cage {
                 .join(" "),
             if self.network { "open" } else { "closed" },
         );
-        if !self.network && abi() < 4 {
+        let version = abi();
+        if !self.network && version < 4 {
             text.push_str(" (this kernel cannot close TCP)");
+        }
+        if version < 5 {
+            text.push_str(" (this kernel cannot restrict device ioctls)");
+        }
+        if version < 3 {
+            text.push_str(" (this kernel cannot restrict truncation)");
         }
         text
     }
@@ -234,9 +264,10 @@ impl Cage {
 
         // `handled_access_net` and the size of the attribute are the ABI: a kernel older than 4 is told
         // about the filesystem only, and the caller is told that TCP stays open.
+        let rights = supported_rights(abi);
         let attr = if abi >= 4 {
             let mut attr = Vec::with_capacity(16);
-            attr.extend_from_slice(&ALL_RIGHTS.to_le_bytes());
+            attr.extend_from_slice(&rights.to_le_bytes());
             let net = if self.network {
                 0
             } else {
@@ -245,7 +276,7 @@ impl Cage {
             attr.extend_from_slice(&net.to_le_bytes());
             attr
         } else {
-            ALL_RIGHTS.to_le_bytes().to_vec()
+            rights.to_le_bytes().to_vec()
         };
 
         let mut rules = Vec::new();
@@ -262,7 +293,7 @@ impl Cage {
             }
         }
         for path in self.writable.iter() {
-            rules.push(self.rule(path, ALL_RIGHTS)?);
+            rules.push(self.rule(path, rights)?);
         }
 
         Ok(Plan {
@@ -431,7 +462,7 @@ impl Plan {
             0,
         );
         if ruleset < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::from_raw_os_error(-ruleset as i32));
         }
         for (rule, _fd) in &self.rules {
             let added = call(
@@ -442,18 +473,18 @@ impl Plan {
                 0,
             );
             if added < 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(std::io::Error::from_raw_os_error(-added as i32));
             }
         }
         // The kernel refuses to confine a process that could still gain privileges from a set-user-id
         // binary, so this comes first. It is also true for its own sake.
         let set = call5(number::PRCTL, number::SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         if set < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::from_raw_os_error(-set as i32));
         }
         let confined = call(number::RESTRICT_SELF, ruleset as usize, 0, 0, 0);
         if confined < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::from_raw_os_error(-confined as i32));
         }
         Ok(())
     }
@@ -474,7 +505,8 @@ pub fn available() -> bool {
 /// The standard library does not expose these, and the alternative to a dozen lines of convention is a
 /// dependency whose whole job would be to write them down. The convention is part of the kernel's ABI: the
 /// number in `rax`, the arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, the result in `rax`, and a failure
-/// signalled by a result in `-1..-4095`, which is what `last_os_error` reads.
+/// signalled by a result in `-1..-4095`. Raw assembly does not set libc's errno;
+/// callers must convert the negated return value with `from_raw_os_error`.
 #[cfg(target_arch = "x86_64")]
 fn call(number: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
     let result: isize;
