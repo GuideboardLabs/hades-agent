@@ -1335,18 +1335,6 @@ fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Where the remaining non-policy caller resolves: `image` (the vision pair reads only what the model
-/// named). Every file tool answers to `World::policy` instead; this is not a gate, so nothing writes
-/// through it.
-fn resolve(root: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
 fn read_file(args: &Value, world: &World) -> String {
     let policy = world.policy();
     let root: &Path = &world.root;
@@ -1448,6 +1436,7 @@ fn search(args: &Value, world: &World) -> String {
         .arg("--no-heading")
         .arg("-m")
         .arg("40")
+        .arg("--")
         .arg(pattern)
         .arg(&path)
         .output();
@@ -1594,8 +1583,9 @@ fn strip_html(text: &str) -> String {
     cleaned
 }
 
-/// Look at a picture with the local vision pair. Paths resolve against the workspace so a screenshot the
-/// browser saved with a relative name is found without the model having to know where it landed.
+/// Look at a picture with the local vision pair. The path answers to the same `World::policy` the other
+/// file tools do, so an absolute or symlinked path outside the workspace is refused before anything is
+/// opened, and `describe` reads the path the policy returns, not the one the model named.
 fn image(args: &Value, world: &World) -> String {
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     if path.is_empty() {
@@ -1606,7 +1596,13 @@ fn image(args: &Value, world: &World) -> String {
         .and_then(Value::as_str)
         .unwrap_or("Describe this image precisely. Read any text it contains.")
         .to_string();
-    let resolved = resolve(&world.root, path);
+    let resolved = match world.policy().read(Path::new(path)) {
+        Ok(path) => path,
+        Err(reason) => return format!("Refused: {reason}."),
+    };
+    if let Some(reason) = crate::floor::protected(&resolved.to_string_lossy(), &world.root) {
+        return format!("Refused: {reason}. A chat does not read the live install.");
+    }
     match crate::vision::describe(&resolved, &question) {
         Ok(said) => said,
         Err(said) => format!("could not look at {}: {said}", resolved.display()),
@@ -2857,6 +2853,92 @@ mod tests {
         assert!(
             !said.contains("a secret pattern"),
             "nothing was read outside the root: {said}"
+        );
+    }
+
+    /// The `image` tool's two gates without a vision server behind it: the probe runs the policy check
+    /// and the floor check on the tool's own code path order and reports the path they would hand
+    /// `describe`, or `None` when the call would be refused before vision is reached.
+    fn image_probe_path(args: &Value, world: &World) -> Option<PathBuf> {
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+        if path.is_empty() {
+            return None;
+        }
+        let _question = args
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("Describe this image precisely. Read any text it contains.")
+            .to_string();
+        match world.policy().read(Path::new(path)) {
+            Err(_) => None,
+            Ok(resolved)
+                if crate::floor::protected(&resolved.to_string_lossy(), &world.root).is_some() =>
+            {
+                None
+            }
+            Ok(resolved) => Some(resolved),
+        }
+    }
+
+    #[test]
+    fn an_image_of_an_absolute_path_outside_the_root_is_refused_before_vision() {
+        let (base, world) = world_beside_outside("agent-policy-image");
+        let file = outside_of(&base, "picture.txt");
+        let said = execute(
+            "image",
+            &json!({ "path": file.display().to_string() }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(said.starts_with("Refused:"), "{said}");
+        assert!(said.contains("outside the permitted read roots"), "{said}");
+        assert!(
+            image_probe_path(&json!({ "path": file.display().to_string() }), &world).is_none(),
+            "the policy gate must answer before the vision pair is reached"
+        );
+    }
+
+    #[test]
+    fn an_image_inside_the_root_resolves_the_way_describe_will_read_it() {
+        let (_, world) = world_beside_outside("agent-policy-image-inside");
+        std::fs::write(world.root.join("shot.png"), "not really pixels")
+            .expect("a picture inside the workspace");
+        let resolved = image_probe_path(&json!({ "path": "shot.png" }), &world)
+            .expect("an in-root image passes both gates");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(world.root.join("shot.png")).expect("the file")
+        );
+        // No binary fixture: nothing is decoded here. Removing the file after the gates pass and
+        // reading `describe`'s error tells the test exactly which path it was handed.
+        std::fs::remove_file(&resolved).expect("the picture was removed");
+        let said = crate::vision::describe(&resolved, "no server here").expect_err("no such file");
+        assert!(
+            said.starts_with(&format!("could not read {}", resolved.display())),
+            "describe read the resolved path, not the model's word: {said}"
+        );
+        assert!(
+            !said.contains("server"),
+            "describe failed at the file read, not at the vision server: {said}"
+        );
+    }
+
+    #[test]
+    fn a_search_pattern_beginning_with_a_dash_is_a_pattern_not_a_flag() {
+        let (_, world) = world_beside_outside("agent-policy-search-dash");
+        std::fs::write(world.root.join("note.txt"), "the -v line stands here\n")
+            .expect("a file to search");
+        let said = execute(
+            "search",
+            &json!({ "pattern": "-v", "path": "." }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(
+            said.contains("-v line stands"),
+            "a leading-dash pattern must be searched as text: {said}"
         );
     }
 }
