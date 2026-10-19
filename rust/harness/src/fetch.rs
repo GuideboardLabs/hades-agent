@@ -57,10 +57,13 @@
 //! an oversize refusal, a non-zero exit, a panic. A failure that leaves a page's headers in a shared
 //! temp directory is a failure that wrote on its way out.
 //!
-//! **The TLS gap, named rather than papered over.** An end-to-end HTTPS fixture needs a TLS server
-//! and therefore a dependency this tree does not take, so a live TLS fixture is not part of this
-//! suite. What is asserted is the part this module owns: `https` parses to port 443, and curl is
-//! handed `https` in both `--proto` and `--proto-redir`. A live HTTPS request is not tested.
+//! **The TLS gap, closed.** HTTPS is proven end to end by a live fixture: the test mints a
+//! self-signed certificate for `127.0.0.1` with the `openssl` CLI, serves a file with
+//! `openssl s_server -WWW` on a loopback port, and fetches it through the tool with `--cacert`
+//! supplied by a test-only seam. No Rust dependency is added, and production never sets a CA:
+//! `run` passes `None`, so the tool trusts the system's store and nothing else. The fixture makes
+//! the `openssl` binary a test-time prerequisite; a machine without it fails that test loudly
+//! rather than skipping it.
 //!
 //! Only `301`, `302`, `303`, `307` and `308` are followed. Any other 3xx carrying a `Location` is a
 //! response, not an invitation, and its body is what the call answers.
@@ -455,7 +458,19 @@ fn resolve(target: &Target, allow_private: bool) -> Result<IpAddr, String> {
 /// character clip the tool's caller keeps (12000). Nothing here reads the environment, so a test
 /// never has to.
 pub fn run(url: &str, limit: usize, allow_private: bool) -> String {
-    match chase(url, allow_private) {
+    match chase(url, allow_private, None) {
+        Ok(text) => clip(&strip_html(&text), limit),
+        Err(reason) => reason,
+    }
+}
+
+/// The tool's entry with a CA file for the suite's TLS fixture. Production never reaches this:
+/// `run` passes `None`, so the tool trusts the system's store and nothing else. The parameter
+/// exists because a self-signed loopback certificate is the only way to prove HTTPS end to end
+/// without a Rust TLS dependency, and curl must be told to trust exactly that certificate.
+#[cfg(test)]
+fn run_with_ca(url: &str, limit: usize, allow_private: bool, ca: &Path) -> String {
+    match chase(url, allow_private, Some(ca)) {
         Ok(text) => clip(&strip_html(&text), limit),
         Err(reason) => reason,
     }
@@ -464,7 +479,7 @@ pub fn run(url: &str, limit: usize, allow_private: bool) -> String {
 /// Validate, connect, and follow. One curl call per hop, never `-L`: the `Location` header is read
 /// from the header file, resolved against the URL that produced it, and pushed through the same
 /// parse, classify and pin the first URL went through.
-fn chase(url: &str, allow_private: bool) -> Result<String, String> {
+fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, String> {
     let deadline = Instant::now() + FETCH_DEADLINE;
     let mut current = url.to_string();
     let mut followed = 0usize;
@@ -474,7 +489,7 @@ fn chase(url: &str, allow_private: bool) -> Result<String, String> {
         let max_time = remaining_seconds(deadline)?;
         let target = Target::parse(&current)?;
         let address = resolve(&target, allow_private)?;
-        match call(&target, &current, address, max_time)? {
+        match call(&target, &current, address, max_time, ca)? {
             Outcome::Page(bytes) => return Ok(String::from_utf8_lossy(&bytes).to_string()),
             Outcome::Oversize => {
                 return Err(
@@ -523,11 +538,17 @@ enum Outcome {
 /// before transfer, both files inside one `0700` directory that `Drop` removes however the call
 /// ends. The URL travels as it was given or resolved: no reassembly, because a second parser is a
 /// second chance to be wrong.
-fn call(target: &Target, url: &str, address: IpAddr, max_time: u64) -> Result<Outcome, String> {
+fn call(
+    target: &Target,
+    url: &str,
+    address: IpAddr,
+    max_time: u64,
+    ca: Option<&Path>,
+) -> Result<Outcome, String> {
     let scratch = Scratch::new()?;
     let headers = scratch.file("hdr");
     let body = scratch.file("body");
-    let args = curl_args(target, url, address, max_time, &headers, &body);
+    let args = curl_args(target, url, address, max_time, &headers, &body, ca);
     let mut command = std::process::Command::new("curl");
     command
         .args(&args)
@@ -575,8 +596,9 @@ fn call(target: &Target, url: &str, address: IpAddr, max_time: u64) -> Result<Ou
 }
 
 /// The argument vector one hop runs with, split out so a test can read exactly what curl is handed
-/// without a server. The protocol walls, the redirects-off switch, the clock, the two scratch files
-/// and the pin are all here; `call` adds only the process's environment.
+/// without a server. The protocol walls, the redirects-off switch, the clock, the two scratch files,
+/// the pin and - only for the TLS fixture - a CA file are all here; `call` adds only the process's
+/// environment.
 fn curl_args(
     target: &Target,
     url: &str,
@@ -584,6 +606,7 @@ fn curl_args(
     max_time: u64,
     headers: &Path,
     body: &Path,
+    ca: Option<&Path>,
 ) -> Vec<String> {
     // The pin is `--resolve host:port:addr`, host spelled as the URL spelled it (bracketed for a
     // v6 literal, which curl also cannot parse - but a literal needs no pin, because there is no
@@ -611,6 +634,13 @@ fn curl_args(
     if target.host.parse::<IpAddr>().is_err() {
         args.push("--resolve".to_string());
         args.push(format!("{}:{}:{}", target.host, target.port, address));
+    }
+    // Trust exactly the fixture's certificate, and nothing else. Production passes `None`, so this
+    // branch is dead in the tool and live only in the end-to-end HTTPS test: there is no `-k`, and
+    // no way for a page to talk the tool out of verification.
+    if let Some(ca) = ca {
+        args.push("--cacert".to_string());
+        args.push(ca.display().to_string());
     }
     args
 }
@@ -1095,9 +1125,9 @@ mod tests {
         }
     }
 
-    /// `https` through the gate, and through curl's own walls. A live TLS fixture would need a TLS
-    /// server and therefore a dependency this tree does not take; the module doc says so, and what
-    /// this module owns is asserted here: the scheme's port and both protocol lists.
+    /// `https` through the gate and through curl's own walls, without a server: the scheme's port,
+    /// both protocol lists, the clock, and the pin rule for a name versus a literal. The live
+    /// request is the next test's job, against an `openssl s_server` fixture.
     #[test]
     fn https_is_admitted_by_the_gate_and_by_curls_protocol_walls() {
         let target = Target::parse("https://example.test/x").expect("https parses");
@@ -1110,6 +1140,7 @@ mod tests {
             30,
             Path::new("/scratch/hdr"),
             Path::new("/scratch/body"),
+            None,
         );
         for wall in ["--proto", "--proto-redir"] {
             let at = args
@@ -1134,8 +1165,33 @@ mod tests {
             30,
             Path::new("/scratch/hdr"),
             Path::new("/scratch/body"),
+            None,
         );
         assert!(!args.contains(&"--resolve".to_string()), "{args:?}");
+    }
+
+    /// HTTPS end to end: a self-signed certificate for `127.0.0.1`, an `openssl s_server -WWW`
+    /// fixture serving one file, and the tool's own parse → resolve → curl path. The CA is supplied
+    /// only through the test seam. The same URL without it is asserted to fail verification, which
+    /// is what proves the fetch is doing TLS rather than being talked out of it: there is no `-k`
+    /// anywhere on the command line.
+    #[test]
+    fn a_https_page_is_fetched_end_to_end_through_a_tls_fixture() {
+        let fixture = TlsSite::new(&[("page", "tls page\n")]);
+        let url = fixture.url("/page");
+        let target = Target::parse(&url).expect("the fixture URL parses");
+        assert_eq!(target.scheme, "https");
+        assert_eq!(target.port, fixture.port);
+
+        let seen = run_with_ca(&url, 12_000, true, &fixture.ca());
+        assert_eq!(seen, "tls page\n");
+
+        // The same request with the system's store alone: the certificate is unknown there, so
+        // verification refuses it. That is the difference the `--cacert` made, and it is the reason
+        // this test can claim a real handshake rather than a bypass.
+        let refused = run(&url, 12_000, true);
+        assert!(refused.contains("curl failed with exit 60"), "{refused}");
+        assert!(refused.contains("certificate"), "{refused}");
     }
 
     /// The absolute-`Location` hop, judged on the header the fixture actually sent rather than on
@@ -1256,6 +1312,119 @@ mod tests {
         let bytes = read_capped(&path).expect("a whole read");
         assert_eq!(bytes, b"small");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loopback HTTPS fixture: `openssl` mints a self-signed certificate for `127.0.0.1` and
+    /// `openssl s_server -WWW` serves the named files out of the fixture directory. The certificate
+    /// is its own CA, so `curl --cacert cert.pem` trusts it and nothing else. `openssl` is a
+    /// test-time prerequisite, named in the failure when it is missing.
+    struct TlsSite {
+        port: u16,
+        dir: PathBuf,
+        child: Option<std::process::Child>,
+    }
+
+    impl TlsSite {
+        fn new(files: &[(&str, &str)]) -> TlsSite {
+            let dir = std::env::temp_dir().join(format!(
+                "hades-tls-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|since| since.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).expect("a TLS fixture directory");
+            for (name, body) in files {
+                std::fs::write(dir.join(name), body).expect("a fixture file");
+            }
+            let key = dir.join("key.pem");
+            let cert = dir.join("cert.pem");
+            let minted = std::process::Command::new("openssl")
+                .arg("req")
+                .arg("-x509")
+                .arg("-newkey")
+                .arg("rsa:2048")
+                .arg("-nodes")
+                .arg("-keyout")
+                .arg(&key)
+                .arg("-out")
+                .arg(&cert)
+                .arg("-days")
+                .arg("1")
+                .arg("-subj")
+                .arg("/CN=127.0.0.1")
+                .arg("-addext")
+                .arg("subjectAltName=IP:127.0.0.1")
+                .arg("-addext")
+                .arg("basicConstraints=critical,CA:TRUE")
+                .output()
+                .expect(
+                    "openssl is a test prerequisite: the TLS fixture mints its certificate with it",
+                );
+            assert!(
+                minted.status.success(),
+                "openssl req failed: {}",
+                String::from_utf8_lossy(&minted.stderr)
+            );
+            let port = free_port();
+            let child = std::process::Command::new("openssl")
+                .arg("s_server")
+                .arg("-accept")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("-cert")
+                .arg(&cert)
+                .arg("-key")
+                .arg(&key)
+                .arg("-WWW")
+                .arg("-quiet")
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("openssl s_server is a test prerequisite");
+            // Ready when the loopback port accepts. A fixture that never listens fails here, with
+            // this message, rather than later inside curl's error text.
+            let mut open = false;
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    open = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(open, "the TLS fixture never accepted on 127.0.0.1:{port}");
+            TlsSite {
+                port,
+                dir,
+                child: Some(child),
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("https://127.0.0.1:{}{path}", self.port)
+        }
+
+        fn ca(&self) -> PathBuf {
+            self.dir.join("cert.pem")
+        }
+    }
+
+    impl Drop for TlsSite {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A loopback port no listener holds. Bind-then-drop is the smallest way to ask the kernel for
+    /// one, and the tiny race with another process is the one every port-using fixture takes.
+    fn free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        listener.local_addr().expect("an address").port()
     }
 
     /// The tools' fixture: a tiny HTTP server on `127.0.0.1:0`, one thread, answers by path. Kept
