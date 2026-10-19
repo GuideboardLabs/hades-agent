@@ -73,6 +73,18 @@ impl PathPolicy {
         self.checked(path, &self.write_roots, "write")
     }
 
+    /// The one-root policy every caller in this crate wants: `root` is the only read root and the only
+    /// write root, whether the caller is the chat loop or a governed turn.
+    ///
+    /// Nothing here is resolved yet: [`PathPolicy::checked`] canonicalizes the roots per check, on
+    /// purpose, so a root that exists at the check rather than at construction is what answers.
+    pub fn for_root(root: &Path) -> PathPolicy {
+        PathPolicy {
+            read_roots: vec![root.to_path_buf()],
+            write_roots: vec![root.to_path_buf()],
+        }
+    }
+
     /// The whole check, once, for one operation and the roots it is permitted by.
     ///
     /// The roots are canonicalized here rather than once at construction. The fields are public, so the
