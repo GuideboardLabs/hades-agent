@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.1-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-624%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.2-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-668%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.1 |
+| **Version** | 0.0.2 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, ledger |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 624 passing, 13 ignored live tests; one TCP-confinement test excluded on the WSL validation host |
+| **Tests** | 668 passing, 13 ignored live tests |
 
 ---
 
@@ -285,9 +285,12 @@ There is no Discord transport.
 ```sh
 hades                         # open the configured workspace in an interactive terminal
 hades tui --root /path/to/repo
+hades tui --state /path/to/state   # runtime state directory (default `~/.hades`)
+hades tui --resume ID              # branch a saved conversation into a new session file
 hades tui --demo               # offline demonstration; no model calls or state writes
 hades tui --no-motion          # static skull, no animated flame
 hades tui --no-mouse           # preserve normal terminal mouse selection
+hades tui --snapshot out.json --width 160 --height 64   # one frame, no terminal
 hades tui --help
 ```
 
@@ -396,10 +399,12 @@ target/debug/hades tui --snapshot /tmp/hades.json --width 160 --height 64 --fram
 ```
 
 The snapshot is the actual renderer's cell buffer, with explicitly labeled offline demo data, suitable
-for reproducible visual checks. The tests cover responsive views, animation, input, quota response
-formats, streamed usage, a real local HTTP/SSE tool-call exchange, private session storage, and resume.
-The PTY check exercises paste, navigation, resizing, clean exit, and terminal restoration.
-See [TUI-VALIDATION.txt](TUI-VALIDATION.txt) for the build's exact checks and kernel limitation.
+for reproducible visual checks. Fifteen `tui::tests` cover responsive views, animation, input, quota
+response formats, streamed usage, a real local HTTP/SSE tool-call exchange, private session storage,
+and resume, and run as part of `cargo test --workspace`. The PTY check exercises the command palette,
+paste, view switching, resizing, clean exit, terminal restoration, and the absence of demo writes.
+See [TUI-VALIDATION.txt](TUI-VALIDATION.txt) for the original branch validation, the merge
+revalidation, and the kernel limitation.
 To reimport the artwork from its original HTML, run
 `python3 harness/tests/import_tui_skull.py /path/to/index.html` from `rust/` with Pillow installed.
 This development helper extracts the embedded PNG without executing the HTML's JavaScript.
@@ -551,7 +556,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **610 passing, 0 failing, 13 ignored**.
+Current state: **668 passing, 0 failing, 13 ignored** across 31 suites.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

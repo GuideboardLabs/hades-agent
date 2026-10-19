@@ -5,6 +5,13 @@ Local working branch: feat/native-tui
 Build: release, Linux x86_64, stable Rust 1.99.1
 Test host: WSL2 Ubuntu, Linux 6.6.87.2, Landlock ABI 3
 
+Merge note: this file records the branch run. The branch was merged into release/0.0.2 as
+330ce674921d1eff3313da9f3e5503cfe46159de, and the same build, clippy, workspace tests (666
+passing at the merge) and PTY check were rerun on the merged tree, where fetch.rs stayed
+byte-identical to the reviewed commit. After the mneme export fix (974b1a1) the workspace
+stands at 668 passing / 0 failing / 13 ignored. The checks below were not weakened by the
+merge; the branch line is kept because the machine that ran them was the branch's host.
+
 PASS: cargo build --release -p harness --bin hades
 PASS: cargo clippy -p harness --all-targets -- -D warnings
 PASS: cargo test -p harness tui::tests --lib
