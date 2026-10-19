@@ -1,0 +1,15 @@
+[package]
+name = "governance"
+version = "0.1.0"
+edition = "2024"
+description = "Who may write memory, what counts as durable, and what the audit has to catch. Port of the Python spec, same oracle."
+license = "MIT"
+
+[package.metadata.hades]
+port_source = "../hades/curator.py"
+port_oracle = "../tests/test_hades_curator.py"
+
+[dependencies]
+# Governance adds no storage and no parser of its own: it writes through the Mneme crate and formats
+# strings, so the only dependency is the crate it governs.
+mneme = { path = "../mneme" }

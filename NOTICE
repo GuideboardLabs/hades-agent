@@ -1,0 +1,11 @@
+Hades Agent
+Copyright (c) 2026 Seth Canfield
+
+This product is derived from Hermes Agent, Copyright (c) 2025 Nous Research, licensed under the MIT License.
+
+The upstream Hermes Agent Python source is the reference the Rust runtime was ported from. It is not
+included in this release checkout and is not built, installed, or run by anything under rust/. The four
+Rust crates (harness, session-tree, mneme, governance) are new work; session-tree, mneme and governance
+were ported from that Python specification and are covered by parity oracles.
+
+The MIT license and copyright notices of the upstream work are reproduced in LICENSE.

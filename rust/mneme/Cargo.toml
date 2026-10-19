@@ -1,0 +1,18 @@
+[package]
+name = "mneme"
+version = "0.1.0"
+edition = "2024"
+description = "Mneme, the second brain: five areas, topics as notes, governed writes. Port of the Python spec, same oracle."
+license = "MIT"
+
+[package.metadata.hades]
+port_source = "../hades/vault.py"
+port_oracle = "../tests/test_hades_vault.py"
+
+[dependencies]
+# Markdown in, markdown out, and one database. SQLite is the record and markdown is its export
+# (`STORAGE.md`); the bundled build compiles FTS5 in (libsqlite3-sys `build.rs`), so the design's
+# 3.45.1 is a reference and not a runtime requirement. No default features: the wasm ffi is not this.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
+# The workspace's existing JSON codec, for `extra`. Not a new crate in the build.
+serde_json = "1"
