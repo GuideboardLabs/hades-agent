@@ -1,0 +1,7 @@
+Source: user-provided index (3).html, Blue Flame Skull.
+The embedded 384 by 384 PNG is preserved as tui-skull.png.
+tui-skull.rgb: 96 by 96 RGB, row-major, three bytes per pixel, Lanczos sampling.
+The native mascot renderer ports the HTML's blue-flame mask and flowing coordinate field.
+Only the hair animates; the face remains unchanged. No JavaScript runs in the product.
+Original PNG SHA-256: 2eab562397933a445c1295d662cd26bbba3c3856ad01cc544613de2cff74bb32
+Sampled RGB SHA-256: bc1f499f6bd0635aafadbf54f5800bb35de65d95b2c3596982dc888f7cc896ff

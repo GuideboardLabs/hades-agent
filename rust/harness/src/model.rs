@@ -18,6 +18,7 @@
 //! when it fences, and the whole answer when it does not. A model that answers with an apology instead of
 //! a program produces a program that fails, and the log carries what it said, which is the honest outcome.
 
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -174,6 +175,8 @@ pub struct OpenAi {
     max_tokens: u32,
     timeout: Duration,
     context: usize,
+    /// Optional endpoint-reported accounting, shared with delegated client clones.
+    usage_log: Option<std::sync::Arc<Mutex<Vec<Usage>>>>,
     /// Whether to ask the endpoint's template for thinking. `None` sends nothing, which is what a cloud
     /// endpoint wants; a local thinking model whose template understands `enable_thinking` is asked for
     /// none, because a model that thinks before it writes a one-line program spends the whole answer
@@ -283,6 +286,7 @@ impl OpenAi {
             // and having the server truncate silently, which is the worst outcome of the three: a context
             // that looks built and is not.
             context: 8192,
+            usage_log: None,
             thinking: None,
             system: SYSTEM.to_string(),
         }
@@ -343,6 +347,19 @@ impl OpenAi {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn with_usage_log(mut self, log: std::sync::Arc<Mutex<Vec<Usage>>>) -> Self {
+        self.usage_log = Some(log);
+        self
+    }
+
+    pub(crate) fn authorization(&self) -> Result<Option<String>, String> {
+        self.key
+            .as_ref()
+            .map(Key::resolve)
+            .transpose()
+            .map_err(|e| e.to_string())
     }
 
     /// What a person may see: where it goes and which model, never a key.
@@ -1078,6 +1095,7 @@ mod tests {
 pub struct Reply {
     pub content: String,
     pub calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1104,6 +1122,9 @@ impl OpenAi {
             "max_tokens": self.max_tokens,
             "stream": true,
         });
+        if self.usage_log.is_some() {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
@@ -1113,6 +1134,7 @@ impl OpenAi {
             headers.push(("Authorization", format!("Bearer {}", key.resolve()?)));
         }
         let mut reply = Reply::default();
+        let started = std::time::Instant::now();
         let mut partial: std::collections::BTreeMap<u64, ToolCall> =
             std::collections::BTreeMap::new();
         http::stream(
@@ -1131,6 +1153,26 @@ impl OpenAi {
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
                     return;
                 };
+                // Usage-only frames have an empty choices array and must be read before delta.
+                if let Some(usage) = value.get("usage").filter(|usage| {
+                    usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
+                        || usage
+                            .get("completion_tokens")
+                            .and_then(Value::as_u64)
+                            .is_some()
+                }) {
+                    reply.usage = Some(Usage {
+                        prompt_tokens: usage
+                            .get("prompt_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        generated_tokens: usage
+                            .get("completion_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        ..Usage::default()
+                    });
+                }
                 let Some(delta) = value.pointer("/choices/0/delta") else {
                     return;
                 };
@@ -1173,6 +1215,14 @@ impl OpenAi {
             },
         )?;
         reply.calls = partial.into_values().collect();
+        if let Some(usage) = &mut reply.usage {
+            usage.millis = started.elapsed().as_millis();
+            if let Some(log) = &self.usage_log
+                && let Ok(mut log) = log.lock()
+            {
+                log.push(*usage);
+            }
+        }
         if reply.content.trim().is_empty() && reply.calls.is_empty() {
             return Err(Fault::model(
                 "the endpoint streamed neither an answer nor a tool call".to_string(),
