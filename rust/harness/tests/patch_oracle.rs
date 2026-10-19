@@ -10,6 +10,7 @@ use std::process::Command;
 use serde_json::json;
 
 use harness::patch::{Edit, FileEdit, apply, plan_all, tool, write_all};
+use harness::path::PathPolicy;
 
 fn scratch(name: &str) -> PathBuf {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
@@ -19,6 +20,12 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
+}
+
+/// The policy the oracle drives through: the scratch directory is the one root, as the workspace is in
+/// the wired tool. Built after the directory exists, because the check canonicalizes its roots.
+fn policy_at(dir: &Path) -> PathPolicy {
+    PathPolicy::for_root(&std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
 }
 
 fn edit(old: &str, new: &str) -> Edit {
@@ -40,7 +47,7 @@ fn one_edit_changes_only_its_own_bytes() {
 
     let said = tool(
         &json!({"path": "note.txt", "edits": [{"old": "beta", "new": "BETA"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("patched"), "{said}");
     assert_eq!(read(&file), "alpha\nBETA\ngamma\n");
@@ -58,7 +65,7 @@ fn two_edits_apply_in_order() {
             {"old": "one", "new": "ONE"},
             {"old": "three", "new": "THREE"}
         ]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("2 edit(s)"), "{said}");
     assert_eq!(read(&file), "ONE\ntwo\nTHREE\n");
@@ -75,7 +82,7 @@ fn a_second_failure_leaves_the_first_edit_unwritten() {
             {"old": "a", "new": "A"},
             {"old": "missing", "new": "x"}
         ]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("not found"), "{said}");
     assert_eq!(read(&file), "a\nb\n", "nothing was written");
@@ -89,7 +96,7 @@ fn an_ambiguous_anchor_is_refused_and_says_how_many() {
 
     let said = tool(
         &json!({"path": "note.txt", "edits": [{"old": "x", "new": "y"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("appears 2 times"), "{said}");
     assert_eq!(read(&file), "x\nx\n");
@@ -101,7 +108,7 @@ fn an_empty_anchor_is_refused() {
     std::fs::write(dir.join("note.txt"), "alpha\n").expect("a file");
     let said = tool(
         &json!({"path": "note.txt", "edits": [{"old": "", "new": "x"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("empty"), "{said}");
 }
@@ -111,10 +118,33 @@ fn a_missing_file_is_refused_and_nothing_is_created() {
     let dir = scratch("missing");
     let said = tool(
         &json!({"path": "new.txt", "edits": [{"old": "a", "new": "b"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("could not resolve"), "{said}");
     assert!(!dir.join("new.txt").exists());
+}
+
+#[test]
+fn a_patch_of_a_path_outside_the_policy_is_refused_by_name() {
+    let dir = scratch("outside");
+    let away = dir
+        .parent()
+        .expect("a parent above the workspace")
+        .join("away");
+    std::fs::create_dir_all(&away).expect("a directory outside the workspace");
+    let file = away.join("note.txt");
+    std::fs::write(&file, "alpha\nbeta\nalpha\n").expect("a file outside the workspace");
+
+    let said = tool(
+        &json!({"path": file.display().to_string(), "edits": [{"old": "beta", "new": "BETA"}]}),
+        &policy_at(&dir),
+    );
+    assert!(said.starts_with("Refused:"), "{said}");
+    assert!(said.contains("outside"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("untouched"),
+        "alpha\nbeta\nalpha\n"
+    );
 }
 
 #[test]
@@ -125,13 +155,13 @@ fn a_crlf_file_asks_for_crlf_in_the_anchor() {
 
     let missed = tool(
         &json!({"path": "note.txt", "edits": [{"old": "alpha\n", "new": "ALPHA\n"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(missed.contains("CRLF"), "{missed}");
 
     let applied = tool(
         &json!({"path": "note.txt", "edits": [{"old": "alpha\r\n", "new": "ALPHA\r\n"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(applied.contains("patched"), "{applied}");
     assert_eq!(read(&file), "ALPHA\r\nbeta\r\n");
@@ -145,12 +175,12 @@ fn a_second_call_sees_the_first_result() {
 
     let first = tool(
         &json!({"path": "note.txt", "edits": [{"old": "alpha", "new": "beta"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(first.contains("patched"), "{first}");
     let second = tool(
         &json!({"path": "note.txt", "edits": [{"old": "beta", "new": "gamma"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(second.contains("patched"), "{second}");
     assert_eq!(read(&file), "gamma\n");
@@ -166,7 +196,7 @@ fn a_symlink_survives_and_its_target_is_edited() {
 
     let said = tool(
         &json!({"path": "link.txt", "edits": [{"old": "alpha", "new": "beta"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("patched"), "{said}");
     assert!(link.is_symlink(), "the link is still a link");
@@ -182,7 +212,7 @@ fn the_mode_survives_and_no_temp_file_is_left() {
 
     let said = tool(
         &json!({"path": "run.sh", "edits": [{"old": "echo old", "new": "echo new"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("patched"), "{said}");
     let mode = std::fs::metadata(&file)
@@ -206,7 +236,7 @@ fn an_unknown_field_in_an_edit_is_named() {
     std::fs::write(dir.join("note.txt"), "alpha\n").expect("a file");
     let said = tool(
         &json!({"path": "note.txt", "edits": [{"old": "alpha", "new": "beta", "after": "x"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("unknown field `after`"), "{said}");
 }
@@ -218,7 +248,7 @@ fn a_file_over_the_cap_is_refused_by_name() {
     std::fs::write(&file, "a".repeat(harness::patch::CAP + 1)).expect("a big file");
     let said = tool(
         &json!({"path": "big.txt", "edits": [{"old": "a", "new": "b"}]}),
-        &dir,
+        &policy_at(&dir),
     );
     assert!(said.contains("1 MiB"), "{said}");
 }
@@ -269,7 +299,7 @@ fn one_bad_anchor_writes_none_of_the_files() {
     std::fs::write(dir.join("b.txt"), "beta\n").expect("b");
 
     let said = plan_all(
-        &dir,
+        &policy_at(&dir),
         &[
             file("a.txt", "alpha", "ALPHA"),
             file("b.txt", "missing", "X"),
@@ -288,7 +318,7 @@ fn two_files_are_planned_then_written_once_each() {
     std::fs::write(dir.join("b.txt"), "beta\n").expect("b");
 
     let plans = plan_all(
-        &dir,
+        &policy_at(&dir),
         &[
             file("a.txt", "alpha", "ALPHA"),
             file("b.txt", "beta", "BETA"),
@@ -308,7 +338,7 @@ fn one_path_spelled_two_ways_is_one_file_with_both_edits_in_order() {
     std::fs::write(dir.join("a.txt"), "one two\n").expect("a");
 
     let plans = plan_all(
-        &dir,
+        &policy_at(&dir),
         &[file("a.txt", "one", "ONE"), file("./a.txt", "two", "TWO")],
     )
     .expect("one file");

@@ -392,7 +392,10 @@ impl<'a> Seams<'a> {
                 payload.insert("rendered".to_string(), json!(answer.rendered()));
                 // Plan every file first. A bad anchor anywhere means no file is written, so the snapshot
                 // and the call are only recorded once the whole answer is known to apply.
-                let plans = match crate::patch::plan_all(self.task.root(), edits) {
+                let plans = match crate::patch::plan_all(
+                    &crate::path::PathPolicy::for_root(self.task.root()),
+                    edits,
+                ) {
                     Ok(plans) => plans,
                     Err(reason) => {
                         entries.push(

@@ -79,6 +79,14 @@ impl World {
     fn memory(&self) -> Result<MnemeMemory, String> {
         MnemeMemory::open(&self.vault, &self.db)
     }
+
+    /// The path policy the file tools answer to: `root` is the only read root and the only write root.
+    ///
+    /// The state directory is deliberately not a root of any kind: the browser and Mneme own their own
+    /// paths under it, and no file tool reaches them.
+    pub fn policy(&self) -> crate::path::PathPolicy {
+        crate::path::PathPolicy::for_root(&self.root)
+    }
 }
 
 /// When a tool starts and when its result is in. The surface shows the first and hides the second, the
@@ -774,11 +782,11 @@ fn execute(
     decided(world, "surface", &what, "allow", "", &artifact);
     match name {
         "shell" => shell(&args, world),
-        "read_file" => read_file(&args, &world.root),
-        "write_file" => write_file(&args, &world.root),
-        "patch" => crate::patch::tool(&args, &world.root),
-        "list_dir" => list_dir(&args, &world.root),
-        "search" => search(&args, &world.root),
+        "read_file" => read_file(&args, world),
+        "write_file" => write_file(&args, world),
+        "patch" => crate::patch::tool(&args, &world.policy()),
+        "list_dir" => list_dir(&args, world),
+        "search" => search(&args, world),
         "recall" => recall(&args, world),
         "remember" => remember(&args, world),
         "skills" => skills(&args, world),
@@ -1327,7 +1335,10 @@ fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-pub(crate) fn resolve(root: &Path, path: &str) -> PathBuf {
+/// Where the remaining non-policy caller resolves: `image` (the vision pair reads only what the model
+/// named). Every file tool answers to `World::policy` instead; this is not a gate, so nothing writes
+/// through it.
+fn resolve(root: &Path, path: &str) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
         path.to_path_buf()
@@ -1336,12 +1347,17 @@ pub(crate) fn resolve(root: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn read_file(args: &Value, root: &Path) -> String {
+fn read_file(args: &Value, world: &World) -> String {
+    let policy = world.policy();
+    let root: &Path = &world.root;
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     if path.is_empty() {
         return "no path given".to_string();
     }
-    let path = resolve(root, path);
+    let path = match policy.read(Path::new(path)) {
+        Ok(path) => path,
+        Err(reason) => return format!("Refused: {reason}."),
+    };
     if let Some(reason) = crate::floor::protected(&path.to_string_lossy(), root) {
         return format!("Refused: {reason}. A chat does not read the live install.");
     }
@@ -1351,13 +1367,17 @@ fn read_file(args: &Value, root: &Path) -> String {
     }
 }
 
-fn write_file(args: &Value, root: &Path) -> String {
+fn write_file(args: &Value, world: &World) -> String {
+    let policy = world.policy();
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     let content = args.get("content").and_then(Value::as_str).unwrap_or("");
     if path.is_empty() {
         return "no path given".to_string();
     }
-    let path = resolve(root, path);
+    let path = match policy.create(Path::new(path)) {
+        Ok(path) => path,
+        Err(reason) => return format!("Refused: {reason}."),
+    };
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
@@ -1369,9 +1389,14 @@ fn write_file(args: &Value, root: &Path) -> String {
     }
 }
 
-fn list_dir(args: &Value, root: &Path) -> String {
+fn list_dir(args: &Value, world: &World) -> String {
+    let policy = world.policy();
+    let root: &Path = &world.root;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let path = resolve(root, path);
+    let path = match policy.read(Path::new(path)) {
+        Ok(path) => path,
+        Err(reason) => return format!("Refused: {reason}."),
+    };
     if let Some(reason) = crate::floor::protected(&path.to_string_lossy(), root) {
         return format!("Refused: {reason}. A chat does not list the live install.");
     }
@@ -1398,7 +1423,9 @@ fn list_dir(args: &Value, root: &Path) -> String {
     }
 }
 
-fn search(args: &Value, root: &Path) -> String {
+fn search(args: &Value, world: &World) -> String {
+    let policy = world.policy();
+    let root: &Path = &world.root;
     let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
     if pattern.is_empty() {
         return "no pattern given".to_string();
@@ -1406,8 +1433,13 @@ fn search(args: &Value, root: &Path) -> String {
     let path = args
         .get("path")
         .and_then(Value::as_str)
-        .map(|p| resolve(root, p))
-        .unwrap_or_else(|| root.to_path_buf());
+        .map(|p| policy.read(Path::new(p)))
+        .unwrap_or_else(|| policy.read(Path::new("")))
+        .map_err(|reason| format!("Refused: {reason}."));
+    let path = match path {
+        Ok(path) => path,
+        Err(said) => return said,
+    };
     if let Some(reason) = crate::floor::protected(&path.to_string_lossy(), root) {
         return format!("Refused: {reason}. A chat does not search the live install.");
     }
@@ -2683,5 +2715,148 @@ mod tests {
         let result =
             std::fs::read_to_string(bundles[0].path().join("result.json")).expect("a typed result");
         assert!(result.contains("\"status\": \"failed\""), "{result}");
+    }
+
+    /// An absolute path outside the workspace, next to a real file there so a refusal is about the
+    /// boundary and not a missing file. The layout is the one `a_chat_shell_cannot_read_outside_its_root`
+    /// uses: the workspace at `<base>/work`, the outside tree beside it at `<base>/away`.
+    fn outside_of(base: &Path, name: &str) -> PathBuf {
+        let away = base.join("away");
+        std::fs::create_dir_all(&away).expect("a directory outside the workspace");
+        let file = away.join(name);
+        std::fs::write(&file, "alpha\nbeta\nalpha\n").expect("a file outside the workspace");
+        file
+    }
+
+    /// A scratch tree with the workspace at `<base>/work`, so something can sit beside the root. Built
+    /// on `world_at`, the module's one `World` helper.
+    fn world_beside_outside(name: &str) -> (PathBuf, World) {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../target/scratch/{name}"));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("work");
+        std::fs::create_dir_all(&root).expect("a scratch workspace");
+        let world = world_at(&root, Mode::Act, "chat:7");
+        (base, world)
+    }
+
+    #[test]
+    fn a_read_file_of_an_absolute_path_outside_the_root_is_refused_by_the_policy() {
+        let (base, world) = world_beside_outside("agent-policy-read");
+        let file = outside_of(&base, "secret.txt");
+        let said = execute(
+            "read_file",
+            &json!({ "path": file.display().to_string() }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(said.starts_with("Refused:"), "{said}");
+        assert!(said.contains("outside the permitted read roots"), "{said}");
+    }
+
+    #[test]
+    fn a_read_file_of_a_symlink_that_leaves_the_root_is_refused_by_the_policy() {
+        let (base, world) = world_beside_outside("agent-policy-link");
+        let file = outside_of(&base, "linked.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&file, world.root.join("door.txt")).expect("the symlink");
+        #[cfg(not(unix))]
+        let _ = file;
+
+        let said = execute(
+            "read_file",
+            &json!({ "path": "door.txt" }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        #[cfg(unix)]
+        {
+            assert!(said.starts_with("Refused:"), "{said}");
+            assert!(said.contains("symlink"), "{said}");
+        }
+        #[cfg(not(unix))]
+        assert!(!said.starts_with("Refused:"), "no unix, no link: {said}");
+    }
+
+    #[test]
+    fn a_write_file_to_an_absolute_path_outside_the_root_is_refused_by_the_policy() {
+        let (base, world) = world_beside_outside("agent-policy-write");
+        let file = outside_of(&base, "made.txt");
+        let said = execute(
+            "write_file",
+            &json!({ "path": file.display().to_string(), "content": "no" }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(said.starts_with("Refused:"), "{said}");
+        assert!(said.contains("outside the permitted write roots"), "{said}");
+        assert!(
+            std::fs::read_to_string(&file).expect("the untouched file") == "alpha\nbeta\nalpha\n",
+            "nothing was written outside the workspace"
+        );
+    }
+
+    #[test]
+    fn a_patch_of_an_absolute_path_outside_the_root_is_refused_by_the_policy() {
+        let (base, world) = world_beside_outside("agent-policy-patch");
+        let file = outside_of(&base, "note.txt");
+        let said = execute(
+            "patch",
+            &json!({
+                "path": file.display().to_string(),
+                "edits": [{ "old": "alpha", "new": "ALPHA" }]
+            })
+            .to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(said.starts_with("Refused:"), "{said}");
+        assert!(said.contains("outside the permitted write roots"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("the untouched file"),
+            "alpha\nbeta\nalpha\n",
+            "nothing was changed outside the workspace"
+        );
+    }
+
+    #[test]
+    fn a_list_dir_of_an_absolute_path_outside_the_root_is_refused_by_the_policy() {
+        let (base, world) = world_beside_outside("agent-policy-list");
+        let away = base.join("away");
+        std::fs::create_dir_all(&away).expect("a directory outside the workspace");
+        let said = execute(
+            "list_dir",
+            &json!({ "path": away.display().to_string() }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(said.starts_with("Refused:"), "{said}");
+        assert!(said.contains("outside the permitted read roots"), "{said}");
+    }
+
+    #[test]
+    fn a_search_of_an_absolute_path_outside_the_root_is_refused_by_the_policy() {
+        let (base, world) = world_beside_outside("agent-policy-search");
+        let away = base.join("away");
+        std::fs::create_dir_all(&away).expect("a directory outside the workspace");
+        std::fs::write(away.join("note.txt"), "a secret pattern here")
+            .expect("a file outside the workspace");
+        let said = execute(
+            "search",
+            &json!({ "pattern": "secret", "path": away.display().to_string() }).to_string(),
+            &world,
+            &OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none"),
+            &|_, _| {},
+        );
+        assert!(said.starts_with("Refused:"), "{said}");
+        assert!(said.contains("outside the permitted read roots"), "{said}");
+        assert!(
+            !said.contains("a secret pattern"),
+            "nothing was read outside the root: {said}"
+        );
     }
 }

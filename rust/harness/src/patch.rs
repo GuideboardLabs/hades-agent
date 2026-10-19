@@ -24,6 +24,7 @@
 //! file still race between the read and the rename, narrower than `write_file`'s last-writer-wins but not
 //! gone, because the file has no lock.
 
+use crate::path::PathPolicy;
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -177,8 +178,10 @@ pub fn render(edits: &[FileEdit]) -> String {
 }
 
 /// Plan one file: resolve, read, apply every edit in memory, and hold the result.
-pub fn plan(root: &Path, path: &str, edits: &[Edit]) -> Result<Plan, String> {
-    let resolved = crate::agent::resolve(root, path);
+pub fn plan(policy: &PathPolicy, path: &str, edits: &[Edit]) -> Result<Plan, String> {
+    let resolved = policy
+        .write(Path::new(path))
+        .map_err(|reason| format!("Refused: {reason}."))?;
     plan_at(&resolved, edits)
 }
 
@@ -246,7 +249,10 @@ fn plan_at(path: &Path, edits: &[Edit]) -> Result<Plan, String> {
 ///
 /// Files are grouped by canonical path, so `a.txt` and `./a.txt` are one file and their edits apply in
 /// the order the answer gave them.
-pub fn plan_all(root: &Path, edits: &[FileEdit]) -> Result<Vec<Plan>, String> {
+///
+/// A policy refusal comes back in the shape the floor refusal uses (`Refused: <reason>.`), so the model
+/// reads a refusal rather than a path error; planning errors keep their own shapes.
+pub fn plan_all(policy: &PathPolicy, edits: &[FileEdit]) -> Result<Vec<Plan>, String> {
     if edits.is_empty() {
         return Err("an edit answer needs at least one edit".to_string());
     }
@@ -260,7 +266,9 @@ pub fn plan_all(root: &Path, edits: &[FileEdit]) -> Result<Vec<Plan>, String> {
     let mut groups: std::collections::HashMap<PathBuf, Vec<Edit>> =
         std::collections::HashMap::new();
     for edit in edits {
-        let resolved = crate::agent::resolve(root, &edit.path);
+        let resolved = policy
+            .write(Path::new(&edit.path))
+            .map_err(|reason| format!("Refused: {reason}."))?;
         let key = std::fs::canonicalize(&resolved)
             .map_err(|error| format!("could not resolve {}: {error}", resolved.display()))?;
         if !groups.contains_key(&key) {
@@ -434,8 +442,9 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 
 /// The tool as the chat loop calls it: arguments in, the result the model reads back.
 ///
-/// Public because the integration oracle drives it directly; `agent::execute` is private.
-pub fn tool(args: &Value, root: &Path) -> String {
+/// Public because the integration oracle drives it directly; `agent::execute` is private. The policy
+/// comes from the world the tool runs in, and the path it may touch is the path the policy returns.
+pub fn tool(args: &Value, policy: &PathPolicy) -> String {
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     if path.is_empty() {
         return "no path given".to_string();
@@ -470,7 +479,7 @@ pub fn tool(args: &Value, root: &Path) -> String {
         edits.push(Edit { old, new });
     }
 
-    match plan(root, path, &edits) {
+    match plan(policy, path, &edits) {
         Ok(plan) => {
             let sent = plan.sent;
             match write_all(std::slice::from_ref(&plan)) {
