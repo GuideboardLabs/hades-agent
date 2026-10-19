@@ -77,6 +77,7 @@ pub mod shadow;
 pub mod skills;
 pub mod task;
 pub mod tool;
+pub mod tui;
 pub mod tuning;
 pub mod turn;
 pub mod verify;

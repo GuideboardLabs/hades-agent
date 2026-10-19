@@ -631,7 +631,7 @@ pub fn answer_stoppable(
     )))
 }
 
-fn label(name: &str, arguments: &str) -> String {
+pub(crate) fn label(name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let detail = match name {
         "shell" => args.get("command").and_then(Value::as_str).unwrap_or(""),
