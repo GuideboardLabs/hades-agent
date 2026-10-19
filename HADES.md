@@ -1,6 +1,11 @@
 # Hades
 
-A second system, built as Hermes' successor, tested on its own machine.
+A distilled harness, built as Hermes' successor and tested on its own machine.
+
+Hades is a conscious reduction of the Hermes Agent harness: its tool loop, skills, session shape, gateway
+and memory seam, rebuilt in Rust. The terminal coding-agent pattern it follows was made familiar by Claude
+Code and the Codex CLI; Hades wraps neither. It builds on Linux Landlock for isolation and SQLite FTS5 for
+memory. Its lineage and the upstream MIT notice are in `NOTICE`.
 
 **Nothing here touches the running Hermes install.** Not its vault, not its config, not its keys, not its
 sessions, not its cache. The relationship is *cloning with tweaks*, never *moving over*: this tree started as a

@@ -25,7 +25,7 @@
 //! past their welcome are reported as stale rather than quietly kept. Fenced paths are never read
 //! and never indexed.
 //!
-//! **The vault is a directory. It is not the corpus.** Seth's vault on disk also contains material that is
+//! **The vault is a directory. It is not the corpus.** The live vault on disk also contains material that is
 //! deliberately outside the knowledge graph (family, health, personal profiles), and a walk that equates the
 //! two reads them. So this crate takes the *directory* because that is where the notes are, and every walk
 //! applies the fence list: [`Vault::iter_notes`] and [`Vault::walk`] are the corpus, and a path is never the

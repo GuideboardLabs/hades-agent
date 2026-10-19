@@ -27,6 +27,24 @@ It is a single-user runtime built around one rule:
 A read job is not asked to avoid writing. It is handed no tool that writes. A memory change cannot happen
 without a write permit. A refusal is a recorded decision, not a sentence in a prompt.
 
+## Lineage and inspirations
+
+Hades is a distilled harness, not a new kind of agent. Its direct ancestor is
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research, released under the MIT
+License. Hades began as a fork of that harness and was then rebuilt as a Rust runtime. The tool loop, the
+skill model, the session shape, the gateway and the memory seam are all distillations of ideas proved
+there. The upstream Python tree is not shipped in this checkout.
+
+The interaction model also owes a debt to the terminal coding agents that made plan, act, check and retry
+feel normal, especially [Claude Code](https://github.com/anthropics/claude-code) and the
+[Codex CLI](https://github.com/openai/codex). Hades does not wrap either one. The loop is local.
+
+The isolation model builds on [Linux Landlock](https://landlock.io/). The memory record builds on
+[SQLite FTS5](https://www.sqlite.org/fts5.html). Those are foundations, not branding.
+
+If you want the original harness this distills, start with Hermes Agent. Hades is the smaller, stricter
+reading of it: the same shape, with the loop, the permissions and the evidence trail made explicit.
+
 ---
 
 ## At a glance
@@ -437,5 +455,5 @@ These are current limits, not aspirations hidden in a roadmap:
 
 ## License
 
-MIT. Copyright (c) 2026 Seth Canfield. Portions copyright (c) 2025 Nous Research, derived from Hermes Agent.
+MIT. Copyright (c) 2026 Guideboard Labs. Portions copyright (c) 2025 Nous Research, derived from Hermes Agent.
 See [`NOTICE`](NOTICE) for details.
