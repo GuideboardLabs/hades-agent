@@ -200,6 +200,13 @@ pub fn shipped() -> [&'static str; 2] {
     [OPEN, GUARDED]
 }
 
+/// The actions a guard samples: what matters is the decision and the reason a person would read for it,
+/// not the private rules that produced them. One list, so a guard digest and a candidate refusal cannot
+/// disagree about which actions the policy is asked about.
+pub const fn probes() -> [&'static str; 4] {
+    ["shell", "shell-run", "write_file", "vault"]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

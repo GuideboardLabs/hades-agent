@@ -2521,6 +2521,104 @@ fn refine_lists_generations_and_rolls_one_back() {
     );
 }
 
+// A successful `tune --adopt` on the profile's own harness path must leave a generation behind: the
+// default harness directory, not a scratch `--harness`, because that is the path a person adopts into.
+#[test]
+fn tune_adopt_writes_generation_one_on_the_profiles_harness_path() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let dir = scratch("adopt-generation");
+    let home = dir.join("home");
+    let root = dir.join("root");
+    let state = dir.join("state");
+    let harness = home.join("harness").join("fix");
+    let candidate = dir.join("candidate");
+    std::fs::create_dir_all(&harness).expect("the profile harness");
+    std::fs::create_dir_all(&root).expect("the root");
+    std::fs::create_dir_all(&candidate).expect("the candidate");
+    std::fs::write(harness.join("system.md"), "BASE").expect("the base prompt");
+    std::fs::write(candidate.join("system.md"), "OTHER").expect("the candidate prompt");
+
+    // The check passes only on the second program run. The base probe runs first and fails; the candidate
+    // is measured after it and passes, so "the candidate won" is a fact rather than a race on milliseconds.
+    let program = "n=$(ls -1 *.step 2>/dev/null | wc -l); : > \"run$n.step\"; test -f run1.step";
+    let output = std::process::Command::new(exe)
+        .args([
+            "tune",
+            "make the second run pass",
+            "--root",
+            root.to_str().unwrap(),
+            "--verify",
+            "test -f run1.step",
+            "--policy",
+            "open",
+            "--program",
+            program,
+            "--profile",
+            "fix",
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--state",
+            state.to_str().unwrap(),
+            "--adopt",
+        ])
+        .env("HADES_HOME", &home)
+        .output()
+        .expect("tune runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("generation 1 keeps what it replaced"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.join("system.md")).expect("the adopted prompt"),
+        "OTHER"
+    );
+
+    let generation = home.join("control").join("harness").join("fix").join("1");
+    let manifest_path = generation.join("manifest.json");
+    assert!(
+        manifest_path.is_file(),
+        "an adoption on the real path wrote no generation: {text}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("the manifest"))
+            .expect("the manifest is JSON");
+    assert_eq!(manifest["id"], 1);
+    assert_eq!(manifest["parent"], serde_json::Value::Null);
+    assert_eq!(
+        manifest["harness"].as_str(),
+        Some(
+            std::fs::canonicalize(&harness)
+                .expect("the harness path")
+                .to_str()
+                .expect("a UTF-8 path")
+        ),
+        "the generation records the harness it belongs to"
+    );
+    let named: Vec<&str> = manifest["files"]
+        .as_array()
+        .expect("a file list")
+        .iter()
+        .map(|file| file["path"].as_str().expect("a path"))
+        .collect();
+    assert_eq!(
+        named,
+        vec!["harness/system.md"],
+        "the manifest names every captured file: {manifest}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(generation.join("harness").join("system.md"))
+            .expect("the captured prompt"),
+        "BASE",
+        "the generation holds the harness the adoption replaced"
+    );
+}
+
 // The guard runs before a probe, so a candidate that quotes the check costs nothing and leaves no evidence
 // of an adoption that never happened.
 #[test]

@@ -38,6 +38,29 @@ pub enum Category {
 }
 
 impl Category {
+    /// Every category, in the order a person reads them.
+    ///
+    /// This is the only list: the guard digest and the candidate refusal both iterate it, so a category
+    /// cannot be enforced by the floor and invisible to a generation's guard. The `match` is exhaustive on
+    /// purpose — adding a variant does not compile until it is named here, which is the tripwire an array
+    /// alone would not give.
+    pub const fn all() -> [Category; 5] {
+        match Category::Delete {
+            Category::Delete => {}
+            Category::Money => {}
+            Category::Credential => {}
+            Category::Access => {}
+            Category::Outbound => {}
+        }
+        [
+            Category::Delete,
+            Category::Money,
+            Category::Credential,
+            Category::Access,
+            Category::Outbound,
+        ]
+    }
+
     /// What this category is called in a refusal or a question.
     pub fn phrase(self) -> &'static str {
         match self {
