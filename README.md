@@ -104,6 +104,11 @@ shared, so width costs model calls, not a second budget. When nothing passes, th
 candidate got furthest, using the check's optional `HADES-CHECK` progress line. Partial progress orders the
 failure. It never turns a failed check into a pass.
 
+`--strict-model` holds a run to the model it names. `turn`, `run` and `submit` accept it. The endpoint and
+the key are checked before a session is opened, so a request that cannot work is refused while the refusal
+is free. A fault from the first call names that model, and nothing is substituted for it: a strict run
+either used the model it asked for or says it could not.
+
 ---
 
 ## Permissions are shapes, not suggestions

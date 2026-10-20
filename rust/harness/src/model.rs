@@ -182,6 +182,10 @@ pub struct OpenAi {
     /// none, because a model that thinks before it writes a one-line program spends the whole answer
     /// thinking and leaves the program empty.
     thinking: Option<bool>,
+    /// Whether a fault from this client names the model it asked. A strict request is one the caller
+    /// named, so a failure has to say which model failed rather than leave the reader guessing whether
+    /// something else was tried.
+    strict: bool,
     /// The system prompt this client sends. The built-in constant unless a harness file replaced it; the
     /// harness is a property of the client, which is what it is, rather than a second thing every call has
     /// to carry.
@@ -288,6 +292,7 @@ impl OpenAi {
             context: 8192,
             usage_log: None,
             thinking: None,
+            strict: false,
             system: SYSTEM.to_string(),
         }
     }
@@ -323,6 +328,65 @@ impl OpenAi {
     /// Whether thinking is asked for, or nothing is said about it.
     pub fn thinking(&self) -> Option<bool> {
         self.thinking
+    }
+
+    /// Hold this client to the model it names: faults from it say which model failed, so a reader can
+    /// tell a strict request from one that fell through to something else.
+    pub fn with_strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    /// The check that costs nothing: is there an endpoint to call, and is the key this client would send
+    /// with it. A request that cannot work fails here, before a session is opened and before a call is
+    /// spent, and the fault names the model and the provider so the reader knows which one to fix.
+    ///
+    /// It dials nothing. Whether the endpoint is *reachable* is only knowable by asking it, and asking is
+    /// the call this exists to avoid wasting on a configuration that was already wrong.
+    pub fn preflight(&self) -> Result<(), Fault> {
+        if self.target.trim().is_empty() {
+            return Err(Fault::model(format!(
+                "the model `{}` has no endpoint configured, so there is nothing to call; pass \
+                 --endpoint or name a preset from `hades models`",
+                self.model
+            )));
+        }
+        if let Err(fault) = http::Target::parse(&self.target) {
+            return Err(Fault::model(format!(
+                "the model `{}` has an endpoint that cannot be called: {}",
+                self.model,
+                fault.detail()
+            )));
+        }
+        if let Some(key) = &self.key {
+            key.resolve().map_err(|fault| {
+                Fault::model(format!(
+                    "the model `{}` at {} (provider {}) needs a key, and it is not there: {}",
+                    self.model,
+                    self.target,
+                    crate::config::provider_for(&self.target),
+                    fault.detail()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A fault with the model's name on it when this client is strict. A failed request that says only
+    /// "connection refused" sends the reader looking at the network when the question was which model.
+    fn named<T>(&self, result: Result<T, Fault>) -> Result<T, Fault> {
+        result.map_err(|fault| {
+            if self.strict && fault.class() == crate::fault::Class::Model {
+                Fault::model(format!(
+                    "model `{}` at {}: {}",
+                    self.model,
+                    self.target,
+                    fault.detail()
+                ))
+            } else {
+                fault
+            }
+        })
     }
 
     pub fn with_key(mut self, key: Key) -> Self {
@@ -406,6 +470,29 @@ impl Harness for OpenAi {
     /// the answer is prose. The client's own system prompt is not used, because a plan is not an answer and
     /// the harness text must not make the model write a program here.
     fn plan(&self, task: &TaskSpec, bundle: &Bundle, _budget: &Budget) -> Result<String, Fault> {
+        self.named(self.write_plan(task, bundle))
+    }
+
+    /// Stream when the endpoint streams, and fall back to one POST when it does not.
+    ///
+    /// The stream is the reason a person can watch a run: the reasoning and the program arrive as they are
+    /// written, and a caller that wants to show them edits one message instead of waiting for the end. A
+    /// server that ignores `stream` answers one JSON object, which produces no deltas, so the same turn is
+    /// asked once more without streaming. That is one wasted request on a non-streaming endpoint and the
+    /// only way to keep both shapes working with one client.
+    fn run(
+        &self,
+        task: &TaskSpec,
+        bundle: &Bundle,
+        budget: &Budget,
+        feed: Option<FeedFn<'_>>,
+    ) -> Result<ModelAnswer, Fault> {
+        self.named(self.answer(task, bundle, budget, feed))
+    }
+}
+
+impl OpenAi {
+    fn write_plan(&self, task: &TaskSpec, bundle: &Bundle) -> Result<String, Fault> {
         let user = format!(
             "Goal: {}\nWorking directory: {}\n\nWhat the harness already knows:\n{}\n\nWrite the plan.",
             task.goal(),
@@ -424,14 +511,7 @@ impl Harness for OpenAi {
         Ok(reply.content.trim().chars().take(4_000).collect())
     }
 
-    /// Stream when the endpoint streams, and fall back to one POST when it does not.
-    ///
-    /// The stream is the reason a person can watch a run: the reasoning and the program arrive as they are
-    /// written, and a caller that wants to show them edits one message instead of waiting for the end. A
-    /// server that ignores `stream` answers one JSON object, which produces no deltas, so the same turn is
-    /// asked once more without streaming. That is one wasted request on a non-streaming endpoint and the
-    /// only way to keep both shapes working with one client.
-    fn run(
+    fn answer(
         &self,
         task: &TaskSpec,
         bundle: &Bundle,

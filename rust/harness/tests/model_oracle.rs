@@ -283,6 +283,79 @@ fn a_model_that_thinks_and_says_nothing_is_a_fault_that_names_the_thinking() {
 }
 
 #[test]
+fn a_preflight_names_the_model_and_the_provider_when_the_key_is_missing() {
+    // A strict request fails on the name it was given, not on a fall-through. The key's *source* is named
+    // and the key itself is not, which is the same rule every other key fault follows.
+    let model = OpenAi::new("https://ollama.com/v1/chat/completions", "strict-ghost")
+        .with_key(Key::Env("HADES_PREFLIGHT_KEY_THAT_IS_NOT_SET".to_string()));
+    let fault = model.preflight().expect_err("refused");
+    assert!(
+        fault.detail().contains("strict-ghost"),
+        "the fault does not name the model: {}",
+        fault.detail()
+    );
+    assert!(
+        fault.detail().contains("ollama-cloud"),
+        "the fault does not name the provider: {}",
+        fault.detail()
+    );
+    assert!(
+        fault
+            .detail()
+            .contains("HADES_PREFLIGHT_KEY_THAT_IS_NOT_SET"),
+        "{}",
+        fault.detail()
+    );
+}
+
+#[test]
+fn a_preflight_refuses_an_endpoint_that_is_not_configured() {
+    let model = OpenAi::new("", "strict-ghost");
+    let fault = model.preflight().expect_err("refused");
+    assert!(
+        fault.detail().contains("strict-ghost"),
+        "{}",
+        fault.detail()
+    );
+    assert!(
+        fault.detail().contains("endpoint"),
+        "the fault does not say what is missing: {}",
+        fault.detail()
+    );
+
+    // An endpoint with no scheme is the same class of mistake: it would spend a call to find out, and a
+    // preflight exists so it does not.
+    let model = OpenAi::new("127.0.0.1:8110/v1/chat/completions", "strict-ghost");
+    let fault = model.preflight().expect_err("refused");
+    assert!(
+        fault.detail().contains("strict-ghost"),
+        "{}",
+        fault.detail()
+    );
+    assert!(fault.detail().contains("scheme"), "{}", fault.detail());
+}
+
+#[test]
+fn a_preflight_that_passes_spends_no_call() {
+    // The listener is never accepted from. A preflight that dialled it would leave a connection in the
+    // backlog, and the check below would find one.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    listener
+        .set_nonblocking(true)
+        .expect("a nonblocking listener");
+    let model = OpenAi::new(
+        format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        "strict-ghost",
+    );
+    model.preflight().expect("a local endpoint needs no key");
+    assert!(
+        listener.accept().is_err(),
+        "the preflight dialled the endpoint"
+    );
+}
+
+#[test]
 fn asking_for_no_thinking_is_a_field_in_the_request_and_asking_for_nothing_is_no_field() {
     let (url, server) = stub(an_answer("true"));
     let model = OpenAi::new(&url, "stub").with_thinking(false);

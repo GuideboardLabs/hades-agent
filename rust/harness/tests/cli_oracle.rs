@@ -2205,3 +2205,172 @@ fn a_failed_branch_reports_the_best_partial_progress() {
         "a failed branch still restores the tree"
     );
 }
+
+/// An endpoint that answers every request with a 500 and counts what arrived.
+///
+/// The count is the point: a strict request that fell through to a second model would leave a second
+/// connection behind, and a test that only read the fault text could not tell the difference.
+fn counting_failure() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut raw: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                raw.extend_from_slice(&chunk[..read]);
+                let Some(end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                let length = head
+                    .split("\r\n")
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let body = "{\"error\":{\"message\":\"this model is not served here\"}}";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1/chat/completions"), seen)
+}
+
+#[test]
+fn a_strict_turn_refuses_a_missing_key_before_a_session_is_created() {
+    let dir = scratch("strict-key");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).expect("a root");
+    let root_arg = root.display().to_string();
+    let state = dir.join("state");
+    let state_arg = state.display().to_string();
+
+    let (code, text) = hades(&[
+        "turn",
+        "make a note",
+        "--model",
+        "strict-ghost",
+        "--endpoint",
+        "https://ollama.com/v1/chat/completions",
+        "--key",
+        "env:HADES_STRICT_KEY_NOT_IN_THE_ENVIRONMENT",
+        "--strict-model",
+        "--root",
+        &root_arg,
+        "--state",
+        &state_arg,
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("strict-ghost"),
+        "the refusal does not name the model: {text}"
+    );
+    assert!(
+        text.contains("ollama-cloud"),
+        "the refusal does not name the provider: {text}"
+    );
+    assert!(
+        text.contains("HADES_STRICT_KEY_NOT_IN_THE_ENVIRONMENT"),
+        "{text}"
+    );
+    // The refusal came before a session existed, so there is no log of a turn that never had a model.
+    assert!(
+        !state.join("sessions/cli.jsonl").exists(),
+        "a strict refusal opened a session anyway"
+    );
+}
+
+#[test]
+fn a_strict_turn_refuses_a_program_that_stands_in_for_a_model() {
+    // A person at the keyboard is not a model, so there is nothing for a strict request to hold to. Said
+    // here rather than silently run, because the flag's whole promise is that a model was named.
+    let (code, text) = hades(&["turn", "make a note", "--program", "true", "--strict-model"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("names no model"), "{text}");
+}
+
+#[test]
+fn a_strict_run_names_the_model_on_its_first_call_and_asks_for_no_other() {
+    use std::sync::atomic::Ordering;
+
+    let (endpoint, calls) = counting_failure();
+    let dir = scratch("strict-run");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).expect("a root");
+    let root_arg = root.display().to_string();
+    let state = dir.join("state");
+    let state_arg = state.display().to_string();
+
+    let (code, text) = hades(&[
+        "run",
+        "make a thing",
+        "--model",
+        "strict-ghost",
+        "--endpoint",
+        &endpoint,
+        "--strict-model",
+        "--attempts",
+        "3",
+        "--minutes",
+        "2",
+        "--profile",
+        "fix",
+        "--policy",
+        "open",
+        "--root",
+        &root_arg,
+        "--state",
+        &state_arg,
+    ]);
+    // A fault ends the walk rather than spending another attempt or another model.
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("strict-ghost"),
+        "the fault does not name the model: {text}"
+    );
+    assert!(text.contains("500"), "{text}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the run asked again after the model it named failed: {text}"
+    );
+}
+
+#[test]
+fn run_help_lists_the_strict_model_flag() {
+    let (code, text) = hades(&["run", "--help"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("--strict-model"),
+        "run --help does not document --strict-model: {text}"
+    );
+
+    for command in ["turn", "submit"] {
+        let (code, text) = hades(&[command, "--help"]);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("--strict-model"),
+            "{command} --help does not document --strict-model: {text}"
+        );
+    }
+}
