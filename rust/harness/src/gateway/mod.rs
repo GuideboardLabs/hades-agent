@@ -1464,6 +1464,15 @@ fn job_messages(job: &crate::cron::Job, workspace: &Path, step: &crate::retry::S
     ]
 }
 
+/// The stop path's one job: join every executor this gateway started and report the count. `drain`
+/// waits for the children rather than killing a model call, so this can take as long as the work does.
+fn stop_gateway(children: &children::Registry) -> usize {
+    let live = children.live();
+    let drained = children.drain();
+    eprintln!("children: drained {drained} executor(s) at shutdown; {live} were live");
+    drained
+}
+
 pub fn serve<T: Transport + Clone + Send + 'static>(
     mut transport: T,
     socket: PathBuf,
@@ -1476,9 +1485,21 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
     // with it. Recovery marks them lost before the gateway admits anything new; nothing is resumed.
     let children = children::Registry::new(&state);
     match children.recover() {
-        Ok(0) => {}
-        Ok(count) => {
-            eprintln!("children: {count} live child(ren) from a previous gateway are marked lost")
+        Ok(report) if report.files == 0 => {}
+        Ok(report) => {
+            if report.marked > 0 {
+                eprintln!(
+                    "children: {} live child(ren) from a previous gateway are marked lost",
+                    report.marked
+                );
+            }
+            for path in &report.unreadable {
+                eprintln!("children: {path}: the record would not parse; left in place");
+            }
+            for said in &report.failed {
+                eprintln!("children: could not mark a lost child: {said}");
+            }
+            debug_assert_eq!(report.accounted(), report.files);
         }
         Err(said) => eprintln!("children: could not recover the registry: {said}"),
     }
@@ -1508,6 +1529,10 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
     let mut pending: Vec<std::thread::JoinHandle<()>> = Vec::new();
     loop {
         if signals.stopped() {
+            // `/shutdown` is the end of this gateway's ownership. Join the children it admitted and
+            // say how many, instead of returning while their threads are still attached to a process
+            // that is about to exit. `drain` waits for them; it does not kill a model call.
+            stop_gateway(&children);
             return Ok(());
         }
         let updates = transport.updates(offset, 50)?;
@@ -1722,5 +1747,67 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("Summarise the feed"), "{said}");
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "hades-gateway-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        base
+    }
+
+    /// A0 fix: `/shutdown` must join the children this gateway admitted and say how many it drained,
+    /// rather than returning while their threads are still attached.
+    #[test]
+    fn the_stop_path_drains_and_reports_the_children() {
+        let state = scratch("stop-drain");
+        let mcp = Arc::new(crate::mcp::Mcp::empty());
+        let registry = children::Registry::new(&state);
+        registry
+            .admit(
+                children::Admission {
+                    id: "spawn-stop".to_string(),
+                    parent: "tg-7-children".to_string(),
+                    session: "spawn-stop".to_string(),
+                    chat: 7,
+                    goal: "say done".to_string(),
+                    schema: children::Admission::report_schema(),
+                    steps: 2,
+                },
+                world_for(
+                    &settings(),
+                    &state,
+                    7,
+                    crate::mode::Mode::Act,
+                    "chat:7",
+                    &mcp,
+                ),
+                crate::model::OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "stub"),
+            )
+            .expect("a child to drain");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while registry.live() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            stop_gateway(&registry),
+            1,
+            "the stop path joins the child it admitted"
+        );
+        assert_eq!(registry.live(), 0);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
