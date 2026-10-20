@@ -150,11 +150,26 @@ pub trait Verifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandVerifier {
     limit: usize,
+    /// How long the check may run. `None` is the caller's own command run untimed, which is what the
+    /// profile check has always done; a goal check names a bound because it runs on the heartbeat thread.
+    deadline: Option<std::time::Duration>,
 }
 
 impl CommandVerifier {
     pub fn new(limit: usize) -> Self {
-        CommandVerifier { limit }
+        CommandVerifier {
+            limit,
+            deadline: None,
+        }
+    }
+
+    /// A verifier whose check is killed after `deadline`. A check that hangs must not be able to hold
+    /// the only thread that continues goals.
+    pub fn with_deadline(limit: usize, deadline: std::time::Duration) -> Self {
+        CommandVerifier {
+            limit,
+            deadline: Some(deadline),
+        }
     }
 }
 
@@ -169,7 +184,7 @@ impl Verifier for CommandVerifier {
 
         // Not caged, on purpose: the check is the caller's own command and not the model's program, and a
         // check that cannot reach its toolchain is not a check. The cage is for what the model wrote.
-        match command::run(command, task.root(), self.limit, None) {
+        match command::run_within(command, task.root(), self.limit, None, self.deadline) {
             Ok(run) => {
                 let progress = Progress::parse(&run.output);
                 let gate_ok = progress.as_ref().map(|p| p.gate).unwrap_or(true);
@@ -200,12 +215,10 @@ impl Verifier for CommandVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("verify-{name}-{}", std::process::id()));
+        let dir = crate::scratch::root().join(format!("verify-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch root");
         dir
