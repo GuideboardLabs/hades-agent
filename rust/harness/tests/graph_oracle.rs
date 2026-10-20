@@ -322,7 +322,7 @@ fn a_run_that_spends_its_token_budget_stops_after_the_call_that_spent_it() {
     // The endpoint reported 1,000 prompt and 500 generated tokens and the run was given 1,200, so the
     // token bound is spent after one call while the attempt bound still has room. The check fails, which is
     // what makes the token budget the only reason to stop: a pass would still be accepted.
-    let rig = Rig::new(
+    let mut rig = Rig::new(
         "tokens",
         "test -f never.txt",
         open(),
@@ -336,10 +336,14 @@ fn a_run_that_spends_its_token_budget_stops_after_the_call_that_spent_it() {
             ModelAnswer::new("true"),
         ]),
     );
+    // The reserve is prompt plus cap, so the fixture declares a small context and a small cap: 200 of
+    // the 1200 is reserved, the first call costs 1500, and the second cannot start.
+    rig.profile.context_tokens = 100;
     let mut session = rig.session("tokens");
     let mut cache = Cache::new();
     let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
-        .with_bounds(Bounds::new(3, 10).with_tokens(1200));
+        .with_bounds(Bounds::new(3, 10).with_tokens(1200))
+        .with_call_tokens(100);
     let walked = runner.run().expect("a walk");
 
     assert_eq!(
@@ -971,7 +975,8 @@ fn a_judged_run_counts_the_judge_call_against_the_token_budget() {
     let mut cache = Cache::new();
     let judge = CostlyJudge;
     let mut runner = Runner::new(rig.parts_judged(&judge, &mut cache), &mut session)
-        .with_bounds(Bounds::new(3, 10).with_tokens(1200));
+        .with_bounds(Bounds::new(3, 10).with_tokens(1200))
+        .with_call_tokens(60);
     let walked = runner.run().expect("a walk");
 
     assert_eq!(
@@ -1011,10 +1016,12 @@ fn a_run_that_writes_nothing_still_pays_for_every_call() {
     let mut session = rig.session("unwritten-tokens");
     let mut cache = Cache::new();
     let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
-        .with_bounds(Bounds::new(3, 10).with_tokens(1200));
+        .with_bounds(Bounds::new(3, 10).with_tokens(1400))
+        .with_call_tokens(60);
     let walked = runner.run().expect("a walk");
 
-    assert_eq!(walked.attempts(), 2, "the budget fired on the second call");
+    // The third visit is refused before the call; the two calls that ran are both on the record.
+    assert_eq!(walked.attempts(), 3, "{:?}", walked.ended);
     assert_eq!(
         walked.spent.len(),
         2,
@@ -1144,4 +1151,39 @@ fn baseline_off_runs_a_green_check_anyway() {
     );
     assert!(walked.baseline.is_none());
     assert!(baseline_entry(&session).is_none(), "no baseline ran");
+}
+
+#[test]
+fn a_call_that_cannot_fit_the_budget_is_not_started() {
+    let rig = Rig::new(
+        "reserve",
+        "test -f made.txt",
+        open(),
+        ScriptedModel::new(["touch made.txt"]),
+    );
+    let mut session = rig.session("reserve");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10).with_tokens(100))
+        .with_call_tokens(1_000);
+    let walked = runner.run().expect("a walk");
+
+    // The attempt node was visited, but no call left it: the check is the missing file, not the count.
+    assert!(
+        walked.spent.is_empty(),
+        "nothing was spent: {:?}",
+        walked.spent
+    );
+    assert!(
+        !rig.root.join("made.txt").exists(),
+        "the model was never asked, so its program never ran"
+    );
+    assert_eq!(walked.ended.cause(), Some(Exhausted::Tokens));
+    match &walked.ended {
+        Ended::GaveUp { reason, .. } => assert!(
+            reason.contains("for the prompt and 1000 for the answer"),
+            "{reason}"
+        ),
+        other => panic!("the run did not give up on tokens: {other:?}"),
+    }
 }

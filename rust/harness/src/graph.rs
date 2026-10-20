@@ -202,6 +202,12 @@ impl Bounds {
         None
     }
 
+    /// What the token allowance has left, or `None` when the caller declared no token budget. A run with
+    /// no declared budget is not made to invent one.
+    pub fn remaining(&self, spent: u64) -> Option<u64> {
+        self.tokens.map(|budget| budget.saturating_sub(spent))
+    }
+
     /// Whether the run has spent its allowance, given how many attempts it has made, how long it has been
     /// going and what it has spent.
     pub fn spent(&self, attempts: u32, elapsed: std::time::Duration, tokens: u64) -> bool {
@@ -712,6 +718,9 @@ where
     /// The ruler taken before the baseline check. Re-hashed after each check; a difference is a refused
     /// result rather than a pass.
     ruler: Option<crate::ruler::Ruler>,
+    /// The completion cap a model call sends. Reserved before the call together with the context budget,
+    /// so a run cannot start a call that the allowance cannot pay for.
+    call_tokens: u64,
 }
 
 impl<'a, S, C> Runner<'a, S, C>
@@ -752,6 +761,7 @@ where
             baseline: None,
             protect: Vec::new(),
             ruler: None,
+            call_tokens: DEFAULT_CALL_TOKENS,
         }
     }
 
@@ -810,6 +820,12 @@ where
     }
 
     /// Add protected paths for this run. Additive on purpose: a flag cannot remove the profile's defaults.
+    /// The completion cap one call may use, for the reserve taken before the call.
+    pub fn with_call_tokens(mut self, tokens: u64) -> Self {
+        self.call_tokens = tokens.max(1);
+        self
+    }
+
     pub fn with_protect(mut self, protect: Vec<Protect>) -> Self {
         self.protect.extend(protect);
         self
@@ -1588,6 +1604,26 @@ where
         )?;
         if let Some(memory) = &self.memory {
             sections.insert(0, memory.section.clone());
+        }
+        // Reserve before the call: the prompt this attempt will send, plus the completion cap. Checking
+        // only after the call is how a run overshoots its allowance by one cap.
+        if let Some(remaining) = self.bounds.remaining(before) {
+            let prompt = (sections
+                .iter()
+                .map(|section| section.text().len())
+                .sum::<usize>()
+                / 4) as u64
+                + 512;
+            let reserve = prompt.saturating_add(self.call_tokens);
+            if remaining < reserve {
+                self.last_cause = Some(Exhausted::Tokens);
+                self.last_reason = Some(format!(
+                    "the token budget has {remaining} left; one call reserves {prompt} for the prompt and \
+                     {} for the answer",
+                    self.call_tokens
+                ));
+                return Ok((When::Exhausted, String::new(), None));
+            }
         }
         let builder = Budgeted::new(sections);
         let seams = Seams::new(

@@ -3497,6 +3497,11 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         Some(tokens) => bounds.with_tokens(tokens),
         None => bounds,
     };
+    let call_tokens = flags
+        .named
+        .get("max-tokens")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(crate::graph::DEFAULT_CALL_TOKENS);
 
     let before = session.len();
     let memo = remembered(
@@ -3514,6 +3519,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         &mut session,
     )
     .with_bounds(bounds)
+    .with_call_tokens(call_tokens)
     .with_baseline(gate)
     .with_protect(protect)
     .with_scoreboard(&score_state);

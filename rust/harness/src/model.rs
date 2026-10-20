@@ -492,6 +492,18 @@ impl Harness for OpenAi {
 }
 
 impl OpenAi {
+    /// The completion cap this client sends unless a caller says otherwise.
+    pub fn call_cap(&self) -> u64 {
+        self.max_tokens as u64
+    }
+
+    /// The same client with a smaller completion cap, for one call.
+    pub fn with_cap(&self, cap: u64) -> OpenAi {
+        let mut client = self.clone();
+        client.max_tokens = cap.min(u32::MAX as u64) as u32;
+        client
+    }
+
     fn write_plan(&self, task: &TaskSpec, bundle: &Bundle) -> Result<String, Fault> {
         let user = format!(
             "Goal: {}\nWorking directory: {}\n\nWhat the harness already knows:\n{}\n\nWrite the plan.",
@@ -1195,11 +1207,24 @@ impl OpenAi {
         tools: Option<&serde_json::Value>,
         feed: FeedFn<'_>,
     ) -> Result<Reply, Fault> {
+        self.chat_with_cap(messages, tools, self.max_tokens as u64, feed)
+    }
+
+    /// The same call under a cap the caller computed for this call. A budget is a reservation, and the
+    /// completion cap is only half of what a call costs: the prompt is the other half, so the caller that
+    /// knows what is left is the caller that must choose the cap.
+    pub fn chat_with_cap(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        cap: u64,
+        feed: FeedFn<'_>,
+    ) -> Result<Reply, Fault> {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": cap.min(u32::MAX as u64),
             "stream": true,
         });
         if self.usage_log.is_some() {
