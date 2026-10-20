@@ -775,6 +775,70 @@ fn a_submitted_run_refuses_a_zero_token_budget() {
     run.stop();
 }
 
+/// The CLI sends every named flag as a JSON string, so a daemon that read only numbers would silently
+/// fall back to the defaults: three attempts, and a zero budget accepted. Both string forms are asserted.
+#[test]
+fn a_submitted_budget_reads_the_strings_the_cli_sends() {
+    let state = scratch("budget-strings");
+    repo(&state);
+    let run = Running::start(&state);
+
+    // "0" is the same zero budget as the numeric form, refused before a lease exists.
+    let refused = ask(
+        &run.socket,
+        json!({
+            "op": "submit",
+            "goal": "make never.txt exist",
+            "root": state.join("repo").display().to_string(),
+            "state": state.display().to_string(),
+            "session": "zero-string",
+            "program": ["true"],
+            "verify": "test -f never.txt",
+            "policy": "open",
+            "attempts": "1",
+            "minutes": "2",
+            "budget-tokens": "0",
+        }),
+    )
+    .expect("an answer");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("`--budget-tokens 0`"),
+        "{refused}"
+    );
+    assert!(!state.join("sessions/zero-string.jsonl").exists());
+
+    // "1" is one attempt, not the default three: the check never passes, and the ending counts the
+    // attempts the string asked for.
+    let mut following = Following::open(
+        &run.socket,
+        json!({
+            "op": "submit",
+            "goal": "make never.txt exist",
+            "root": state.join("repo").display().to_string(),
+            "state": state.display().to_string(),
+            "session": "one-string",
+            "program": ["true"],
+            "verify": "test -f never.txt",
+            "policy": "open",
+            "attempts": "1",
+            "minutes": "2",
+        }),
+    );
+    let finished = following.until_finished();
+    assert_eq!(finished["code"], json!(1), "{finished}");
+    let ended = finished["ended"].as_str().unwrap_or_default();
+    assert!(
+        ended.starts_with("gave up after 1 attempt(s)"),
+        "the string attempts value was not read: {ended}"
+    );
+
+    run.stop();
+}
+
 #[test]
 fn a_strict_submit_is_refused_before_a_session_exists() {
     let state = scratch("strict-model");
