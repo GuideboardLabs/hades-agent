@@ -431,11 +431,19 @@ fn a_question_nobody_has_asked_is_not_answerable() {
 
 #[test]
 fn an_answer_has_to_be_an_answer() {
+    use harness::approval::{ApprovalBroker as _, OnDisk};
     let root = scratch("badanswer");
+    std::fs::create_dir_all(root.join("state")).expect("a state directory");
+    let broker = OnDisk::open(root.join("state/approvals.jsonl")).expect("the record");
+    let ask = harness::question::Ask::permission("Delete build?", "it cannot be undone");
+    let prompt = ask.prompt.clone();
+    broker
+        .request_ask("chat", "permanently delete", &prompt, Some(ask))
+        .expect("a question");
     let state = root.join("state").display().to_string();
     let (code, text) = hades(&["answer", "0", "maybe", "--state", &state]);
     assert_eq!(code, 2);
-    assert!(text.contains("say allow or deny"), "{text}");
+    assert!(text.contains("not an option"), "{text}");
 
     let (code, text) = hades(&[
         "answer", "0", "allow", "--scope", "forever", "--state", &state,
@@ -2804,4 +2812,102 @@ fn a_paused_goal_can_be_resumed() {
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("transition"), "{text}");
     let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn approvals_shows_each_option_and_answer_takes_the_key() {
+    use harness::approval::{ApprovalBroker as _, OnDisk};
+    use harness::question::{Ask, Choice, Effect};
+
+    let root = scratch("approvals-options");
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).expect("a state directory");
+    let broker = OnDisk::open(state.join("approvals.jsonl")).expect("the record");
+    let mut ask = Ask::choice(
+        "Which store should this use?",
+        "both fit the requirements",
+        true,
+        vec![
+            Choice::new("sqlite", "SQLite", "one file, no server", Effect::Free).recommended(),
+            Choice::new("postgres", "Postgres", "a server to run", Effect::Free),
+        ],
+    );
+    ask.family = "storage".into();
+    let prompt = ask.prompt.clone();
+    broker
+        .request_ask("chat-1", "question", &prompt, Some(ask))
+        .expect("a question");
+
+    let state_arg = state.display().to_string();
+    let (code, text) = hades(&["approvals", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Which store should this use?"), "{text}");
+    assert!(
+        text.contains("▸ sqlite"),
+        "the recommendation is marked: {text}"
+    );
+    assert!(text.contains("postgres"), "every option is shown: {text}");
+    assert!(text.contains("waiting"), "{text}");
+
+    let (code, text) = hades(&[
+        "answer",
+        "0",
+        "sqlite",
+        "--note",
+        "same as the last one",
+        "--state",
+        &state_arg,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("answered allow"), "{text}");
+
+    let (code, text) = hades(&["log", "--asks", "chat-1", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("option sqlite"), "{text}");
+    assert!(text.contains("same as the last one"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn taste_prints_the_recommendation_it_learned_and_forget_clears_it() {
+    use harness::approval::{Answer, Scope};
+    use harness::policy::Decision;
+    use harness::question::{Ask, Choice, Effect};
+
+    let root = scratch("taste-cli");
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).expect("a state directory");
+    let mut ask = Ask::choice(
+        "Which store should this use?",
+        "both fit",
+        true,
+        vec![
+            Choice::new("postgres", "Postgres", "a server", Effect::Free).recommended(),
+            Choice::new("sqlite", "SQLite", "one file", Effect::Free),
+        ],
+    );
+    ask.family = "storage".into();
+    for _ in 0..3 {
+        let answer = Answer {
+            decision: Decision::Allow,
+            scope: Scope::Once,
+            by: "operator".into(),
+            at: "2026-10-20T12:00:00Z".into(),
+            option: Some("sqlite".into()),
+            note: None,
+        };
+        harness::taste::record(&state, &root, &ask, &answer).expect("a recorded answer");
+    }
+    let state_arg = state.display().to_string();
+    let (code, text) = hades(&["taste", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("recommendation sqlite"), "{text}");
+    assert!(text.contains("3 answers"), "{text}");
+
+    let (code, text) = hades(&["taste", "forget", "all", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("forgot 3"), "{text}");
+    let (_, text) = hades(&["taste", "--state", &state_arg]);
+    assert!(text.contains("no answers recorded"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -81,6 +81,7 @@ pub mod service;
 pub mod shadow;
 pub mod skills;
 pub mod task;
+pub mod taste;
 pub mod tool;
 pub mod tui;
 pub mod tuning;
