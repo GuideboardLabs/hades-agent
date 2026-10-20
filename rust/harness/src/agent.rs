@@ -947,6 +947,17 @@ sessions and images. Do the task with them instead of asking about it. You canno
 sent you this task, so treat the task text as everything you know. Answer with a short report: what you did, \
 what you found, and exact paths or numbers. Never ask a question back.";
 
+/// The one system prompt a child sees, whether it runs in the blocking path or in the gateway's
+/// executor. A second copy of this text is a second contract, and A4 compares the two paths' answers.
+pub(crate) fn child_prompt(schema: &Value) -> String {
+    format!(
+        "{WORKER}\n\nReturn one JSON object and nothing else. It must satisfy this schema:\n{}\n\
+         Do not put prose around it. Do not use Markdown fences. A missing or mistyped field fails \
+         the task.",
+        serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
 /// One delegated task: a goal and the schema its answer must satisfy. A string task gets the default
 /// envelope, so every delegation returns a checked object rather than a paragraph the parent has to parse.
 struct Job {
@@ -990,7 +1001,7 @@ fn jobs(args: &Value) -> Vec<Job> {
 
 /// The object a worker meant to return. A fenced block or a sentence before the JSON is tolerated,
 /// because models decorate; the first `{` to the last `}` is the last honest attempt.
-fn parse_json_answer(text: &str) -> Option<Value> {
+pub(crate) fn parse_json_answer(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str(trimmed) {
         return Some(value);
@@ -1006,7 +1017,7 @@ fn parse_json_answer(text: &str) -> Option<Value> {
 /// A small structural check, not a JSON Schema engine: object, array, string, number, integer, boolean,
 /// null, required keys and declared properties. That is the shape a delegation contract needs, and a
 /// bigger engine would be a dependency for a claim this one can test.
-fn fits(schema: &Value, value: &Value) -> Result<(), String> {
+pub(crate) fn fits(schema: &Value, value: &Value) -> Result<(), String> {
     let kind = schema.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         "object" => {
@@ -1086,12 +1097,7 @@ fn run_child(
         json!({"actor": kind, "parent": worker.actor, "parent_session": parent, "role": worker.role.name(), "goal": goal, "schema": schema}),
     );
     let _ = log.append(session_tree::Kind::User, json!({"text": goal}));
-    let system = format!(
-        "{WORKER}\n\nReturn one JSON object and nothing else. It must satisfy this schema:\n{}\n\
-         Do not put prose around it. Do not use Markdown fences. A missing or mistyped field fails \
-         the task.",
-        serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string())
-    );
+    let system = child_prompt(schema);
     let mut messages = vec![
         json!({"role": "system", "content": system}),
         json!({"role": "user", "content": goal}),
@@ -1442,7 +1448,9 @@ fn refusal_text(refusal: &Refusal) -> String {
         Refusal::TimedOut { .. } => format!("timeout: {refusal}"),
         Refusal::Finished { .. } => format!("finished: {refusal}"),
         Refusal::Missing { .. } => format!("missing: {refusal}"),
-        Refusal::Exists { .. } | Refusal::Io { .. } => format!("failed: {refusal}"),
+        Refusal::Exists { .. } | Refusal::SessionInUse { .. } | Refusal::Io { .. } => {
+            format!("failed: {refusal}")
+        }
     }
 }
 

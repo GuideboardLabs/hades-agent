@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use session_tree::{FileStore, Kind, Session, SessionId, SystemClock};
 
-use crate::agent::{Activity, Inbox, World};
+use crate::agent::{Activity, Inbox, World, child_prompt, fits, parse_json_answer};
 use crate::model::{Feed, OpenAi};
 
 /// The most children one gateway process runs at once. The bound exists so a model that keeps spawning
@@ -56,6 +56,11 @@ pub struct Record {
     pub ended: Option<i64>,
     /// Why a child is `failed` or `lost`. Absent while it is running and after a clean finish.
     pub reason: Option<String>,
+    /// The process that wrote this record, and that process's start token. Both are absent on a record
+    /// written before ownership was recorded: such a record has no owner this build can find alive, so
+    /// recovery treats it as a dead gateway's child.
+    pub pid: Option<u32>,
+    pub start: Option<u64>,
 }
 
 impl Record {
@@ -70,11 +75,14 @@ impl Record {
             "started": self.started,
             "ended": self.ended,
             "reason": self.reason,
+            "pid": self.pid,
+            "start": self.start,
         })
     }
 
     /// Strict: a record missing a field an owner relies on is not a record. `ended` and `reason` are
-    /// nullable because a live child has neither.
+    /// nullable because a live child has neither. `pid` and `start` are optional only for records this
+    /// build did not write; a record that has them is checked against the live process table.
     pub fn from_value(value: &Value) -> Option<Record> {
         Some(Record {
             id: value.get("id")?.as_str()?.to_string(),
@@ -89,6 +97,11 @@ impl Record {
                 .get("reason")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            pid: value
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            start: value.get("start").and_then(Value::as_u64),
         })
     }
 
@@ -158,6 +171,12 @@ pub enum Refusal {
     Exists {
         id: String,
     },
+    /// The session already belongs to a child. The child's log and `result.json` are derived from the
+    /// session, so admitting a second child with the same one would make them share both.
+    SessionInUse {
+        session: String,
+        id: String,
+    },
     Io {
         path: String,
         detail: String,
@@ -187,6 +206,9 @@ impl std::fmt::Display for Refusal {
                 "the gateway is already running {live} children (limit {limit}); try again when one finishes"
             ),
             Refusal::Exists { id } => write!(f, "child {id} already exists"),
+            Refusal::SessionInUse { session, id } => {
+                write!(f, "session {session} already belongs to child {id}")
+            }
             Refusal::Io { path, detail } => write!(f, "{path}: {detail}"),
             Refusal::Missing { id } => write!(f, "there is no child {id} on this gateway"),
             Refusal::Finished { id, state } => write!(
@@ -206,6 +228,38 @@ impl std::fmt::Display for Refusal {
 }
 
 impl std::error::Error for Refusal {}
+
+/// What one startup sweep did, with every file in the children directory in exactly one bucket.
+/// `accounted` is the invariant: it must equal `files`, so a caller can tell a complete sweep from a
+/// partial one without trusting a single count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recovery {
+    /// How many `.json` files the sweep saw.
+    pub files: usize,
+    /// Admitted/running records whose owner is gone, now `lost`.
+    pub marked: usize,
+    /// Records not admitted or running: already terminal, or a state this build does not resume.
+    pub terminal: usize,
+    /// Live records this process owns (including a second `serve` sharing this registry).
+    pub this_process: usize,
+    /// Live records owned by another process that is still alive.
+    pub elsewhere: usize,
+    /// Files that did not parse. Left in place for a person; never guessed at.
+    pub unreadable: Vec<String>,
+    /// Records the sweep could not rewrite, with the failure. The sweep keeps going.
+    pub failed: Vec<String>,
+}
+
+impl Recovery {
+    pub fn accounted(&self) -> usize {
+        self.marked
+            + self.terminal
+            + self.this_process
+            + self.elsewhere
+            + self.unreadable.len()
+            + self.failed.len()
+    }
+}
 
 /// A child lifecycle event. The `type` discriminator is the whole point: an older reader sees a Meta
 /// payload it does not understand and ignores it, instead of failing the log or inventing a state.
@@ -376,8 +430,12 @@ struct Inner {
     /// Admitted ids whose executor has not finished. The cap counts this, so a child that exited is not
     /// still occupying a slot.
     live: Mutex<BTreeSet<String>>,
-    /// Executors kept so a test or a shutdown can join them. A thread cannot remove its own handle
-    /// without joining itself, so finished ids stay here until `drain`.
+    /// The child that owns each session. A session names the child's log and artifact directory, so it
+    /// belongs to one child for the life of the registry, even after that child ends. The on-disk
+    /// records cover an earlier process; this map covers the window before the first record is written.
+    sessions: Mutex<BTreeMap<String, String>>,
+    /// Executors kept so a test or a shutdown can join them. Finished handles are pruned at the next
+    /// admission; a thread cannot remove its own handle without joining itself.
     threads: Mutex<BTreeMap<String, std::thread::JoinHandle<()>>>,
     /// The mailbox a running child reads between steps. `tell` pushes here; the executor's loop drains
     /// it before its next model call. Kept beside the live set because both describe work in flight.
@@ -402,6 +460,7 @@ impl Registry {
         let inner = Arc::new(Inner {
             state: state.clone(),
             live: Mutex::new(BTreeSet::new()),
+            sessions: Mutex::new(BTreeMap::new()),
             threads: Mutex::new(BTreeMap::new()),
             mailboxes: Mutex::new(BTreeMap::new()),
         });
@@ -427,13 +486,15 @@ impl Registry {
         &self.inner.state
     }
 
-    /// Startup recovery. A child that was `admitted` or `running` when the process died has no thread
-    /// any more, so it is marked `lost` with a reason rather than left looking alive. Returns how many
-    /// records changed.
-    pub fn recover(&self) -> Result<usize, String> {
+    /// Startup recovery. A child that was `admitted` or `running` when its owning process died has no
+    /// thread any more, so it is marked `lost` with a reason rather than left looking alive. A record
+    /// owned by a live process is left alone: another gateway, or a second `serve` sharing this
+    /// registry, still owns that child. Returns one bucket per file, whether or not it parsed.
+    pub fn recover(&self) -> Result<Recovery, String> {
         let dir = children_dir(&self.inner.state);
+        let mut report = Recovery::default();
         if !dir.exists() {
-            return Ok(0);
+            return Ok(report);
         }
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|error| format!("{}: {error}", dir.display()))?
@@ -444,23 +505,94 @@ impl Registry {
             })
             .collect();
         paths.sort();
-        let mut marked = 0;
         for path in paths {
-            let mut record = read_record(&path).ok_or_else(|| {
-                format!(
-                    "{}: the child record would not parse; refusing to guess its state",
-                    path.display()
-                )
-            })?;
-            if record.state == STATE_ADMITTED || record.state == STATE_RUNNING {
-                record.state = STATE_LOST.to_string();
-                record.ended = Some(epoch());
-                record.reason = Some("the gateway restarted while this child was live".to_string());
-                Record::write(&self.inner.state, &record)?;
-                marked += 1;
+            report.files += 1;
+            let Some(mut record) = read_record(&path) else {
+                // One unreadable file is a fact to report, not a reason to abandon every other child.
+                // It stays in place: guessing a state, or deleting the evidence, would be worse.
+                report.unreadable.push(path.display().to_string());
+                continue;
+            };
+            if record.state != STATE_ADMITTED && record.state != STATE_RUNNING {
+                report.terminal += 1;
+                continue;
+            }
+            match self.owner(&record) {
+                Owner::ThisProcess => report.this_process += 1,
+                Owner::Alive => report.elsewhere += 1,
+                Owner::Gone => {
+                    record.state = STATE_LOST.to_string();
+                    record.ended = Some(epoch());
+                    record.reason = Some(match record.pid {
+                        Some(pid) => format!(
+                            "the gateway restarted while this child was live (owner pid {pid} is gone)"
+                        ),
+                        None => "the gateway restarted while this child was live".to_string(),
+                    });
+                    match Record::write(&self.inner.state, &record) {
+                        Ok(()) => report.marked += 1,
+                        Err(said) => report.failed.push(format!("{}: {said}", path.display())),
+                    }
+                }
             }
         }
-        Ok(marked)
+        Ok(report)
+    }
+
+    /// Who owns a record now. The live set is checked first so a second `serve` in one process can
+    /// never mark its own children lost, even if the process table cannot be read.
+    fn owner(&self, record: &Record) -> Owner {
+        if self
+            .inner
+            .live
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .contains(&record.id)
+        {
+            return Owner::ThisProcess;
+        }
+        let Some(pid) = record.pid else {
+            // A record from before ownership was recorded has no owner this build can find alive.
+            return Owner::Gone;
+        };
+        let Some(start) = process_start(pid) else {
+            return Owner::Gone;
+        };
+        // A pid can be reused; the start token is what says this is the process that wrote the record.
+        if record.start.is_some_and(|recorded| recorded != start) {
+            return Owner::Gone;
+        }
+        if pid == std::process::id() {
+            Owner::ThisProcess
+        } else {
+            Owner::Alive
+        }
+    }
+
+    /// The child that already owns a session, if any. The on-disk records cover every earlier child;
+    /// the in-memory map covers an admission whose record is not written yet.
+    fn session_owner(&self, session: &str) -> Result<Option<String>, String> {
+        let dir = children_dir(&self.inner.state);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let entries =
+            std::fs::read_dir(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                continue;
+            }
+            if let Some(record) = read_record(&path)
+                && record.session == session
+            {
+                return Ok(Some(record.id));
+            }
+        }
+        Ok(None)
     }
 
     /// Write the record, start the executor, and return the handle before the first model call. The
@@ -472,6 +604,9 @@ impl Registry {
         mut world: World,
         client: OpenAi,
     ) -> Result<Admitted, Refusal> {
+        // A handle whose executor is finished is not joinable work; drop it before it accumulates one
+        // entry per child for the life of the process.
+        self.prune_threads();
         if !valid_name(&admission.id) {
             return Err(Refusal::Io {
                 path: path_of(&self.inner.state, &admission.id)
@@ -517,6 +652,32 @@ impl Registry {
             if live.contains(&admission.id) || path.exists() {
                 return Err(Refusal::Exists { id: admission.id });
             }
+            // A session names the child's log and its `result.json`, so it may belong to one child only.
+            // The map covers this process's admissions; the records cover every earlier process.
+            let mut sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|held| held.into_inner());
+            if let Some(existing) = sessions.get(&admission.session) {
+                return Err(Refusal::SessionInUse {
+                    session: admission.session.clone(),
+                    id: existing.clone(),
+                });
+            }
+            let existing =
+                self.session_owner(&admission.session)
+                    .map_err(|detail| Refusal::Io {
+                        path: children_dir(&self.inner.state).display().to_string(),
+                        detail,
+                    })?;
+            if let Some(existing) = existing {
+                return Err(Refusal::SessionInUse {
+                    session: admission.session.clone(),
+                    id: existing,
+                });
+            }
+            sessions.insert(admission.session.clone(), admission.id.clone());
             live.insert(admission.id.clone());
         }
 
@@ -532,6 +693,8 @@ impl Registry {
             started,
             ended: None,
             reason: None,
+            pid: Some(std::process::id()),
+            start: process_start(std::process::id()),
         };
         let admitting = Event::Admitted {
             child_id: admission.id.clone(),
@@ -546,6 +709,7 @@ impl Registry {
         if let Err(said) = record_event(&self.inner.state, &admission.session, &admitting)
             .and_then(|()| Record::write(&self.inner.state, &record))
         {
+            self.unclaim_session(&admission.session);
             self.unslot(&admission.id);
             return Err(Refusal::Io {
                 path: path.display().to_string(),
@@ -748,6 +912,26 @@ impl Registry {
             .remove(id);
     }
 
+    /// Release a session claim taken by an admission that never wrote its record, so a retry can reuse
+    /// the session. A claim whose record exists is never released: the artifact path stays owned.
+    fn unclaim_session(&self, session: &str) {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .remove(session);
+    }
+
+    /// Drop handles whose executor has finished. The threads map is for joining live work, not an
+    /// archive of every child this process ever ran.
+    fn prune_threads(&self) {
+        self.inner
+            .threads
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .retain(|_, handle| !handle.is_finished());
+    }
+
     /// Join every executor this gateway started and return how many were joined. Used by tests and by a
     /// shutdown that wants the threads gone; it is not a way to make a slow model call finish sooner.
     pub fn drain(&self) -> usize {
@@ -896,6 +1080,30 @@ fn epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// Who owns a child record: this gateway process, another live process, or a process that is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    ThisProcess,
+    Alive,
+    Gone,
+}
+
+/// A process's start time from `/proc/<pid>/stat`: the token that tells a live pid from a reused one.
+/// `None` means there is no such process (or it has no readable stat entry). Linux is the platform this
+/// gateway runs on; other platforms can only vouch for their own pid.
+#[cfg(target_os = "linux")]
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    // After the parenthesised name, fields start at field 3 (state); starttime is field 22.
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start(pid: u32) -> Option<u64> {
+    (pid == std::process::id()).then_some(0)
+}
+
 fn read_record(path: &Path) -> Option<Record> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
@@ -945,95 +1153,13 @@ fn open_log(state: &Path, session: &str) -> Result<Log, String> {
     }
 }
 
-/// What a child is told. Close to the blocking spawn path's prompt, because A4 compares the two paths'
-/// results for the same scripted child.
+/// What a child is told. The blocking path's prompt is the contract; this function exists so the
+/// gateway executor and `spawn`/`delegate` cannot drift into two prompts for one child.
 fn child_messages(goal: &str, schema: &Value) -> Vec<Value> {
-    let system = format!(
-        "You are one child agent in a team. You have tools: shell, files, search, the web, memory, \
-         skills, sessions and images. Do the task with them instead of asking about it. You cannot see \
-         the conversation that sent you this task, so treat the task text as everything you know. \
-         Return one JSON object and nothing else. It must satisfy this schema:\n{}\nDo not put prose \
-         around it. Do not use Markdown fences. A missing or mistyped field fails the task.",
-        serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string())
-    );
     vec![
-        json!({"role": "system", "content": system}),
+        json!({"role": "system", "content": child_prompt(schema)}),
         json!({"role": "user", "content": goal}),
     ]
-}
-
-/// The object a child meant to return. A fenced block or a sentence before the JSON is tolerated,
-/// because models decorate; the first `{` to the last `}` is the last honest attempt.
-fn parse_json_answer(text: &str) -> Option<Value> {
-    let trimmed = text.trim();
-    if let Ok(value) = serde_json::from_str(trimmed) {
-        return Some(value);
-    }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    serde_json::from_str(&trimmed[start..=end]).ok()
-}
-
-/// A small structural check, the same contract the blocking path enforces: object, array, string,
-/// number, integer, boolean, null, required keys and declared properties. A bigger engine would be a
-/// dependency for a claim this one can test. Kept here because the gateway executor and the blocking
-/// path must agree on what a valid child result is.
-fn fits(schema: &Value, value: &Value) -> Result<(), String> {
-    let kind = schema.get("type").and_then(Value::as_str).unwrap_or("");
-    match kind {
-        "object" => {
-            let object = value
-                .as_object()
-                .ok_or_else(|| "expected an object".to_string())?;
-            if let Some(required) = schema.get("required").and_then(Value::as_array) {
-                for key in required.iter().filter_map(Value::as_str) {
-                    if !object.contains_key(key) {
-                        return Err(format!("missing required field `{key}`"));
-                    }
-                }
-            }
-            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-                for (key, sub) in properties {
-                    if let Some(field) = object.get(key) {
-                        fits(sub, field).map_err(|why| format!("{key}: {why}"))?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        "array" => {
-            let items = value
-                .as_array()
-                .ok_or_else(|| "expected an array".to_string())?;
-            if let Some(item) = schema.get("items") {
-                for (index, entry) in items.iter().enumerate() {
-                    fits(item, entry).map_err(|why| format!("[{index}]: {why}"))?;
-                }
-            }
-            Ok(())
-        }
-        "string" if value.is_string() => Ok(()),
-        "number" if value.is_number() => Ok(()),
-        "integer" if value.as_i64().is_some() || value.as_u64().is_some() => Ok(()),
-        "boolean" if value.is_boolean() => Ok(()),
-        "null" if value.is_null() => Ok(()),
-        "" => Ok(()),
-        other => Err(format!("expected {other}, got {}", kind_of(value))),
-    }
-}
-
-fn kind_of(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1167,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::process::Command;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1105,7 +1232,23 @@ mod tests {
             started: 10,
             ended: None,
             reason: None,
+            pid: None,
+            start: None,
         }
+    }
+
+    /// A record an identified process wrote: the shape this build writes, and the shape recovery has to
+    /// judge by ownership rather than by its own opinion about whether a thread exists.
+    fn owned(id: &str, state: &str, pid: u32, start: Option<u64>) -> Record {
+        Record {
+            pid: Some(pid),
+            start,
+            ..record(id, state)
+        }
+    }
+
+    fn unreachable() -> crate::model::OpenAi {
+        crate::model::OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "stub")
     }
 
     type Stub = (
@@ -1255,7 +1398,10 @@ mod tests {
         Record::write(&state, &finished).expect("a record");
 
         let registry = Registry::new(&state);
-        assert_eq!(registry.recover().expect("recovery"), 2, "two were live");
+        let report = registry.recover().expect("recovery");
+        assert_eq!(report.marked, 2, "two were live");
+        assert_eq!(report.files, 3, "every file is accounted for");
+        assert_eq!(report.accounted(), report.files);
 
         for id in ["spawn-admitted", "spawn-running"] {
             let lost = registry.record(id).expect("the record");
@@ -1276,6 +1422,198 @@ mod tests {
         assert_eq!(registry.record("spawn-done"), Some(finished));
         assert_eq!(registry.live(), 0);
         assert_eq!(registry.drain(), 0);
+        cleanup(&state);
+    }
+
+    /// A0 fix: one file that will not parse is reported, not fatal. Every other record is still
+    /// recovered, and the report accounts for every file in the directory.
+    #[test]
+    fn recovery_reports_a_bad_record_and_keeps_going() {
+        let state = scratch("recovery-unreadable");
+        Record::write(&state, &record("spawn-lost", "running")).expect("a record");
+        let mut finished = record("spawn-done", "done");
+        finished.ended = Some(20);
+        Record::write(&state, &finished).expect("a record");
+        std::fs::write(children_dir(&state).join("spawn-bad.json"), "{not json")
+            .expect("a bad record");
+
+        let registry = Registry::new(&state);
+        let report = registry.recover().expect("recovery keeps going");
+
+        assert_eq!(report.files, 3);
+        assert_eq!(
+            report.marked, 1,
+            "the record after the bad file is recovered"
+        );
+        assert_eq!(report.terminal, 1);
+        assert_eq!(report.unreadable.len(), 1);
+        assert!(
+            report.unreadable[0].ends_with("spawn-bad.json"),
+            "the report names the file it could not read: {:?}",
+            report.unreadable
+        );
+        assert_eq!(report.accounted(), report.files);
+        assert_eq!(
+            registry.record("spawn-lost").expect("the record").state,
+            "lost"
+        );
+        assert!(
+            children_dir(&state).join("spawn-bad.json").exists(),
+            "an unreadable record is left for a person, not deleted"
+        );
+        cleanup(&state);
+    }
+
+    /// A0 fix: a child whose gateway process is still alive is not lost. Recovery is about dead
+    /// owners, not about this process's inability to find a thread for another process's child.
+    #[test]
+    fn recovery_keeps_a_child_whose_owner_is_alive() {
+        let state = scratch("recovery-owner-alive");
+        let mut owner = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a live process");
+        let pid = owner.id();
+        let start = process_start(pid).expect("a start token for a live process");
+        Record::write(&state, &owned("spawn-alive", "running", pid, Some(start)))
+            .expect("a record");
+
+        let registry = Registry::new(&state);
+        let report = registry.recover().expect("recovery");
+
+        assert_eq!(report.marked, 0);
+        assert_eq!(report.elsewhere, 1);
+        assert_eq!(
+            registry.record("spawn-alive").expect("the record").state,
+            "running",
+            "a live gateway still owns this child"
+        );
+
+        let _ = owner.kill();
+        let _ = owner.wait();
+        cleanup(&state);
+    }
+
+    /// A0 fix: a second `serve` in one process shares the same registry. Recovery must never mark that
+    /// registry's own live children lost, even though it has no idea which thread they belong to.
+    #[test]
+    fn recovery_keeps_this_registrys_own_live_children() {
+        let state = scratch("recovery-own");
+        let registry = Registry::new(&state);
+        let start = process_start(std::process::id()).expect("a start token for this process");
+        Record::write(
+            &state,
+            &owned("spawn-own", "running", std::process::id(), Some(start)),
+        )
+        .expect("a record");
+        registry
+            .inner
+            .live
+            .lock()
+            .expect("the live set")
+            .insert("spawn-own".to_string());
+
+        let second = Registry::new(&state);
+        let report = second.recover().expect("recovery");
+
+        assert_eq!(report.marked, 0);
+        assert_eq!(report.this_process, 1);
+        assert_eq!(
+            second.record("spawn-own").expect("the record").state,
+            "running"
+        );
+        registry
+            .inner
+            .live
+            .lock()
+            .expect("the live set")
+            .remove("spawn-own");
+        cleanup(&state);
+    }
+
+    /// A0 fix: the owner's pid is not enough, because pids are reused. The start token has to match,
+    /// and a record whose owner is gone becomes lost with a reason.
+    #[test]
+    fn recovery_marks_a_child_whose_owner_pid_is_gone_lost() {
+        let state = scratch("recovery-owner-gone");
+        let mut dead = Command::new("true").spawn().expect("a short process");
+        let pid = dead.id();
+        dead.wait().expect("the short process ends");
+        Record::write(
+            &state,
+            &owned("spawn-dead", "admitted", pid, Some(u64::MAX)),
+        )
+        .expect("a record");
+
+        let registry = Registry::new(&state);
+        let report = registry.recover().expect("recovery");
+
+        assert_eq!(report.marked, 1);
+        let lost = registry.record("spawn-dead").expect("the record");
+        assert_eq!(lost.state, "lost");
+        assert!(
+            lost.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("gateway restarted")),
+            "{:?}",
+            lost.reason
+        );
+        cleanup(&state);
+    }
+
+    /// A0 fix: the artifact path is derived from the session, so two children may not share one. A
+    /// session already named by a record is refused even when that child is finished.
+    #[test]
+    fn an_admission_whose_session_is_already_owned_is_refused() {
+        let state = scratch("session-reuse");
+        let mut first = record("spawn-first", "done");
+        first.session = "shared-session".to_string();
+        first.ended = Some(20);
+        Record::write(&state, &first).expect("a record");
+        let registry = Registry::new(&state);
+
+        let mut second = admission("spawn-second");
+        second.session = "shared-session".to_string();
+        let refused = registry.admit(second, world(&state), unreachable());
+
+        assert_eq!(
+            refused,
+            Err(Refusal::SessionInUse {
+                session: "shared-session".to_string(),
+                id: "spawn-first".to_string(),
+            })
+        );
+        assert!(
+            registry.record("spawn-second").is_none(),
+            "a refused admission writes no record"
+        );
+        assert_eq!(registry.drain(), 0);
+        cleanup(&state);
+    }
+
+    /// A0 fix: a live child holds its session too, including before its executor writes anything else.
+    #[test]
+    fn a_live_child_holds_its_session() {
+        let state = scratch("session-live");
+        let registry = Registry::new(&state);
+        let mut first = admission("spawn-first");
+        first.session = "shared-session".to_string();
+        registry
+            .admit(first, world(&state), unreachable())
+            .expect("the first child");
+
+        let mut second = admission("spawn-second");
+        second.session = "shared-session".to_string();
+        let refused = registry.admit(second, world(&state), unreachable());
+
+        assert_eq!(
+            refused,
+            Err(Refusal::SessionInUse {
+                session: "shared-session".to_string(),
+                id: "spawn-first".to_string(),
+            })
+        );
+        assert_eq!(registry.drain(), 1);
         cleanup(&state);
     }
 
@@ -1398,5 +1736,65 @@ mod tests {
         assert_eq!(events[1].payload()["type"], "child_message");
         assert_eq!(events[2].payload()["type"], "child_result");
         assert_eq!(events[1].payload()["parent_session"], "p");
+    }
+
+    /// A0 fix: the gateway executor and the blocking path must hand the model one contract. The prompt
+    /// is the blocking path's, not a second paraphrase that can drift from it.
+    #[test]
+    fn the_gateway_child_uses_the_blocking_paths_worker_prompt() {
+        let schema = Admission::report_schema();
+        let messages = child_messages("say done", &schema);
+
+        assert_eq!(
+            messages[0]["content"],
+            crate::agent::child_prompt(&schema),
+            "a child sees the same system prompt wherever it was created"
+        );
+        let system = messages[0]["content"].as_str().expect("a system message");
+        assert!(system.contains("You are one worker in a team."), "{system}");
+        assert!(system.contains("Return one JSON object"), "{system}");
+        assert_eq!(messages[1]["content"], "say done");
+    }
+
+    /// A0 fix: the threads map is for joining live work, not an archive. A finished handle is pruned
+    /// when the next child is admitted, so a long-lived gateway does not keep one handle per child.
+    #[test]
+    fn a_finished_handle_is_pruned_before_the_next_child() {
+        let state = scratch("thread-prune");
+        let (url, observed, go, server) = model_server(
+            state.clone(),
+            "spawn-first".to_string(),
+            json!({"report": "done"}).to_string(),
+        );
+        let registry = Registry::new(&state);
+        registry
+            .admit(
+                admission("spawn-first"),
+                world(&state),
+                crate::model::OpenAi::new(&url, "stub"),
+            )
+            .expect("the first child");
+        let (_, _) = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first model call");
+        go.send(()).expect("the endpoint is waiting");
+        wait_for(&registry, "spawn-first", "done");
+        server.join().expect("the endpoint");
+        assert_eq!(
+            registry.inner.threads.lock().expect("the threads").len(),
+            1,
+            "the finished handle is still there to be joined"
+        );
+
+        registry
+            .admit(admission("spawn-second"), world(&state), unreachable())
+            .expect("the second child");
+        assert_eq!(
+            registry.inner.threads.lock().expect("the threads").len(),
+            1,
+            "the finished handle was pruned at admission"
+        );
+        assert_eq!(registry.drain(), 1);
+        cleanup(&state);
     }
 }
