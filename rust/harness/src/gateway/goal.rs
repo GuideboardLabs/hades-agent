@@ -7,27 +7,25 @@
 //! goals ignores it and `SCHEMA_VERSION` stays 1.
 //!
 //! The heartbeat is bounded twice. It runs only when the session has no live job and the last entry is
-//! older than the interval, and each continuation draws a fresh [`crate::agent::Allowance`] of the goal's
-//! budget. A goal that spends that allowance is paused with `budget` recorded; it is never retried
-//! quietly.
+//! older than the interval, and the goal's budget is a total: each continuation draws what is left of
+//! it, and the record keeps what the goal has already spent. A goal whose budget is gone is paused with
+//! `budget` recorded; it is never retried quietly, and it is not handed a fresh allowance per heartbeat.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use session_tree::{FileStore, Kind, Session, SessionId, SystemClock};
 
 use crate::gateway::{Settings, chat_path, load_chat, save_chat, system_prompt, world_for};
 use crate::model::{OpenAi, from_preset, preset};
 use crate::task::TaskSpec;
 use crate::verify::{CommandVerifier, Verifier};
 
-/// The model calls one continuation may spend when a goal does not name a budget. It is per continuation,
-/// not per goal: a goal that keeps making progress is allowed to keep going, and a goal that burns the
-/// whole allowance in one turn is paused rather than handed another.
+/// The model calls one goal may spend in total when it does not name a budget. It is the goal's whole
+/// allowance, not each continuation's: a goal that burns it in one turn is paused, and a goal that
+/// spreads it across heartbeats stops at the same total.
 pub const DEFAULT_BUDGET: u32 = 8;
 
 /// The idle interval before the heartbeat re-enters a session, in seconds. Fifteen minutes is long
@@ -37,6 +35,11 @@ pub const DEFAULT_HEARTBEAT_SECS: i64 = 900;
 /// How often the heartbeat thread looks for due goals. The interval is measured in seconds; this is
 /// only how promptly a due goal is noticed.
 pub const TICK_SECS: u64 = 30;
+
+/// How long a goal's recorded check may run before it is killed. The heartbeat is one thread and it is
+/// the only thing that continues goals, so a check that hangs must not take the heartbeat with it: the
+/// deadline is under [`TICK_SECS`], so even a check that is killed cannot make the next tick late.
+pub const CHECK_SECS: u64 = 20;
 
 /// Where a goal's life cycle stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +185,9 @@ pub struct Goal {
     pub model: String,
     pub check: String,
     pub budget: u32,
+    /// Model calls this goal has spent, summed over every continuation. The budget is the goal's whole
+    /// allowance, so a continuation is handed `budget - spent` and the delta is written back here.
+    pub spent: u32,
     pub executor: Executor,
     pub created: i64,
     pub updated: i64,
@@ -219,6 +225,7 @@ impl Goal {
             "model": self.model,
             "check": self.check,
             "budget": self.budget,
+            "spent": self.spent,
             "executor": self.executor.name(),
             "created": self.created,
             "updated": self.updated,
@@ -256,6 +263,7 @@ impl Goal {
                     .unwrap_or(u64::from(DEFAULT_BUDGET)),
             )
             .ok()?,
+            spent: u32::try_from(value.get("spent").and_then(Value::as_u64).unwrap_or(0)).ok()?,
             executor: Executor::parse(executor).ok()?,
             created: value.get("created").and_then(Value::as_i64).unwrap_or(0),
             updated: value.get("updated").and_then(Value::as_i64).unwrap_or(0),
@@ -374,9 +382,40 @@ pub fn path_of(state: &Path, id: u64) -> Result<PathBuf, String> {
     Err(format!("there is no goal {id}"))
 }
 
+/// The cross-process lock for the goal store. The gateway appends a heartbeat stamp from its own
+/// process while `hades goal set`/`pause`/`clear` runs in another, so the load, the change and the save
+/// have to be one step across processes and not only across threads. An advisory lock on
+/// `<state>/goals/.lock` is that step; the file is released when the handle drops.
+///
+/// `std::fs::File::lock` is the platform's own lock, so this needs no dependency. A caller that already
+/// holds it must call the `*_unlocked` writers instead: an flock taken twice in one process on separate
+/// descriptors is a deadlock, not a second lock.
+fn store_lock(state: &Path) -> Result<std::fs::File, Refusal> {
+    let folder = dir(state);
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| Refusal::Store(format!("{}: {error}", folder.display())))?;
+    let path = folder.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| Refusal::Store(format!("{}: {error}", path.display())))?;
+    file.lock()
+        .map_err(|error| Refusal::Store(format!("{}: {error}", path.display())))?;
+    Ok(file)
+}
+
 /// Write one goal. The write goes through a temp name and a rename so a heartbeat reading the file at
 /// the same moment sees the old record or the new one, never half of either.
 pub fn save(state: &Path, goal: &Goal) -> Result<PathBuf, String> {
+    let _held = store_lock(state).map_err(|refusal| refusal.to_string())?;
+    save_unlocked(state, goal)
+}
+
+/// [`save`] for a caller that already holds the store lock.
+fn save_unlocked(state: &Path, goal: &Goal) -> Result<PathBuf, String> {
     let folder = dir(state);
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
     let path = path_of(state, goal.id).unwrap_or_else(|_| {
@@ -401,6 +440,10 @@ pub fn next_id(goals: &[Goal]) -> u64 {
 
 /// Create a goal. Only the fields a heartbeat needs are required; everything else is either derived
 /// (`session`) or bounded (`budget`, `executor`).
+///
+/// The id is claimed with `create_new`, which is `O_EXCL`: two `hades goal set` processes that read the
+/// same "next" number race for the same file, and only one wins it. The loser steps to the next number
+/// rather than overwriting the winner's record.
 pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
     let text = new.text.trim().to_string();
     if text.is_empty() {
@@ -418,9 +461,13 @@ pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
     } else {
         new.session.trim().to_string()
     };
+    let _held = store_lock(state)?;
     let (goals, _) = load(state);
-    let goal = Goal {
-        id: next_id(&goals),
+    let folder = dir(state);
+    let slug = mneme::slugify(&text, 4);
+    let mut id = next_id(&goals);
+    let mut goal = Goal {
+        id,
         text,
         state: State::Open,
         session,
@@ -428,6 +475,7 @@ pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
         model: new.model,
         check: new.check,
         budget: new.budget,
+        spent: 0,
         executor,
         created: now,
         updated: now,
@@ -435,7 +483,40 @@ pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
         reason: String::new(),
         last_check: String::new(),
     };
-    save(state, &goal).map_err(Refusal::Store)?;
+    loop {
+        let path = folder.join(format!("{id}-{slug}.json"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                goal.id = id;
+                let text = serde_json::to_string_pretty(&goal.to_value()).map_err(|error| {
+                    let _ = std::fs::remove_file(&path);
+                    Refusal::Store(format!("the goal could not be rendered: {error}"))
+                })?;
+                file.write_all(text.as_bytes()).map_err(|error| {
+                    let _ = std::fs::remove_file(&path);
+                    Refusal::Store(format!("{}: {error}", path.display()))
+                })?;
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                id += 1;
+                if id > u64::from(u32::MAX) {
+                    return Err(Refusal::Store(format!(
+                        "could not find a free goal number under {}: every number up to {id} is taken",
+                        folder.display()
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(Refusal::Store(format!("{}: {error}", path.display())));
+            }
+        }
+    }
     record(state, &goal, "open");
     Ok(goal)
 }
@@ -443,18 +524,22 @@ pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
 /// A person pausing a goal. Only an open goal can be paused; pausing a paused goal is refused rather
 /// than treated as a second, quieter pause.
 pub fn pause(state: &Path, id: u64, reason: &str, now: i64) -> Result<Goal, Refusal> {
+    let _held = store_lock(state)?;
     let mut goal = load_one(state, id).ok_or(Refusal::NoGoal { id })?;
     goal.transition(State::Paused, reason, now)?;
-    save(state, &goal).map_err(Refusal::Store)?;
+    save_unlocked(state, &goal).map_err(Refusal::Store)?;
     record(state, &goal, "paused");
     Ok(goal)
 }
 
-/// Resume a paused goal. The heartbeat then treats it as open on the next tick.
+/// Resume a paused goal. The heartbeat then treats it as open on the next tick, with whatever budget is
+/// left; a goal paused because its budget was spent has nothing left to draw, so resuming it is honest
+/// only about the state and not about a fresh allowance.
 pub fn resume(state: &Path, id: u64, now: i64) -> Result<Goal, Refusal> {
+    let _held = store_lock(state)?;
     let mut goal = load_one(state, id).ok_or(Refusal::NoGoal { id })?;
     goal.transition(State::Open, "resumed", now)?;
-    save(state, &goal).map_err(Refusal::Store)?;
+    save_unlocked(state, &goal).map_err(Refusal::Store)?;
     record(state, &goal, "resumed");
     Ok(goal)
 }
@@ -462,9 +547,10 @@ pub fn resume(state: &Path, id: u64, now: i64) -> Result<Goal, Refusal> {
 /// A person closing a goal. This is the one close that needs no check: a person is allowed to decide the
 /// work is no longer wanted.
 pub fn clear(state: &Path, id: u64, now: i64) -> Result<Goal, Refusal> {
+    let _held = store_lock(state)?;
     let mut goal = load_one(state, id).ok_or(Refusal::NoGoal { id })?;
     goal.transition(State::Cleared, "a person cleared the goal", now)?;
-    save(state, &goal).map_err(Refusal::Store)?;
+    save_unlocked(state, &goal).map_err(Refusal::Store)?;
     record(state, &goal, "cleared");
     Ok(goal)
 }
@@ -472,7 +558,29 @@ pub fn clear(state: &Path, id: u64, now: i64) -> Result<Goal, Refusal> {
 /// The agent claiming done. The claim is not the close: the goal's own recorded check is run in the
 /// goal's workspace, and `done` is written only when it passes. A failure is recorded on the goal and
 /// returned as a typed refusal, so the goal stays open with the reason it is still open.
+///
+/// The check is bounded. The heartbeat is one thread, so a check that never returns would stop every
+/// goal behind it; a check that outlives [`CHECK_SECS`] is killed and recorded as failed.
 pub fn complete(state: &Path, id: u64, root: &Path, now: i64) -> Result<Goal, Refusal> {
+    complete_within(
+        state,
+        id,
+        root,
+        now,
+        std::time::Duration::from_secs(CHECK_SECS),
+    )
+}
+
+/// [`complete`] with the check's deadline named. A test uses a short one so a sleeping check is proven
+/// to be killed rather than waited for.
+pub fn complete_within(
+    state: &Path,
+    id: u64,
+    root: &Path,
+    now: i64,
+    deadline: std::time::Duration,
+) -> Result<Goal, Refusal> {
+    let _held = store_lock(state)?;
     let mut goal = load_one(state, id).ok_or(Refusal::NoGoal { id })?;
     if goal.state != State::Open {
         return Err(Refusal::Illegal {
@@ -484,20 +592,20 @@ pub fn complete(state: &Path, id: u64, root: &Path, now: i64) -> Result<Goal, Re
         "could_not_run: the goal records no check".to_string()
     } else {
         let task = TaskSpec::new(&goal.text, root);
-        CommandVerifier::new(4_000)
+        CommandVerifier::with_deadline(4_000, deadline)
             .verify(&task, &goal.check)
             .state_line()
     };
     goal.last_check = outcome.clone();
     if outcome.starts_with("passed") {
         goal.transition(State::Done, "the recorded check passed", now)?;
-        save(state, &goal).map_err(Refusal::Store)?;
+        save_unlocked(state, &goal).map_err(Refusal::Store)?;
         record(state, &goal, "done");
         Ok(goal)
     } else {
         goal.updated = now;
         goal.reason = format!("the recorded check {outcome}");
-        save(state, &goal).map_err(Refusal::Store)?;
+        save_unlocked(state, &goal).map_err(Refusal::Store)?;
         record(state, &goal, "check_failed");
         Err(Refusal::Check { result: outcome })
     }
@@ -537,19 +645,37 @@ where
 {
     let (goals, _) = load(state);
     let mut due_now = Vec::new();
-    for mut goal in goals {
-        if !due(&goal, now, interval, last_entry(state, goal.chat)) {
+    for stale in goals {
+        if !due(&stale, now, interval, last_entry(state, stale.chat)) {
             continue;
         }
-        if busy(&goal) {
+        if busy(&stale) {
             continue;
         }
-        goal.heartbeat = now;
-        save(state, &goal)?;
-        record(state, &goal, "heartbeat");
-        due_now.push(goal);
+        if let Some(goal) = stamp(state, &stale, now)? {
+            due_now.push(goal);
+        }
     }
     Ok(due_now)
+}
+
+/// Write this tick's attempt stamp, but only if the record the tick judged is still the record on disk.
+///
+/// The tick read every goal before it asked whether any was busy, and a person can run `hades goal
+/// pause` in that window. Stamping the stale copy would quietly put a paused goal back to work, so a
+/// state or `updated` that moved since the load means this tick does not own the record and skips it.
+pub(crate) fn stamp(state: &Path, stale: &Goal, now: i64) -> Result<Option<Goal>, String> {
+    let _held = store_lock(state).map_err(|refusal| refusal.to_string())?;
+    let Some(mut goal) = load_one(state, stale.id) else {
+        return Ok(None);
+    };
+    if goal.state != stale.state || goal.updated != stale.updated || goal.state != State::Open {
+        return Ok(None);
+    }
+    goal.heartbeat = now;
+    save_unlocked(state, &goal)?;
+    record(state, &goal, "heartbeat");
+    Ok(Some(goal))
 }
 
 /// What a continuation tells the model. It names the check because a model that does not know how it
@@ -588,6 +714,13 @@ pub fn continuation_with<T: crate::gateway::Transport>(
     stop: Option<&AtomicBool>,
 ) -> Result<String, String> {
     let root = PathBuf::from(&settings.root);
+    let remaining = goal.budget.saturating_sub(goal.spent);
+    if remaining == 0 {
+        // The budget is the goal's whole allowance, so a goal that has spent it is paused rather than
+        // handed another continuation's worth.
+        pause_for_budget(state, goal, transport, now)?;
+        return Err("budget".to_string());
+    }
     let mut world = world_for(
         settings,
         state,
@@ -596,10 +729,11 @@ pub fn continuation_with<T: crate::gateway::Transport>(
         &format!("goal:{}", goal.id),
         mcp,
     );
-    // The continuation runs in the conversation's session, not the child-lifecycle log `world_for`
-    // supplies, so its Meta evidence lands where the goal says it does.
-    world.session = goal.session.clone();
-    world.allowance = crate::agent::Allowance::new(goal.budget.max(1));
+    // The continuation runs in the chat's child-lifecycle session, which is the key the chat's own
+    // surface uses. A child it spawns is therefore one the chat can see with `children` and collect
+    // with `result`; the goal record keeps `tg-<chat>` as its session key for lease and busy checks.
+    world.session = crate::gateway::child_session(goal.chat);
+    world.allowance = crate::agent::Allowance::new(remaining);
 
     let mut messages = vec![json!({
         "role": "system",
@@ -613,6 +747,9 @@ pub fn continuation_with<T: crate::gateway::Transport>(
     let nothing = |_: crate::agent::Activity, _: &str| {};
     let answer =
         crate::agent::answer_stoppable(client, &mut messages, &world, &silent, &nothing, 12, stop);
+    // What this continuation actually spent, from the allowance it was handed. Written back even when
+    // the turn failed: a call that was made costs, and the budget is what was promised to the person.
+    let spent = remaining.saturating_sub(world.allowance.left());
 
     match answer {
         Ok(Some(text)) => {
@@ -628,6 +765,18 @@ pub fn continuation_with<T: crate::gateway::Transport>(
             history.push(json!({"role": "assistant", "content": text}));
             save_chat(state, goal.chat, &history);
             refresh(state, goal);
+            charge(state, goal, spent, now)?;
+            if goal.state == State::Paused {
+                transport.send(
+                    goal.chat,
+                    &format!(
+                        "<b>Goal {} paused: budget.</b> The goal has spent all {} of its model \
+                         calls, so no continuation will run until a person resumes it.",
+                        goal.id, goal.budget
+                    ),
+                    &[],
+                )?;
+            }
             Ok(text)
         }
         Ok(None) => {
@@ -639,30 +788,26 @@ pub fn continuation_with<T: crate::gateway::Transport>(
                 &[],
             )?;
             refresh(state, goal);
+            charge(state, goal, spent, now)?;
             Ok(String::new())
         }
         Err(fault) => {
             // The agent's own `goal done` call writes the file while this loop is running. Reload before
             // deciding, or a goal that just finished is overwritten with a pause.
             refresh(state, goal);
-            let out_of_budget = world.allowance.left() == 0 && fault.detail().contains("allowance");
+            let charged = charge(state, goal, spent, now)?;
+            if charged {
+                // The calls this continuation made were the last of the budget. It is a pause for
+                // `budget`, not a failure of the work, and the person is told so.
+                pause_for_budget(state, goal, transport, now)?;
+                return Err("budget".to_string());
+            }
             if goal.state != State::Open {
                 return Ok(String::new());
             }
+            let out_of_budget = world.allowance.left() == 0 && fault.detail().contains("allowance");
             if out_of_budget {
-                goal.transition(State::Paused, "budget", now)
-                    .map_err(|refusal| refusal.to_string())?;
-                save(state, goal)?;
-                record(state, goal, "paused");
-                transport.send(
-                    goal.chat,
-                    &format!(
-                        "<b>Goal {} paused: budget.</b> A continuation spent all {} model call(s) \
-                         without finishing. It will not be retried until a person resumes it.",
-                        goal.id, goal.budget
-                    ),
-                    &[],
-                )?;
+                pause_for_budget(state, goal, transport, now)?;
                 return Err("budget".to_string());
             }
             goal.reason = format!("continuation failed: {}", fault.detail());
@@ -680,6 +825,54 @@ pub fn continuation_with<T: crate::gateway::Transport>(
             Err(fault.to_string())
         }
     }
+}
+
+/// Record what a continuation spent and pause the goal when the total is gone. Returns whether the goal
+/// is now paused for its budget.
+///
+/// `refresh` runs first because the agent may have closed the goal during the turn: a `done` written by
+/// the goal tool is newer than this loop's copy, and a spent count is worth less than the close it is
+/// attached to.
+fn charge(state: &Path, goal: &mut Goal, spent: u32, now: i64) -> Result<bool, String> {
+    refresh(state, goal);
+    goal.spent = goal.spent.saturating_add(spent).min(goal.budget);
+    let exhausted = goal.state == State::Open && goal.spent >= goal.budget;
+    if exhausted {
+        goal.transition(State::Paused, "budget", now)
+            .map_err(|refusal| refusal.to_string())?;
+        save(state, goal)?;
+        record(state, goal, "paused");
+    } else {
+        save(state, goal)?;
+    }
+    Ok(exhausted)
+}
+
+/// Pause a goal that has nothing left to draw, and say so once. Used both before a continuation (the
+/// budget was spent by an earlier heartbeat or a person paused it at zero) and after one.
+fn pause_for_budget<T: crate::gateway::Transport>(
+    state: &Path,
+    goal: &mut Goal,
+    transport: &mut T,
+    now: i64,
+) -> Result<(), String> {
+    refresh(state, goal);
+    if goal.state == State::Open {
+        goal.transition(State::Paused, "budget", now)
+            .map_err(|refusal| refusal.to_string())?;
+        save(state, goal)?;
+        record(state, goal, "paused");
+    }
+    transport.send(
+        goal.chat,
+        &format!(
+            "<b>Goal {} paused: budget.</b> A continuation spent all {} of the goal's model call(s) \
+             without finishing. It will not be retried until a person resumes it.",
+            goal.id, goal.budget
+        ),
+        &[],
+    )?;
+    Ok(())
 }
 
 /// One continuation, with the model taken from the goal or the gateway's configured preset.
@@ -723,13 +916,14 @@ pub fn describe(goal: &Goal) -> String {
         goal.text.lines().next().unwrap_or("")
     );
     text.push_str(&format!(
-        "\n  check: {}\n  budget: {} call(s)\n  last heartbeat: {}",
+        "\n  check: {}\n  budget: {} call(s) ({} spent)\n  last heartbeat: {}",
         if goal.check.trim().is_empty() {
             "none".to_string()
         } else {
             goal.check.clone()
         },
         goal.budget,
+        goal.spent,
         heartbeat_text(goal.heartbeat)
     ));
     if !goal.reason.is_empty() {
@@ -752,56 +946,32 @@ pub fn heartbeat_text(at: i64) -> String {
 /// The Meta evidence. A best-effort append: the goal file is the record work runs from, and a log that
 /// cannot be appended does not undo a goal that was already created.
 ///
-/// The daemon owns `tg-<chat>` while a run is leased there, and the heartbeat only appends when no run
-/// is leased. A set or a pause issued from a terminal during a live run can still lose that race; the
-/// failure is reported here and the goal file, which is what the continuation reads, is unaffected.
+/// The goal store owns its own log, `tg-<chat>-goals`. It used to append to `tg-<chat>`, which the
+/// daemon writes from another process while a run is leased; two processes on one log can compute the
+/// same entry id and leave a log the store refuses to load. `goal.session` stays the chat's session key
+/// for lease and busy checks — it is not the append target.
 fn record(state: &Path, goal: &Goal, action: &str) {
-    let lock = log_lock(state, &goal.session);
-    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let outcome = open_log(state, &goal.session).and_then(|mut log| {
-        log.append(
-            Kind::Meta,
-            json!({
-                "type": "goal",
-                "action": action,
-                "goal": goal.to_value(),
-            }),
-        )
-        .map(|_| ())
-        .map_err(|fault| fault.to_string())
+    record_on(state, &log_of(goal.chat), goal, action);
+}
+
+/// The goal log a chat owns. One function so the writer and a reader cannot disagree about the name.
+pub fn log_of(chat: i64) -> String {
+    format!("tg-{chat}-goals")
+}
+
+/// [`record`] with the log named, for a caller (or a test) that is proving two writers share one lock.
+pub(crate) fn record_on(state: &Path, session: &str, goal: &Goal, action: &str) {
+    let payload = json!({
+        "type": "goal",
+        "action": action,
+        "goal": goal.to_value(),
     });
-    if let Err(said) = outcome {
-        eprintln!("goal {}: the session log was not written: {said}", goal.id);
+    if let Err(said) = crate::gateway::session::append_meta(state, session, payload) {
+        eprintln!(
+            "goal {}: the session log {session} was not written: {said}",
+            goal.id
+        );
     }
-}
-
-fn open_log(state: &Path, session: &str) -> Result<Session<FileStore, SystemClock>, String> {
-    let store = FileStore::new(state.join("sessions"));
-    match Session::load(store.clone(), SystemClock, SessionId::new(session)) {
-        Ok(log) => Ok(log),
-        // A missing log is a new session. Any other fault is real and must not be papered over.
-        Err(session_tree::Fault::Io { .. }) => {
-            Session::create(store, SystemClock, SessionId::new(session))
-                .map_err(|fault| fault.to_string())
-        }
-        Err(fault) => Err(fault.to_string()),
-    }
-}
-
-/// One lock per session log, for the life of the process. Deliberately the same shape as the child
-/// registry's lock: goals and children write different logs, and each writer needs the load and the
-/// append to be one step so two handles do not compute the same next entry id.
-type Locks = Mutex<BTreeMap<(PathBuf, String), Arc<Mutex<()>>>>;
-
-fn log_lock(state: &Path, session: &str) -> Arc<Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(|held| held.into_inner());
-    Arc::clone(
-        locks
-            .entry((state.to_path_buf(), session.to_string()))
-            .or_default(),
-    )
 }
 
 #[cfg(test)]
@@ -856,6 +1026,7 @@ mod tests {
             model: String::new(),
             check: "true".to_string(),
             budget: 3,
+            spent: 0,
             executor: Executor::Chat,
             created: 100,
             updated: 100,
@@ -885,7 +1056,7 @@ mod tests {
         assert_eq!(goals, vec![goal.clone()]);
 
         let text =
-            std::fs::read_to_string(state.join("sessions/tg-7.jsonl")).expect("the session log");
+            std::fs::read_to_string(state.join("sessions/tg-7-goals.jsonl")).expect("the goal log");
         let entries: Vec<Value> = text
             .lines()
             .map(|line| serde_json::from_str(line).expect("one entry per line"))
@@ -1252,6 +1423,404 @@ mod tests {
             fake.sent
         );
         stub.server.join().expect("the endpoint");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Both paths used to keep a private lock map, so a heartbeat continuation's child event and its
+    /// goal event could load the same log at once and write the same entry id. One table, so they queue.
+    #[test]
+    fn child_and_goal_writers_share_one_lock_on_one_log() {
+        let state = scratch("shared-lock");
+        let goal = set(&state, new_goal(7, "true", 3), 100).expect("a goal");
+        let mut threads = Vec::new();
+        for writer in 0..2 {
+            let state = state.clone();
+            let goal = goal.clone();
+            threads.push(std::thread::spawn(move || {
+                for index in 0..20 {
+                    if writer == 0 {
+                        crate::gateway::children::record_event(
+                            &state,
+                            "tg-7-goals",
+                            &crate::gateway::children::Event::Message {
+                                child_id: "c1".to_string(),
+                                parent_session: "tg-7".to_string(),
+                                text: format!("m{index}"),
+                            },
+                        )
+                        .expect("a child event");
+                    } else {
+                        record_on(&state, "tg-7-goals", &goal, "open");
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("a writer");
+        }
+        let log = session_tree::Session::load(
+            session_tree::FileStore::new(state.join("sessions")),
+            session_tree::SystemClock,
+            session_tree::SessionId::new("tg-7-goals"),
+        )
+        .expect("one loadable log");
+        assert_eq!(
+            log.entries().len(),
+            42,
+            "the create header, the open event and both writers, no entry lost"
+        );
+        let ids: Vec<u64> = log.entries().iter().map(|entry| entry.id.0).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 42, "every id is unique: {ids:?}");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A goal write from a terminal while a daemon run owns `tg-<chat>` must not touch that log. The goal
+    /// store owns `tg-<chat>-goals`, so both logs stay loadable.
+    #[test]
+    fn a_goal_write_during_a_live_daemon_run_leaves_both_logs_loadable() {
+        let state = scratch("cli-during-run");
+        let base = base_time();
+        // The daemon's side: a fresh handle per append, the way a separate process would load it.
+        let daemon = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                for index in 0..25 {
+                    let mut log = session_tree::Session::load(
+                        session_tree::FileStore::new(state.join("sessions")),
+                        session_tree::SystemClock,
+                        session_tree::SessionId::new("tg-7"),
+                    )
+                    .unwrap_or_else(|_| {
+                        session_tree::Session::create(
+                            session_tree::FileStore::new(state.join("sessions")),
+                            session_tree::SystemClock,
+                            session_tree::SessionId::new("tg-7"),
+                        )
+                        .expect("the daemon log")
+                    });
+                    log.append(
+                        session_tree::Kind::ToolResult,
+                        json!({"tool": "shell", "status": 0, "output": format!("run {index}")}),
+                    )
+                    .expect("a daemon entry");
+                }
+            })
+        };
+        for index in 0..5 {
+            set(
+                &state,
+                new_goal(7, &format!("goal {index}"), 3),
+                base + index,
+            )
+            .expect("a goal written from a terminal");
+        }
+        daemon.join().expect("the daemon");
+        for name in ["tg-7", "tg-7-goals"] {
+            let log = session_tree::Session::load(
+                session_tree::FileStore::new(state.join("sessions")),
+                session_tree::SystemClock,
+                session_tree::SessionId::new(name),
+            )
+            .unwrap_or_else(|fault| panic!("{name} would not load: {fault:?}"));
+            let ids: Vec<u64> = log.entries().iter().map(|entry| entry.id.0).collect();
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), ids.len(), "{name} has duplicate ids: {ids:?}");
+        }
+        // The goal's own evidence is on its own log, not the daemon's.
+        let goals = session_tree::Session::load(
+            session_tree::FileStore::new(state.join("sessions")),
+            session_tree::SystemClock,
+            session_tree::SessionId::new("tg-7-goals"),
+        )
+        .expect("the goal log");
+        // Five goals, each with its `open` event, plus the log's own create header.
+        assert_eq!(goals.entries().len(), 6);
+        assert_eq!(log_of(7), "tg-7-goals");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A pause that lands between the tick's load and its stamp must not be undone. The stamp refuses a
+    /// record whose state or `updated` moved, and the pause stands.
+    #[test]
+    fn a_pause_that_lands_during_a_tick_is_not_reverted() {
+        let state = scratch("pause-during-tick");
+        let goal = set(&state, new_goal(7, "true", 3), 100).expect("a goal");
+        let stale = load_one(&state, goal.id).expect("the record the tick read");
+        pause(&state, goal.id, "a person stopped it", 150).expect("a pause");
+        assert_eq!(
+            stamp(&state, &stale, 200).expect("a stamp"),
+            None,
+            "the tick did not own the record any more"
+        );
+        let kept = load_one(&state, goal.id).expect("the goal");
+        assert_eq!(kept.state, State::Paused, "the pause stands");
+        assert_eq!(kept.heartbeat, 0, "no attempt was stamped");
+        assert_eq!(kept.reason, "a person stopped it");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Two `hades goal set` processes read the same "next" number. The claim is `create_new`, so the
+    /// loser steps to the next number instead of overwriting the winner's file.
+    #[test]
+    fn two_creators_at_once_get_distinct_ids() {
+        let state = scratch("two-creators");
+        let mut threads = Vec::new();
+        for writer in 0..6 {
+            let state = state.clone();
+            threads.push(std::thread::spawn(move || {
+                for index in 0..3 {
+                    set(&state, new_goal(7, &format!("w{writer}-g{index}"), 3), 100)
+                        .expect("a goal");
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("a creator");
+        }
+        let (goals, problems) = load(&state);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(goals.len(), 18);
+        let mut ids: Vec<u64> = goals.iter().map(|goal| goal.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 18, "every id is distinct: {ids:?}");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A check that sleeps forever must not hold the only heartbeat thread. The deadline kills it and the
+    /// goal records the failure instead of hanging.
+    #[test]
+    fn a_sleeping_check_is_killed_and_the_goal_records_the_failure() {
+        let state = scratch("slow-check");
+        let root = state.join("work");
+        std::fs::create_dir_all(&root).expect("a workspace");
+        let goal = set(&state, new_goal(7, "sleep 5; true", 3), 100).expect("a goal");
+        let started = std::time::Instant::now();
+        let refused = complete_within(
+            &state,
+            goal.id,
+            &root,
+            200,
+            std::time::Duration::from_millis(300),
+        )
+        .expect_err("the sleeping check cannot pass");
+        assert!(matches!(refused, Refusal::Check { .. }), "{refused:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the check was waited for: {:?}",
+            started.elapsed()
+        );
+        let kept = load_one(&state, goal.id).expect("the goal");
+        assert_eq!(kept.state, State::Open);
+        assert!(
+            kept.last_check.contains("killed") || kept.last_check.contains("failed"),
+            "{:?}",
+            kept.last_check
+        );
+        assert!(
+            kept.reason.contains("the recorded check"),
+            "{:?}",
+            kept.reason
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A stub that answers by what it is asked, not by position: the child's call and the continuation's
+    /// second call arrive on different threads, so a queue would answer the wrong one.
+    fn routing_stub(expected: usize) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        let server = std::thread::spawn(move || {
+            for _ in 0..expected {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream);
+                let messages = request["messages"].as_array().cloned().unwrap_or_default();
+                let is_child = messages
+                    .first()
+                    .and_then(|message| message["content"].as_str())
+                    .is_some_and(|text| text.contains("You are one worker in a team."));
+                let saw_tool = messages.iter().any(|message| message["role"] == "tool");
+                let delta = if is_child {
+                    json!({"content": "{\"report\":\"done\"}"})
+                } else if saw_tool {
+                    json!({"content": "spawned"})
+                } else {
+                    json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {"name": "spawn", "arguments": "{\"goal\":\"read the report\"}"}
+                        }]
+                    })
+                };
+                write_answer(&mut stream, &delta);
+            }
+        });
+        (url, server)
+    }
+
+    fn chat_world(state: &Path, root: &Path) -> crate::agent::World {
+        crate::agent::World {
+            root: root.to_path_buf(),
+            vault: state.join("vault"),
+            db: state.join("mneme.db"),
+            skills: Vec::new(),
+            sessions: vec![state.join("sessions")],
+            state: state.to_path_buf(),
+            chat: 7,
+            depth: 0,
+            mode: crate::mode::Mode::Act,
+            role: crate::profile::Role::Patch,
+            actor: "chat:7".to_string(),
+            session: crate::gateway::child_session(7),
+            inbox: None,
+            mcp: Arc::new(crate::mcp::Mcp::empty()),
+            allowance: crate::agent::Allowance::new(8),
+        }
+    }
+
+    /// A heartbeat continuation spawns a child. The child must belong to the same session the chat uses,
+    /// or `children` and `result` in the chat cannot see work the heartbeat started on its behalf.
+    #[test]
+    fn a_continuation_spawn_is_visible_to_the_chat_and_collectable() {
+        let state = scratch("continuation-spawn");
+        let root = state.join("work");
+        std::fs::create_dir_all(&root).expect("a workspace");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let base = base_time();
+        let goal = set(&state, new_goal(7, "true", 3), base).expect("a goal");
+        let (url, server) = routing_stub(3);
+        let mut fake = Fake::default();
+        let mut continuing = load_one(&state, goal.id).expect("the goal");
+        let outcome = continuation_with(
+            &OpenAi::new(&url, "stub"),
+            &settings(&root),
+            &state,
+            &mut continuing,
+            &mut fake,
+            &Arc::new(crate::mcp::Mcp::empty()),
+            base,
+            None,
+        );
+        assert_eq!(outcome.expect("a continuation"), "spawned");
+        server.join().expect("the endpoint");
+
+        let records = registry.records().expect("the records");
+        let child = records
+            .iter()
+            .find(|record| record.parent == crate::gateway::child_session(7))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the continuation's child is not on the chat's session: {:?}",
+                    records
+                        .iter()
+                        .map(|record| record.parent.clone())
+                        .collect::<Vec<_>>()
+                )
+            })
+            .clone();
+        registry
+            .wait(&child.id, std::time::Duration::from_secs(10))
+            .expect("the child finished");
+
+        let chat = chat_world(&state, &root);
+        let listed = crate::agent::list_children(&chat);
+        assert!(
+            listed.contains(&child.id),
+            "the chat cannot see the child: {listed}"
+        );
+        let collected = crate::agent::child_result(&json!({"child_id": child.id}), &chat);
+        assert!(
+            collected.contains("\"status\":\"ok\""),
+            "the chat cannot collect the child: {collected}"
+        );
+        assert!(
+            collected.contains("done"),
+            "the child's report is the one it wrote: {collected}"
+        );
+        // The goal record still names the chat's own session for lease and busy checks.
+        assert_eq!(load_one(&state, goal.id).expect("the goal").session, "tg-7");
+        registry.drain();
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The budget is the goal's whole allowance. A goal of three calls that spends one on the first
+    /// heartbeat and two on the second has spent three, and it pauses rather than drawing a fresh three.
+    #[test]
+    fn a_three_call_goal_across_two_heartbeats_spends_exactly_three_and_pauses() {
+        let state = scratch("goal-total-budget");
+        let root = state.join("work");
+        std::fs::create_dir_all(&root).expect("a workspace");
+        let base = base_time();
+        let goal = set(&state, new_goal(7, "true", 3), base).expect("a goal");
+        let mut fake = Fake::default();
+
+        let first = stub(vec![json!({"content": "still working"})]);
+        let mut continuing = load_one(&state, goal.id).expect("the goal");
+        continuation_with(
+            &OpenAi::new(&first.url, "stub"),
+            &settings(&root),
+            &state,
+            &mut continuing,
+            &mut fake,
+            &Arc::new(crate::mcp::Mcp::empty()),
+            base,
+            None,
+        )
+        .expect("the first heartbeat");
+        first.server.join().expect("the endpoint");
+        let after_first = load_one(&state, goal.id).expect("the goal");
+        assert_eq!(after_first.spent, 1, "one call, one spent");
+        assert_eq!(after_first.state, State::Open, "two calls are left");
+
+        let call = json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"missing.txt\"}"}
+            }]
+        });
+        let second = stub(vec![call.clone(), call]);
+        continuation_with(
+            &OpenAi::new(&second.url, "stub"),
+            &settings(&root),
+            &state,
+            &mut continuing,
+            &mut fake,
+            &Arc::new(crate::mcp::Mcp::empty()),
+            base + 900,
+            None,
+        )
+        .expect_err("the goal's budget is spent");
+        second.server.join().expect("the endpoint");
+
+        assert_eq!(
+            first.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first heartbeat spent one call"
+        );
+        assert_eq!(
+            second.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second heartbeat spent the two that were left, and no more"
+        );
+        let kept = load_one(&state, goal.id).expect("the goal");
+        assert_eq!(
+            kept.spent, 3,
+            "exactly the budget, not one budget per heartbeat"
+        );
+        assert_eq!(kept.state, State::Paused);
+        assert_eq!(kept.reason, "budget");
         let _ = std::fs::remove_dir_all(&state);
     }
 }
