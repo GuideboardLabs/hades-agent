@@ -56,9 +56,15 @@ hades — the harness, one turn or a whole graph
   hades tune <goal> [--candidate <dir>]... [--adopt] [--verify <cmd>] [--holdout <cmd>] [--profile <id>]
       run the goal under the base harness, edit two candidates from the transcript
       (or take given candidate directories), probe each against the same check, and
-      keep the best. --adopt copies the winner into the profile's harness directory.
+      keep the best. --adopt copies the winner into the profile's harness directory
+      and numbers the harness it replaced, so the change is one command to undo.
       The floor, the policy and the check are never editable, and the editor never
       sees the check's text
+
+  hades refine [--rollback <n>] [--profile <id>] [--harness <dir>] [--state <dir>]
+      the numbered harness generations and what each one recorded; --rollback <n>
+      puts those files back. A generation captured under a different floor, policy
+      or set of profile defaults is refused
 
   hades route <goal>
       which profile the rules pick for a goal, and why
@@ -273,6 +279,7 @@ fn dispatch(
         "profiles" => profiles(rest),
         "harness" => harness_cmd(rest),
         "tune" => tune(rest),
+        "refine" => refine(rest),
         "route" => route(rest),
         "skills" => skills_cmd(rest),
         "explain" => explain(rest),
@@ -1296,6 +1303,8 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
     let mut dirs: Vec<(String, String)> = Vec::new();
     let mut sources: std::collections::BTreeMap<String, std::path::PathBuf> =
         std::collections::BTreeMap::new();
+    // The probe session each candidate was measured in, so an adoption can name the evidence it came from.
+    let mut labels: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     let given: Vec<String> = flags.repeated.get("candidate").cloned().unwrap_or_default();
     let mut candidates: Vec<(String, std::path::PathBuf, String)> = Vec::new();
@@ -1396,8 +1405,16 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
         }
     }
 
+    // Refused before a probe runs, not after: a candidate that edits the guardrail is not a candidate whose
+    // cost or pass rate is worth measuring.
+    for (name, dir, _) in &candidates {
+        crate::tuning::refuses(dir, &check)
+            .map_err(|said| format!("candidate `{name}` is refused: {said}"))?;
+    }
+
     for (index, (name, dir, reason)) in candidates.iter().enumerate() {
         let label = format!("tune_{stamp}_{}", slug_label(name));
+        labels.insert(name.clone(), label.clone());
         let state = work.join(format!("probe-{}", index + 1)).join("state");
         let mut receipt = probe(&flags, &goal, Some(dir), &state, &label)?;
         if let Some(command) = &holdout {
@@ -1431,15 +1448,28 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
             let source = sources
                 .get(&name)
                 .ok_or_else(|| format!("no candidate directory recorded for `{name}`"))?;
-            let kept = crate::tuning::keep_version(&target)?;
-            crate::tuning::adopt(&target, source)?;
-            adopted_line = match kept {
-                Some(dir) => format!(
-                    "{name} (copied to {}; previous kept at {})",
+            // One call, so the copy and the number that makes it undoable cannot come apart. `--auto` takes
+            // the same path: the decision is automatic, the record of it is not optional.
+            let generation = crate::tuning::record_adoption(
+                &hades_home()?,
+                profile.id.as_str(),
+                &target,
+                &state,
+                source,
+                labels.get(&name).map(String::as_str).unwrap_or("tune"),
+                &rows[at].receipt.check,
+                &crate::tuning::guard_digest(),
+            )?;
+            adopted_line = match generation {
+                Some(generation) => format!(
+                    "{name} (copied to {}; generation {} keeps what it replaced)",
                     target.display(),
-                    dir.display()
+                    generation.id
                 ),
-                None => format!("{name} (copied to {})", target.display()),
+                None => format!(
+                    "{name} (copied to {}; it was already the harness, so no generation was written)",
+                    target.display()
+                ),
             };
         } else {
             adopted_line = format!("{name} (not copied; pass --adopt)");
@@ -1512,6 +1542,106 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
         library.display()
     ));
     Ok((text, 0))
+}
+
+/// The numbered generations of a profile's harness, and the one command that puts one back.
+///
+/// A generation is the harness an adoption replaced, so rolling back to `n` is undoing that adoption. The
+/// files restored are exactly the ones the manifest names: a skill added after the generation is left where
+/// it is, because undoing a harness edit is not deleting work done since.
+fn refine(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse(args, &["profile", "state", "harness", "rollback"])?;
+    let home = hades_home()?;
+    let state = state_of(&flags)?;
+    let profile = match flags.named.get("profile") {
+        Some(id) => id.clone(),
+        None => sole_profile(&home)?,
+    };
+    let harness = match flags.named.get("harness") {
+        Some(dir) => guarded(Path::new(dir))?,
+        None => home.join("harness").join(&profile),
+    };
+    let Some(wanted) = flags.named.get("rollback") else {
+        return Ok((generation_list(&home, &profile)?, 0));
+    };
+    let id: u64 = wanted
+        .parse()
+        .map_err(|_| format!("`--rollback {wanted}` is not a generation number"))?;
+    let generation = crate::tuning::restore(
+        &home,
+        &profile,
+        &harness,
+        &state,
+        id,
+        &crate::tuning::guard_digest(),
+    )?;
+    let mut text = format!(
+        "restored generation {} of `{profile}`: {} file(s) into {}\n",
+        generation.id,
+        generation.files.len(),
+        harness.display()
+    );
+    for file in &generation.files {
+        text.push_str(&format!("  {}\n", file.path));
+    }
+    Ok((text, 0))
+}
+
+fn generation_list(home: &Path, profile: &str) -> Result<String, String> {
+    let generations = crate::tuning::generations(home, profile)?;
+    let mut text = format!(
+        "harness generations for `{profile}` under {}\n",
+        crate::tuning::generations_root(home, profile).display()
+    );
+    if generations.is_empty() {
+        text.push_str("  none; `hades tune --adopt` writes one for every harness it replaces\n");
+        return Ok(text);
+    }
+    for generation in generations {
+        text.push_str(&format!(
+            "  {:<3} parent {:<4} {:>2} file(s)  check {:<12} {}\n",
+            generation.id,
+            generation
+                .parent
+                .map(|parent| parent.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            generation.files.len(),
+            if generation.check.is_empty() {
+                "not run"
+            } else {
+                generation.check.as_str()
+            },
+            generation.source_session
+        ));
+    }
+    Ok(text)
+}
+
+/// The profile to work on when the caller named none: the only one that has generations. Guessing between
+/// two is how the wrong harness gets restored.
+fn sole_profile(home: &Path) -> Result<String, String> {
+    let root = home.join("control").join("harness");
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().is_dir() && !crate::tuning::generations(home, &name)?.is_empty() {
+                found.push(name);
+            }
+        }
+    }
+    found.sort();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!(
+            "no harness generations under {}; `hades tune --adopt` writes one",
+            root.display()
+        )),
+        _ => Err(format!(
+            "several profiles have generations ({}): pass --profile",
+            found.join(", ")
+        )),
+    }
 }
 
 fn slug_label(name: &str) -> String {

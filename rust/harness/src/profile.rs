@@ -239,6 +239,35 @@ pub fn named(id: &str) -> Option<Profile> {
     shipped().into_iter().find(|p| p.id.as_str() == id)
 }
 
+/// Every shipped parameter, one line per profile: what a harness edit may not change.
+///
+/// A digest of this is recorded with each harness generation, so a rollback made across a change to a
+/// default is refused instead of being applied to a harness that was measured under another one. Every
+/// field is in the line, including the ones nobody would miss, because those are the ones that change
+/// silently.
+pub fn parameter_text() -> String {
+    let mut text = String::new();
+    for profile in shipped() {
+        text.push_str(&format!(
+            "profile {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+            profile.id.as_str(),
+            profile.role.name(),
+            profile.model,
+            profile.effort.name(),
+            profile.context_tokens,
+            profile.verify,
+            profile.judge,
+            profile.plan_first,
+            profile.edits,
+            profile.shadow,
+            profile.attempts,
+            profile.minutes,
+            profile.network,
+        ));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
