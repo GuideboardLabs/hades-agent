@@ -466,11 +466,13 @@ pub struct GenerationFile {
 /// The order matters and it is the reason this type exists. A generation is the state *before* an
 /// adoption, so restoring generation `n` undoes adoption `n` and the first adoption is undoable too. The
 /// parent pointer makes the chain readable, and the check records what the adoption that came after this
-/// state was measured with.
+/// state was measured with. `harness` is the absolute directory those harness files belonged to, so a
+/// restore into a different `--harness` is refused rather than silently writing a tree that never held them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
     pub id: u64,
     pub parent: Option<u64>,
+    pub harness: Option<String>,
     pub files: Vec<GenerationFile>,
     pub source_session: String,
     pub check: String,
@@ -482,19 +484,14 @@ pub const MANIFEST: &str = "manifest.json";
 /// The digest of the floor, policy and profile defaults this generation was captured under.
 const GUARD: &str = "guard.txt";
 
-/// The five floor categories, in the order a person reads them. A category added to `floor` and not to this
-/// list is a category the guard digest does not cover, which is why the list is here rather than generated.
-const FLOOR: [crate::floor::Category; 5] = [
-    crate::floor::Category::Delete,
-    crate::floor::Category::Money,
-    crate::floor::Category::Credential,
-    crate::floor::Category::Access,
-    crate::floor::Category::Outbound,
-];
+/// The five floor categories, read from the floor itself so a category added there is in the digest. There
+/// is no second list here to fall behind: `Category::all` is the only enumeration.
+const GUARDED_CATEGORIES: [crate::floor::Category; 5] = crate::floor::Category::all();
 
-/// The actions a policy digest probes. The rules themselves are private and an action list is a better
-/// question anyway: what matters is the decision and the reason a person would read for it.
-const PROBED: [&str; 4] = ["shell", "shell-run", "write_file", "vault"];
+/// The actions a policy digest probes, from the policy. The rules themselves are private and an action
+/// list is a better question anyway: what matters is the decision and the reason a person would read for
+/// it.
+const PROBED: [&str; 4] = crate::policy::probes();
 
 fn sha256(bytes: &[u8]) -> String {
     mneme::sha256::hex(bytes)
@@ -547,6 +544,10 @@ fn read_generation(home: &Path, profile: &str, id: u64) -> Result<Option<Generat
     Ok(Some(Generation {
         id,
         parent: number(value.get("parent")),
+        harness: value
+            .get("harness")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         files,
         source_session: string(value.get("source_session")),
         check: string(value.get("check")),
@@ -654,15 +655,46 @@ pub fn capture(
     if previous.as_ref().is_some_and(|last| last.files == files) {
         return Ok(None);
     }
+    let root = generations_root(home, profile);
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("could not make {}: {error}", root.display()))?;
+    // The claim is `create_dir`, not `create_dir_all`: two adoptions that read the same "last" number race
+    // for the same directory, and only one wins it. The loser steps to the next number. A directory that
+    // already exists is not ours — it is a write that did not finish, or another adoption's — so writing
+    // into it would overwrite the only copy of somebody else's bytes.
     let mut id = previous.as_ref().map(|last| last.id + 1).unwrap_or(1);
-    // A directory that already exists is a write that did not finish, not a generation. Step over it
-    // instead of writing into it, because the copy in it may be the only one of those bytes.
-    while generation_dir(home, profile, id).exists() {
-        id += 1;
-    }
+    let dir = loop {
+        let candidate = generation_dir(home, profile, id);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                id += 1;
+                if id > u64::from(u32::MAX) {
+                    return Err(format!(
+                        "could not find a free generation number under {}: every number up to {id} is taken",
+                        root.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not claim generation {id} at {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    };
+    // The parent is the newest generation that exists *now*, after the claim: a concurrent adoption that
+    // took the number just below ours is the state this one actually replaced, not the one we read first.
+    let parent = generations(home, profile)?
+        .into_iter()
+        .filter(|generation| generation.id < id)
+        .map(|generation| generation.id)
+        .next_back();
     let generation = Generation {
         id,
-        parent: previous.as_ref().map(|last| last.id),
+        parent,
+        harness: Some(absolute(harness).display().to_string()),
         files,
         source_session: source_session.to_string(),
         check: check.to_string(),
@@ -671,9 +703,6 @@ pub fn capture(
             .map(|since| since.as_secs())
             .unwrap_or(0),
     };
-    let dir = generation_dir(home, profile, id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
     let bytes = captured(harness, state)?;
     for file in &generation.files {
         let Some((_, content)) = bytes.iter().find(|(path, _)| *path == file.path) else {
@@ -703,6 +732,7 @@ fn manifest_text(generation: &Generation) -> String {
     let value = serde_json::json!({
         "id": generation.id,
         "parent": generation.parent,
+        "harness": generation.harness,
         "files": files,
         "source_session": generation.source_session,
         "check": generation.check,
@@ -755,9 +785,26 @@ pub fn record_adoption(
     Ok(generation)
 }
 
+/// The path a generation records and a restore compares: absolute, with symlinks resolved when the path
+/// exists. A recorded path and a requested path that name the same directory must compare equal.
+fn absolute(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
 /// Put the files a generation recorded back where they belong. Only the files the manifest names are
 /// touched: a skill added after the generation is left alone, because a rollback of the harness is not a
 /// deletion of work done since.
+///
+/// Verification is a whole pass before the first write: a generation that is tampered with in its last
+/// file is refused without any earlier file having been overwritten. A refused rollback changes nothing.
 pub fn restore(
     home: &Path,
     profile: &str,
@@ -780,6 +827,28 @@ pub fn restore(
              restoring it would cross a floor change, so it is refused"
         ));
     }
+    let keeps_harness = generation
+        .files
+        .iter()
+        .any(|file| file.path.starts_with("harness/"));
+    if let Some(recorded) = &generation.harness
+        && absolute(Path::new(recorded)) != absolute(harness)
+    {
+        return Err(format!(
+            "generation {id} was captured from {recorded}, and {} is a different harness; restoring \
+             it would put those bytes in a tree that never held them, so it is refused",
+            harness.display()
+        ));
+    }
+    if keeps_harness && !harness.join("system.md").is_file() {
+        return Err(format!(
+            "{} has no system.md, so it is not the harness generation {id} was captured from; it is \
+             refused",
+            harness.display()
+        ));
+    }
+    // Pass one: resolve every destination and check every recorded byte. Nothing is written yet.
+    let mut writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
     for file in &generation.files {
         let to = destination(harness, state, &file.path)?;
         let from = dir.join(&file.path);
@@ -792,12 +861,28 @@ pub fn restore(
                 file.path
             ));
         }
+        writes.push((to, bytes));
+    }
+    // Pass two: every file verified, so the rollback can begin. Each write goes through a temporary
+    // sibling and a rename, so a half-written file is never what a later read sees.
+    for (to, bytes) in writes {
         if let Some(parent) = to.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
         }
-        std::fs::write(&to, bytes)
+        let temporary = to.with_file_name(format!(
+            ".{}.restore-{}.tmp",
+            to.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            std::process::id()
+        ));
+        std::fs::write(&temporary, bytes)
             .map_err(|error| format!("could not restore {}: {error}", to.display()))?;
+        std::fs::rename(&temporary, &to).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("could not restore {}: {error}", to.display())
+        })?;
     }
     Ok(generation)
 }
@@ -834,7 +919,7 @@ fn destination(harness: &Path, state: &Path, path: &str) -> Result<std::path::Pa
 /// profile default. One string so that a person can read what a digest actually covers.
 pub fn guard_text() -> String {
     let mut text = String::new();
-    for category in FLOOR {
+    for category in GUARDED_CATEGORIES {
         text.push_str(&format!(
             "floor {} {}\n",
             category.action(),
@@ -877,7 +962,7 @@ pub fn refuses(source: &Path, check: &str) -> Result<(), String> {
     if !check.trim().is_empty() {
         forbidden.push(("the check", check.trim().to_string()));
     }
-    for category in FLOOR {
+    for category in GUARDED_CATEGORIES {
         forbidden.push(("the floor", category.action().to_string()));
     }
     for name in crate::policy::shipped() {
@@ -1595,6 +1680,205 @@ mod generation_tests {
         ] {
             assert!(text.contains(phrase), "{phrase} is missing from {text}");
         }
+    }
+
+    /// The digest is the whole floor and the whole probe list, not whichever items somebody remembered to
+    /// write down a second time. This test walks the enumerations themselves.
+    #[test]
+    fn the_guard_digest_covers_every_floor_category_and_policy_action() {
+        let text = guard_text();
+        let categories = crate::floor::Category::all();
+        assert_eq!(
+            categories.len(),
+            5,
+            "the floor's category list is the source the digest reads"
+        );
+        for category in categories {
+            assert!(
+                text.contains(&format!(
+                    "floor {} {}",
+                    category.action(),
+                    category.phrase()
+                )),
+                "{} is missing from the guard digest text",
+                category.action()
+            );
+        }
+        for action in crate::policy::probes() {
+            for name in crate::policy::shipped() {
+                let policy = crate::policy::named(name).expect("a shipped policy");
+                let ruling = policy.decide(action);
+                assert!(
+                    text.contains(&format!(
+                        "policy {name} {action} {} {}",
+                        ruling.decision().name(),
+                        ruling.reason()
+                    )),
+                    "policy {name} on {action} is missing from the guard digest text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_rollback_writes_none_of_the_files_it_verified_first() {
+        let home = place("atomic");
+        let harness = seeded(&home);
+        let skill = home.join("skills").join("alpha").join("SKILL.md");
+        let generation = capture(
+            &home,
+            "fix",
+            &harness,
+            &home,
+            "session-1",
+            "passed",
+            "guard-a",
+        )
+        .expect("a capture")
+        .expect("a generation");
+        // What the adoption did after the capture: both files now differ from the generation.
+        std::fs::write(harness.join("system.md"), "adopted prompt").expect("the adopted prompt");
+        std::fs::write(&skill, "adopted skill").expect("the adopted skill");
+
+        // The tampered file sorts last, so a one-pass restore would already have overwritten the prompt.
+        let last = generation
+            .files
+            .last()
+            .expect("a generation names files")
+            .path
+            .clone();
+        assert_eq!(
+            last, "skills/alpha/SKILL.md",
+            "the test tampers with the last file the manifest names"
+        );
+        std::fs::write(generation_dir(&home, "fix", 1).join(&last), "tampered")
+            .expect("a tampered generation");
+
+        let refused = restore(&home, "fix", &harness, &home, 1, "guard-a")
+            .expect_err("a tampered generation is refused");
+        assert!(refused.contains("does not match"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(harness.join("system.md")).expect("the prompt"),
+            "adopted prompt",
+            "a refusal must not restore the files it verified before the tampered one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&skill).expect("the skill"),
+            "adopted skill",
+            "a refusal touches nothing"
+        );
+    }
+
+    #[test]
+    fn a_pre_created_generation_number_is_stepped_over_not_written_into() {
+        let home = place("claimed");
+        let harness = seeded(&home);
+        let first = capture(
+            &home,
+            "fix",
+            &harness,
+            &home,
+            "session-1",
+            "passed",
+            "guard-a",
+        )
+        .expect("a capture")
+        .expect("a generation");
+        assert_eq!(first.id, 1);
+
+        // A number that already exists belongs to somebody else: a crashed write or another adoption.
+        let taken = generation_dir(&home, "fix", 2);
+        std::fs::create_dir_all(&taken).expect("a pre-created number");
+        std::fs::write(taken.join("evidence.txt"), "not ours").expect("the other write's bytes");
+
+        std::fs::write(harness.join("system.md"), "second prompt").expect("a changed prompt");
+        let second = capture(
+            &home,
+            "fix",
+            &harness,
+            &home,
+            "session-2",
+            "passed",
+            "guard-a",
+        )
+        .expect("a capture")
+        .expect("a generation");
+        assert_eq!(second.id, 3, "the taken number is skipped");
+        assert_eq!(
+            second.parent,
+            Some(1),
+            "the chain points at the state it replaced"
+        );
+        assert!(
+            !taken.join(MANIFEST).exists(),
+            "a pre-created number is not adopted as this generation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(taken.join("evidence.txt")).expect("the other write's bytes"),
+            "not ours",
+            "the other write is left alone"
+        );
+        assert!(generation_dir(&home, "fix", 3).join(MANIFEST).is_file());
+    }
+
+    #[test]
+    fn a_rollback_into_a_different_harness_is_refused_and_writes_nothing() {
+        let home = place("wrong-harness");
+        let harness = seeded(&home);
+        capture(
+            &home,
+            "fix",
+            &harness,
+            &home,
+            "session-1",
+            "passed",
+            "guard-a",
+        )
+        .expect("a capture")
+        .expect("a generation");
+        std::fs::write(harness.join("system.md"), "adopted prompt").expect("the adopted prompt");
+
+        let other = home.join("harness").join("other");
+        std::fs::create_dir_all(&other).expect("a different harness");
+        std::fs::write(other.join("system.md"), "somebody else's prompt")
+            .expect("the other prompt");
+        let refused = restore(&home, "fix", &other, &home, 1, "guard-a")
+            .expect_err("the wrong harness is refused");
+        assert!(refused.contains("different harness"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(other.join("system.md")).expect("the other prompt"),
+            "somebody else's prompt",
+            "a refused rollback writes nothing into the wrong tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(harness.join("system.md")).expect("the adopted prompt"),
+            "adopted prompt",
+            "a refused rollback leaves the right tree alone too"
+        );
+
+        // A generation from before the path was recorded falls back to refusing a tree with no prompt.
+        let empty = home.join("harness").join("empty");
+        std::fs::create_dir_all(&empty).expect("an empty directory");
+        let path = generation_dir(&home, "fix", 1).join(MANIFEST);
+        let mut recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the manifest"))
+                .expect("a manifest");
+        recorded["harness"] = serde_json::Value::from(empty.display().to_string());
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&recorded).expect("json"),
+        )
+        .expect("a manifest without a matching harness");
+        let refused = restore(&home, "fix", &empty, &home, 1, "guard-a")
+            .expect_err("a directory with no system.md is refused");
+        assert!(refused.contains("no system.md"), "{refused}");
+        assert!(
+            std::fs::read_dir(&empty)
+                .expect("the empty directory")
+                .next()
+                .is_none(),
+            "a refused rollback left files in the empty directory"
+        );
     }
 }
 
