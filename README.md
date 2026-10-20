@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.2-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-668%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.4-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-738%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.2 |
+| **Version** | 0.0.4 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, ledger |
@@ -61,9 +61,21 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 668 passing, 13 ignored live tests |
+| **Tests** | 738 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.4 adds
+
+0.0.4 is Part I of the 0.0.3 plan: five changes to the runtime itself, with the session format unchanged.
+
+- **Admission handles.** `spawn` returns `{child_id, session, state:"admitted"}` before the child's first model call. A gateway-owned registry caps live children at 16, records them under `<state>/children/`, and marks a crashed gateway's children `lost` on restart instead of resuming them silently. `tell`, `children` and `result` are the tools a parent uses to work with a live child.
+- **Goals that outlive a turn.** A goal is session state (`open`, `paused`, `done`, `cleared`) with its chat, model, check and budget. The gateway heartbeat re-enters an idle session on schedule. A goal closes when its recorded check passes, when a person closes it, or when its budget is spent, and the reason is recorded.
+- **Budgets that name their cause.** `hades run` and `hades submit` take `--budget-tokens`; the end of a run names `attempts`, `minutes` or `tokens`, and the scoreboard sums the spend the endpoint reported.
+- **Numbered harness generations.** Every `tune --adopt` writes `<state>/control/harness/<profile>/<n>/` with a manifest naming every captured file and its hash. `hades refine --rollback <n>` restores exactly those files in two passes, and refuses to cross a floor change. The floor and policy guard lists are enumerated by the type system rather than by hand.
+- **Strict model requests.** `--strict-model` preflights the endpoint and key before a session exists. A configured but unreachable endpoint fails on the first call naming the model instead of substituting another.
+
+Part II of the plan, which covers the satellite transport broker, generations in service and the evolve loop, is not in this release. It is the next stage.
 
 ## Why this exists
 
@@ -495,11 +507,12 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 |---|---|
 | `hades init` | Write the home, config and vault skeleton |
 | `hades` / `hades tui` / `hades chat` | Native terminal workspace; `--demo` opens an offline preview |
-| `hades run <goal>` | A governed walk: plan, program, check, attempts, `--branch n` |
+| `hades run <goal>` | A governed walk: plan, program, check, attempts, `--branch n`, `--budget-tokens n` |
 | `hades explain <session>` | A compact turn map: action, state, tokens, decision |
 | `hades distill <session>` | Draft a runbook from a verified run; `--run` proves it |
 | `hades replay <runbook>` | Execute a runbook in a fresh root against `--check <cmd>` |
-| `hades tune <goal>` | Probe candidate harnesses; `--holdout` guards adoption |
+| `hades tune <goal>` | Probe candidate harnesses; `--holdout` guards adoption, each adoption is a numbered generation |
+| `hades refine --rollback <n>` | Restore the files named in harness generation n |
 | `hades job <spec>` | Write a scheduled job |
 | `hades jobs` | List scheduled jobs |
 | `hades goal set\|list\|pause\|clear` | A goal kept for one chat; the gateway heartbeat continues it when idle |
@@ -562,7 +575,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **668 passing, 0 failing, 13 ignored** across 31 suites.
+Current state: **738 passing, 0 failing, 13 ignored** across 31 suites.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -582,7 +595,8 @@ These are current limits, not aspirations hidden in a roadmap:
 - Linux only. Landlock and systemd units are part of the design.
 - Telegram is the only messaging transport.
 - The network is open or closed per role. There is no per-domain egress proxy.
-- Restoring an adoption is a copy from `versions/<seconds>/`; there is no automatic rollback command yet.
+- Harness rollback restores the files named in a generation manifest. It does not roll back the model, the sessions or the state directory.
+- Part II of the 0.0.3 plan (satellite transport, generation swap in service, the evolve loop) is not shipped in 0.0.4.
 - The browser needs an external Chromium binary. Vision is optional and needs local GGUF model files.
 - `eval` can act outside the textual safety floor. It is an explicit escape hatch.
 
