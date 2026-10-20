@@ -55,9 +55,19 @@ impl Standing {
         self.prompt_tokens + self.generated_tokens
     }
 
+    /// What one pass cost, in tokens. A pass that costs five times another is not a free win, so the
+    /// cost is divided by passes rather than by runs; zero passes is zero, not a division by zero.
+    pub fn tokens_per_pass(&self) -> u64 {
+        if self.passes == 0 {
+            0
+        } else {
+            self.tokens() / self.passes as u64
+        }
+    }
+
     pub fn line(&self) -> String {
         format!(
-            "{:<10} {:>3} run(s)  {:>3}/{:<3}  {:>5.1}%  {:>6} ms mean  {:>7} tokens{}",
+            "{:<10} {:>3} run(s)  {:>3}/{:<3}  {:>5.1}%  {:>6} ms mean  {:>7} tokens  {:>7}/pass{}",
             self.profile,
             self.runs,
             self.passes,
@@ -65,6 +75,7 @@ impl Standing {
             self.rate() * 100.0,
             self.mean_ms,
             self.tokens(),
+            self.tokens_per_pass(),
             if self.runs < MIN_RUNS {
                 "  (too few to choose)"
             } else {
@@ -190,7 +201,7 @@ pub fn report(records: &[Record]) -> String {
         return "no finished runs yet: the scoreboard is written by `hades run`\n".to_string();
     }
     let mut text = format!(
-        "profile    runs    passes   rate      mean           tokens{}\n",
+        "profile    runs    passes   rate      mean           tokens     per pass{}\n",
         if records.len() == 1 {
             " (1 record)"
         } else {
@@ -334,5 +345,24 @@ mod tests {
             & 0o777;
         assert_eq!(dir, 0o700, "the state directory is not private");
         assert_eq!(file, 0o600, "the scoreboard is not private");
+    }
+
+    #[test]
+    fn the_report_shows_cost_per_pass() {
+        // Two runs, one pass: the total is 300 tokens and the cost of the pass is all 300, because the
+        // failed run bought no pass. Dividing by runs would flatter it.
+        let records = vec![
+            spent("fix", true, 10, 100, 50),
+            spent("fix", false, 20, 100, 50),
+        ];
+        let mut rows = standings(&records);
+        let standing = rows.remove(0);
+        assert_eq!(standing.tokens(), 300);
+        assert_eq!(standing.tokens_per_pass(), 300);
+        assert!(
+            report(&records).contains("300/pass"),
+            "{}",
+            report(&records)
+        );
     }
 }

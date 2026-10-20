@@ -28,6 +28,10 @@ pub struct Receipt {
     pub passed: bool,
     pub answers: usize,
     pub millis: u64,
+    /// What the endpoint reported for the calls in this run. Zero when the endpoint reported nothing,
+    /// which is a fact about the endpoint rather than a claim that the run was free.
+    pub prompt_tokens: u64,
+    pub generated_tokens: u64,
     pub answer_bytes: usize,
     pub check: String,
     /// The run stopped at an approval question and nobody was there to answer it. Different from a check
@@ -42,8 +46,10 @@ pub struct Receipt {
 impl Receipt {
     pub fn line(&self) -> String {
         format!(
-            "{} answer(s), {} ms, {} bytes, check {}{}",
+            "{} answer(s), {} prompt + {} generated tokens, {} ms, {} bytes, check {}{}",
             self.answers,
+            self.prompt_tokens,
+            self.generated_tokens,
             self.millis,
             self.answer_bytes,
             if self.check.is_empty() {
@@ -65,6 +71,8 @@ pub fn receipt(log: &Path) -> Receipt {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let mut answers = 0;
     let mut millis = 0;
+    let mut prompt_tokens = 0u64;
+    let mut generated_tokens = 0u64;
     let mut answer_bytes = 0;
     let mut check = String::new();
     let mut awaiting = false;
@@ -84,6 +92,14 @@ pub fn receipt(log: &Path) -> Receipt {
                 if let Some(model) = payload.get("model") {
                     answers += 1;
                     millis += model.get("millis").and_then(Value::as_u64).unwrap_or(0);
+                    prompt_tokens += model
+                        .get("prompt_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    generated_tokens += model
+                        .get("generated_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                 }
                 if let Some(program) = payload.get("program").and_then(Value::as_str) {
                     answer_bytes += program.len();
@@ -111,6 +127,8 @@ pub fn receipt(log: &Path) -> Receipt {
         passed: check == "passed",
         answers,
         millis,
+        prompt_tokens,
+        generated_tokens,
         answer_bytes,
         check,
         awaiting,
@@ -1123,7 +1141,7 @@ mod tests {
     }
 
     const RUN: &str = concat!(
-        r#"{"kind":"tool_call","payload":{"tool":"shell","program":"echo hi","model":{"millis":1000}}}"#,
+        r#"{"kind":"tool_call","payload":{"tool":"shell","program":"echo hi","model":{"millis":1000,"prompt_tokens":120,"generated_tokens":30}}}"#,
         "\n",
         r#"{"kind":"tool_result","payload":{"tool":"shell","output":"hi\n","state":"ok"}}"#,
         "\n",
@@ -1142,6 +1160,13 @@ mod tests {
         assert_eq!(receipt.millis, 1000);
         assert_eq!(receipt.check, "passed");
         assert!(receipt.answer_bytes > 0);
+        assert_eq!(receipt.prompt_tokens, 120);
+        assert_eq!(receipt.generated_tokens, 30);
+        assert!(
+            receipt.line().contains("120 prompt + 30 generated tokens"),
+            "{}",
+            receipt.line()
+        );
         assert!(!receipt.awaiting);
     }
 
@@ -1186,6 +1211,8 @@ mod tests {
                 passed,
                 answers,
                 millis,
+                prompt_tokens: 0,
+                generated_tokens: 0,
                 answer_bytes: 10,
                 check: if passed {
                     "passed".into()
@@ -2039,6 +2066,8 @@ mod progress_tests {
                 passed,
                 answers: 1,
                 millis,
+                prompt_tokens: 0,
+                generated_tokens: 0,
                 answer_bytes: 10,
                 check: if passed {
                     "passed".into()
