@@ -1375,6 +1375,11 @@ fn world_for(
         mode,
         role: crate::profile::Role::Patch,
         actor: actor.to_string(),
+        // The chat's child-lifecycle log. Kept apart from `tg-<chat>`, which the daemon appends to from
+        // another process for a run: two processes writing one log can compute the same next id, and
+        // the session tree refuses a log with a duplicate id outright.
+        session: format!("tg-{chat}-children"),
+        inbox: None,
         mcp: Arc::clone(mcp),
         allowance: crate::agent::Allowance::new(64),
     }

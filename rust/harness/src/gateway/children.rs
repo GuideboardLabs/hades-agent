@@ -13,11 +13,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use session_tree::{FileStore, Kind, Session, SessionId, SystemClock};
 
-use crate::agent::{Activity, World};
+use crate::agent::{Activity, Inbox, World};
 use crate::model::{Feed, OpenAi};
 
 /// The most children one gateway process runs at once. The bound exists so a model that keeps spawning
@@ -145,13 +146,37 @@ impl Admitted {
     }
 }
 
-/// Why admission was refused. `Busy` is the one a tool reports as a typed busy fault; the other two are
-/// refusals to overwrite or to invent a path.
+/// Why admission was refused, or why `tell`/`result` could not answer. `Busy` is the one a tool
+/// reports as a typed busy fault; the rest name the case plainly so a caller can tell a retryable
+/// refusal from a wrong id from a child that is simply not finished yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    Busy { live: usize, limit: usize },
-    Exists { id: String },
-    Io { path: String, detail: String },
+    Busy {
+        live: usize,
+        limit: usize,
+    },
+    Exists {
+        id: String,
+    },
+    Io {
+        path: String,
+        detail: String,
+    },
+    /// No child with that id on this gateway.
+    Missing {
+        id: String,
+    },
+    /// The child reached a terminal state, so a message would be queued for nobody to read.
+    Finished {
+        id: String,
+        state: String,
+    },
+    /// The wait ran out before the child finished. The child was not killed and may still finish.
+    TimedOut {
+        id: String,
+        state: String,
+        waited_ms: u128,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -163,6 +188,19 @@ impl std::fmt::Display for Refusal {
             ),
             Refusal::Exists { id } => write!(f, "child {id} already exists"),
             Refusal::Io { path, detail } => write!(f, "{path}: {detail}"),
+            Refusal::Missing { id } => write!(f, "there is no child {id} on this gateway"),
+            Refusal::Finished { id, state } => write!(
+                f,
+                "child {id} is already {state}; it will not read another message"
+            ),
+            Refusal::TimedOut {
+                id,
+                state,
+                waited_ms,
+            } => write!(
+                f,
+                "child {id} was still {state} after {waited_ms} ms; it was not killed"
+            ),
         }
     }
 }
@@ -290,12 +328,36 @@ pub fn append_event(log: &mut Log, event: &Event) -> Result<(), String> {
         .map_err(|fault| fault.to_string())
 }
 
-/// Append an event to a session log by id, creating the log when it does not exist yet. A caller
-/// appending to a shared parent log must serialize its own writers; the session tree caches entry ids
-/// per handle and two concurrent loads can compute the same next id.
+/// Append an event to a session log by id, creating the log when it does not exist yet. Callers may
+/// run on different threads: the per-session lock below covers the load and the append, because the
+/// session tree numbers an entry from the handle's own length and two handles that load at once
+/// compute the same next id. That is why `admit` writes the child's log and the parent's log through
+/// this function rather than through `append_event` on a handle it happens to hold.
 pub fn record_event(state: &Path, session: &str, event: &Event) -> Result<(), String> {
+    let lock = log_lock(state, session);
+    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut log = open_log(state, session)?;
     append_event(&mut log, event)
+}
+
+/// One lock per session log, for the life of the process. Keyed on the state directory too, so two
+/// gateways with different state directories never wait on each other.
+type Locks = Mutex<BTreeMap<(PathBuf, String), Arc<Mutex<()>>>>;
+
+fn log_lock(state: &Path, session: &str) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|held| held.into_inner());
+    Arc::clone(
+        locks
+            .entry((state.to_path_buf(), session.to_string()))
+            .or_default(),
+    )
+}
+
+/// A child is finished when no executor will write to its record again.
+fn terminal(state: &str) -> bool {
+    matches!(state, STATE_DONE | STATE_FAILED | STATE_LOST)
 }
 
 /// The registry a gateway holds for its life. Cloning is another handle to the same registry, which is
@@ -317,15 +379,23 @@ struct Inner {
     /// Executors kept so a test or a shutdown can join them. A thread cannot remove its own handle
     /// without joining itself, so finished ids stay here until `drain`.
     threads: Mutex<BTreeMap<String, std::thread::JoinHandle<()>>>,
+    /// The mailbox a running child reads between steps. `tell` pushes here; the executor's loop drains
+    /// it before its next model call. Kept beside the live set because both describe work in flight.
+    mailboxes: Mutex<BTreeMap<String, Arc<Inbox>>>,
+}
+
+/// The registry map: one weak handle per state directory. Weak, not strong, so a registry dies with
+/// its last holder and a finished gateway leaves no live count behind in a long-lived process.
+fn known() -> &'static Mutex<BTreeMap<PathBuf, std::sync::Weak<Inner>>> {
+    static REGISTRIES: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Weak<Inner>>>> =
+        std::sync::OnceLock::new();
+    REGISTRIES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 impl Registry {
     pub fn new(state: impl Into<PathBuf>) -> Registry {
         let state = state.into();
-        static REGISTRIES: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Weak<Inner>>>> =
-            std::sync::OnceLock::new();
-        let known = REGISTRIES.get_or_init(|| Mutex::new(BTreeMap::new()));
-        let mut known = known.lock().unwrap_or_else(|held| held.into_inner());
+        let mut known = known().lock().unwrap_or_else(|held| held.into_inner());
         if let Some(inner) = known.get(&state).and_then(std::sync::Weak::upgrade) {
             return Registry { inner };
         }
@@ -333,9 +403,24 @@ impl Registry {
             state: state.clone(),
             live: Mutex::new(BTreeSet::new()),
             threads: Mutex::new(BTreeMap::new()),
+            mailboxes: Mutex::new(BTreeMap::new()),
         });
         known.insert(state, Arc::downgrade(&inner));
         Registry { inner }
+    }
+
+    /// The gateway's registry for this state directory, if this process has one, without creating one.
+    ///
+    /// `spawn` uses this as its seam: a surface inside a gateway admits a child and returns a handle,
+    /// and a surface with no gateway (`hades turn`, or a test) keeps the blocking path. It deliberately
+    /// does not create a registry, because a surface that never had a gateway must not start threads
+    /// behind its parent's back and leave them for nobody to own.
+    pub fn existing(state: &Path) -> Option<Registry> {
+        let known = known().lock().unwrap_or_else(|held| held.into_inner());
+        known
+            .get(state)
+            .and_then(std::sync::Weak::upgrade)
+            .map(|inner| Registry { inner })
     }
 
     pub fn state(&self) -> &Path {
@@ -384,7 +469,7 @@ impl Registry {
     pub fn admit(
         &self,
         admission: Admission,
-        world: World,
+        mut world: World,
         client: OpenAi,
     ) -> Result<Admitted, Refusal> {
         if !valid_name(&admission.id) {
@@ -401,6 +486,18 @@ impl Registry {
                 detail: format!(
                     "the session id {:?} is not a plain file name",
                     admission.session
+                ),
+            });
+        }
+        // The parent's session becomes a file name too, because the admission is recorded in the
+        // parent's log. Refusing here keeps a bad id from writing outside the state directory, and
+        // keeps the "walk the parent log" invariant from silently skipping a child.
+        if !valid_name(&admission.parent) {
+            return Err(Refusal::Io {
+                path: self.inner.state.join("sessions").display().to_string(),
+                detail: format!(
+                    "the parent session {:?} is not a plain file name",
+                    admission.parent
                 ),
             });
         }
@@ -449,16 +546,39 @@ impl Registry {
         if let Err(said) = record_event(&self.inner.state, &admission.session, &admitting)
             .and_then(|()| Record::write(&self.inner.state, &record))
         {
-            self.inner
-                .live
-                .lock()
-                .unwrap_or_else(|held| held.into_inner())
-                .remove(&admission.id);
+            self.unslot(&admission.id);
             return Err(Refusal::Io {
                 path: path.display().to_string(),
                 detail: said,
             });
         }
+
+        // The parent's log names the child before the child does anything. A failure here is fatal for
+        // the admission: a child the parent's log does not name is exactly the orphan A5 forbids, so the
+        // record is moved to `failed` with the reason rather than left looking live.
+        if let Err(said) = record_event(&self.inner.state, &admission.parent, &admitting) {
+            self.unslot(&admission.id);
+            let _ = self.transition(
+                &admission.id,
+                STATE_FAILED,
+                Some(epoch()),
+                Some(said.clone()),
+            );
+            return Err(Refusal::Io {
+                path: path.display().to_string(),
+                detail: said,
+            });
+        }
+
+        // A message can only reach a loop that is still running, so the mailbox belongs to the admission
+        // and dies with the executor.
+        let inbox = Arc::new(Inbox::default());
+        world.inbox = Some(Arc::clone(&inbox));
+        self.inner
+            .mailboxes
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .insert(admission.id.clone(), inbox);
 
         let worker = self.clone();
         let id = admission.id.clone();
@@ -479,11 +599,7 @@ impl Registry {
                 })
             }
             Err(error) => {
-                self.inner
-                    .live
-                    .lock()
-                    .unwrap_or_else(|held| held.into_inner())
-                    .remove(&id);
+                self.unslot(&id);
                 let _ = self.transition(
                     &id,
                     STATE_FAILED,
@@ -541,6 +657,97 @@ impl Registry {
             .len()
     }
 
+    /// Hand one message to a child that is still running. The child reads it at its next step, not
+    /// inside a call already in flight, so "delivered" means the mailbox has it and the loop has not
+    /// yet ended. A terminal child refuses: a result already written cannot be influenced, and a
+    /// message queued for nobody to read would be a promise this cannot keep.
+    pub fn tell(&self, id: &str, text: &str) -> Result<Record, Refusal> {
+        let record = self
+            .record(id)
+            .ok_or_else(|| Refusal::Missing { id: id.to_string() })?;
+        if terminal(&record.state) {
+            return Err(Refusal::Finished {
+                id: id.to_string(),
+                state: record.state,
+            });
+        }
+        let inbox = self
+            .inner
+            .mailboxes
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .get(id)
+            .map(Arc::clone);
+        let Some(inbox) = inbox else {
+            // The record says live but no executor holds a mailbox: this process did not admit it, or
+            // its executor has just gone. Refusing is honest; the caller can read the record.
+            return Err(Refusal::Missing { id: id.to_string() });
+        };
+        // The log says what was delivered before it is delivered, so a message the child acted on has
+        // evidence even if the mailbox is drained at the same moment.
+        record_event(
+            &self.inner.state,
+            &record.session,
+            &Event::Message {
+                child_id: id.to_string(),
+                parent_session: record.parent.clone(),
+                text: text.to_string(),
+            },
+        )
+        .map_err(|detail| Refusal::Io {
+            path: path_of(&self.inner.state, id).display().to_string(),
+            detail,
+        })?;
+        inbox.push(text);
+        Ok(record)
+    }
+
+    /// Wait for a child to reach a terminal state, up to `timeout`, and return its final record.
+    ///
+    /// This is its own clock on purpose. The run's `Bounds` are checked at graph edges and cannot
+    /// interrupt a model call already in flight, so a deadline promised through them would be a
+    /// promise this cannot keep; a wall-clock wait here ends when it says it will. The wait never
+    /// kills the child: a timeout is a fact about the caller's patience, not about the work.
+    pub fn wait(&self, id: &str, timeout: Duration) -> Result<Record, Refusal> {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        loop {
+            let record = self
+                .record(id)
+                .ok_or_else(|| Refusal::Missing { id: id.to_string() })?;
+            if terminal(&record.state) {
+                return Ok(record);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Refusal::TimedOut {
+                    id: id.to_string(),
+                    state: record.state,
+                    waited_ms: now.duration_since(started).as_millis(),
+                });
+            }
+            // Polling, not a condition variable: the executor writes a record through the filesystem and
+            // has no channel to wake a waiter, and a 25 ms tick is invisible next to a model call.
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Free the slot and the mailbox for a child, whatever ended it. Idempotent, because an admission
+    /// that fails after the slot is taken, an executor that finishes, and a thread that never starts
+    /// all have to be able to say "this id is done" without stepping on each other.
+    fn unslot(&self, id: &str) {
+        self.inner
+            .live
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .remove(id);
+        self.inner
+            .mailboxes
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .remove(id);
+    }
+
     /// Join every executor this gateway started and return how many were joined. Used by tests and by a
     /// shutdown that wants the threads gone; it is not a way to make a slow model call finish sooner.
     pub fn drain(&self) -> usize {
@@ -580,11 +787,7 @@ impl Registry {
                 );
             }
         }
-        self.inner
-            .live
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-            .remove(&id);
+        self.unslot(&id);
     }
 
     fn run(&self, admission: &Admission, world: &World, client: &OpenAi) -> Result<(), String> {
@@ -617,17 +820,17 @@ impl Registry {
 
         let result_path = result_path(&self.inner.state, &admission.session);
         write_result(&result_path, &status, &result, &raw)?;
-        if let Ok(mut log) = open_log(&self.inner.state, &admission.session) {
-            let _ = append_event(
-                &mut log,
-                &Event::Result {
-                    child_id: admission.id.clone(),
-                    parent_session: admission.parent.clone(),
-                    status: status.clone(),
-                    result_path: result_path.display().to_string(),
-                },
-            );
-        }
+        let ended = Event::Result {
+            child_id: admission.id.clone(),
+            parent_session: admission.parent.clone(),
+            status: status.clone(),
+            result_path: result_path.display().to_string(),
+        };
+        // The parent's log learns the outcome from the child's own thread. That is the append A5 has to
+        // serialize: two children finishing at once would otherwise load the same parent log and both
+        // write entry id N.
+        let _ = record_event(&self.inner.state, &admission.session, &ended);
+        let _ = record_event(&self.inner.state, &admission.parent, &ended);
 
         let state = if status == "ok" {
             STATE_DONE
@@ -872,6 +1075,8 @@ mod tests {
             mode: crate::mode::Mode::Read,
             role: crate::profile::Role::Patch,
             actor: "chat:7".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(8),
         }

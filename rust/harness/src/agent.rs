@@ -6,6 +6,7 @@
 //! person said and what the agent knows.
 
 use crate::fault::Fault;
+use crate::gateway::children::{Admission, Event as ChildEvent, Refusal, Registry};
 use crate::memory::{Memory, MnemeMemory};
 use crate::model::{Feed, FeedFn, OpenAi};
 use serde_json::{Value, json};
@@ -68,11 +69,48 @@ pub struct World {
     /// Who is speaking in the ledger: `chat:<id>` or `job:<id>`. A separate field from `chat`, because a
     /// job's report chat and the job's identity are different facts.
     pub actor: String,
+    /// The session this surface speaks for: the parent a spawned child records, and the log its
+    /// `child_admitted` and `child_result` events land in. The gateway supplies the chat's
+    /// child-lifecycle session and the TUI supplies its own; a surface that never spawns with a
+    /// gateway (a `hades turn`, a test) supplies a name whose log stays quiet.
+    pub session: String,
+    /// Messages a running loop reads between steps. `None` for a surface nobody can send to; a child
+    /// admitted by the gateway gets one, and `tell` is the only thing that writes it.
+    pub inbox: Option<std::sync::Arc<Inbox>>,
     /// The MCP servers this surface may reach, shared by the chats and workers a gateway spawns so a
     /// server is started once rather than per message.
     pub mcp: std::sync::Arc<crate::mcp::Mcp>,
     /// The model calls this conversation and its workers may spend, counted once for the whole tree.
     pub allowance: std::sync::Arc<Allowance>,
+}
+
+/// A mailbox a caller can hand a running loop. The loop owns the type because the loop is what decides
+/// when a message can be seen: at a step boundary, never inside a call already sent to the model. A
+/// message that arrives too late for that is not retried and not faked; it waits for the next step, and
+/// if there is none it is never read. That is the honest limit of a turn-based loop.
+#[derive(Debug, Default)]
+pub struct Inbox {
+    messages: std::sync::Mutex<Vec<String>>,
+}
+
+impl Inbox {
+    /// Hand one message to the loop. Never blocks and never fails: a mailbox with no reader is a
+    /// message the child will not see, not an error in the sender.
+    pub fn push(&self, text: impl Into<String>) {
+        self.messages
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .push(text.into());
+    }
+
+    /// Everything waiting, oldest first. The loop calls this at the top of a step.
+    pub fn drain(&self) -> Vec<String> {
+        let mut held = self
+            .messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *held)
+    }
 }
 
 impl World {
@@ -433,7 +471,7 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
             "type": "function",
             "function": {
                 "name": "spawn",
-                "description": "Create one child graph: a worker with its own loop and session that must return one JSON object matching a schema. Use it for a sub-goal that deserves its own investigation and a typed answer. The child can spawn one level further; the depth and the model-call allowance are both shared. The child returns to you, not to the person's conversation.",
+                "description": "Create one child graph: a worker with its own loop and session that must return one JSON object matching a schema. Use it for a sub-goal that deserves its own investigation and a typed answer. On a gateway the child is admitted and you get a handle back at once: collect it with `result` and check on it with `children`. The child can spawn one level further; the depth and the model-call allowance are both shared. The child returns to you, not to the person's conversation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -442,6 +480,44 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
                         "steps": {"type": "integer", "description": "Model calls this child may make, 2 to 12. Default 8."}
                     },
                     "required": ["goal"]
+                }
+            }
+        }));
+        list.as_array_mut().unwrap().push(json!({
+            "type": "function",
+            "function": {
+                "name": "children",
+                "description": "The children you spawned, with their state, session and result path. A child is one of admitted, running, done, failed or lost. Use it when you want to know what is still out.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }));
+        list.as_array_mut().unwrap().push(json!({
+            "type": "function",
+            "function": {
+                "name": "result",
+                "description": "Collect one child's answer. Waits until the child finishes or until `timeout_s` runs out, then returns the checked JSON object for a child that succeeded, or its status and what went wrong for one that did not. A timeout is not a kill: the child may still finish.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "child_id": {"type": "string", "description": "The id `spawn` returned."},
+                        "timeout_s": {"type": "integer", "description": "Seconds to wait for it, 1 to 600. Default 60."}
+                    },
+                    "required": ["child_id"]
+                }
+            }
+        }));
+        list.as_array_mut().unwrap().push(json!({
+            "type": "function",
+            "function": {
+                "name": "tell",
+                "description": "Send one message to a child that is still running. It reads it at its next step, so it can change what the child does next but not what it already did. A finished child refuses it: collect its result instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "child_id": {"type": "string", "description": "The id `spawn` returned."},
+                        "text": {"type": "string", "description": "What the child should know or do next. It cannot see this conversation."}
+                    },
+                    "required": ["child_id", "text"]
                 }
             }
         }));
@@ -478,7 +554,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-const TOOLS: [&str; 18] = [
+const TOOLS: [&str; 21] = [
     "shell",
     "read_file",
     "write_file",
@@ -497,6 +573,9 @@ const TOOLS: [&str; 18] = [
     "mcp",
     "delegate",
     "spawn",
+    "children",
+    "result",
+    "tell",
 ];
 
 /// Record one decided action. Best effort: a ledger write that fails is reported, and the action it was
@@ -528,7 +607,15 @@ fn epoch() -> i64 {
 fn mutating(name: &str) -> bool {
     matches!(
         name,
-        "shell" | "write_file" | "patch" | "remember" | "cron" | "browser" | "mcp" | "spawn"
+        "shell"
+            | "write_file"
+            | "patch"
+            | "remember"
+            | "cron"
+            | "browser"
+            | "mcp"
+            | "spawn"
+            | "tell"
     )
 }
 
@@ -566,6 +653,17 @@ pub fn answer_stoppable(
     for _ in 0..steps {
         if stopped() {
             return Ok(None);
+        }
+        // A message from the parent is read at a step boundary, before the model is asked. It cannot
+        // interrupt the call already in flight, and it does not count as the model's own turn: the
+        // label says where it came from so a child cannot mistake an instruction for its own idea.
+        if let Some(inbox) = &world.inbox {
+            for said in inbox.drain() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": format!("[a message from your parent while you work] {said}")
+                }));
+            }
         }
         if !world.allowance.take() {
             return Err(Fault::model(
@@ -672,6 +770,15 @@ pub(crate) fn label(name: &str, arguments: &str) -> String {
             .get("goal")
             .and_then(Value::as_str)
             .unwrap_or("a sub-goal"),
+        "children" => "children",
+        "result" => args
+            .get("child_id")
+            .and_then(Value::as_str)
+            .unwrap_or("a child"),
+        "tell" => args
+            .get("child_id")
+            .and_then(Value::as_str)
+            .unwrap_or("a child"),
         "browser" => ["url", "ref", "selector", "text", "action"]
             .iter()
             .find_map(|key| args.get(*key).and_then(Value::as_str))
@@ -821,6 +928,9 @@ fn execute(
         "web_search" => web_search(&args),
         "delegate" => delegate(&args, world, client, activity),
         "spawn" => spawn(&args, world, client, activity),
+        "children" => list_children(world),
+        "result" => child_result(&args, world),
+        "tell" => tell_child(&args, world),
         "cron" => crate::agent::cron(&args, world),
         "mcp" => world
             .mcp
@@ -963,14 +1073,17 @@ fn run_child(
     client: &OpenAi,
     kind: &str,
     steps: usize,
+    parent: &str,
 ) -> Result<(String, Option<Value>, String), String> {
     let store = session_tree::FileStore::new(worker.state.join("sessions"));
     let id = session_tree::SessionId::new(name);
     let mut log = session_tree::Session::create(store, session_tree::SystemClock, id.clone())
         .map_err(|fault| format!("{fault:?}"))?;
+    // `parent_session` is the same key the registry writes, so a reader walking either path finds the
+    // same fact: this log belongs to a child of that session.
     let _ = log.append(
         session_tree::Kind::Meta,
-        json!({"actor": kind, "parent": worker.actor, "role": worker.role.name(), "goal": goal, "schema": schema}),
+        json!({"actor": kind, "parent": worker.actor, "parent_session": parent, "role": worker.role.name(), "goal": goal, "schema": schema}),
     );
     let _ = log.append(session_tree::Kind::User, json!({"text": goal}));
     let system = format!(
@@ -1058,6 +1171,13 @@ fn delegate(
 
     let mut handles = Vec::new();
     for (index, job) in jobs.into_iter().enumerate() {
+        // A child gets its own log and its own bundle. The parent's context gets a handle and a checked
+        // result, not the worker's whole transcript.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        let child = format!("deleg-{stamp}-{index}-{}", mneme::slugify(&job.goal, 4));
         let worker = World {
             root: world.root.clone(),
             vault: world.vault.clone(),
@@ -1070,6 +1190,8 @@ fn delegate(
             mode: world.mode,
             role: world.role,
             actor: world.actor.clone(),
+            session: child.clone(),
+            inbox: None,
             mcp: std::sync::Arc::clone(&world.mcp),
             allowance: std::sync::Arc::clone(&world.allowance),
         };
@@ -1081,20 +1203,24 @@ fn delegate(
         let started = job.goal.clone();
         let schema = job.schema.clone();
         let typed = job.typed;
-        // A child gets its own log and its own bundle. The parent's context gets a handle and a checked
-        // result, not the worker's whole transcript.
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or(0);
-        let child = format!("deleg-{stamp}-{index}-{}", mneme::slugify(&started, 4));
+        let parent = world.session.clone();
+        note_child(
+            world,
+            ChildEvent::Admitted {
+                child_id: child.clone(),
+                parent_session: parent.clone(),
+                session: child.clone(),
+                chat: world.chat,
+                goal: started.clone(),
+            },
+        );
         let name = child.clone();
         handles.push((
             started.clone(),
             child,
             std::thread::spawn(move || {
                 run_child(
-                    &name, &started, &schema, typed, &worker, &client, "delegate", 12,
+                    &name, &started, &schema, typed, &worker, &client, "delegate", 12, &parent,
                 )
             }),
         ));
@@ -1109,6 +1235,18 @@ fn delegate(
             .join("artifacts")
             .join(&child)
             .join("result.json");
+        note_child(
+            world,
+            ChildEvent::Result {
+                child_id: child.clone(),
+                parent_session: world.session.clone(),
+                status: match &report {
+                    Ok((status, _, _)) => status.clone(),
+                    Err(_) => "failed".to_string(),
+                },
+                result_path: artifact.display().to_string(),
+            },
+        );
         out.push_str(&format!(
             "--- worker: {} ---\nsession: {child}\nartifact: {}\n",
             clip(&task, 60),
@@ -1126,9 +1264,15 @@ fn delegate(
     out.trim().to_string()
 }
 
-/// A recursive node: one child graph, run to completion, returned to the caller that spawned it. The child
-/// gets a depth, a slice of the shared allowance and a typed contract. It returns to this parent only; it
-/// cannot reach the root, and the root learns of it through this result.
+/// A recursive node: one child graph with a depth, a slice of the shared allowance and a typed
+/// contract. It returns to this parent only; it cannot reach the root, and the root learns of it
+/// through this result.
+///
+/// Two shapes, one meaning. Inside a gateway the child is *admitted*: the record and the executor
+/// exist before the first model call, and the caller gets `{child_id, session, state}` at once, with
+/// `result` to collect. On a surface with no gateway (`hades turn`, a test) the child runs here and the
+/// finished outcome is returned. The shapes differ on purpose: a handle is not a result, and pretending
+/// otherwise would make a caller parse a field that may not be there yet.
 fn spawn(
     args: &Value,
     world: &World,
@@ -1148,7 +1292,9 @@ fn spawn(
     let given = args
         .get("result_schema")
         .filter(|schema| schema.is_object());
-    let typed = given.is_some();
+    // One contract on both paths: the child returns a JSON object, and the parent checks it against the
+    // schema (the report envelope when none was given). Letting the blocking path wrap prose into a
+    // report would make one tool mean two things depending on which surface ran it.
     let schema = given.cloned().unwrap_or_else(report_envelope);
     let steps = args
         .get("steps")
@@ -1161,6 +1307,11 @@ fn spawn(
             world.allowance.left()
         );
     }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let name = format!("spawn-{stamp}-{}", mneme::slugify(&goal, 4));
     let worker = World {
         root: world.root.clone(),
         vault: world.vault.clone(),
@@ -1173,33 +1324,274 @@ fn spawn(
         mode: world.mode,
         role: world.role,
         actor: world.actor.clone(),
+        // The child speaks for its own session, so a grandchild records the right parent.
+        session: name.clone(),
+        // The registry hands the executor a mailbox at admission; this surface has none to give.
+        inbox: None,
         mcp: std::sync::Arc::clone(&world.mcp),
         allowance: std::sync::Arc::clone(&world.allowance),
     };
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
-    let name = format!("spawn-{stamp}-{}", mneme::slugify(&goal, 4));
     activity(Activity::Start, &format!("spawn: {}", clip(&goal, 60)));
+
+    // Inside a gateway the child outlives this call. The registry counted the slot, wrote the record
+    // and started the executor before this returns, so the handle is a fact and not a promise.
+    if let Some(registry) = Registry::existing(&world.state) {
+        let admission = Admission {
+            id: name.clone(),
+            parent: world.session.clone(),
+            session: name,
+            chat: world.chat,
+            goal,
+            schema,
+            steps,
+        };
+        return match registry.admit(admission, worker, client.clone()) {
+            Ok(admitted) => admitted.to_value().to_string(),
+            Err(refusal) => refusal_text(&refusal),
+        };
+    }
+
+    // No gateway: run it here. `hades turn` and the tests take this path, and it blocks for the whole
+    // child, which is the honest behaviour when there is no process to own it.
     let artifact = world
         .state
         .join("artifacts")
         .join(&name)
         .join("result.json");
-    match run_child(
-        &name, &goal, &schema, typed, &worker, client, "spawn", steps,
-    ) {
-        Ok((status, Some(result), _)) => format!(
-            "session: {name}\nartifact: {}\nstatus: {status}\nresult: {}\n",
-            artifact.display(),
-            serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string())
-        ),
-        Ok((status, None, raw)) => format!(
-            "session: {name}\nartifact: {}\nstatus: {status}\n{raw}\n",
-            artifact.display()
-        ),
-        Err(error) => format!("session: {name}\nstatus: failed\n{error}\n"),
+    note_child(
+        world,
+        ChildEvent::Admitted {
+            child_id: name.clone(),
+            parent_session: world.session.clone(),
+            session: name.clone(),
+            chat: world.chat,
+            goal: goal.clone(),
+        },
+    );
+    let outcome = run_child(
+        &name,
+        &goal,
+        &schema,
+        true,
+        &worker,
+        client,
+        "spawn",
+        steps,
+        &world.session,
+    );
+    let status = match &outcome {
+        Ok((status, _, _)) => status.clone(),
+        Err(_) => "failed".to_string(),
+    };
+    note_child(
+        world,
+        ChildEvent::Result {
+            child_id: name.clone(),
+            parent_session: world.session.clone(),
+            status: status.clone(),
+            result_path: artifact.display().to_string(),
+        },
+    );
+    match outcome {
+        Ok((_, Some(result), _)) => json!({
+            "session": name,
+            "artifact": artifact.display().to_string(),
+            "status": status,
+            "result": result,
+        })
+        .to_string(),
+        Ok((_, None, raw)) => json!({
+            "session": name,
+            "artifact": artifact.display().to_string(),
+            "status": status,
+            "result": Value::Null,
+            "raw": raw,
+        })
+        .to_string(),
+        Err(error) => json!({
+            "session": name,
+            "artifact": artifact.display().to_string(),
+            "status": status,
+            "result": Value::Null,
+            "raw": error,
+        })
+        .to_string(),
+    }
+}
+
+/// One line to the parent's log. Best effort on a surface with no gateway: the child is real whether
+/// or not the evidence landed, and refusing to spawn because a log could not be written would make a
+/// history problem into a work problem. The registry path is stricter, because a child it admits will
+/// outlive the call that admitted it.
+fn note_child(world: &World, event: ChildEvent) {
+    if let Err(said) = crate::gateway::children::record_event(&world.state, &world.session, &event)
+    {
+        eprintln!(
+            "children: could not record {} for {}: {said}",
+            event.type_name(),
+            world.session
+        );
+    }
+}
+
+/// A refusal as the model reads it. The prefix is the class, because a model that cannot tell "try
+/// again when one finishes" from "that id is wrong" from "it is still running" retries the wrong one.
+fn refusal_text(refusal: &Refusal) -> String {
+    match refusal {
+        Refusal::Busy { .. } => format!("busy: {refusal}"),
+        Refusal::TimedOut { .. } => format!("timeout: {refusal}"),
+        Refusal::Finished { .. } => format!("finished: {refusal}"),
+        Refusal::Missing { .. } => format!("missing: {refusal}"),
+        Refusal::Exists { .. } | Refusal::Io { .. } => format!("failed: {refusal}"),
+    }
+}
+
+/// The registry for this surface, or the explanation that there is none. Read surfaces and a surface
+/// with no gateway get the explanation rather than an empty list that looks like "no children".
+fn gateway_registry(world: &World) -> Result<Registry, String> {
+    Registry::existing(&world.state).ok_or_else(|| {
+        "there are no gateway children on this surface: a child here runs to completion and hands \
+         back its result, so there is nothing to list, collect or message"
+            .to_string()
+    })
+}
+
+/// `children`: what this parent has out. Scoped to `world.session`, because two chats in one gateway
+/// must not see each other's work, and the cap is the only fact they share. A surface with no gateway
+/// gets an empty list: it has no children, and a sentence is not a list.
+fn list_children(world: &World) -> String {
+    let Ok(registry) = gateway_registry(world) else {
+        return "[]".to_string();
+    };
+    match registry.records() {
+        Ok(records) => Value::Array(
+            records
+                .into_iter()
+                .filter(|record| record.parent == world.session)
+                .map(|record| {
+                    json!({
+                        "child_id": record.id,
+                        "session": record.session,
+                        "state": record.state,
+                        "started": record.started,
+                        "ended": record.ended,
+                        "result_path": record.result_path,
+                    })
+                })
+                .collect(),
+        )
+        .to_string(),
+        Err(said) => format!("failed: {said}"),
+    }
+}
+
+/// One child this parent owns. Another chat's child is `missing` rather than readable: the registry is
+/// gateway-wide, but a parent's reach is not.
+fn owned(registry: &Registry, id: &str, world: &World) -> Result<(), String> {
+    match registry.record(id) {
+        Some(record) if record.parent == world.session => Ok(()),
+        _ => Err(format!("missing: there is no child {id} of this session")),
+    }
+}
+
+/// `result`: the child's checked JSON, or its status and why it has none. The wait is this tool's own
+/// clock (see `Registry::wait`); a timeout says so and never claims the child was killed.
+fn child_result(args: &Value, world: &World) -> String {
+    let Some(id) = argument(args, "child_id") else {
+        return "result needs a child_id".to_string();
+    };
+    let seconds = args
+        .get("timeout_s")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .clamp(1, 600);
+    let registry = match gateway_registry(world) {
+        Ok(registry) => registry,
+        Err(said) => return said,
+    };
+    if let Err(said) = owned(&registry, &id, world) {
+        return said;
+    }
+    let record = match registry.wait(&id, std::time::Duration::from_secs(seconds)) {
+        Ok(record) => record,
+        Err(refusal) => return refusal_text(&refusal),
+    };
+    let text = match std::fs::read_to_string(&record.result_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return format!(
+                "failed: the child is {}, but its result at {} could not be read: {error}",
+                record.state, record.result_path
+            );
+        }
+    };
+    let held: Value = match serde_json::from_str(&text) {
+        Ok(held) => held,
+        Err(error) => {
+            return format!(
+                "failed: the child's result at {} is not JSON: {error}",
+                record.result_path
+            );
+        }
+    };
+    let status = held
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("failed")
+        .to_string();
+    let mut out = json!({
+        "child_id": record.id,
+        "session": record.session,
+        "state": record.state,
+        "status": status,
+        "result": held.get("result").cloned().unwrap_or(Value::Null),
+    });
+    // A result that is not an object has no checked value to hand back. The first line of `raw` is the
+    // reason, which is what the parent can act on; the whole raw stays on disk in the artifact.
+    if status != "ok"
+        && let Some(object) = out.as_object_mut()
+    {
+        let raw = held.get("raw").and_then(Value::as_str).unwrap_or("");
+        object.insert(
+            "detail".to_string(),
+            json!(
+                raw.lines()
+                    .next()
+                    .unwrap_or("the child failed without a reason")
+            ),
+        );
+        if let Some(reason) = &record.reason {
+            object.insert("reason".to_string(), json!(reason));
+        }
+    }
+    out.to_string()
+}
+
+/// `tell`: one message to a child that is still running. It is refused, not queued, once the child is
+/// finished: the answer is already written, and a message nobody will read is a lie about influence.
+fn tell_child(args: &Value, world: &World) -> String {
+    let Some(id) = argument(args, "child_id") else {
+        return "tell needs a child_id".to_string();
+    };
+    let Some(text) = argument(args, "text") else {
+        return "tell needs text".to_string();
+    };
+    let registry = match gateway_registry(world) {
+        Ok(registry) => registry,
+        Err(said) => return said,
+    };
+    if let Err(said) = owned(&registry, &id, world) {
+        return said;
+    }
+    match registry.tell(&id, &text) {
+        Ok(record) => json!({
+            "child_id": record.id,
+            "session": record.session,
+            "state": record.state,
+            "delivered": true,
+        })
+        .to_string(),
+        Err(refusal) => refusal_text(&refusal),
     }
 }
 
@@ -1998,6 +2390,8 @@ mod tests {
             mode: Mode::Read,
             role: crate::profile::Role::Patch,
             actor: "chat:test".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
         };
@@ -2155,6 +2549,8 @@ mod tests {
             mode,
             role: crate::profile::Role::Patch,
             actor: actor.to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
         }
@@ -2244,6 +2640,8 @@ mod tests {
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
             actor: "chat:7".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: mcp_with(&dir, &["echo"]),
             allowance: crate::agent::Allowance::new(64),
         };
@@ -2282,6 +2680,8 @@ mod tests {
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
             actor: "chat:7".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: mcp_with(&dir, &["echo"]),
             allowance: crate::agent::Allowance::new(64),
         };
@@ -2314,6 +2714,8 @@ mod tests {
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
             actor: "chat:test".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
         };
@@ -2378,6 +2780,8 @@ mod tests {
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
             actor: "chat:test".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
         };
@@ -2445,6 +2849,8 @@ mod tests {
             mode: crate::mode::Mode::Act,
             role: crate::profile::Role::Patch,
             actor: "chat:test".to_string(),
+            session: "parent-session".to_string(),
+            inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
         };
@@ -2547,9 +2953,14 @@ mod tests {
             .expect("a sessions dir")
             .flatten()
             .collect();
-        assert_eq!(logs.len(), 1, "the child has its own log");
-        let text = std::fs::read_to_string(logs[0].path()).expect("the log");
-        assert!(text.contains("\"delegate\""), "{text}");
+        // Two logs now: the child's, and the parent's child-lifecycle log that names it.
+        assert_eq!(logs.len(), 2, "the child has its own log: {logs:?}");
+        let text = logs
+            .iter()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|text| text.contains("\"delegate\""))
+            .expect("the child's log says what it is: a delegate");
+        assert!(text.contains("parent_session"), "{text}");
     }
 
     #[test]
@@ -2709,14 +3120,25 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a dir");
         let world = world_at(&dir, Mode::Act, "chat:7");
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
-        let said = spawn(
+        let said = handle_of(&spawn(
             &json!({"goal": "write down one fact", "steps": 2}),
             &world,
             &client,
             &|_, _| {},
+        ));
+        assert_eq!(said["status"], "failed", "{said}");
+        assert!(
+            said["artifact"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("result.json")),
+            "{said}"
         );
-        assert!(said.contains("status: failed"), "{said}");
-        assert!(said.contains("artifact: "), "{said}");
+        assert!(
+            said["raw"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("Model")),
+            "the failure keeps its class: {said}"
+        );
         let bundles: Vec<_> = std::fs::read_dir(dir.join("state/artifacts"))
             .expect("an artifacts dir")
             .flatten()
@@ -2993,5 +3415,752 @@ mod tests {
             said.contains("-v line stands"),
             "a leading-dash pattern must be searched as text: {said}"
         );
+    }
+    // ---- A2 to A5: the admission handle, its tools, and the session invariant --------------------
+
+    /// Read one HTTP request and return its JSON body. The test endpoints below speak just enough HTTP
+    /// for the harness's streaming client, and share this so two copies cannot drift.
+    fn read_request(stream: &mut std::net::TcpStream) -> Value {
+        use std::io::{BufRead, BufReader, Read};
+        let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("a header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).expect("a body");
+        serde_json::from_slice(&body).expect("a request")
+    }
+
+    /// Answer one chat call as one streamed delta, then close.
+    fn write_answer(stream: &mut std::net::TcpStream, delta: &Value) {
+        use std::io::Write;
+        let frame = json!({"choices": [{"delta": delta}]}).to_string();
+        let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("a response");
+    }
+
+    /// The children on disk at one moment, as `{id, state}`. A test can then say what the registry
+    /// looked like *inside* a model call rather than after it.
+    fn children_at(state: &Path) -> Vec<Value> {
+        std::fs::read_dir(crate::gateway::children::children_dir(state))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+                    .map(|record| json!({"id": record["id"], "state": record["state"]}))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A scripted model endpoint: one connection and one answer per script entry. Each request reports
+    /// the messages it was sent and the children on disk at that instant, then holds the answer until
+    /// the test releases it. The barrier is the only clock these tests use: "the handle came back while
+    /// the child was busy" is proven by the endpoint still holding the answer, not by a sleep.
+    struct Stub {
+        url: String,
+        seen: std::sync::mpsc::Receiver<(Vec<Value>, Vec<Value>)>,
+        release: std::sync::mpsc::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl Stub {
+        /// The next request, reported with what the registry looked like when it arrived.
+        fn next(&self) -> (Vec<Value>, Vec<Value>) {
+            self.seen
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a model call")
+        }
+
+        fn go(&self) {
+            self.release.send(()).expect("the endpoint is waiting");
+        }
+    }
+
+    /// An endpoint that answers at once. A blocking surface waits for the answer inside `spawn`, so a
+    /// test holding the answer would deadlock itself; this is the same child without the barrier.
+    fn eager(answer: Value) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        let server = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = read_request(&mut stream);
+            write_answer(&mut stream, &answer);
+        });
+        (url, server)
+    }
+
+    fn script(state: PathBuf, answers: Vec<Value>) -> Stub {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        let (report, requests) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            for answer in answers {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream);
+                let messages = request
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if report.send((messages, children_at(&state))).is_err() {
+                    return;
+                }
+                if go.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                    return;
+                }
+                write_answer(&mut stream, &answer);
+            }
+        });
+        Stub {
+            url,
+            seen: requests,
+            release,
+            server,
+        }
+    }
+
+    /// A gate every held answer waits behind. A test opens it once and all the held children proceed
+    /// together, which is the closest a test gets to "at the same instant" without a clock.
+    #[derive(Default)]
+    struct Gate {
+        open: std::sync::Mutex<bool>,
+        ready: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn new() -> std::sync::Arc<Gate> {
+            std::sync::Arc::new(Gate::default())
+        }
+
+        fn release(&self) {
+            *self.open.lock().expect("the gate") = true;
+            self.ready.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().expect("the gate");
+            while !*open {
+                open = self.ready.wait(open).expect("the gate");
+            }
+        }
+    }
+
+    /// A model endpoint that accepts `count` connections at once, holds every answer behind the gate,
+    /// and answers them all when it opens. Used for the cap and for the concurrent parent-log writes.
+    fn farm(
+        answer: Value,
+        count: usize,
+        gate: std::sync::Arc<Gate>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        let (entered, arrivals) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let answer = answer.clone();
+                let gate = std::sync::Arc::clone(&gate);
+                let entered = entered.clone();
+                handlers.push(std::thread::spawn(move || {
+                    let _ = read_request(&mut stream);
+                    let _ = entered.send(());
+                    gate.wait();
+                    write_answer(&mut stream, &answer);
+                }));
+            }
+            for handler in handlers {
+                let _ = handler.join();
+            }
+        });
+        (url, arrivals, server)
+    }
+
+    /// A scratch directory under the repo's target, cleared first, so two runs cannot share a registry.
+    fn admission_scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/scratch")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).expect("a scratch state");
+        dir
+    }
+
+    fn answer(report: &str) -> Value {
+        json!({"content": json!({"report": report}).to_string()})
+    }
+
+    fn handle_of(said: &str) -> Value {
+        serde_json::from_str(said)
+            .unwrap_or_else(|error| panic!("spawn did not return an object: {error}: {said}"))
+    }
+
+    /// A2: the handle is written before the first model call, and it comes back while the child is
+    /// provably blocked. The endpoint reads the record while the call is in flight, so a record written
+    /// later cannot pass; the endpoint holds the answer, so a child that finished before the handle
+    /// cannot pass either.
+    #[test]
+    fn spawn_returns_a_handle_while_the_child_is_blocked_at_the_model() {
+        let dir = admission_scratch("agent-spawn-admit");
+        let state = dir.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let stub = script(state.clone(), vec![answer("done")]);
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let said = spawn(
+            &json!({"goal": "say done"}),
+            &world,
+            &OpenAi::new(&stub.url, "stub"),
+            &|_, _| {},
+        );
+
+        let handle = handle_of(&said);
+        let id = handle["child_id"].as_str().expect("a child id").to_string();
+        assert_eq!(handle["state"], "admitted", "{handle}");
+        assert_eq!(handle["session"], handle["child_id"]);
+        let mut keys: Vec<String> = handle
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["child_id", "session", "state"],
+            "a handle is not a result: {handle}"
+        );
+
+        // The call has arrived and is being held. Its own report says the record already existed and
+        // said `running` when it got there, which is the claim "before the first model call" made
+        // observable from inside the call.
+        let (messages, at_call) = stub.next();
+        assert_eq!(at_call.len(), 1, "one child, one record: {at_call:?}");
+        assert_eq!(at_call[0]["id"], id, "{at_call:?}");
+        assert_eq!(at_call[0]["state"], "running", "{at_call:?}");
+        assert!(
+            messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("say done"))
+            }),
+            "the goal reaches the child: {messages:?}"
+        );
+        assert_eq!(
+            registry.live(),
+            1,
+            "the child is still live while the model is blocked"
+        );
+
+        stub.go();
+        let collected: Value = serde_json::from_str(&child_result(
+            &json!({"child_id": id, "timeout_s": 10}),
+            &world,
+        ))
+        .expect("a result object");
+        assert_eq!(collected["status"], "ok", "{collected}");
+        assert_eq!(collected["result"]["report"], "done", "{collected}");
+        assert_eq!(registry.drain(), 1);
+        stub.server.join().expect("the endpoint");
+    }
+
+    /// A2: the cap is the gateway's, and it refuses through the tool rather than starting a
+    /// seventeenth thread. Every child is held inside its first call, so none can free a slot.
+    #[test]
+    fn a_seventeenth_live_child_is_refused_busy_by_the_spawn_tool() {
+        let dir = admission_scratch("agent-spawn-cap");
+        let state = dir.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let limit = crate::gateway::children::MAX_LIVE;
+        let gate = Gate::new();
+        let (url, entered, farm) = farm(answer("done"), limit, std::sync::Arc::clone(&gate));
+        for index in 0..limit {
+            let id = format!("held-{index}");
+            registry
+                .admit(
+                    Admission {
+                        id: id.clone(),
+                        parent: "parent-session".to_string(),
+                        session: id,
+                        chat: 7,
+                        goal: "hold".to_string(),
+                        schema: Admission::report_schema(),
+                        steps: 2,
+                    },
+                    world_at(&dir, Mode::Act, "chat:7"),
+                    OpenAi::new(&url, "stub"),
+                )
+                .expect("an admitted child");
+        }
+        for _ in 0..limit {
+            entered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a held model call");
+        }
+        assert_eq!(registry.live(), limit);
+
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let refused = spawn(
+            &json!({"goal": "one too many"}),
+            &world,
+            &OpenAi::new(&url, "stub"),
+            &|_, _| {},
+        );
+        assert!(
+            refused.starts_with("busy: "),
+            "a typed busy fault: {refused}"
+        );
+        assert!(
+            !refused.contains("child_id"),
+            "a refused admission is not a handle: {refused}"
+        );
+        assert!(
+            registry.records().expect("records").len() == limit,
+            "no record for the refused child"
+        );
+        assert_eq!(registry.live(), limit, "the refusal took no slot");
+
+        gate.release();
+        assert_eq!(registry.drain(), limit);
+        assert_eq!(registry.live(), 0);
+        farm.join().expect("the endpoint");
+    }
+
+    /// A3: a message reaches a running child at its next step. The first call is held, the parent
+    /// tells while it is in flight, and the second request carries the message and nothing before it.
+    #[test]
+    fn a_running_child_reads_a_told_message_on_its_next_turn() {
+        let dir = admission_scratch("agent-tell");
+        let state = dir.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let stub = script(
+            state.clone(),
+            vec![
+                json!({"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}}]}),
+                answer("done"),
+            ],
+        );
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let handle = handle_of(&spawn(
+            &json!({"goal": "say done", "steps": 4}),
+            &world,
+            &OpenAi::new(&stub.url, "stub"),
+            &|_, _| {},
+        ));
+        let id = handle["child_id"].as_str().expect("a child id").to_string();
+
+        let (first, _) = stub.next();
+        assert!(
+            !first.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("keep going"))
+            }),
+            "the message is not in a request that went out before it was sent: {first:?}"
+        );
+        let told = tell_child(&json!({"child_id": id, "text": "keep going"}), &world);
+        assert!(told.contains("\"delivered\":true"), "{told}");
+
+        stub.go();
+        let (second, _) = stub.next();
+        assert!(
+            second.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("keep going"))
+            }),
+            "the next turn carries the message: {second:?}"
+        );
+        stub.go();
+
+        let collected: Value = serde_json::from_str(&child_result(
+            &json!({"child_id": id, "timeout_s": 10}),
+            &world,
+        ))
+        .expect("a result object");
+        assert_eq!(collected["status"], "ok", "{collected}");
+        assert_eq!(registry.drain(), 1);
+        stub.server.join().expect("the endpoint");
+    }
+
+    /// A3: a finished child refuses a message instead of queueing one nobody reads.
+    #[test]
+    fn tell_on_a_finished_child_is_refused_rather_than_queued() {
+        let dir = admission_scratch("agent-tell-finished");
+        let state = dir.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let stub = script(state.clone(), vec![answer("done")]);
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let handle = handle_of(&spawn(
+            &json!({"goal": "say done"}),
+            &world,
+            &OpenAi::new(&stub.url, "stub"),
+            &|_, _| {},
+        ));
+        let id = handle["child_id"].as_str().expect("a child id").to_string();
+        stub.next();
+        stub.go();
+        let collected: Value = serde_json::from_str(&child_result(
+            &json!({"child_id": id, "timeout_s": 10}),
+            &world,
+        ))
+        .expect("a result object");
+        assert_eq!(collected["state"], "done", "{collected}");
+
+        let refused = tell_child(&json!({"child_id": id, "text": "one more thing"}), &world);
+        assert!(
+            refused.starts_with("finished: "),
+            "a finished child refuses: {refused}"
+        );
+        // Not queued either: the child's log records the admission and the result, and no message.
+        let store = session_tree::FileStore::new(state.join("sessions"));
+        let log = session_tree::Session::load(
+            store,
+            session_tree::SystemClock,
+            session_tree::SessionId::new(&id),
+        )
+        .expect("the child log");
+        let kinds: Vec<&str> = crate::gateway::children::events(log.entries())
+            .iter()
+            .map(|event| event.type_name())
+            .collect();
+        assert_eq!(kinds, ["child_admitted", "child_result"]);
+        assert_eq!(registry.drain(), 1);
+        stub.server.join().expect("the endpoint");
+    }
+
+    /// A3: `result` waits on its own wall clock and reports a typed timeout at the parent's deadline,
+    /// without killing the child. The Bounds are checked at graph edges and cannot interrupt a call in
+    /// flight, so this deadline cannot be theirs.
+    #[test]
+    fn result_times_out_typed_at_the_parents_deadline_and_the_child_survives() {
+        let dir = admission_scratch("agent-result-timeout");
+        let state = dir.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let stub = script(state.clone(), vec![answer("done")]);
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let handle = handle_of(&spawn(
+            &json!({"goal": "say done"}),
+            &world,
+            &OpenAi::new(&stub.url, "stub"),
+            &|_, _| {},
+        ));
+        let id = handle["child_id"].as_str().expect("a child id").to_string();
+        stub.next();
+
+        let started = std::time::Instant::now();
+        let timed_out = child_result(&json!({"child_id": id, "timeout_s": 1}), &world);
+        assert!(
+            timed_out.starts_with("timeout: "),
+            "a typed timeout: {timed_out}"
+        );
+        assert!(
+            timed_out.contains("not killed"),
+            "a timeout is not a kill: {timed_out}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the deadline is the parent's, not the client's 180 s"
+        );
+        assert_eq!(
+            registry.live(),
+            1,
+            "the child survives the parent's impatience"
+        );
+
+        stub.go();
+        let collected: Value = serde_json::from_str(&child_result(
+            &json!({"child_id": id, "timeout_s": 10}),
+            &world,
+        ))
+        .expect("a result object");
+        assert_eq!(collected["result"]["report"], "done", "{collected}");
+        assert_eq!(registry.drain(), 1);
+        stub.server.join().expect("the endpoint");
+    }
+
+    /// A4: the same scripted child, once with no gateway and once admitted. The typed value is the
+    /// same object; the shapes differ because a handle is not a result.
+    #[test]
+    fn the_blocking_path_and_the_registry_agree_on_a_childs_typed_value() {
+        let blocked = admission_scratch("agent-spawn-blocking");
+        let (url, server) = eager(answer("same"));
+        let world = world_at(&blocked, Mode::Act, "chat:7");
+        let blocking = handle_of(&spawn(
+            &json!({"goal": "say done"}),
+            &world,
+            &OpenAi::new(&url, "stub"),
+            &|_, _| {},
+        ));
+        server.join().expect("the endpoint");
+        assert_eq!(blocking["status"], "ok", "{blocking}");
+
+        let admitted = admission_scratch("agent-spawn-registry");
+        let state = admitted.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let stub = script(state.clone(), vec![answer("same")]);
+        let world = world_at(&admitted, Mode::Act, "chat:7");
+        let handle = handle_of(&spawn(
+            &json!({"goal": "say done"}),
+            &world,
+            &OpenAi::new(&stub.url, "stub"),
+            &|_, _| {},
+        ));
+        let id = handle["child_id"].as_str().expect("a child id").to_string();
+        stub.next();
+        stub.go();
+        let collected: Value = serde_json::from_str(&child_result(
+            &json!({"child_id": id, "timeout_s": 10}),
+            &world,
+        ))
+        .expect("a result object");
+
+        assert_eq!(
+            blocking["result"], collected["result"],
+            "one child, one value"
+        );
+        assert_eq!(blocking["status"], collected["status"]);
+        assert!(
+            blocking.get("artifact").is_some() && blocking.get("child_id").is_none(),
+            "the blocking path returns a finished outcome: {blocking}"
+        );
+        assert!(
+            collected.get("child_id").is_some() && collected.get("artifact").is_none(),
+            "the registry path returns a collected result: {collected}"
+        );
+        assert_eq!(registry.drain(), 1);
+        stub.server.join().expect("the endpoint");
+    }
+
+    /// A5: walking the parent's log finds every child that was admitted, each event names its child
+    /// session, each child's own log names the parent, and no event names a child with no record.
+    #[test]
+    fn a_parent_log_names_every_child_it_admitted_and_no_orphan() {
+        let dir = admission_scratch("agent-parent-log");
+        let state = dir.join("state");
+        let parent = "parent-session";
+        // A real parent session with history, so the walk is a walk of a log that already existed.
+        {
+            let store = session_tree::FileStore::new(state.join("sessions"));
+            let mut log = session_tree::Session::create(
+                store,
+                session_tree::SystemClock,
+                session_tree::SessionId::new(parent),
+            )
+            .expect("the parent log");
+            log.append(session_tree::Kind::User, json!({"text": "spawn three"}))
+                .expect("the parent's request");
+        }
+        let registry = crate::gateway::children::Registry::new(&state);
+        let stub = script(
+            state.clone(),
+            vec![answer("one"), answer("two"), answer("three")],
+        );
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let mut ids = Vec::new();
+        for goal in ["first", "second", "third"] {
+            let handle = handle_of(&spawn(
+                &json!({"goal": goal}),
+                &world,
+                &OpenAi::new(&stub.url, "stub"),
+                &|_, _| {},
+            ));
+            ids.push(handle["child_id"].as_str().expect("a child id").to_string());
+        }
+        for _ in 0..3 {
+            stub.next();
+            stub.go();
+        }
+        for id in &ids {
+            let collected: Value = serde_json::from_str(&child_result(
+                &json!({"child_id": id, "timeout_s": 10}),
+                &world,
+            ))
+            .expect("a result object");
+            assert_eq!(collected["status"], "ok", "{collected}");
+        }
+        assert_eq!(registry.drain(), 3);
+        stub.server.join().expect("the endpoint");
+
+        let store = session_tree::FileStore::new(state.join("sessions"));
+        let log = session_tree::Session::load(
+            store.clone(),
+            session_tree::SystemClock,
+            session_tree::SessionId::new(parent),
+        )
+        .expect("the parent log");
+        let walked = crate::gateway::children::events(log.entries());
+        let admitted: Vec<&crate::gateway::children::Event> = walked
+            .iter()
+            .filter(|event| event.type_name() == "child_admitted")
+            .collect();
+        let finished: Vec<&crate::gateway::children::Event> = walked
+            .iter()
+            .filter(|event| event.type_name() == "child_result")
+            .collect();
+        assert_eq!(admitted.len(), 3, "{walked:?}");
+        assert_eq!(finished.len(), 3, "{walked:?}");
+        for event in &admitted {
+            let crate::gateway::children::Event::Admitted {
+                child_id,
+                parent_session,
+                session,
+                ..
+            } = event
+            else {
+                panic!("a non-admission event where the walk expects one");
+            };
+            assert_eq!(parent_session, parent);
+            assert!(
+                ids.contains(child_id),
+                "{child_id} is not a child we spawned"
+            );
+            let record = registry.record(child_id).expect("a record for every child");
+            assert_eq!(
+                &record.session, session,
+                "the event names the child session"
+            );
+            assert_eq!(record.parent, parent);
+            assert_eq!(record.state, "done");
+            // And the child's own log says where it came from, so the walk works from either end.
+            let child_log = session_tree::Session::load(
+                store.clone(),
+                session_tree::SystemClock,
+                session_tree::SessionId::new(session),
+            )
+            .expect("the child log");
+            let own = crate::gateway::children::events(child_log.entries());
+            assert!(!own.is_empty(), "a child log with no events is an orphan");
+            for event in own {
+                match event {
+                    crate::gateway::children::Event::Admitted { parent_session, .. }
+                    | crate::gateway::children::Event::Message { parent_session, .. }
+                    | crate::gateway::children::Event::Result { parent_session, .. } => {
+                        assert_eq!(parent_session, parent)
+                    }
+                }
+            }
+        }
+        // No orphans the other way either: every record names this parent and is named in the log.
+        let records = registry.records().expect("records");
+        assert_eq!(records.len(), 3, "{records:?}");
+        for record in records {
+            assert_eq!(record.parent, parent);
+            assert!(
+                admitted.iter().any(|event| matches!(
+                    event,
+                    crate::gateway::children::Event::Admitted { child_id, .. } if child_id == &record.id
+                )),
+                "{} has a record but no admission in the parent log",
+                record.id
+            );
+        }
+    }
+
+    /// A5: several children finish at once and every one appends to the parent log from its own
+    /// thread. The session tree numbers an entry from the handle's length, so without one writer per
+    /// session at a time two children would write the same id and the log would refuse to load.
+    #[test]
+    fn children_finishing_at_once_append_to_one_parent_log_without_colliding() {
+        let dir = admission_scratch("agent-parent-log-race");
+        let state = dir.join("state");
+        let registry = crate::gateway::children::Registry::new(&state);
+        let count = 8;
+        let gate = Gate::new();
+        let (url, entered, farm) = farm(answer("done"), count, std::sync::Arc::clone(&gate));
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let id = format!("race-{index}");
+            registry
+                .admit(
+                    Admission {
+                        id: id.clone(),
+                        parent: "parent-session".to_string(),
+                        session: id.clone(),
+                        chat: 7,
+                        goal: "say done".to_string(),
+                        schema: Admission::report_schema(),
+                        steps: 2,
+                    },
+                    world_at(&dir, Mode::Act, "chat:7"),
+                    OpenAi::new(&url, "stub"),
+                )
+                .expect("an admitted child");
+            ids.push(id);
+        }
+        for _ in 0..count {
+            entered
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a held model call");
+        }
+        gate.release();
+        assert_eq!(registry.drain(), count);
+        farm.join().expect("the endpoint");
+
+        let store = session_tree::FileStore::new(state.join("sessions"));
+        let log = session_tree::Session::load(
+            store,
+            session_tree::SystemClock,
+            session_tree::SessionId::new("parent-session"),
+        )
+        .expect("the parent log parses: no two children wrote the same entry id");
+        let ids_on_disk: Vec<u64> = log.entries().iter().map(|entry| entry.id.0).collect();
+        assert_eq!(
+            ids_on_disk,
+            (0..ids_on_disk.len() as u64).collect::<Vec<_>>(),
+            "the log is one unbroken chain"
+        );
+        let walked = crate::gateway::children::events(log.entries());
+        assert_eq!(
+            walked.len(),
+            count * 2,
+            "every child is admitted and reported: {walked:?}"
+        );
+        for record in registry.records().expect("records") {
+            assert_eq!(record.state, "done", "{} did not finish", record.id);
+        }
+        for id in &ids {
+            assert!(
+                walked.iter().any(|event| matches!(
+                    event,
+                    crate::gateway::children::Event::Result { child_id, .. } if child_id == id
+                )),
+                "{id} has no result in the parent log"
+            );
+        }
     }
 }
