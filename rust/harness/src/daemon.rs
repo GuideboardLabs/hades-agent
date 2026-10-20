@@ -71,6 +71,11 @@ impl Daemon {
     pub fn bind(state: impl Into<PathBuf>, socket: impl Into<PathBuf>) -> Result<Daemon, Fault> {
         let state = state.into();
         let socket = socket.into();
+        // Private before anything is written into it: the session transcript is the most sensitive file
+        // the harness keeps, and `create_dir_all` would take its mode from the caller's umask.
+        crate::scratch::state_dir(&state).map_err(|error| {
+            Fault::harness(format!("could not protect {}: {error}", state.display()))
+        })?;
         fs::create_dir_all(state.join("sessions")).map_err(|error| {
             Fault::harness(format!(
                 "could not make {}: {error}",

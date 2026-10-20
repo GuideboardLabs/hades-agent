@@ -220,10 +220,20 @@ impl Bounds {
 /// (`model.rs`) holds the same value, and the two must move together.
 pub const DEFAULT_CALL_TOKENS: u64 = 4096;
 
+/// The smallest prompt the reserve ever assumes. A budget that cannot pay this much plus one cap can never
+/// start a call, so [`budget_tokens`] refuses it before the run begins instead of letting the first attempt
+/// discover it. The same number is the constant term of the reserve's estimate.
+pub const PROMPT_FLOOR: u64 = 512;
+
 /// A token allowance, refused before it is used when it cannot mean what the caller thinks. Zero is not a
 /// budget: a run that may not spend is not a run. A budget below one call's completion cap is refused too,
 /// because that call would be allowed to spend more than the whole run before anything could stop it. The
 /// cap is the declared `--max-tokens` when there is one, and [`DEFAULT_CALL_TOKENS`] when there is not.
+///
+/// The floor is cap plus [`PROMPT_FLOOR`], not the cap alone: the budget counts prompt and generated
+/// together, so a budget equal to one cap reserves the whole allowance for the answer and leaves nothing for
+/// the prompt. That combination used to pass this check and then refuse the first attempt at run time; it is
+/// refused here now, with both numbers named.
 pub fn budget_tokens(tokens: u64, max_tokens: Option<u64>) -> Result<u64, String> {
     if tokens == 0 {
         return Err(
@@ -236,6 +246,13 @@ pub fn budget_tokens(tokens: u64, max_tokens: Option<u64>) -> Result<u64, String
         return Err(format!(
             "`--budget-tokens {tokens}` is less than `--max-tokens {call}`: one call could spend the whole \
              run's allowance"
+        ));
+    }
+    let floor = call.saturating_add(PROMPT_FLOOR);
+    if floor > tokens {
+        return Err(format!(
+            "`--budget-tokens {tokens}` cannot pay for one call: the answer may take {call} and a prompt \
+             reserves at least {PROMPT_FLOOR}, so the smallest runnable budget is {floor}"
         ));
     }
     Ok(tokens)
@@ -1605,21 +1622,26 @@ where
         if let Some(memory) = &self.memory {
             sections.insert(0, memory.section.clone());
         }
-        // Reserve before the call: the prompt this attempt will send, plus the completion cap. Checking
-        // only after the call is how a run overshoots its allowance by one cap.
+        // Reserve before the call: the prompt this attempt will send, plus one completion cap for every
+        // model call the attempt makes before it has any evidence. That is the answer, and the plan when the
+        // profile asks for one first. The judge is not reserved for: it is paid after the check, and a pass
+        // whose judge takes the allowance over the line is still accepted on purpose (`graph_oracle`'s
+        // "a pass would still be accepted"). Checking only after the call is how a run overshoots by a cap.
         if let Some(remaining) = self.bounds.remaining(before) {
             let prompt = (sections
                 .iter()
                 .map(|section| section.text().len())
                 .sum::<usize>()
                 / 4) as u64
-                + 512;
-            let reserve = prompt.saturating_add(self.call_tokens);
+                + PROMPT_FLOOR;
+            let calls = 1 + u64::from(self.profile.plan_first);
+            let answers = self.call_tokens.saturating_mul(calls);
+            let reserve = prompt.saturating_add(answers);
             if remaining < reserve {
                 self.last_cause = Some(Exhausted::Tokens);
                 self.last_reason = Some(format!(
-                    "the token budget has {remaining} left; one call reserves {prompt} for the prompt and \
-                     {} for the answer",
+                    "the token budget has {remaining} left; one attempt reserves {prompt} for the prompt \
+                     and {answers} for {calls} answer(s) at {} each",
                     self.call_tokens
                 ));
                 return Ok((When::Exhausted, String::new(), None));
@@ -1922,10 +1944,18 @@ mod tests {
         // The cap is the declared one when there is one, and the model client's default when there is
         // not: a budget below either would let the first call spend more than the whole run.
         assert!(budget_tokens(500, None).is_err());
-        assert_eq!(budget_tokens(4096, None), Ok(4096));
+        // The budget counts prompt and answer together, so one cap is not enough to start a call: the
+        // prompt floor has to fit beside it.
+        assert!(budget_tokens(4096, None).is_err());
+        assert_eq!(budget_tokens(4096 + PROMPT_FLOOR, None), Ok(4608));
         assert!(budget_tokens(500, Some(4096)).is_err());
-        // A cap the caller narrowed below the budget is the cap that call may spend, so the run fits.
-        assert_eq!(budget_tokens(500, Some(200)), Ok(500));
+        // The boundary the other guard advertises - a budget equal to one call's cap - is refused here,
+        // rather than passing and then refusing the first attempt with no model ever asked.
+        assert!(budget_tokens(100, Some(100)).is_err());
+        // A cap the caller narrowed below the budget is the cap that call may spend, so the run fits -
+        // once the prompt floor fits beside it.
+        assert!(budget_tokens(500, Some(200)).is_err());
+        assert_eq!(budget_tokens(712, Some(200)), Ok(712));
         assert!(budget_tokens(500, Some(600)).is_err());
         assert!(budget_tokens(0, Some(1)).is_err());
     }

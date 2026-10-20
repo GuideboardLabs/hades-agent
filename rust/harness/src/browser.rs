@@ -63,7 +63,7 @@ impl BrowserPolicy {
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
         match scheme.as_deref() {
             Some("http") | Some("https") => Ok(()),
-            Some("about") if url.eq_ignore_ascii_case("about:blank") => Ok(()),
+            Some("about") if blank_page(url) => Ok(()),
             Some("file") if self.allow_local => Ok(()),
             Some("file") => Err(
                 "the browser is not allowed to read local files: `file://` is refused".to_string(),
@@ -74,6 +74,24 @@ impl BrowserPolicy {
             None => Err(format!("`{url}` is not an absolute URL with a scheme")),
         }
     }
+}
+
+/// The blank page, with or without the fragment or query a script puts on it.
+///
+/// A page that sets `location.hash` is still the page Chromium opened, and refusing it tore the whole
+/// browser down mid-task. A prefix test alone would accept `about:blankety`, so the character after the
+/// name has to end the URL or start a fragment or query.
+fn blank_page(url: &str) -> bool {
+    const BLANK: &str = "about:blank";
+    // `get`, not a slice: a URL whose prefix splits a multi-byte character must be refused, not panic.
+    let named = url
+        .get(..BLANK.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(BLANK));
+    named
+        && matches!(
+            url.as_bytes().get(BLANK.len()),
+            None | Some(b'#') | Some(b'?')
+        )
 }
 
 #[cfg(test)]
@@ -87,6 +105,8 @@ mod policy {
             "https://example.com",
             "http://127.0.0.1:8000/x?y=1",
             "about:blank",
+            "about:blank#step2",
+            "about:blank?x=1",
             "  https://example.com  ",
         ] {
             assert!(policy.check(url).is_ok(), "{url}");
@@ -1575,6 +1595,15 @@ impl Session {
                     .and_then(Value::as_str)
                     .ok_or("upload needs a file path")?;
                 let path = std::path::Path::new(path);
+                // Reading a local file into a page is the same capability as loading one with `file://`,
+                // so it is behind the same switch. Without this the deny policy could be walked around by
+                // uploading the file into a page the model controls and reading it back with `eval`.
+                if !self.policy.allow_local {
+                    return Err(
+                        "the browser is not allowed to read local files: `upload` is refused"
+                            .to_string(),
+                    );
+                }
                 if !path.is_file() {
                     return Err(format!("{} is not a file", path.display()));
                 }

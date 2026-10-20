@@ -202,9 +202,8 @@ fn a_green_check_from_a_verifier_the_model_edited_is_refused() {
     rig.profile.protect = vec![harness::profile::Protect::dir("tests").expect("a rule")];
     let mut session = rig.session("ruler-edited");
     let mut cache = Cache::new();
-    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
-        .with_bounds(Bounds::new(3, 10))
-        .with_protect(rig.profile.protect.clone());
+    let mut runner =
+        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(3, 10));
     let walked = runner.run().expect("a walk");
 
     match &walked.ended {
@@ -241,9 +240,8 @@ fn an_edit_outside_the_protected_set_still_accepts() {
     rig.profile.protect = vec![harness::profile::Protect::dir("tests").expect("a rule")];
     let mut session = rig.session("ruler-clean");
     let mut cache = Cache::new();
-    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
-        .with_bounds(Bounds::new(3, 10))
-        .with_protect(rig.profile.protect.clone());
+    let mut runner =
+        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(3, 10));
     let walked = runner.run().expect("a walk");
     assert!(matches!(walked.ended, Ended::Accepted { .. }));
     assert!(walked.ruler.is_some());
@@ -1180,10 +1178,9 @@ fn a_call_that_cannot_fit_the_budget_is_not_started() {
     );
     assert_eq!(walked.ended.cause(), Some(Exhausted::Tokens));
     match &walked.ended {
-        Ended::GaveUp { reason, .. } => assert!(
-            reason.contains("for the prompt and 1000 for the answer"),
-            "{reason}"
-        ),
+        Ended::GaveUp { reason, .. } => {
+            assert!(reason.contains("for 1 answer(s) at 1000 each"), "{reason}")
+        }
         other => panic!("the run did not give up on tokens: {other:?}"),
     }
 }

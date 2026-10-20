@@ -190,3 +190,46 @@ fn an_inline_test_module_is_outside_a_file_ruler() {
         "a file ruler must report unchanged, which is exactly the hole the help text names"
     );
 }
+
+#[test]
+fn a_symlink_added_under_a_protected_directory_is_a_change() {
+    // The verifier can be a link: `cargo test` and every shell follow it. A walk that skipped symlinks
+    // let a model add a test file to `tests/` without the ruler seeing it, from a target the cage keeps
+    // writable (`state/tmp`).
+    let root = scratch("symlink-add");
+    let outside = root.join("state/tmp");
+    fs::create_dir_all(&outside).expect("a writable target");
+    write(&root, "tests/check.sh", "exit 0\n");
+    let before = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+
+    let target = outside.join("extra.rs");
+    fs::write(&target, "#[test]\nfn extra() {}\n").expect("the target");
+    std::os::unix::fs::symlink(&target, root.join("tests/extra.rs")).expect("a link");
+
+    let after = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+    let change = before.diff(&after).expect("the added link is a change");
+    assert!(
+        change.contains("tests/extra.rs") || change.contains("added"),
+        "{change}"
+    );
+}
+
+#[test]
+fn a_change_to_the_file_a_frozen_symlink_points_at_is_a_change() {
+    let root = scratch("symlink-target");
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).expect("a target directory");
+    let target = outside.join("gate.rs");
+    fs::write(&target, "#[test]\nfn a() { assert!(true); }\n").expect("the target");
+    fs::create_dir_all(root.join("tests")).expect("the test directory");
+    std::os::unix::fs::symlink(&target, root.join("tests/gate.rs")).expect("a link");
+
+    let before = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+    fs::write(&target, "#[test]\nfn a() {}\n").expect("a weaker target");
+    let after = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+
+    let change = before
+        .diff(&after)
+        .expect("the target's contents are frozen");
+    assert!(change.contains("tests/gate.rs"), "{change}");
+}

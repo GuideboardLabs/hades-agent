@@ -15,8 +15,11 @@
 //! - **A check that is a script.** The command text is always hashed, so changing `./check.sh` to
 //!   `./check.sh --skip x` is caught. Editing the script's contents is caught only when the script is
 //!   named in `protect`.
-//! - **Symlinks.** A symlink is skipped rather than followed: the files it points at are outside the
-//!   declared tree, and hashing through one would make the ruler's path set depend on where a link went.
+//! - **Symlinks.** A symlink is an entry in its own right: the digest is the link's target plus the digest
+//!   of what it resolves to, so adding one under a protected directory, retargeting one, or changing the
+//!   file it points at is all a change. What is not covered is the *contents* of a pre-existing symlinked
+//!   directory: the walk records the link and does not descend through it, because descending would make
+//!   the ruler's path set depend on where a link went.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -49,7 +52,10 @@ impl Ruler {
             match rule {
                 Protect::File(spec) => {
                     let path = root.join(spec);
-                    if path.is_file() {
+                    // `symlink_metadata`, not `is_file`: a rule naming a path that is a symlink - or a
+                    // directory - is still an entry the model can replace, and a missing entry is the one
+                    // an attacker creates.
+                    if std::fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_dir()) {
                         insert_file(root, &path, &mut files)?;
                     }
                 }
@@ -127,8 +133,12 @@ impl Ruler {
     }
 }
 
-/// Hash one file into the map, keyed by its path relative to the root. A file that cannot be read is an
-/// error rather than an empty digest: an unreadable verifier is not a frozen one.
+/// Hash one entry into the map, keyed by its path relative to the root.
+///
+/// A regular file is its bytes. A symlink is its target *and* the digest of what it resolves to: the target
+/// alone would miss an edit to the file the check actually reads, and the contents alone would miss a
+/// retarget. A dangling link is still an entry, so a link that is created and then pointed somewhere is a
+/// change rather than a read error that aborts the run.
 fn insert_file(
     root: &Path,
     path: &Path,
@@ -137,9 +147,25 @@ fn insert_file(
     let relative = path
         .strip_prefix(root)
         .map_err(|_| format!("`{}` is not under the root", path.display()))?;
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("the ruler could not read `{}`: {error}", path.display()))?;
-    files.insert(relative_key(relative), mneme::sha256::hex(&bytes));
+    let digest = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let target = std::fs::read_link(path).map_err(|error| {
+                format!("the ruler could not read `{}`: {error}", path.display())
+            })?;
+            let resolved = std::fs::read(path)
+                .map(|bytes| mneme::sha256::hex(&bytes))
+                .unwrap_or_else(|_| "unresolved".to_string());
+            // A newline cannot appear in a path, so the two halves cannot be shifted into each other.
+            mneme::sha256::hex(format!("link:{}\n{resolved}", target.to_string_lossy()).as_bytes())
+        }
+        _ => {
+            let bytes = std::fs::read(path).map_err(|error| {
+                format!("the ruler could not read `{}`: {error}", path.display())
+            })?;
+            mneme::sha256::hex(&bytes)
+        }
+    };
+    files.insert(relative_key(relative), digest);
     Ok(())
 }
 
@@ -178,6 +204,9 @@ fn walk(
             continue;
         };
         if meta.file_type().is_symlink() {
+            // A link that points at a directory is recorded and not entered: descending through it would
+            // make the hashed set depend on where the link went, and a loop would not terminate.
+            visit(&path)?;
             continue;
         }
         if meta.is_dir() {

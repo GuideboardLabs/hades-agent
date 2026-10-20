@@ -41,12 +41,16 @@ pub struct Receipt {
     pub progress: Option<Progress>,
     /// The protected holdout check, when a person supplied one. `None` means unmeasured.
     pub holdout: Option<bool>,
+    /// The log recorded a `RulerChanged` refusal. The last verify result in that log is `passed`, because
+    /// the check did pass - against a verifier the run no longer trusts - so a receipt that reads only the
+    /// check line would report a tampered run as a win for the tuner.
+    pub ruler_changed: bool,
 }
 
 impl Receipt {
     pub fn line(&self) -> String {
         format!(
-            "{} answer(s), {} prompt + {} generated tokens, {} ms, {} bytes, check {}{}",
+            "{} answer(s), {} prompt + {} generated tokens, {} ms, {} bytes, check {}{}{}",
             self.answers,
             self.prompt_tokens,
             self.generated_tokens,
@@ -60,7 +64,12 @@ impl Receipt {
             self.progress
                 .as_ref()
                 .map(|progress| format!(" ({})", progress.line()))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if self.ruler_changed {
+                " (the check changed during the run; not a pass)"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -77,6 +86,7 @@ pub fn receipt(log: &Path) -> Receipt {
     let mut check = String::new();
     let mut awaiting = false;
     let mut progress: Option<Progress> = None;
+    let mut ruler_changed = false;
 
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -113,6 +123,15 @@ pub fn receipt(log: &Path) -> Receipt {
                     .to_string();
                 progress = payload.get("progress").and_then(Progress::from_value);
             }
+            // The refusal is a checkpoint on the ruler node with condition `Changed`, written before the
+            // run ends as `Ended::RulerChanged`. It means the check that passed is not the check that was
+            // frozen - the one case where a `state: passed` line must not be read as a pass.
+            "checkpoint"
+                if payload.get("node").and_then(Value::as_str) == Some("ruler")
+                    && payload.get("condition").and_then(Value::as_str) == Some("Changed") =>
+            {
+                ruler_changed = true;
+            }
             "checkpoint"
                 if payload.get("node").and_then(Value::as_str) == Some("awaiting")
                     || payload.get("condition").and_then(Value::as_str) == Some("Asked") =>
@@ -124,7 +143,9 @@ pub fn receipt(log: &Path) -> Receipt {
     }
 
     Receipt {
-        passed: check == "passed",
+        // A check that passed against a verifier the run refused to trust is not a pass this tool may
+        // report: `beats_base` and `--adopt` read this field.
+        passed: check == "passed" && !ruler_changed,
         answers,
         millis,
         prompt_tokens,
@@ -134,6 +155,7 @@ pub fn receipt(log: &Path) -> Receipt {
         awaiting,
         progress,
         holdout: None,
+        ruler_changed,
     }
 }
 
@@ -1152,6 +1174,22 @@ mod tests {
     );
 
     #[test]
+    fn a_run_the_ruler_refused_is_not_a_pass() {
+        // The log of a refused run ends with `state: passed`, because the check did pass against the
+        // verifier the run then refused to trust. A receipt that read only that line scored a tampered
+        // probe as a win, and `beats_base`/`--adopt` read the score.
+        let refused = format!(
+            "{RUN}{}\n",
+            r#"{"kind":"checkpoint","payload":{"node":"ruler","condition":"Changed","detail":"the protected file `tests/check.sh` changed","attempt":1}}"#
+        );
+        let path = log("refused", &refused);
+        let receipt = receipt(&path);
+        assert!(!receipt.passed, "a refused run was scored as a win");
+        assert!(receipt.ruler_changed);
+        assert!(receipt.line().contains("not a pass"), "{}", receipt.line());
+    }
+
+    #[test]
     fn a_receipt_reads_answers_cost_and_the_check() {
         let path = log("receipt", RUN);
         let receipt = receipt(&path);
@@ -1222,6 +1260,7 @@ mod tests {
                 awaiting: false,
                 progress: None,
                 holdout: None,
+                ruler_changed: false,
             },
             note: String::new(),
         }
@@ -2075,6 +2114,7 @@ mod progress_tests {
                     "failed".into()
                 },
                 awaiting: false,
+                ruler_changed: false,
                 progress: progress.map(|(passed, total)| Progress {
                     gate: false,
                     passed,

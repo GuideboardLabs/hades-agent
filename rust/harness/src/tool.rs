@@ -91,8 +91,14 @@ impl Tool for Shell {
         }
     }
 
+    /// A model's program, run under the scrubbed environment.
+    ///
+    /// Every program this tool runs was written by a model, so the child never sees the environment the
+    /// harness was started with: a repo script that prints `env` would otherwise read a provider key the
+    /// model was never given. The checker is not this tool; it runs as the caller's own command and keeps
+    /// the caller's environment (`verify.rs`), which is the deliberate difference.
     fn call(&self, call: &Call) -> Result<Run, Fault> {
-        command::run(&call.program, &self.root, self.limit, self.cage.as_ref())
+        command::run_clean(&call.program, &self.root, self.limit, self.cage.as_ref())
     }
 
     fn describe(&self) -> String {
@@ -100,5 +106,41 @@ impl Tool for Shell {
             Some(cage) => cage.describe(),
             None => "nothing is confined: the program runs with the caller's rights".to_string(),
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The surface the run graph uses, not `command::run_clean` directly: this is the test that fails when
+    /// the scrub is applied one layer below the tool the model's programs actually reach.
+    #[test]
+    fn the_tool_a_run_wires_runs_without_the_harness_environment() {
+        // The shell path a governed run builds: no cage, so nothing but the environment can confound this.
+        let root = crate::scratch::root().join(format!("tool-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        unsafe {
+            std::env::set_var("HADES_TOOL_SECRET", "«redacted:sk-…»");
+        }
+        let shell = Shell::new(&root, 100_000);
+        let run = shell
+            .call(&Call::new("env"))
+            .expect("the tool runs a program");
+        unsafe {
+            std::env::remove_var("HADES_TOOL_SECRET");
+        }
+
+        assert!(
+            !run.output.contains("HADES_TOOL_SECRET"),
+            "the tool handed the model's program the harness environment: {}",
+            run.output
+        );
+        assert!(
+            run.output.contains("PATH="),
+            "a shell still needs PATH: {}",
+            run.output
+        );
     }
 }

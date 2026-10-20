@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
   <img alt="Version" src="https://img.shields.io/badge/version-0.0.8-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-812%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-849%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 842 passing, 13 ignored live tests |
+| **Tests** | 849 passing, 13 ignored live tests |
 
 ---
 
@@ -74,19 +74,27 @@ never given, and a pass now carries what it cost.
   protected are hashed before the baseline run and re-hashed after every passing check. A change ends the
   run as `RulerChanged`, exit 1, with no accepted claim; the claim ladder refuses at `Attempted` before it
   reads the check, and a distilled case reads the ruler checkpoint from the log rather than trusting a
-  green line. `--protect <path>` adds a file or directory for one run. A file ruler cannot see inside an
-  inline `#[cfg(test)]` module in `src/`, which the help text says rather than pretends otherwise.
+  green line. `--protect <path>` adds a file or directory for one run. The shipped `fix` and `sweep`
+  profiles also freeze the build configuration (`Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml`,
+  `build.rs`), because those decide what the check runs: a `[target.*] runner` entry or a `[[test]] path`
+  is a way to move the verifier without touching a test file. Symlinks are entries in their own right, so a
+  link added under a protected directory is a change. A file ruler cannot see inside an inline
+  `#[cfg(test)]` module in `src/`, which the help text says rather than pretends otherwise.
 - **The browser has a scheme policy.** HTTP, HTTPS and `about:blank` only; `file://` is refused unless a
   fixture opts in. The policy is checked before `Page.navigate`, on every tab refresh (clicks, tab switches,
-  redirects) and before observation text is returned. Chromium starts with a cleared environment and a HOME
-  inside the state directory. The floor records `file:`, `data:`, `javascript:` and `vbscript:` opens as
+  redirects) and before observation text is returned; `upload` reads local files only under the same opt-in
+  that `file://` needs, because the browser runs outside the cage. Chromium starts with a cleared
+  environment and a HOME inside the state directory. The floor records `file:`, `data:`, `javascript:` and `vbscript:` opens as
   security access.
 - **A model-run shell cannot read the harness' keys.** The child starts from `env_clear` plus PATH, HOME,
-  TMPDIR, locale and the toolchain locations; the checker keeps the caller's environment because it is the
-  caller's own command.
-- **State is private.** One `state_dir` creator makes 0700 directories and tightens existing ones; scoreboard
-  rows and shadow manifests are 0600. Snapshots skip credential names (`.env`, `.netrc`, `.npmrc`,
-  `.git-credentials`, `id_*`, `*.pem`, `*.key`) and the manifest names what it skipped.
+  TMPDIR, locale and the toolchain locations; this is the tool every governed run gives the model, not only
+  the chat shell. The checker keeps the caller's environment because it is the caller's own command.
+- **State is private.** `state_dir` makes 0700 directories and tightens existing ones, and every path that
+  opens a session goes through it, so `turn`, `submit` and the daemon no longer leave a 0755 transcript
+  behind. Scoreboard rows and the generated HTTP token are 0600, the token created with the mode rather than
+  chmod'd after. Snapshots skip credential names (`.env`, `.netrc`, `.npmrc`, `.git-credentials`, `id_*`,
+  `credentials`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.tfstate`) and the manifest names what it skipped. A
+  directory is never treated as a credential, whatever it is called.
 - **The HTTP surface has no open mode.** Every bind needs a token, loopback included. With none configured
   the server generates one at `<state>/http.token` (0600) and reuses it on restart; the path is printed,
   never the token. Behind it, a present `Origin` must name the connected address and a POST must be
@@ -647,7 +655,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **812 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **849 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

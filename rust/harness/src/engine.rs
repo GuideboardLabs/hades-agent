@@ -130,6 +130,24 @@ impl Engine {
             }
         };
 
+        // The store creates `sessions/` with the process umask, so the private mode has to be in place
+        // first. Doing it here covers every command that opens a session, not only the creators that were
+        // routed through `scratch::state_dir` one at a time.
+        // The store's own directory too: it creates it on first write with the umask, and a transcript
+        // inside a private parent is safe but a directory a later mode change exposes is not.
+        if let Err(error) = crate::scratch::state_dir(&spec.state.join("sessions")) {
+            return Err(format!(
+                "could not protect {}: {error}",
+                spec.state.join("sessions").display()
+            ));
+        }
+        if let Err(error) = crate::scratch::state_dir(&spec.state) {
+            return Err(format!(
+                "could not protect {}: {error}",
+                spec.state.display()
+            ));
+        }
+
         Ok(Engine {
             task: TaskSpec::new(spec.goal, spec.root.clone()),
             profile: spec.profile,

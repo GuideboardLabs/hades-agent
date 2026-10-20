@@ -113,10 +113,18 @@ impl Subject {
         // to live under a directory called `target` is a snapshot of that tree; judging the whole absolute
         // path would find the ancestor and copy nothing, which is the quietest way to have no safety net.
         let judged = path.strip_prefix(&self.root).unwrap_or(path);
-        judged.components().any(|part| match part {
+        let parts: Vec<Component<'_>> = judged.components().collect();
+        // A directory is never a secret, whatever it is called: `src/id_gen/` is source, and pruning it
+        // would drop the subtree from every snapshot. Only the entry itself can be a credential file.
+        let is_dir = path.is_dir();
+        parts.iter().enumerate().any(|(index, part)| match part {
             Component::Normal(name) => {
                 let name = name.to_string_lossy();
-                self.ignore.iter().any(|ignored| name == ignored.as_str()) || secret_name(&name)
+                // The ignore list names directories as well as files, so it judges every component. The
+                // secret rule names *files*: a directory called `id_gen` or `keys.env` is source, and
+                // dropping it from the snapshot would leave a subtree `hades undo` silently cannot restore.
+                self.ignore.iter().any(|ignored| name == ignored.as_str())
+                    || (!is_dir && index + 1 == parts.len() && secret_name(&name))
             }
             _ => false,
         })
@@ -129,11 +137,16 @@ impl Subject {
 fn secret_name(name: &str) -> bool {
     matches!(
         name,
-        ".env" | ".netrc" | ".npmrc" | ".git-credentials" | ".htpasswd"
+        ".env" | ".netrc" | ".npmrc" | ".git-credentials" | ".htpasswd" | "credentials"
     ) || name.starts_with("id_")
         || name.ends_with(".pem")
         || name.ends_with(".key")
         || name.ends_with(".env")
+        // Certificate bundles and infrastructure state hold the same kind of secret as a `.pem`, and the
+        // shadow is written where it outlives the run.
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.ends_with(".tfstate")
 }
 
 /// What a restore did. A restore that did nothing says so with numbers rather than with `ok`.

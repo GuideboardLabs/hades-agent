@@ -235,7 +235,10 @@ hades — the harness, one turn or a whole graph
       write and again after the check, and an edit ends the run as refused. A file ruler
       does not cover inline `#[cfg(test)]` modules inside `src/*.rs`; move the tests to
       `tests/` or name the script the check runs. With no protected path the receipt says
-      `ruler: command only`
+      `ruler: command only`. The shipped fix and sweep profiles also freeze the build
+      configuration - `Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml`, `build.rs` -
+      because those decide what the check runs: a fix that must change the manifest is two
+      steps, change it and then run.
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
@@ -415,6 +418,12 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
                 return Err(format!("`{key}` has to be a string or a number"));
             }
         };
+        // One path and a list of paths mean the same thing. `protect_of` reads the repeatable form, so a
+        // string left only in `named` was silently dropped and the caller believed the path was frozen.
+        if key == "protect" {
+            flags.repeated.insert(key.to_string(), vec![given]);
+            continue;
+        }
         flags.named.insert(key.to_string(), given);
     }
 
@@ -3606,8 +3615,11 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         ),
         None => String::new(),
     };
+    // A run with no boundary says so on its receipt, the way `hades turn` does: a person reading
+    // `--cage off` output otherwise sees the same shape as a confined run.
+    let cage_line = engine.cage();
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}{ruler_line}context: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}{ruler_line}cage:    {cage_line}\ncontext: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
         session.id(),
         session.len(),
         session.len() - before,
@@ -4130,8 +4142,21 @@ fn token_of(flags: &Flags, state: &std::path::Path) -> Result<String, String> {
     let token = new_token()?;
     crate::scratch::state_dir(state)
         .map_err(|error| format!("could not make {}: {error}", state.display()))?;
-    std::fs::write(&path, format!("{token}\n"))
-        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    // Created with the mode, not chmod'd after: a token that exists at the umask for even a moment is a
+    // token another local user can read. `private_file` stays as the assertion that it holds.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        file.write_all(format!("{token}\n").as_bytes())
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
     crate::scratch::private_file(&path)
         .map_err(|error| format!("could not protect {}: {error}", path.display()))?;
     eprintln!(
@@ -4280,7 +4305,18 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
         let tokens = value
             .parse::<u64>()
             .map_err(|_| format!("`--budget-tokens {value}` is not a number"))?;
-        crate::graph::budget_tokens(tokens, None)?;
+        // The cap this submit will send, when it names one: the floor depends on it, and checking against
+        // the default while the request asks for another cap is how a budget that cannot run got through.
+        let cap = flags
+            .named
+            .get("max-tokens")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("`--max-tokens {value}` is not a number"))
+            })
+            .transpose()?;
+        crate::graph::budget_tokens(tokens, cap)?;
     }
     let state = state_of(&flags)?;
     let socket = crate::daemon::live(&state).ok_or_else(|| {

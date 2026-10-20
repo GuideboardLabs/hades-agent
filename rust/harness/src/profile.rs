@@ -152,6 +152,12 @@ impl Protect {
         }
         let trailing = spec.ends_with('/') || spec.ends_with('\\');
         let bare = spec.trim_end_matches(['/', '\\']);
+        // `./tests` is the same path as `tests`. Refusing it taught a person that their correct path was
+        // wrong, so the leading `./` is dropped here rather than rejected below.
+        let bare = bare.trim_start_matches("./").trim_start_matches(".\\");
+        if bare.is_empty() || bare == "." {
+            return Err(format!("`{spec}` names no path under the root"));
+        }
         let rule = if trailing || root.join(bare).is_dir() {
             Protect::Dir(bare.to_string())
         } else {
@@ -266,6 +272,26 @@ impl Profile {
     }
 }
 
+/// What the shipped editing profiles freeze: the files whose contents decide what the check runs.
+///
+/// `tests/` and `benches/` are the verifier itself. The four build-configuration files are here because a
+/// file ruler that hashes only the test tree can still be moved: `[target.*] runner` in `.cargo/config.toml`
+/// turns `cargo test` into a no-op that exits zero, and a `[[test]] path`/`harness = false` in `Cargo.toml`
+/// points the check at a file that always passes. The cost is deliberate and stated in the help text: a fix
+/// that must change the manifest is two steps - change it, then run - because a manifest edited during a run
+/// is a check whose meaning moved.
+fn build_config() -> Vec<Protect> {
+    vec![
+        Protect::Dir("tests".to_string()),
+        Protect::Dir("benches".to_string()),
+        Protect::Suffix("_test.rs".to_string()),
+        Protect::File("Cargo.toml".to_string()),
+        Protect::File(".cargo/config.toml".to_string()),
+        Protect::File("rust-toolchain.toml".to_string()),
+        Protect::File("build.rs".to_string()),
+    ]
+}
+
 /// The profiles this build ships. Rules name them, and nothing here is tuned: these are the starting
 /// parameters, listed in one place so that changing one is a visible act rather than a scattered edit.
 pub fn shipped() -> Vec<Profile> {
@@ -283,11 +309,7 @@ pub fn shipped() -> Vec<Profile> {
             shadow: true,
             attempts: 3,
             minutes: 10,
-            protect: vec![
-                Protect::Dir("tests".to_string()),
-                Protect::Dir("benches".to_string()),
-                Protect::Suffix("_test.rs".to_string()),
-            ],
+            protect: build_config(),
             network: true,
         },
         Profile {
@@ -303,11 +325,7 @@ pub fn shipped() -> Vec<Profile> {
             shadow: true,
             attempts: 4,
             minutes: 30,
-            protect: vec![
-                Protect::Dir("tests".to_string()),
-                Protect::Dir("benches".to_string()),
-                Protect::Suffix("_test.rs".to_string()),
-            ],
+            protect: build_config(),
             network: true,
         },
         Profile {
@@ -423,6 +441,47 @@ mod tests {
             shipped().iter().any(|profile| !profile.protect.is_empty()),
             "the absence above is vacuous if no profile protects anything"
         );
+    }
+
+    #[test]
+    fn the_shipped_editing_profiles_freeze_the_build_configuration() {
+        // The files that decide what `cargo test` runs are part of the verifier. Without them a model
+        // rewrote `.cargo/config.toml`'s runner and turned a red check into exit 0 with no test run.
+        for profile in shipped().iter().filter(|profile| profile.edits) {
+            let names: Vec<String> = profile
+                .protect
+                .iter()
+                .filter_map(|rule| match rule {
+                    Protect::File(spec) => Some(spec.clone()),
+                    _ => None,
+                })
+                .collect();
+            for required in [
+                "Cargo.toml",
+                ".cargo/config.toml",
+                "rust-toolchain.toml",
+                "build.rs",
+            ] {
+                assert!(
+                    names.iter().any(|name| name == required),
+                    "{} does not freeze {required}: {names:?}",
+                    profile.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_protect_path_with_a_leading_dot_slash_is_the_same_path() {
+        // `--protect ./tests` is what a person types. It used to be refused as escaping the root.
+        let root = std::env::temp_dir().join(format!("hades-protect-dot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tests")).expect("a directory");
+        for spec in ["./tests", "tests", "tests/"] {
+            let rule = Protect::parse(spec, &root).expect(spec);
+            assert!(matches!(rule, Protect::Dir(_)), "{spec} gave {rule:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

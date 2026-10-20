@@ -796,8 +796,14 @@ fn page(args: &Value) -> Option<Floor> {
     // A URL scheme is a read primitive: `file://` renders the local filesystem, and the other three run
     // code the harness never parsed. This is a floor beside the browser's own policy, not a replacement
     // for it: the policy is what refuses before `Page.navigate`, and this is what an audit reads.
-    if action == "open" {
-        let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
+    if matches!(action, "open" | "new_tab" | "new_context") {
+        // Trimmed first: the policy trims and refuses ` file:///x`, so an untrimmed read here would let
+        // the refusal happen with no line in the audit trail.
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
         let scheme = url
             .split_once(':')
             .map(|(scheme, _)| scheme.to_ascii_lowercase())

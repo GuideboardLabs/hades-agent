@@ -391,6 +391,50 @@ fn a_secret_is_not_copied_and_the_manifest_names_it() {
         "the manifest does not name the key: {:?}",
         manifest.skipped_names
     );
-    let restored = shadows.manifest(&id).expect("a manifest");
-    assert_eq!(restored.skipped_names.len(), 2);
+    // A real restore, not a second read of the manifest: the skipped files must be left exactly as they
+    // are, and the run's other writes must come back. The secret's bytes are read from disk rather than
+    // written as a literal here, so this test never needs to know what a credential looks like.
+    let secret_before = read(&root.join(".env"));
+    write(&root.join("notes.txt"), "changed by the model\n");
+    write(&root.join("invented.txt"), "new\n");
+    let restored = shadows
+        .restore(&Subject::new("cli", &root), &id)
+        .expect("a restore");
+    assert_eq!(read(&root.join("notes.txt")), "hello\n");
+    assert!(
+        !root.join("invented.txt").exists(),
+        "the restore removed it"
+    );
+    assert_eq!(
+        read(&root.join(".env")),
+        secret_before,
+        "a skipped secret was rewritten or removed by the restore"
+    );
+    assert!(restored.removed >= 1, "{}", restored.line());
+}
+
+#[test]
+fn a_directory_whose_name_looks_like_a_secret_is_still_snapshotted() {
+    // The secret rule names files. Applying it to every path component dropped a whole subtree from the
+    // snapshot whenever a directory happened to be called `id_gen` or `keys.env`, and `hades undo` then
+    // silently could not restore it.
+    let root = scratch("secret-dir");
+    write(&root.join("src/id_gen/mod.rs"), "pub fn make() {}\n");
+    write(&root.join("src/lib.rs"), "pub fn a() {}\n");
+    let store = scratch("secret-dir-store");
+    let shadows = Shadows::new(&store);
+    let id = taken(
+        shadows
+            .snapshot(&Subject::new("cli", &root))
+            .expect("a snapshot"),
+    );
+    let manifest = shadows.manifest(&id).expect("a manifest");
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.path == "src/id_gen/mod.rs"),
+        "a directory named like a secret was dropped: {:?}",
+        manifest.files
+    );
 }
