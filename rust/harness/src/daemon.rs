@@ -345,9 +345,28 @@ impl Daemon {
             _ => std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()),
         };
 
-        let answer = self
-            .broker()?
-            .resolve(PendingId(id), decision, scope, &by)?;
+        let option = text(request, "option");
+        let note = text(request, "note");
+        let broker = self.broker()?;
+        let answer = if option.is_empty() {
+            broker.resolve(PendingId(id), decision, scope, &by)?
+        } else if option == "other" {
+            broker.resolve_answer(
+                PendingId(id),
+                decision,
+                scope,
+                Some("other"),
+                (!note.is_empty()).then_some(note.as_str()),
+                &by,
+            )?
+        } else {
+            broker.resolve_choice(
+                PendingId(id),
+                &option,
+                (!note.is_empty()).then_some(note.as_str()),
+                &by,
+            )?
+        };
         Ok(json!({
             "ok": true,
             "id": id,

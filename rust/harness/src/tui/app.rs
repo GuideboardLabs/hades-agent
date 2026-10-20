@@ -370,11 +370,50 @@ impl App {
         let Ok(questions) = broker.questions() else {
             return;
         };
-        let mine = questions
+        let mine: Vec<_> = questions
             .into_iter()
             .filter(|question| question.request.session == self.id)
             .collect();
         self.ask.set(mine);
+        // The Approvals view is the same questions with the same options, for a person who prefers a list.
+        self.overview.approvals = self
+            .ask
+            .questions
+            .iter()
+            .map(|question| {
+                let ask = question.request.ask.clone();
+                let detail = ask
+                    .as_ref()
+                    .map(|ask| {
+                        ask.options
+                            .iter()
+                            .map(|choice| {
+                                format!(
+                                    "{}{} {}",
+                                    if choice.recommended { "▸ " } else { "" },
+                                    choice.key,
+                                    choice.label
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    })
+                    .unwrap_or_else(|| question.request.reason.clone());
+                Row {
+                    id: format!("#{}", question.request.id.0),
+                    title: ask
+                        .as_ref()
+                        .map(|ask| ask.prompt.clone())
+                        .unwrap_or_else(|| question.request.action.clone()),
+                    detail,
+                    status: ask
+                        .as_ref()
+                        .map(|ask| if ask.blocking { "blocking" } else { "advisory" })
+                        .unwrap_or("waiting")
+                        .to_string(),
+                }
+            })
+            .collect();
     }
 
     /// Answer the question the bar is showing. `other` records the input text as the note; for a
@@ -429,6 +468,14 @@ impl App {
                     .retain(|pending| pending.request.id != question.request.id);
                 self.input.set(String::new());
                 self.last_ask_poll = None;
+                if let Some(ask) = question.request.ask.clone() {
+                    let _ = crate::taste::record(
+                        &self.options.state,
+                        &self.options.root,
+                        &ask,
+                        &answer,
+                    );
+                }
                 let label = question
                     .request
                     .ask
@@ -1168,7 +1215,18 @@ impl App {
                     self.status = error;
                 }
             }
-            View::Approvals => self.open_overlay(Overlay::Approval(row)),
+            View::Approvals => {
+                if !self.ask.questions.is_empty() {
+                    self.ask.active = self.selected.min(self.ask.questions.len() - 1);
+                    self.ask.option = self.ask.recommended().unwrap_or(0);
+                    self.ask.focus = Some(super::ask::Focus::Options);
+                    self.ask.collapsed = false;
+                    self.view = View::Chat;
+                    self.status = "Answer in the bar below; Enter takes the selected option".into();
+                } else {
+                    self.open_overlay(Overlay::Approval(row));
+                }
+            }
             _ => self.open_overlay(Overlay::Detail(row.title, row.detail)),
         }
     }

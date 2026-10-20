@@ -143,6 +143,9 @@ impl Choice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ask {
     pub kind: AskKind,
+    /// A stable name for the family of question, so a preference can be learned for "storage" without
+    /// tying it to one wording. Empty means: derive it from the prompt.
+    pub family: String,
     pub prompt: String,
     pub why: String,
     /// A blocking question stops the run. An advisory one takes the default and continues.
@@ -157,6 +160,7 @@ impl Ask {
     pub fn permission(prompt: impl Into<String>, why: impl Into<String>) -> Self {
         Ask {
             kind: AskKind::Permission,
+            family: "permission".into(),
             prompt: prompt.into(),
             why: why.into(),
             blocking: true,
@@ -192,12 +196,22 @@ impl Ask {
         blocking: bool,
         options: Vec<Choice>,
     ) -> Self {
+        // A blocking question always has a safe default: its own recommendation, if it named one.
+        let default = if blocking {
+            options
+                .iter()
+                .find(|choice| choice.recommended)
+                .map(|choice| choice.key.clone())
+        } else {
+            None
+        };
         Ask {
             kind: AskKind::Choice,
+            family: String::new(),
             prompt: prompt.into(),
             why: why.into(),
             blocking,
-            default: None,
+            default,
             options,
         }
     }
@@ -339,9 +353,19 @@ impl Ask {
         Ok(())
     }
 
+    /// The family this question belongs to. Permissions are their own family; a choice uses the explicit
+    /// family or a slug of its prompt, which is stable enough to learn from and short enough to print.
+    pub fn family(&self) -> String {
+        if !self.family.is_empty() {
+            return self.family.clone();
+        }
+        slug(&self.prompt)
+    }
+
     pub fn json(&self) -> Value {
         json!({
             "kind": self.kind.name(),
+            "family": self.family(),
             "prompt": self.prompt,
             "why": self.why,
             "blocking": self.blocking,
@@ -387,6 +411,7 @@ impl Ask {
             .collect::<Result<Vec<_>, String>>()?;
         let ask = Ask {
             kind,
+            family: value["family"].as_str().unwrap_or("").to_string(),
             prompt: text("prompt")?,
             why: text("why")?,
             blocking: value["blocking"].as_bool().unwrap_or(false),
@@ -437,10 +462,22 @@ impl Budget {
     }
 }
 
+/// An answer that arrived after the run had already taken its recommendation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Late {
+    pub id: PendingId,
+    pub assumed: String,
+    pub chosen: Option<String>,
+    pub note: Option<String>,
+}
+
 /// The question surface a chat is handed: one broker, one budget, and the wait.
 pub struct Desk {
     broker: Arc<dyn ApprovalBroker + Send + Sync>,
     budget: Budget,
+    /// Questions the run moved past. Their answers are delivered at the next step boundary instead of
+    /// pretending the work can be rewound.
+    assumed: std::sync::Mutex<Vec<(PendingId, String)>>,
 }
 
 impl std::fmt::Debug for Desk {
@@ -456,7 +493,38 @@ impl Desk {
         Arc::new(Desk {
             broker,
             budget: Budget::new(limit),
+            assumed: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Remember that the run continued without this answer, so a later answer can be delivered.
+    pub fn note_assumed(&self, id: PendingId, key: &str) {
+        if let Ok(mut assumed) = self.assumed.lock() {
+            assumed.push((id, key.to_string()));
+        }
+    }
+
+    /// Answers that arrived for questions already assumed. Each is delivered once.
+    pub fn drain_late(&self) -> Vec<Late> {
+        let Ok(mut assumed) = self.assumed.lock() else {
+            return Vec::new();
+        };
+        let mut late = Vec::new();
+        assumed.retain(|(id, key)| match self.broker.answer(*id) {
+            Ok(Some(answer)) => {
+                if answer.option.as_deref() != Some(key.as_str()) || answer.note.is_some() {
+                    late.push(Late {
+                        id: *id,
+                        assumed: key.clone(),
+                        chosen: answer.option,
+                        note: answer.note,
+                    });
+                }
+                false
+            }
+            _ => true,
+        });
+        late
     }
 
     /// A floor question. Permissions do not spend the model's question budget: safety is not a quota.
@@ -511,6 +579,27 @@ impl Desk {
     pub fn left(&self) -> u32 {
         self.budget.left()
     }
+}
+
+/// A stable, printable family name from a question's wording.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push('.');
+            }
+            gap = false;
+            out.extend(ch.to_lowercase());
+        } else {
+            gap = true;
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    if out.is_empty() { "choice".into() } else { out }
 }
 
 #[cfg(test)]
@@ -580,6 +669,12 @@ mod tests {
             true,
             vec![choice("a", true), choice("b", false)],
         );
+        assert_eq!(
+            ask.default.as_deref(),
+            Some("a"),
+            "a blocking choice takes its recommendation as the default"
+        );
+        ask.default = None;
         assert!(ask.validate().unwrap_err().contains("default"));
         ask.default = Some("missing".into());
         assert!(ask.validate().unwrap_err().contains("not an option"));
@@ -609,5 +704,37 @@ mod tests {
         assert!(budget.take());
         assert!(!budget.take());
         assert_eq!(budget.left(), 0);
+    }
+
+    #[test]
+    fn an_answer_after_an_assumption_is_delivered_once() {
+        use crate::approval::{ApprovalBroker as _, InMemory};
+        let broker = Arc::new(InMemory::new());
+        let desk = Desk::new(broker.clone(), 3);
+        let ask = Ask::choice(
+            "Which store?",
+            "both fit",
+            false,
+            vec![
+                Choice::new("sqlite", "SQLite", "one file", Effect::Free).recommended(),
+                Choice::new("postgres", "Postgres", "a server", Effect::Free),
+            ],
+        );
+        let prompt = ask.prompt.clone();
+        let request = desk
+            .choice("chat", "question", &prompt, ask)
+            .expect("the question is recorded")
+            .expect("a question");
+        desk.note_assumed(request.id, "sqlite");
+        assert!(desk.drain_late().is_empty(), "nothing answered yet");
+        broker
+            .resolve_choice(request.id, "postgres", Some("we run one"), "tui")
+            .expect("the late answer");
+        let late = desk.drain_late();
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].assumed, "sqlite");
+        assert_eq!(late[0].chosen.as_deref(), Some("postgres"));
+        assert_eq!(late[0].note.as_deref(), Some("we run one"));
+        assert!(desk.drain_late().is_empty(), "delivered once");
     }
 }

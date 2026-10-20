@@ -718,6 +718,24 @@ pub fn answer_stoppable(
                 }));
             }
         }
+        // An answer to a question the run already moved past. It arrives here, at a step boundary, with
+        // the assumption it replaces. Nothing already done is rewound.
+        if let Some(desk) = &world.questions {
+            for late in desk.drain_late() {
+                let chosen = late.chosen.unwrap_or_else(|| "no option".into());
+                let note = late
+                    .note
+                    .map(|note| format!(" Their note: {note}"))
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "user",
+                    "content": format!(
+                        "[the person answered question #{} after you had assumed `{}`. They chose `{}`.{} Continue from here; work already done is not rewound.]",
+                        late.id.0, late.assumed, chosen, note
+                    )
+                }));
+            }
+        }
         if !world.allowance.take() {
             return Err(Fault::model(
                 "the shared model-call allowance is spent; the tree is bounded".to_string(),
@@ -1112,6 +1130,36 @@ fn ask_tool(args: &Value, world: &World, stop: Option<&AtomicBool>) -> String {
             "The question was refused: {said}. Fix it and ask again, or decide yourself and say which you assumed."
         );
     }
+    ask.family = args["kind"].as_str().unwrap_or("").to_string();
+    // What this root has already taught us about this family of question.
+    let entries = crate::taste::read(&world.state).unwrap_or_default();
+    let learned = crate::taste::learn(&entries, &world.root.to_string_lossy(), &ask.family());
+    if learned.auto
+        && let Some(key) = learned.recommendation.clone()
+    {
+        return json!({
+            "assumed (learned)": key,
+            "note": "the last five answers agreed, so this question was not asked; say so if this one should differ"
+        })
+        .to_string();
+    }
+    if let Some(key) = learned.recommendation.clone()
+        && ask.option(&key).is_some()
+    {
+        for choice in &mut ask.options {
+            choice.recommended = choice.key == key;
+        }
+        let position = ask
+            .options
+            .iter()
+            .position(|choice| choice.key == key)
+            .unwrap_or(0);
+        let choice = ask.options.remove(position);
+        ask.options.insert(0, choice);
+        if ask.blocking {
+            ask.default = Some(key);
+        }
+    }
     let request = match desk.choice(&world.session, "question", &ask.prompt, ask.clone()) {
         Ok(Some(request)) => request,
         Ok(None) => {
@@ -1126,6 +1174,10 @@ fn ask_tool(args: &Value, world: &World, stop: Option<&AtomicBool>) -> String {
     } else {
         None
     };
+    if answer.is_none() {
+        // The run is moving on. A later answer is delivered at the next step boundary.
+        desk.note_assumed(request.id, &ask.fallback());
+    }
     let key = answer
         .as_ref()
         .and_then(|answer| answer.option.clone())
@@ -4907,6 +4959,64 @@ mod tests {
         let said = worker.join().expect("the tool thread");
         assert!(said.contains("\"option\":\"postgres\""), "{said}");
         assert!(said.contains("we already run one"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Five agreeing answers turn a choice into an assumption: no bar, no budget spent, and the result
+    /// says it was learned rather than guessed.
+    #[test]
+    fn a_learned_choice_is_not_asked_again_and_says_so() {
+        let dir = crate::scratch::root().join("agent-taste-auto");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).expect("a state directory");
+        let mut world = world_at(&dir, Mode::Plan, "chat:test");
+        world.questions = Some(crate::question::Desk::new(
+            std::sync::Arc::new(crate::approval::InMemory::new()),
+            6,
+        ));
+        let mut ask = crate::question::Ask::choice(
+            "Which store?",
+            "both fit",
+            false,
+            vec![
+                crate::question::Choice::new(
+                    "postgres",
+                    "Postgres",
+                    "a server",
+                    crate::question::Effect::Free,
+                )
+                .recommended(),
+                crate::question::Choice::new(
+                    "sqlite",
+                    "SQLite",
+                    "one file",
+                    crate::question::Effect::Free,
+                ),
+            ],
+        );
+        ask.family = "storage".into();
+        for _ in 0..5 {
+            let answer = crate::approval::Answer {
+                decision: Decision::Allow,
+                scope: crate::approval::Scope::Once,
+                by: "test".into(),
+                at: "2026-10-20T12:00:00Z".into(),
+                option: Some("postgres".into()),
+                note: None,
+            };
+            crate::taste::record(&dir.join("state"), &dir, &ask, &answer)
+                .expect("a recorded answer");
+        }
+        let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+        let said = execute(
+            "ask",
+            r#"{"kind":"storage","prompt":"Which store?","why":"both fit","blocking":true,"options":[{"key":"postgres","label":"Postgres","detail":"a server","recommended":true},{"key":"sqlite","label":"SQLite","detail":"one file"}]}"#,
+            &world,
+            &client,
+            &|_, _| {},
+        );
+        assert!(said.contains("assumed (learned)"), "{said}");
+        assert!(said.contains("postgres"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

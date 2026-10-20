@@ -129,10 +129,18 @@ hades — the harness, one turn or a whole graph
       write the record out as markdown; a file a hand edited is refused unless --force
 
   hades approvals [--state <dir>]
-      every question that has been asked, and what came of it
+      every question that has been asked, with its options and what came of it
 
-  hades answer <id> <allow|deny> [--scope once|session] [--by <who>] [--state <dir>]
-      answer a question, from this process or any other
+  hades answer <id> <option|allow|deny> [--note <text>] [--scope once|session] [--by <who>]
+      answer a question, from this process or any other; `other` is a decline with a note
+
+  hades log --asks <session> [--state <dir>]
+      every question and answer for one session, as the record has them
+
+  hades taste [--state <dir>]
+      what the answers have taught: recommendations, streaks, and deny proposals
+  hades taste forget <n|all> [--state <dir>]
+      remove one line of the ledger, or all of them
 
   hades undo <session> [--to <n|latest>] [--state <dir>] [--root <dir>]
       put the tree back the way a shadow snapshot found it
@@ -307,6 +315,8 @@ fn dispatch(
         "mneme" => mneme(rest),
         "approvals" => approvals(rest),
         "answer" => answer(rest),
+        "taste" => taste_cmd(rest),
+        "log" => log_cmd(rest),
         "turn" => turn(rest),
         "run" => run_graph(rest),
         "fork" => fork(rest),
@@ -3626,35 +3636,76 @@ fn approvals(args: &[String]) -> Result<(String, i32), String> {
     let questions = broker
         .questions()
         .map_err(|fault| format!("could not read the record of questions: {}", fault.detail()))?;
-
     if questions.is_empty() {
         return Ok(("no questions have been asked\n".to_string(), 0));
     }
-
-    let mut text = String::from("id    session        action   answer\n");
+    let mut text = String::new();
     for question in &questions {
-        let answer = match &question.answer {
-            Some(answer) => format!(
-                "{} {} by {} at {}",
-                answer.decision.name(),
-                answer.scope.name(),
-                answer.by,
-                answer.at
-            ),
-            None => "waiting".to_string(),
-        };
-        text.push_str(&format!(
-            "{:<5} {:<14} {:<8} {}\n",
-            question.request.id, question.request.session, question.request.action, answer
-        ));
+        text.push_str(&question_text(question, true));
+        text.push('\n');
     }
     Ok((text, 0))
 }
 
-/// Answer a question. The surface the design asks for: any process, any order, and the answer is recorded
-/// with who gave it and how long it lasts.
+/// One question, its options and its answer, in the form both `approvals` and `log --asks` print.
+fn question_text(question: &crate::approval::Question, with_session: bool) -> String {
+    let request = &question.request;
+    let mut text = format!("#{}", request.id.0);
+    if with_session {
+        text.push_str(&format!("  {}", request.session));
+    }
+    text.push('\n');
+    match &request.ask {
+        Some(ask) => {
+            text.push_str(&format!("  {}\n", ask.prompt));
+            if !ask.why.is_empty() {
+                text.push_str(&format!("  why: {}\n", ask.why));
+            }
+            for choice in &ask.options {
+                text.push_str(&format!(
+                    "  {} {:<14} {}{}\n",
+                    if choice.recommended { "▸" } else { " " },
+                    choice.key,
+                    choice.label,
+                    if choice.recommended {
+                        "  (recommended)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+        None => text.push_str(&format!(
+            "  {}\n  why: {}\n",
+            request.action, request.reason
+        )),
+    }
+    match &question.answer {
+        Some(answer) => {
+            let mut line = format!(
+                "  -> {} {} by {}",
+                answer.decision.name(),
+                answer.scope.name(),
+                answer.by
+            );
+            if let Some(option) = &answer.option {
+                line.push_str(&format!(" option {option}"));
+            }
+            if let Some(note) = &answer.note {
+                line.push_str(&format!(" note: {note}"));
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        None => text.push_str("  -> waiting\n"),
+    }
+    text
+}
+
+/// Answer a question. The option key is the normal form; `allow` and `deny` remain for a legacy question
+/// with no options, and `other` is the decline-with-a-steer.
 fn answer(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(args, &["scope", "by", "state"])?;
+    let flags = parse(args, &["scope", "by", "state", "note"])?;
     let id = flags
         .positional
         .first()
@@ -3662,17 +3713,17 @@ fn answer(args: &[String]) -> Result<(String, i32), String> {
         .trim_start_matches('#')
         .parse::<u64>()
         .map_err(|_| "the question id is a number".to_string())?;
-    let decision = match flags.positional.get(1).map(String::as_str) {
-        Some("allow") => Decision::Allow,
-        Some("deny") => Decision::Deny,
-        Some(other) => return Err(format!("`{other}` is not an answer: say allow or deny")),
-        None => return Err("answer needs allow or deny".to_string()),
-    };
+    let given = flags
+        .positional
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "answer needs an option key, allow, or deny".to_string())?;
+    let note = flags.named.get("note").map(String::as_str);
     let scope = match flags
         .named
         .get("scope")
         .map(String::as_str)
-        .unwrap_or("session")
+        .unwrap_or("once")
     {
         "once" => Scope::Once,
         "session" => Scope::Session,
@@ -3684,23 +3735,58 @@ fn answer(args: &[String]) -> Result<(String, i32), String> {
         .cloned()
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "unknown".to_string());
-
     let state = state_of(&flags)?;
-    // One writer for the question record. `approvals.jsonl` is append-only with no lock and assumes a single
-    // writer, so when a daemon is running it owns that file and the answer goes to it rather than being
-    // appended here. The common case is stopped; a lock the file does not have is not claimed.
+    let broker = OnDisk::open(state.join("approvals.jsonl"))
+        .map_err(|fault| format!("could not open the record of questions: {}", fault.detail()))?;
+    let questions = broker
+        .questions()
+        .map_err(|fault| format!("could not read the record of questions: {}", fault.detail()))?;
+    let question = questions
+        .iter()
+        .find(|question| question.request.id == PendingId(id))
+        .ok_or_else(|| format!("no question #{id} was ever asked"))?;
+    let ask = question.request.ask.clone();
+    let option = match given.as_str() {
+        "allow" => (Decision::Allow, None),
+        "deny" => (Decision::Deny, None),
+        "other" => {
+            let decision = match ask.as_ref().map(|ask| ask.kind) {
+                Some(crate::question::AskKind::Choice) => Decision::Allow,
+                _ => Decision::Deny,
+            };
+            (decision, Some("other"))
+        }
+        key if ask.as_ref().is_some_and(|ask| ask.option(key).is_some()) => {
+            (Decision::Allow, Some(key))
+        }
+        other => {
+            let keys = ask
+                .as_ref()
+                .map(|ask| {
+                    ask.options
+                        .iter()
+                        .map(|choice| choice.key.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "allow, deny".into());
+            return Err(format!("`{other}` is not an option; keys: {keys}"));
+        }
+    };
+
+    // One writer for the question record: a live daemon owns it and the answer goes to it.
+    let payload = serde_json::json!({
+        "op": "answer",
+        "id": id,
+        "decision": option.0.name(),
+        "scope": scope.name(),
+        "option": option.1.unwrap_or(""),
+        "note": note.unwrap_or(""),
+        "by": by,
+    });
     if let Some(socket) = crate::daemon::live(&state) {
-        let reply = crate::daemon::ask(
-            &socket,
-            serde_json::json!({
-                "op": "answer",
-                "id": id,
-                "decision": decision.name(),
-                "scope": scope.name(),
-                "by": by,
-            }),
-        )
-        .map_err(|fault| fault.detail().to_string())?;
+        let reply =
+            crate::daemon::ask(&socket, payload).map_err(|fault| fault.detail().to_string())?;
         let code = if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
             0
         } else {
@@ -3709,11 +3795,25 @@ fn answer(args: &[String]) -> Result<(String, i32), String> {
         return Ok((format!("{reply}\n"), code));
     }
 
-    let broker = OnDisk::open(state.join("approvals.jsonl"))
-        .map_err(|fault| format!("could not open the record of questions: {}", fault.detail()))?;
-    let answer = broker
-        .resolve(PendingId(id), decision, scope, &by)
-        .map_err(|fault| fault.detail().to_string())?;
+    let answer = match option.1 {
+        Some("other") => broker
+            .resolve_answer(PendingId(id), option.0, scope, Some("other"), note, &by)
+            .map_err(|fault| fault.detail().to_string())?,
+        Some(key) => broker
+            .resolve_choice(PendingId(id), key, note, &by)
+            .map_err(|fault| fault.detail().to_string())?,
+        None => broker
+            .resolve(PendingId(id), option.0, scope, &by)
+            .map_err(|fault| fault.detail().to_string())?,
+    };
+
+    // Learn from the answer where the session log can tell us the root. A missing log is not an error:
+    // the answer is recorded, it just cannot teach this root.
+    if let Some(ask) = &ask
+        && let Ok(facts) = crate::distill::load(&state, &question.request.session)
+    {
+        let _ = crate::taste::record(&state, &facts.root, ask, &answer);
+    }
 
     Ok((
         format!(
@@ -3729,6 +3829,97 @@ fn answer(args: &[String]) -> Result<(String, i32), String> {
         ),
         0,
     ))
+}
+
+/// Every question and answer for one session, as the record has them.
+fn log_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state"], &["asks"])?;
+    if !flags.named.contains_key("asks") {
+        return Err("log takes one form: `hades log --asks <session>`".to_string());
+    }
+    let session = flags
+        .positional
+        .first()
+        .ok_or_else(|| "log --asks needs a session id".to_string())?;
+    let state = state_of(&flags)?;
+    let broker = OnDisk::open(state.join("approvals.jsonl"))
+        .map_err(|fault| format!("could not open the record of questions: {}", fault.detail()))?;
+    let questions = broker
+        .questions()
+        .map_err(|fault| format!("could not read the record of questions: {}", fault.detail()))?;
+    let mine: Vec<_> = questions
+        .iter()
+        .filter(|question| &question.request.session == session)
+        .collect();
+    if mine.is_empty() {
+        return Ok((format!("no questions for {session}\n"), 0));
+    }
+    let mut text = String::new();
+    for question in mine {
+        text.push_str(&question_text(question, false));
+        text.push('\n');
+    }
+    Ok((text, 0))
+}
+
+/// What the answers have taught, and how to forget it.
+fn taste_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse(args, &["state"])?;
+    let state = state_of(&flags)?;
+    match flags.positional.first().map(String::as_str) {
+        None => {
+            let entries = crate::taste::read(&state)
+                .map_err(|fault| format!("could not read taste: {}", fault.detail()))?;
+            if entries.is_empty() {
+                return Ok(("taste: no answers recorded yet\n".to_string(), 0));
+            }
+            let mut text = String::new();
+            for (root, family) in crate::taste::families(&entries) {
+                let learned = crate::taste::learn(&entries, &root, &family);
+                let count = entries
+                    .iter()
+                    .filter(|entry| entry.root == root && entry.kind == family)
+                    .count();
+                text.push_str(&format!("{root}\n  {family}: {count} answers"));
+                if let Some(key) = &learned.recommendation {
+                    text.push_str(&format!(", recommendation {key}"));
+                }
+                if learned.streak > 0 {
+                    text.push_str(&format!(", {} in a row agreed", learned.streak));
+                }
+                text.push_str(if learned.auto {
+                    ", asking is off\n"
+                } else {
+                    "\n"
+                });
+            }
+            for (root, family, count) in crate::taste::deny_proposals(&entries) {
+                text.push_str(&format!(
+                    "proposal: {root} {family}: {count} declines with Other; consider a never rule\n"
+                ));
+            }
+            Ok((text, 0))
+        }
+        Some("forget") => {
+            let which = flags
+                .positional
+                .get(1)
+                .ok_or_else(|| "taste forget needs a line number or all".to_string())?;
+            let removed = if which == "all" {
+                crate::taste::forget(&state, None)
+            } else {
+                let index = which
+                    .parse::<usize>()
+                    .map_err(|_| "a taste line is a number, or all".to_string())?;
+                crate::taste::forget(&state, Some(index))
+            }
+            .map_err(|fault| fault.detail().to_string())?;
+            Ok((format!("forgot {removed} taste line(s)\n"), 0))
+        }
+        Some(other) => Err(format!(
+            "`{other}` is not a taste command: try `taste` or `taste forget <n|all>`"
+        )),
+    }
 }
 
 /// Own the sessions under one state directory, in the foreground.
