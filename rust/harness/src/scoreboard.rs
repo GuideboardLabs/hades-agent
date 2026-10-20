@@ -78,12 +78,13 @@ impl Standing {
 /// row must never turn a finished run into a failed one.
 pub fn record(state: &Path, record: &Record) -> std::io::Result<()> {
     use std::io::Write as _;
-    std::fs::create_dir_all(state)?;
+    crate::scratch::state_dir(state)?;
     let path = state.join("scoreboard.jsonl");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?;
+        .open(&path)?;
+    crate::scratch::private_file(&path)?;
     writeln!(
         file,
         "{}",
@@ -314,5 +315,24 @@ mod tests {
         let said = reason(&standing);
         assert!(said.contains("2 of 3 runs"), "{said}");
         assert!(said.contains("100 ms"), "{said}");
+    }
+
+    #[test]
+    fn a_record_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = scratch("private");
+        record(&state, &row("fix", true, 1)).expect("a record");
+        let dir = std::fs::metadata(&state)
+            .expect("the state")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file = std::fs::metadata(state.join("scoreboard.jsonl"))
+            .expect("the scoreboard")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir, 0o700, "the state directory is not private");
+        assert_eq!(file, 0o600, "the scoreboard is not private");
     }
 }

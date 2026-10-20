@@ -100,9 +100,17 @@ mod policy {
         let deny = BrowserPolicy::deny();
         let error = deny.check("file:///etc/passwd").expect_err("a refusal");
         assert!(error.contains("file://"), "{error}");
-        assert!(BrowserPolicy::permit_local().check("file:///tmp/page.html").is_ok());
+        assert!(
+            BrowserPolicy::permit_local()
+                .check("file:///tmp/page.html")
+                .is_ok()
+        );
         // The opt-in is for file only. It does not become a general permission.
-        assert!(BrowserPolicy::permit_local().check("data:text/html,x").is_err());
+        assert!(
+            BrowserPolicy::permit_local()
+                .check("data:text/html,x")
+                .is_err()
+        );
     }
 
     #[test]
@@ -323,9 +331,7 @@ impl Session {
             .env("TMPDIR", state.join("browser").join("tmp"))
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8");
-        if headed
-            && let Some(display) = std::env::var_os("DISPLAY")
-        {
+        if headed && let Some(display) = std::env::var_os("DISPLAY") {
             command.env("DISPLAY", display);
         }
         // The patched binary reads its fingerprint from the seed and the platform flag. A stock Chrome

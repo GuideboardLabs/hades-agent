@@ -54,7 +54,7 @@ pub fn propose(
         return Ok(None);
     }
     let dir = proposed_dir(state);
-    std::fs::create_dir_all(&dir)
+    crate::scratch::state_dir(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
     let path = dir.join(format!("{name}.md"));
     if path.exists() {
@@ -89,7 +89,7 @@ pub fn propose_runbook(
     check: &str,
 ) -> Result<PathBuf, String> {
     let dir = proposed_dir(state);
-    std::fs::create_dir_all(&dir)
+    crate::scratch::state_dir(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
     let path = dir.join(format!("{name}.md"));
     if path.exists() {
@@ -205,7 +205,7 @@ pub fn promote(state: &Path, name: &str) -> Result<PathBuf, String> {
         .map_err(|_| format!("there is no proposal called `{name}`"))?;
     let text = text.replace("status: proposed", "status: active");
     let dir = installed_dir(state).join(name);
-    std::fs::create_dir_all(&dir)
+    crate::scratch::state_dir(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
     let to = dir.join("SKILL.md");
     std::fs::write(&to, text)
@@ -229,7 +229,7 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let dir = crate::scratch::root().join(format!("skills-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch state");
+        crate::scratch::state_dir(&dir).expect("a scratch state");
         dir
     }
 

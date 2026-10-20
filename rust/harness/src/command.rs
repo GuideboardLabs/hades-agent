@@ -63,10 +63,13 @@ pub fn clean_environment() -> Vec<(String, String)> {
     let mut kept = Vec::new();
     for key in [
         "PATH",
+        "HOME",
+        "TMPDIR",
         "LANG",
         "LC_ALL",
         "TZ",
         "TERM",
+        // The toolchain locations this box needs. A path is not a credential.
         "CARGO_HOME",
         "RUSTUP_HOME",
         "SSL_CERT_FILE",
@@ -345,9 +348,16 @@ mod clean {
         let clean = run_clean("env", &root, 100_000, None).expect("a clean run");
         assert!(!clean.output.contains("sk-do-not-leak"), "{}", clean.output);
         for name in ["HADES_TEST_SECRET", "OPENAI_API_KEY", "HADES_PROXY"] {
-            assert!(!clean.output.contains(name), "{name} reached the model's shell");
+            assert!(
+                !clean.output.contains(name),
+                "{name} reached the model's shell"
+            );
         }
-        assert!(clean.output.contains("PATH="), "a shell still needs PATH: {}", clean.output);
+        assert!(
+            clean.output.contains("PATH="),
+            "a shell still needs PATH: {}",
+            clean.output
+        );
 
         // The contrast is the point: the same command inherits the key without `run_clean`.
         let inherited = run("env", &root, 100_000, None).expect("an inherited run");

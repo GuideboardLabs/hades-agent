@@ -345,3 +345,52 @@ fn scratch_base() -> std::path::PathBuf {
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }
+
+#[test]
+fn a_secret_is_not_copied_and_the_manifest_names_it() {
+    let root = scratch("secrets");
+    write(&root.join(".env"), "OPENAI_API_KEY=sk-do-not-copy\n");
+    write(&root.join("keys/id_rsa"), "-----BEGIN PRIVATE KEY-----\n");
+    write(&root.join("notes.txt"), "hello\n");
+    let store = scratch("secrets-store");
+    let shadows = Shadows::new(&store);
+    let id = taken(
+        shadows
+            .snapshot(&Subject::new("cli", &root))
+            .expect("a snapshot"),
+    );
+    let manifest = shadows.manifest(&id).expect("a manifest");
+    assert!(
+        !manifest
+            .files
+            .iter()
+            .any(|file| file.path.ends_with(".env")),
+        "a .env was copied: {:?}",
+        manifest.files
+    );
+    assert!(
+        !manifest
+            .files
+            .iter()
+            .any(|file| file.path.contains("id_rsa"))
+    );
+    assert!(manifest.files.iter().any(|file| file.path == "notes.txt"));
+    assert!(
+        manifest
+            .skipped_names
+            .iter()
+            .any(|name| name.ends_with(".env")),
+        "the manifest does not name the .env: {:?}",
+        manifest.skipped_names
+    );
+    assert!(
+        manifest
+            .skipped_names
+            .iter()
+            .any(|name| name.ends_with("id_rsa")),
+        "the manifest does not name the key: {:?}",
+        manifest.skipped_names
+    );
+    let restored = shadows.manifest(&id).expect("a manifest");
+    assert_eq!(restored.skipped_names.len(), 2);
+}

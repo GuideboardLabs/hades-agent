@@ -114,13 +114,26 @@ impl Subject {
         // path would find the ancestor and copy nothing, which is the quietest way to have no safety net.
         let judged = path.strip_prefix(&self.root).unwrap_or(path);
         judged.components().any(|part| match part {
-            Component::Normal(name) => self
-                .ignore
-                .iter()
-                .any(|ignored| name.to_string_lossy() == ignored.as_str()),
+            Component::Normal(name) => {
+                let name = name.to_string_lossy();
+                self.ignore.iter().any(|ignored| name == ignored.as_str()) || secret_name(&name)
+            }
             _ => false,
         })
     }
+}
+
+/// A name a snapshot must never copy. Credentials live in these files, and a shadow is written to the
+/// state directory, which outlives the run that made it. Exact names, a prefix and suffixes, not globs:
+/// the crate has no glob dependency and a rule an auditor can read is better than a pattern.
+fn secret_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".env" | ".netrc" | ".npmrc" | ".git-credentials" | ".htpasswd"
+    ) || name.starts_with("id_")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".env")
 }
 
 /// What a restore did. A restore that did nothing says so with numbers rather than with `ok`.
@@ -323,9 +336,11 @@ pub struct Manifest {
     pub files: Vec<SnapshotFile>,
     pub bytes: u64,
     pub millis: u64,
-    /// Paths that were skipped: ignored names, never-touch subtrees, and anything that is not a regular
-    /// file. Counted rather than listed, because the number is the check that the ignore list worked.
+    /// Paths that were skipped: ignored names, never-touch subtrees, secrets, and anything that is not a
+    /// regular file. A count alone says something was left out; the names say what, which is what a person
+    /// auditing a restore needs. Older manifests parse with an empty list.
     pub skipped: u64,
+    pub skipped_names: Vec<String>,
 }
 
 /// The manifest, written and read by hand for the same reason the session store does it by hand: the crate
@@ -339,6 +354,7 @@ impl Manifest {
         out.insert("bytes".into(), json!(self.bytes));
         out.insert("millis".into(), json!(self.millis));
         out.insert("skipped".into(), json!(self.skipped));
+        out.insert("skipped_names".into(), json!(self.skipped_names));
         out.insert(
             "files".into(),
             Value::Array(
@@ -385,6 +401,16 @@ impl Manifest {
             bytes: object["bytes"].as_u64().unwrap_or(0),
             millis: object["millis"].as_u64().unwrap_or(0),
             skipped: object["skipped"].as_u64().unwrap_or(0),
+            skipped_names: object["skipped_names"]
+                .as_array()
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -420,6 +446,7 @@ impl Checkpointer for Shadows {
         let mut files: Vec<SnapshotFile> = Vec::new();
         let mut bytes = 0u64;
         let mut skipped = 0u64;
+        let mut skipped_names = Vec::new();
         copy_tree(
             &subject,
             subject.root(),
@@ -427,6 +454,7 @@ impl Checkpointer for Shadows {
             &mut files,
             &mut bytes,
             &mut skipped,
+            &mut skipped_names,
         )?;
 
         let millis = started.elapsed().as_millis() as u64;
@@ -437,6 +465,7 @@ impl Checkpointer for Shadows {
             bytes,
             millis,
             skipped,
+            skipped_names,
         };
         write_json(&self.manifest_of(&id), &manifest.to_value())?;
         // The cost is a fact in the log, not an estimate in a comment: a copy per attempt is only
@@ -591,6 +620,7 @@ fn copy_tree(
     files: &mut Vec<SnapshotFile>,
     bytes: &mut u64,
     skipped: &mut u64,
+    skipped_names: &mut Vec<String>,
 ) -> Result<(), Fault> {
     let listing = match fs::read_dir(from) {
         Ok(listing) => listing,
@@ -598,6 +628,7 @@ fn copy_tree(
         // answer the repo map learned: skip it and say so in the count.
         Err(_) => {
             *skipped += 1;
+            skipped_names.push(from.display().to_string());
             return Ok(());
         }
     };
@@ -608,6 +639,12 @@ fn copy_tree(
     for path in entries {
         if subject.skips(&path) {
             *skipped += 1;
+            skipped_names.push(
+                path.strip_prefix(subject.root())
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
             continue;
         }
         let metadata = match fs::symlink_metadata(&path) {
@@ -627,10 +664,10 @@ fn copy_tree(
         let target = to.join(&relative);
 
         if metadata.is_dir() {
-            fs::create_dir_all(&target).map_err(|error| {
+            crate::scratch::state_dir(&target).map_err(|error| {
                 Fault::harness(format!("could not make {}: {error}", target.display()))
             })?;
-            copy_tree(subject, &path, to, files, bytes, skipped)?;
+            copy_tree(subject, &path, to, files, bytes, skipped, skipped_names)?;
         } else if metadata.is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
@@ -702,7 +739,9 @@ fn write_json(path: &Path, value: &Value) -> Result<(), Fault> {
         Fault::harness(format!("could not write {}: {error}", staging.display()))
     })?;
     fs::rename(&staging, path)
-        .map_err(|error| Fault::harness(format!("could not finish {}: {error}", path.display())))
+        .map_err(|error| Fault::harness(format!("could not finish {}: {error}", path.display())))?;
+    crate::scratch::private_file(path)
+        .map_err(|error| Fault::harness(format!("could not protect {}: {error}", path.display())))
 }
 
 fn append_line(path: &Path, value: &Value) -> Result<(), Fault> {
@@ -717,6 +756,9 @@ fn append_line(path: &Path, value: &Value) -> Result<(), Fault> {
         .append(true)
         .open(path)
         .map_err(|error| Fault::harness(format!("could not open {}: {error}", path.display())))?;
+    crate::scratch::private_file(path).map_err(|error| {
+        Fault::harness(format!("could not protect {}: {error}", path.display()))
+    })?;
     writeln!(file, "{value}")
         .map_err(|error| Fault::harness(format!("could not write {}: {error}", path.display())))
 }

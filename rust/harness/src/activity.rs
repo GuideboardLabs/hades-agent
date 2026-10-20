@@ -69,7 +69,7 @@ fn epoch() -> i64 {
 
 /// Append one decided action. Best effort by contract: the caller reports a failure and carries on.
 pub fn record(state: &Path, line: &Line) -> Result<(), String> {
-    std::fs::create_dir_all(state).map_err(|error| error.to_string())?;
+    crate::scratch::state_dir(state).map_err(|error| error.to_string())?;
     let body = json!({
         "at": line.at,
         "actor": line.actor,

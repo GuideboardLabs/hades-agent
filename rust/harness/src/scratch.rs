@@ -151,3 +151,31 @@ mod tests {
         );
     }
 }
+
+/// Make a state directory private, and keep an existing one private. One creator, because four modules
+/// calling `create_dir_all` with the process umask is four chances for a key to be world-readable.
+pub fn state_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::symlink_metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Set a state file to 0600. Called after the file exists, so it covers a file an earlier version made.
+pub fn private_file(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::symlink_metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
