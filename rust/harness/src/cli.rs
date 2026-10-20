@@ -3127,6 +3127,7 @@ pub(crate) fn assemble(
         reason,
         caged,
         shadow,
+        prompt: Some(harness.prompt().fact()),
     })?;
     Ok((engine, answerer, harness, judge))
 }

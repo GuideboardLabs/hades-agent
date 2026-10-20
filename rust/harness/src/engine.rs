@@ -60,6 +60,9 @@ pub struct Assembly {
     pub caged: bool,
     /// Where the shadow snapshots go. `None` means nothing is snapshotted, which the run says out loud.
     pub shadow: Option<PathBuf>,
+    /// What prompt the model was given: one size and one digest, recorded in the session at creation so a
+    /// reader can tell which harness text produced the run. `None` for a caller that has no prompt in hand.
+    pub prompt: Option<crate::harness_files::PromptFact>,
 }
 
 /// Everything one run needs except the model and the program.
@@ -81,6 +84,8 @@ pub struct Engine {
     cache_path: PathBuf,
     root: PathBuf,
     state: PathBuf,
+    /// Recorded in a new session's first Meta entry. `None` means the caller did not name a prompt.
+    prompt: Option<crate::harness_files::PromptFact>,
 }
 
 impl Engine {
@@ -144,6 +149,7 @@ impl Engine {
             cache_path,
             root: spec.root,
             state: spec.state,
+            prompt: spec.prompt,
         })
     }
 
@@ -156,8 +162,28 @@ impl Engine {
             Session::load(store, SystemClock, id.clone())
                 .map_err(|fault| format!("could not read session {}: {fault}", id.as_str()))
         } else {
-            Session::create(store, SystemClock, id.clone())
-                .map_err(|fault| format!("could not start session {}: {fault}", id.as_str()))
+            let mut session = Session::create(store, SystemClock, id.clone())
+                .map_err(|fault| format!("could not start session {}: {fault}", id.as_str()))?;
+            // The prompt that produced this run, as one size and one digest. Written once, at creation, so
+            // a resumed session keeps the fact of the prompt it started with rather than the current one.
+            if let Some(prompt) = &self.prompt {
+                session
+                    .append(
+                        session_tree::Kind::Meta,
+                        serde_json::json!({
+                            "type": "harness",
+                            "prompt_bytes": prompt.bytes,
+                            "prompt_sha256": prompt.sha256,
+                        }),
+                    )
+                    .map_err(|fault| {
+                        format!(
+                            "could not record the prompt in session {}: {fault}",
+                            id.as_str()
+                        )
+                    })?;
+            }
+            Ok(session)
         }
     }
 
@@ -286,5 +312,75 @@ impl Engine {
     /// What the checkpointer may do, said out loud, for the same reason the cage is.
     pub fn shadows(&self) -> String {
         self.checkpointer.describe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use session_tree::Kind;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            crate::scratch::root().join(format!("hades-engine-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    fn assembly(
+        state: &std::path::Path,
+        prompt: Option<crate::harness_files::PromptFact>,
+    ) -> Assembly {
+        Assembly {
+            state: state.to_path_buf(),
+            root: state.to_path_buf(),
+            goal: "a goal".to_string(),
+            session_id: "engine-test".to_string(),
+            profile: crate::profile::named("fix").expect("a shipped profile"),
+            policy: crate::policy::named(crate::policy::OPEN).expect("a shipped policy"),
+            policy_name: crate::policy::OPEN.to_string(),
+            reason: RoutingReason::chosen("test"),
+            caged: false,
+            shadow: None,
+            prompt,
+        }
+    }
+
+    fn recorded(session: &Session<FileStore, SystemClock>) -> Vec<&serde_json::Value> {
+        session
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == Kind::Meta && entry.payload["type"] == "harness")
+            .map(|entry| &entry.payload)
+            .collect()
+    }
+
+    #[test]
+    fn a_new_session_records_the_prompt_fact_once() {
+        let state = scratch("prompt");
+        let prompt = crate::harness_files::compose(vec![crate::harness_files::Block {
+            name: "system",
+            text: "hello".to_string(),
+        }])
+        .fact();
+        let engine = Engine::open(assembly(&state, Some(prompt))).expect("engine");
+        let session = engine.session().expect("a new session");
+        let facts = recorded(&session);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0]["prompt_bytes"], 5);
+        assert_eq!(facts[0]["prompt_sha256"].as_str().unwrap().len(), 64);
+        // A resume reads the log; it does not write the fact a second time.
+        drop(session);
+        let resumed = engine.session().expect("a resumed session");
+        assert_eq!(recorded(&resumed).len(), 1);
+    }
+
+    #[test]
+    fn a_session_without_a_prompt_records_no_fact() {
+        let state = scratch("no-prompt");
+        let engine = Engine::open(assembly(&state, None)).expect("engine");
+        let session = engine.session().expect("a new session");
+        assert!(recorded(&session).is_empty());
     }
 }

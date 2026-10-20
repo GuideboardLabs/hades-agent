@@ -966,13 +966,27 @@ what you found, and exact paths or numbers. Never ask a question back.";
 
 /// The one system prompt a child sees, whether it runs in the blocking path or in the gateway's
 /// executor. A second copy of this text is a second contract, and A4 compares the two paths' answers.
+///
+/// Two blocks: the fixed worker preamble, then the contract and its schema. Siblings share the first block
+/// byte for byte, so a provider that caches a prefix can reuse it; the joined text is identical to the
+/// pre-composer format, which a test pins.
 pub(crate) fn child_prompt(schema: &Value) -> String {
-    format!(
-        "{WORKER}\n\nReturn one JSON object and nothing else. It must satisfy this schema:\n{}\n\
-         Do not put prose around it. Do not use Markdown fences. A missing or mistyped field fails \
-         the task.",
-        serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string())
-    )
+    let schema = serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string());
+    crate::harness_files::compose(vec![
+        crate::harness_files::Block {
+            name: "worker",
+            text: WORKER.to_string(),
+        },
+        crate::harness_files::Block {
+            name: "schema",
+            text: format!(
+                "Return one JSON object and nothing else. It must satisfy this schema:\n{schema}\n\
+                 Do not put prose around it. Do not use Markdown fences. A missing or mistyped field fails \
+                 the task."
+            ),
+        },
+    ])
+    .text
 }
 
 /// One delegated task: a goal and the schema its answer must satisfy. A string task gets the default
@@ -2411,6 +2425,34 @@ mod tests {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn child_prompt_is_byte_identical_to_the_pre_composer_format() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        });
+        let expected = format!(
+            "{WORKER}\n\nReturn one JSON object and nothing else. It must satisfy this schema:\n{}\n\
+             Do not put prose around it. Do not use Markdown fences. A missing or mistyped field fails \
+             the task.",
+            serde_json::to_string_pretty(&schema).unwrap()
+        );
+        assert_eq!(child_prompt(&schema), expected);
+    }
+
+    #[test]
+    fn fan_out_siblings_share_the_worker_preamble_byte_for_byte() {
+        let one = child_prompt(&serde_json::json!({"type": "object"}));
+        let two = child_prompt(&serde_json::json!({"type": "array"}));
+        let preamble = format!("{WORKER}\n\n");
+        assert!(one.starts_with(&preamble), "{one}");
+        assert!(two.starts_with(&preamble), "{two}");
+        // Only the block after the preamble differs, so a cached prefix survives across siblings.
+        assert_ne!(one, two);
+        assert_ne!(one[preamble.len()..], two[preamble.len()..]);
     }
 
     #[test]
