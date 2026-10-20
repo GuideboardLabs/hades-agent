@@ -4,7 +4,7 @@
 //! Nothing here mocks the transport: the point of the feature is that a process is spawned, initialised,
 //! asked for its tools and told to run one, and a mock would prove none of that.
 //!
-//! Every path is a `--config` flag under `target/scratch`, and `HADES_HOME` is set once before the first
+//! Every path is a `--config` flag under the test scratch root, and `HADES_HOME` is set once before the first
 //! CLI call, so no test reads or writes the Hades home of the machine it runs on.
 
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn scratch_base() -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).expect("the scratch base");
     base.canonicalize().unwrap_or(base)
 }

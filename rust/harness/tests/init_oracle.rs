@@ -264,7 +264,7 @@ fn init_refuses_the_live_vault_and_writes_nothing() {
 }
 
 fn scratch_base() -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).expect("the scratch base");
     base.canonicalize().unwrap_or(base)
 }

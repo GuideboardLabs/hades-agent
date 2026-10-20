@@ -587,12 +587,11 @@ impl Context for Budgeted {
 #[cfg(test)]
 mod tests {
 
-    /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
-    ///
-    /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:
-    /// that refusal is the boundary doing its job, so the tests must not ask it to make an exception.
+    /// A scratch base outside the source tree: the build directory when cargo names one, the temp
+    /// directory otherwise. Never `<manifest>/../target`, which belongs to the build and, on a machine
+    /// with a nearly full root filesystem, is the wrong disk to fill.
     fn scratch_base() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch")
+        crate::scratch::root()
     }
 
     use super::*;

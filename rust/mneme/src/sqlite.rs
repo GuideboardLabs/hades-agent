@@ -883,13 +883,18 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("the crate is inside the workspace")
-            .join("target/scratch/sqlite")
-            .join(name);
-        fs::create_dir_all(&base).expect("scratch");
-        fs::canonicalize(&base).expect("canonical scratch")
+        let named = std::env::var("CARGO_TARGET_DIR")
+            .ok()
+            .filter(|dir| !dir.trim().is_empty());
+        let base = match named {
+            Some(dir) => PathBuf::from(dir).join("scratch"),
+            None => {
+                PathBuf::from(std::env::var("HOME").expect("a home")).join(".hades/test-scratch")
+            }
+        };
+        let dir = base.join("sqlite").join(name);
+        fs::create_dir_all(&dir).expect("scratch");
+        fs::canonicalize(&dir).expect("canonical scratch")
     }
 
     /// A scratch directory with nothing left from the previous run.

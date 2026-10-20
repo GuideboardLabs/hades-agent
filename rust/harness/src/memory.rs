@@ -429,10 +429,7 @@ mod tests {
 
     #[test]
     fn a_correction_retires_the_note_it_replaces() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../target/scratch/memory-supersede-{}",
-            std::process::id()
-        ));
+        let dir = crate::scratch::root().join(format!("memory-supersede-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch vault");
         // Canonicalized: the store compares the note's parent to the root, and a `..` in the root makes

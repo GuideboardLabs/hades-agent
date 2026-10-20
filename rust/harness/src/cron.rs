@@ -428,7 +428,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+        let base = crate::scratch::root();
         let dir = base.join(format!("cron-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch state directory");

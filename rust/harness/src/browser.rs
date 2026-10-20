@@ -2644,8 +2644,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_is_observable() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/browser-live");
+        let state = crate::scratch::root().join("browser-live");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let opened = tool(
@@ -2663,8 +2662,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_can_be_clicked_and_typed() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-actions");
+        let state = crate::scratch::root().join("browser-live-actions");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let page = state.join("page.html");
@@ -2725,8 +2723,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_popup_becomes_a_tab_the_model_can_switch_to() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-tabs");
+        let state = crate::scratch::root().join("browser-live-tabs");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let second = state.join("second.html");
@@ -2762,8 +2759,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_dialog_is_handled_and_an_upload_lands() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-dialog");
+        let state = crate::scratch::root().join("browser-live-dialog");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let page = state.join("page.html");
@@ -2816,8 +2812,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_download_lands_in_the_state_directory() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-download");
+        let state = crate::scratch::root().join("browser-live-download");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let page = state.join("page.html");
@@ -2850,8 +2845,7 @@ mod tests {
         unsafe {
             std::env::set_var("HADES_HEADED", "1");
         }
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-headed");
+        let state = crate::scratch::root().join("browser-live-headed");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let opened = tool(
@@ -2869,8 +2863,7 @@ mod tests {
     #[ignore = "starts a real Chromium and a cross-origin server; run with --ignored"]
     fn a_cross_origin_frame_can_be_observed_and_clicked() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-oopif");
+        let state = crate::scratch::root().join("browser-live-oopif");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let site = state.join("site");
@@ -2978,8 +2971,7 @@ mod tests {
         unsafe {
             std::env::set_var("HADES_PROXY", format!("http://user:pass@127.0.0.1:{port}"));
         }
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-proxy");
+        let state = crate::scratch::root().join("browser-live-proxy");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let opened = tool(
@@ -2999,8 +2991,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_browser_context_isolates_its_tab() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-context");
+        let state = crate::scratch::root().join("browser-live-context");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let page = state.join("page.html");
@@ -3052,8 +3043,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_same_origin_frame_can_be_observed_and_clicked() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-iframe");
+        let state = crate::scratch::root().join("browser-live-iframe");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         std::fs::write(
@@ -3092,8 +3082,7 @@ mod tests {
         unsafe {
             std::env::set_var("HADES_HUMANIZE", "1");
         }
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-human");
+        let state = crate::scratch::root().join("browser-live-human");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let page = state.join("page.html");
@@ -3131,8 +3120,7 @@ mod tests {
     #[ignore = "starts a real Chromium and a local HTTP server; run with --ignored"]
     fn network_storage_and_cookies_are_visible() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch/browser-live-network");
+        let state = crate::scratch::root().join("browser-live-network");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
         let site = state.join("site");

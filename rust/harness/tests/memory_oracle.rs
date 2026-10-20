@@ -9,7 +9,7 @@ use harness::memory::{Memory, MnemeMemory, OutcomeNote, RecallReason};
 use mneme::{Clock, Frontmatter, NoteStore, SqliteStore, SystemClock, Vault};
 
 fn scratch(name: &str) -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).expect("the scratch base");
     let base = base.canonicalize().unwrap_or(base);
     let dir = base.join(format!("hades-memory-{name}-{}", std::process::id()));

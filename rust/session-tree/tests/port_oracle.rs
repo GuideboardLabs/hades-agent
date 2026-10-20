@@ -486,16 +486,19 @@ fn the_system_clock_renders_the_python_shape() {
     assert_eq!(&text[19..], "+00:00");
 }
 
-/// A scratch base inside this crate's own `target/`, never the machine's temp directory.
-///
-/// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:
-/// that refusal is the boundary doing its job, so the tests must not ask it to make an exception.
 fn scratch_base() -> std::path::PathBuf {
-    // Created and then canonicalized: a path with `..` in it compares unequal to the same directory reached
-    // by the store, and the snapshot's never-touch test is a prefix test. The first run of this helper put the
-    // store inside the tree it was copying, and the copy recursed into itself until the kernel refused the
-    // file name.
-    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    // Off the source tree's disk: a full root filesystem must not be filled by a test run, and the build
+    // directory is the natural place when Cargo names one. Without one, a directory under the Hades home
+    // is used rather than the machine's temp directory, which on this box lives under the live install and
+    // is refused by Hades' boundary.
+    let named = std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty());
+    if let Some(dir) = named {
+        return std::path::PathBuf::from(dir).join("scratch");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = std::path::PathBuf::from(home).join(".hades/test-scratch");
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }

@@ -106,11 +106,7 @@ impl Transport for Fake {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("target")
-        .join("scratch")
-        .join(format!("gateway-{name}"));
+    let base = harness::scratch::root().join(format!("gateway-{name}"));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("scratch");
     base.canonicalize().expect("canonical")

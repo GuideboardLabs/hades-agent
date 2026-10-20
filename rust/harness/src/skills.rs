@@ -225,12 +225,9 @@ pub fn reject(state: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("skills-{name}-{}", std::process::id()));
+        let dir = crate::scratch::root().join(format!("skills-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch state");
         dir

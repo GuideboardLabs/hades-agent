@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 fn scratch_base() -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }

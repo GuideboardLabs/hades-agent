@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use harness::cli;
 
 fn scratch(name: &str) -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).expect("the scratch base");
     let base = base.canonicalize().unwrap_or(base);
     let dir = base.join(format!("hades-mneme-{name}-{}", std::process::id()));
@@ -22,7 +22,7 @@ fn isolated_home() {
     use std::sync::OnceLock;
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+        let base = harness::scratch::root();
         std::fs::create_dir_all(&base).expect("the scratch base");
         let home = base
             .canonicalize()
