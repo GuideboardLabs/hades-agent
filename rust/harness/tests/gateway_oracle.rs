@@ -188,6 +188,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
             model: "nanbeige-3b".to_string(),
             root: dir.join("work").display().to_string(),
             vault: dir.join("mneme").display().to_string(),
+            heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
             mcp: harness::mcp::McpConfig::default(),
         }
     );
@@ -203,6 +204,7 @@ fn an_unauthorized_sender_gets_nothing() {
         model: "nanbeige-3b".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
     };
     let mut fake = Fake::default();
@@ -267,6 +269,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
         model: "nanbeige-3b".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
     };
     let mut fake = Fake::default();
@@ -378,6 +381,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
         model: "nanbeige-3b".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
     };
     let fake = Fake::default();
@@ -446,6 +450,7 @@ fn the_offset_advances_after_a_batch() {
         model: "nanbeige-3b".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
     };
     // One batch with one update, then nothing. `--once` handles the batch and returns.
@@ -496,6 +501,7 @@ fn settings_for(chat: i64) -> Settings {
         model: "none".to_string(),
         root: "/work".to_string(),
         vault: "/work/mneme".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
     }
 }

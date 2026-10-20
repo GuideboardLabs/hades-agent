@@ -140,6 +140,15 @@ Two settings live in `config.json` under `gateway.telegram`: `allowed_users`, a 
 ids, and `policy`, `guarded` by default. An absent section or an empty list refuses to start. The token is
 `HADES_TELEGRAM_TOKEN` in `~/.hades/.env` or the environment, never in the JSON, and it is never printed.
 
+A goal is session state, not a schedule. `hades goal set <text> --chat <id> --check <command>` records one
+under `<state>/goals`, and the gateway's heartbeat continues it in that chat when the session has no live
+run and its last entry is older than `gateway.heartbeat` seconds (default 900). The agent claims done by
+calling the goal tool, and the goal's recorded check decides; a failing check leaves the goal open with the
+verdict recorded. Each continuation is bounded by the goal's `--budget` of model calls, and a goal that
+spends it pauses with `budget` as the reason. `hades goal list` reads the files and calls no model, so it
+answers on a machine whose endpoint is down. `hades goal pause <id>` stops the heartbeat until a person
+resumes it, and `hades goal clear <id>` closes it.
+
 The poller stays free while a run happens: each run gets its own daemon socket and thread, so the
 approval that run is blocked on can reach a person and come back on the poller's connection. The update
 offset is one file under the state directory, so a restart replays at most one batch.

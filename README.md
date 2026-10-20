@@ -502,6 +502,7 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 | `hades tune <goal>` | Probe candidate harnesses; `--holdout` guards adoption |
 | `hades job <spec>` | Write a scheduled job |
 | `hades jobs` | List scheduled jobs |
+| `hades goal set\|list\|pause\|clear` | A goal kept for one chat; the gateway heartbeat continues it when idle |
 | `hades profiles` | Show the five profiles and their parameters |
 | `hades route <goal>` | Show which profile the rules pick, and why |
 | `hades scoreboard` | What finished runs say per profile |

@@ -189,6 +189,14 @@ hades — the harness, one turn or a whole graph
   hades jobs [--state <dir>]
       the standing goal files, with the fields a correction edits
 
+  hades goal set <text> --chat <id> [--session <id>] [--model <preset>] [--check <cmd>]
+                 [--budget <calls>] [--executor chat] [--state <dir>]
+  hades goal list [--state <dir>]
+  hades goal pause <id> [--reason <text>] [--state <dir>]
+  hades goal clear <id> [--state <dir>]
+      a goal kept for one chat: the gateway heartbeat continues it when the session is idle,
+      and the recorded check decides when it is done. `list` reads files and calls no model
+
   hades activity [--state <dir>] [--limit n]
       the last decided actions, one line each, oldest first
 
@@ -313,6 +321,7 @@ fn dispatch(
         "tools" => tools(rest),
         "mcp" => mcp(rest),
         "jobs" => jobs(rest),
+        "goal" => goal_cmd(rest),
         "activity" => activity(rest),
         "stop" => stop(rest),
         "cancel" => cancel(rest),
@@ -654,6 +663,144 @@ fn jobs(args: &[String]) -> Result<(String, i32), String> {
         text = format!("no jobs under {}\n", crate::cron::dir(&state).display());
     }
     Ok((text, 0))
+}
+
+/// The epoch second a goal file records. One clock for `set`, `pause` and `clear`, so a listing reads
+/// as one event sequence.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `hades goal`: the file surface a person uses when the agent should keep working across turns.
+///
+/// `list` reads the goal files and nothing else, which is why it needs no config and no model: the
+/// question "what is Hades still working on" must be answerable on a machine whose endpoint is down.
+fn goal_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let rest = &args[1..];
+    let flags = parse(
+        rest,
+        &[
+            "state", "chat", "session", "model", "check", "budget", "executor", "reason",
+        ],
+    )?;
+    let state = match flags.named.get("state") {
+        Some(dir) => PathBuf::from(dir),
+        None => hades_home()?,
+    };
+    let now = now();
+    match action {
+        "set" => {
+            let text = flags.positional.join(" ");
+            if text.trim().is_empty() {
+                return Err("`hades goal set` needs the goal text".to_string());
+            }
+            let chat: i64 = flags
+                .named
+                .get("chat")
+                .ok_or_else(|| {
+                    "a goal needs --chat <id>; a goal with no chat cannot be re-entered".to_string()
+                })?
+                .parse()
+                .map_err(|_| "`--chat` has to be a number".to_string())?;
+            let budget: u32 = match flags.named.get("budget") {
+                Some(value) => value
+                    .parse()
+                    .map_err(|_| format!("`--budget {value}` is not a number of calls"))?,
+                None => crate::gateway::goal::DEFAULT_BUDGET,
+            };
+            let session = flags
+                .named
+                .get("session")
+                .cloned()
+                .unwrap_or_else(|| format!("tg-{chat}"));
+            let new = crate::gateway::goal::NewGoal {
+                text,
+                session,
+                chat,
+                model: flags.named.get("model").cloned().unwrap_or_default(),
+                check: flags.named.get("check").cloned().unwrap_or_default(),
+                budget,
+                executor: flags
+                    .named
+                    .get("executor")
+                    .cloned()
+                    .unwrap_or_else(|| "chat".to_string()),
+            };
+            match crate::gateway::goal::set(&state, new, now) {
+                Ok(goal) => Ok((
+                    format!(
+                        "goal {} is open for chat {} (session {}); last heartbeat: {}\n",
+                        goal.id,
+                        goal.chat,
+                        goal.session,
+                        crate::gateway::goal::heartbeat_text(goal.heartbeat)
+                    ),
+                    0,
+                )),
+                Err(refusal) => Err(format!("{refusal} ({})", refusal.name())),
+            }
+        }
+        "list" => {
+            let (goals, problems) = crate::gateway::goal::load(&state);
+            let mut text = String::new();
+            for goal in &goals {
+                text.push_str(&crate::gateway::goal::describe(goal));
+                text.push('\n');
+            }
+            for problem in &problems {
+                text.push_str(&format!("not read: {problem}\n"));
+            }
+            if text.is_empty() {
+                text = format!(
+                    "no goals under {}\n",
+                    crate::gateway::goal::dir(&state).display()
+                );
+            }
+            Ok((text, 0))
+        }
+        "pause" | "clear" => {
+            let id: u64 = flags
+                .positional
+                .first()
+                .ok_or_else(|| format!("`hades goal {action}` needs a goal number"))?
+                .parse()
+                .map_err(|_| "a goal number is a whole number".to_string())?;
+            let outcome = match action {
+                "pause" => {
+                    let reason = flags
+                        .named
+                        .get("reason")
+                        .cloned()
+                        .unwrap_or_else(|| "paused by a person".to_string());
+                    crate::gateway::goal::pause(&state, id, &reason, now)
+                }
+                _ => crate::gateway::goal::clear(&state, id, now),
+            };
+            match outcome {
+                Ok(goal) => Ok((
+                    format!(
+                        "goal {} is {}{}\n",
+                        goal.id,
+                        goal.state.name(),
+                        if goal.reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", goal.reason)
+                        }
+                    ),
+                    0,
+                )),
+                Err(refusal) => Err(format!("{refusal} ({})", refusal.name())),
+            }
+        }
+        other => Err(format!(
+            "`{other}` is not a goal action: say set, list, pause or clear"
+        )),
+    }
 }
 
 fn activity(args: &[String]) -> Result<(String, i32), String> {

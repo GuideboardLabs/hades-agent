@@ -20,6 +20,7 @@
 //! call. That is a limit of the Bot API's shape, recorded here rather than hidden.
 
 pub mod children;
+pub mod goal;
 pub mod telegram;
 
 use std::collections::BTreeMap;
@@ -59,6 +60,9 @@ pub struct Settings {
     pub root: String,
     /// Hades' own memory, the same vault the governed runs use.
     pub vault: String,
+    /// How long a session must be idle before the heartbeat continues an open goal, in seconds. From
+    /// `gateway.heartbeat`, with the fifteen-minute default when the key is absent.
+    pub heartbeat: i64,
     /// The MCP servers a chat may reach, parsed from the same file.
     pub mcp: crate::mcp::McpConfig,
 }
@@ -146,6 +150,17 @@ pub fn settings(path: &Path) -> Result<Settings, String> {
             path.display()
         ));
     }
+    // A heartbeat interval of zero would turn every tick into a continuation. Refusing is the honest
+    // direction: a config that cannot mean what it says must not be guessed at.
+    let heartbeat = match value.pointer("/gateway/heartbeat") {
+        None => goal::DEFAULT_HEARTBEAT_SECS,
+        Some(value) => value.as_i64().filter(|secs| *secs > 0).ok_or_else(|| {
+            format!(
+                "{}: `gateway.heartbeat` is {value}; it has to be a positive number of seconds",
+                path.display()
+            )
+        })?,
+    };
     Ok(Settings {
         allowed,
         policy,
@@ -153,6 +168,7 @@ pub fn settings(path: &Path) -> Result<Settings, String> {
         model,
         root,
         vault,
+        heartbeat,
         mcp: crate::mcp::McpConfig::from_value(value.get("mcp"), path)?,
     })
 }
@@ -253,6 +269,14 @@ impl Signals {
             }
             None => false,
         }
+    }
+
+    /// Whether a chat answer is running. The worker holds the chat's lock for its whole life, so a lock
+    /// that cannot be taken is a live job. A poisoned lock is also work this surface cannot safely
+    /// interleave with, so it counts as busy rather than free.
+    pub fn busy(&self, chat: i64) -> bool {
+        let lock = self.lock(chat);
+        lock.try_lock().is_err()
     }
 
     fn flag(&self, chat: i64) -> Option<Arc<AtomicBool>> {
@@ -1351,6 +1375,84 @@ fn epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// The heartbeat, beside the scheduler and not inside it. Every tick it asks the goal store which open
+/// goals are due, then runs one continuation for each in the chat the goal records. The stamp is written
+/// before the continuation runs, so a crash or a failure costs one interval rather than one tick.
+fn heartbeat<T: Transport + Clone + Send + 'static>(
+    mut transport: T,
+    settings: Settings,
+    state: PathBuf,
+    socket: PathBuf,
+    mcp: Arc<crate::mcp::Mcp>,
+    signals: Arc<Signals>,
+) {
+    loop {
+        let now = epoch();
+        let busy = |goal: &goal::Goal| {
+            signals.busy(goal.chat)
+                || daemon_busy(&socket, &goal.session)
+                || child_busy(&state, goal.chat)
+        };
+        match goal::due_goals(&state, now, settings.heartbeat, busy) {
+            Ok(goals) => {
+                for mut continuing in goals {
+                    // The chat's own lock serialises a heartbeat with the person's answer. The busy check
+                    // ran a moment ago; taking the lock is what makes the gap harmless.
+                    let lock = signals.lock(continuing.chat);
+                    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let flag = signals.begin(continuing.chat);
+                    let outcome = goal::continuation(
+                        &settings,
+                        &state,
+                        &mut continuing,
+                        &mut transport,
+                        &mcp,
+                        now,
+                        Some(&flag),
+                    );
+                    signals.leave(continuing.chat, &flag);
+                    if let Err(said) = outcome {
+                        eprintln!("goal {}: {said}", continuing.id);
+                    }
+                }
+            }
+            Err(said) => eprintln!("heartbeat: {said}"),
+        }
+        std::thread::sleep(Duration::from_secs(goal::TICK_SECS));
+    }
+}
+
+/// Whether a daemon run holds a lease on this session. The gateway can ask the daemon the same question a
+/// person's `/status` asks; a daemon that is not running is not busy, and the goal waits for it.
+fn daemon_busy(socket: &Path, session: &str) -> bool {
+    let Ok(response) = ask(socket, &json!({"op": "status"})) else {
+        return false;
+    };
+    response
+        .get("sessions")
+        .and_then(Value::as_array)
+        .is_some_and(|sessions| {
+            sessions.iter().any(|entry| {
+                entry.get("session").and_then(Value::as_str) == Some(session)
+                    && entry.get("run").is_some()
+            })
+        })
+}
+
+/// Whether a child executor for this chat is still live. The record is written before the first model
+/// call, so this covers the whole life of the child, not only the part after its first reply.
+fn child_busy(state: &Path, chat: i64) -> bool {
+    children::Registry::existing(state).is_some_and(|registry| {
+        registry.records().is_ok_and(|records| {
+            records.iter().any(|record| {
+                record.chat == chat
+                    && (record.state == children::STATE_ADMITTED
+                        || record.state == children::STATE_RUNNING)
+            })
+        })
+    })
+}
+
 /// The one place this surface builds a `World`. The person's chat runs as `act`; a scheduled job carries
 /// the mode it was created with. Two literals drifted once already, and the mode is exactly the kind of
 /// field that goes missing from one of them.
@@ -1526,6 +1628,17 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
         std::thread::spawn(move || scheduler(worker, settings, state, mcp));
     }
     let signals = Arc::new(Signals::default());
+    {
+        // The heartbeat is a second thread beside the scheduler, not a cron schedule: it continues a
+        // conversation that already exists, and cron's shape is a new run that reports into a chat.
+        let worker = transport.clone();
+        let settings = settings.clone();
+        let state = state.clone();
+        let socket = socket.clone();
+        let mcp = Arc::clone(&mcp);
+        let signals = Arc::clone(&signals);
+        std::thread::spawn(move || heartbeat(worker, settings, state, socket, mcp, signals));
+    }
     let mut pending: Vec<std::thread::JoinHandle<()>> = Vec::new();
     loop {
         if signals.stopped() {
@@ -1670,6 +1783,7 @@ mod tests {
             model: "none".to_string(),
             root: "/work".to_string(),
             vault: "/work/mneme".to_string(),
+            heartbeat: goal::DEFAULT_HEARTBEAT_SECS,
             mcp: crate::mcp::McpConfig::default(),
         }
     }
@@ -1809,5 +1923,51 @@ mod tests {
         );
         assert_eq!(registry.live(), 0);
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_chat_answer_makes_the_heartbeat_see_the_session_as_busy() {
+        let signals = Signals::default();
+        assert!(!signals.busy(7), "an idle chat is not busy");
+        let lock = signals.lock(7);
+        let _held = lock.lock().expect("the chat lock");
+        assert!(
+            signals.busy(7),
+            "a worker holds the chat lock for its whole life"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_interval_is_configurable_and_defaults_to_fifteen_minutes() {
+        let dir = scratch("settings-heartbeat");
+        let path = dir.join("config.json");
+        let base = r#"{
+            "gateway": {"telegram": {"allowed_users": [7], "verify": "true"}},
+            "model": "nanbeige-3b",
+            "root": "/work",
+            "vault": "/work/mneme"
+        }"#;
+        std::fs::write(&path, base).expect("a config");
+        assert_eq!(
+            super::settings(&path).expect("settings").heartbeat,
+            goal::DEFAULT_HEARTBEAT_SECS,
+            "the default is fifteen minutes"
+        );
+
+        let configured = base.replace(
+            r#""gateway": {"telegram""#,
+            r#""gateway": {"heartbeat": 60, "telegram""#,
+        );
+        std::fs::write(&path, configured).expect("a configured interval");
+        assert_eq!(super::settings(&path).expect("settings").heartbeat, 60);
+
+        let zero = base.replace(
+            r#""gateway": {"telegram""#,
+            r#""gateway": {"heartbeat": 0, "telegram""#,
+        );
+        std::fs::write(&path, zero).expect("an impossible interval");
+        let refused = super::settings(&path).expect_err("zero is refused");
+        assert!(refused.contains("heartbeat"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
