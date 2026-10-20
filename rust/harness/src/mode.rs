@@ -13,6 +13,8 @@ pub enum Mode {
     /// Read, search, fetch and answer. No tool that changes anything.
     #[default]
     Read,
+    /// Read, investigate and ask, then answer with a plan. No tool that changes anything.
+    Plan,
     /// Everything, with the hard floor in front of it.
     Act,
 }
@@ -21,6 +23,7 @@ impl Mode {
     pub fn name(self) -> &'static str {
         match self {
             Mode::Read => "read",
+            Mode::Plan => "plan",
             Mode::Act => "act",
         }
     }
@@ -28,6 +31,7 @@ impl Mode {
     pub fn parse(text: &str) -> Option<Mode> {
         Some(match text.trim().to_ascii_lowercase().as_str() {
             "read" => Mode::Read,
+            "plan" => Mode::Plan,
             "act" => Mode::Act,
             _ => return None,
         })
@@ -35,6 +39,10 @@ impl Mode {
 
     pub fn acts(self) -> bool {
         self == Mode::Act
+    }
+
+    pub fn plans(self) -> bool {
+        self == Mode::Plan
     }
 }
 

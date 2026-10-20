@@ -1,6 +1,7 @@
 //! The terminal is a projection of App: no I/O, credentials, or execution in draw().
 use super::{
     app::{App, Message, Overlay, View},
+    ask::Focus,
     backend,
 };
 use ratatui::style::Stylize;
@@ -354,17 +355,29 @@ pub fn draw(f: &mut Frame, app: &mut App, frame: u64) {
     } else {
         6
     };
-    let composer = if app.view == View::Chat {
+    let ask_rows = if app.view == View::Chat {
+        app.ask.rows()
+    } else {
+        0
+    };
+    let composer_base = if app.view == View::Chat {
         (app.input.position(area.width.saturating_sub(6) as usize).0 as u16 + 3).clamp(3, 8)
     } else {
         0
     };
+    // The banner, tabs, a three-row transcript, two spacers and the footer are fixed; the question may
+    // only use what is left, so a short terminal clips the bar rather than pushing the input off screen.
+    let max_composer = area
+        .height
+        .saturating_sub(if ask_rows > 0 { 9 } else { 11 });
+    let ask_rows = ask_rows.min(max_composer.saturating_sub(composer_base));
+    let composer = composer_base + ask_rows;
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(banner),
             Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Min(if ask_rows > 0 { 1 } else { 3 }),
             Constraint::Length(u16::from(app.view == View::Chat)),
             Constraint::Length(composer),
             Constraint::Length(1),
@@ -393,10 +406,15 @@ pub fn draw(f: &mut Frame, app: &mut App, frame: u64) {
                 0
             };
             // Short conversations flow straight into the input; a full transcript
-            // uses all available height and keeps the input at the bottom.
-            let composer_area = Rect {
-                y: layout[2].y + chat_height.max(sidebar_height) + 1,
-                ..layout[4]
+            // uses all available height and keeps the input at the bottom. A question takes the
+            // bottom-anchored slot, so the option rows grow upward and the input stays put.
+            let composer_area = if ask_rows > 0 {
+                layout[4]
+            } else {
+                Rect {
+                    y: layout[2].y + chat_height.max(sidebar_height) + 1,
+                    ..layout[4]
+                }
             };
             composer_widget(f, app, composer_area);
             footer.y = composer_area.bottom() + 1;
@@ -823,21 +841,67 @@ fn inspector(f: &mut Frame, app: &App, area: Rect, frame: u64) -> u16 {
 }
 
 fn composer_widget(f: &mut Frame, app: &App, area: Rect) {
-    let title = format!(
-        "{}  /  {}",
-        app.options.user,
-        if app.busy {
-            "draft while Hades works"
-        } else {
-            "message"
-        }
+    let ask = app.ask.current().and_then(|_| app.ask.ask());
+    // Never claim more rows than the composer actually got.
+    let rows = app.ask.rows().min(area.height.saturating_sub(3));
+    let title = match &ask {
+        Some(_) if app.ask.collapsed => format!(
+            "HADES ASKS · {} question{} · Enter to open",
+            app.ask.questions.len(),
+            if app.ask.questions.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+        Some(ask) => format!(
+            "HADES ASKS · {} of {} · {}",
+            app.ask.active + 1,
+            app.ask.questions.len(),
+            clip(&ask.prompt, area.width.saturating_sub(34) as usize)
+        ),
+        None => format!(
+            "{}  /  {}",
+            app.options.user,
+            if app.busy {
+                "draft while Hades works"
+            } else {
+                "message"
+            }
+        ),
+    };
+    f.render_widget(
+        block(title).color(if ask.is_some() { SKY } else { USER_GREY }),
+        inset(area, 1, 0),
     );
-    f.render_widget(block(title).color(USER_GREY), inset(area, 1, 0));
-    let inner = inset(area, 3, 1);
+    if let Some(ask) = &ask {
+        let bar = Rect {
+            x: area.x + 3,
+            y: area.y + 1,
+            width: area.width.saturating_sub(6),
+            height: rows,
+        };
+        ask_bar(f, app, ask, bar);
+    }
+    let inner = Rect {
+        x: area.x + 3,
+        y: area.y + 1 + rows,
+        width: area.width.saturating_sub(6),
+        height: area.height.saturating_sub(2 + rows),
+    };
     let (row, col) = app.input.position(inner.width as usize);
     let offset = row.saturating_sub(inner.height.saturating_sub(1) as usize);
     if app.input.text.is_empty() {
-        paragraph(f, "What should Hades get done?", inner, MUTED);
+        paragraph(
+            f,
+            if ask.is_some() {
+                "Type your own answer, or a reason to decline"
+            } else {
+                "What should Hades get done?"
+            },
+            inner,
+            MUTED,
+        );
     } else {
         let lines = wrap(
             vec![span(
@@ -860,6 +924,132 @@ fn composer_widget(f: &mut Frame, app: &App, area: Rect) {
             inner.x + col.min(inner.width as usize - 1) as u16,
             inner.y + (row - offset).min(inner.height as usize - 1) as u16,
         ));
+    }
+}
+
+/// The question anchored to the top edge of the input: a reason line, the options with the recommended
+/// one first, and an `Other` row that is the automatic decline of everything above it.
+fn ask_bar(f: &mut Frame, app: &App, ask: &crate::question::Ask, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    if app.ask.collapsed {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                span("● ", RED),
+                span(
+                    format!(
+                        "{} question{} waiting",
+                        app.ask.questions.len(),
+                        if app.ask.questions.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                    YELLOW,
+                ),
+                span(" · Enter opens it · Esc stays collapsed", MUTED),
+            ])),
+            area,
+        );
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            span(
+                if ask.blocking {
+                    "NEEDS AN ANSWER · "
+                } else {
+                    "ADVISORY · "
+                },
+                if ask.blocking { RED } else { YELLOW },
+            ),
+            span(
+                clip(&ask.why, area.width.saturating_sub(18) as usize),
+                MUTED,
+            ),
+        ])),
+        Rect { height: 1, ..area },
+    );
+    for (index, choice) in ask.options.iter().enumerate() {
+        if 1 + index as u16 >= area.height {
+            break;
+        }
+        let selected = app.ask.focus == Some(Focus::Options) && app.ask.option == index;
+        let mut line = vec![
+            span(
+                if selected { "▸ " } else { "  " },
+                if selected { SKY } else { MUTED },
+            ),
+            span(
+                format!("{}. ", index + 1),
+                if selected { SKY } else { MUTED },
+            ),
+            span(choice.label.clone(), TEXT),
+        ];
+        if !choice.detail.is_empty() {
+            line.push(span(
+                format!(
+                    "  {}",
+                    clip(&choice.detail, area.width.saturating_sub(26) as usize)
+                ),
+                MUTED,
+            ));
+        }
+        if choice.recommended {
+            line.push(span("  recommended", GREEN));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(line)).style(if selected {
+                Style::default().bg(TILE)
+            } else {
+                Style::default()
+            }),
+            Rect {
+                x: area.x,
+                y: area.y + 1 + index as u16,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+    let selected = app.ask.focus == Some(Focus::Input);
+    if (1 + ask.options.len() as u16) < area.height {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                span(
+                    if selected { "▸ " } else { "  " },
+                    if selected { SKY } else { MUTED },
+                ),
+                span("Other…", if selected { TEXT } else { MUTED }),
+                span("  type an answer, or a reason to decline", MUTED),
+            ]))
+            .style(if selected {
+                Style::default().bg(TILE)
+            } else {
+                Style::default()
+            }),
+            Rect {
+                x: area.x,
+                y: area.y + 1 + ask.options.len() as u16,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+    if app.ask.questions.len() > 1 && area.height as usize > ask.options.len() + 2 {
+        paragraph(
+            f,
+            format!("{} more waiting · Tab cycles", app.ask.questions.len() - 1),
+            Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+            MUTED,
+        );
     }
 }
 

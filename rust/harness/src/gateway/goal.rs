@@ -1731,6 +1731,7 @@ mod tests {
             inbox: None,
             mcp: Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(8),
+            questions: None,
         }
     }
 

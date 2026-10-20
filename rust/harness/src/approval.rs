@@ -35,6 +35,7 @@ use session_tree::{Clock, SystemClock};
 
 use crate::fault::Fault;
 use crate::policy::Decision;
+use crate::question::Ask;
 
 /// How long an answer lasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,9 @@ pub struct ApprovalRequest {
     pub action: String,
     pub reason: String,
     pub at: String,
+    /// The options the ask bar renders. `None` on a legacy record, which is answered by the three
+    /// built-in choices.
+    pub ask: Option<Ask>,
 }
 
 /// A decision about a question, with who made it and how long it lasts.
@@ -92,6 +96,10 @@ pub struct Answer {
     pub scope: Scope,
     pub by: String,
     pub at: String,
+    /// The option key that was picked, when the question had options.
+    pub option: Option<String>,
+    /// The person's own words when they declined with `Other`.
+    pub note: Option<String>,
 }
 
 /// A standing answer for an action in a session: what was decided, by whom, from which question.
@@ -115,7 +123,17 @@ pub struct Question {
 /// Deliberately not `&mut self`: a question outlives the call that raised it, and a surface answering one
 /// must not have to hold the run in order to do it.
 pub trait ApprovalBroker {
-    fn request(&self, session: &str, action: &str, reason: &str) -> Result<ApprovalRequest, Fault>;
+    fn request(&self, session: &str, action: &str, reason: &str) -> Result<ApprovalRequest, Fault> {
+        self.request_ask(session, action, reason, None)
+    }
+    /// Raise a question with the options a surface renders. `None` is a legacy permission question.
+    fn request_ask(
+        &self,
+        session: &str,
+        action: &str,
+        reason: &str,
+        ask: Option<Ask>,
+    ) -> Result<ApprovalRequest, Fault>;
     /// Every question in order, answered or not.
     fn questions(&self) -> Result<Vec<Question>, Fault>;
     /// The answer if there is one. `None` means still pending, which is a state and not an error.
@@ -127,6 +145,46 @@ pub trait ApprovalBroker {
         id: PendingId,
         decision: Decision,
         scope: Scope,
+        by: &str,
+    ) -> Result<Answer, Fault> {
+        self.resolve_answer(id, decision, scope, None, None, by)
+    }
+    /// Answer with the option key the bar showed. The effect on the question decides allow or deny.
+    fn resolve_choice(
+        &self,
+        id: PendingId,
+        key: &str,
+        note: Option<&str>,
+        by: &str,
+    ) -> Result<Answer, Fault> {
+        let question = self
+            .questions()?
+            .into_iter()
+            .find(|question| question.request.id == id)
+            .ok_or_else(|| Fault::harness(format!("no question {id} was ever asked")))?;
+        let ask = question
+            .request
+            .ask
+            .ok_or_else(|| Fault::harness(format!("question {id} has no options")))?;
+        let choice = ask
+            .option(key)
+            .ok_or_else(|| Fault::harness(format!("question {id} has no option `{key}`")))?;
+        self.resolve_answer(
+            id,
+            choice.effect.decision(),
+            choice.effect.scope(),
+            Some(key),
+            note,
+            by,
+        )
+    }
+    fn resolve_answer(
+        &self,
+        id: PendingId,
+        decision: Decision,
+        scope: Scope,
+        option: Option<&str>,
+        note: Option<&str>,
         by: &str,
     ) -> Result<Answer, Fault>;
 }
@@ -140,6 +198,7 @@ enum Event {
         action: String,
         reason: String,
         at: String,
+        ask: Option<Ask>,
     },
     Answered {
         id: PendingId,
@@ -147,6 +206,8 @@ enum Event {
         scope: Scope,
         by: String,
         at: String,
+        option: Option<String>,
+        note: Option<String>,
     },
 }
 
@@ -159,6 +220,7 @@ impl Event {
                 action,
                 reason,
                 at,
+                ask,
             } => json!({
                 "v": 1,
                 "event": "asked",
@@ -167,6 +229,7 @@ impl Event {
                 "action": action,
                 "reason": reason,
                 "at": at,
+                "ask": ask.as_ref().map(Ask::json),
             }),
             Event::Answered {
                 id,
@@ -174,6 +237,8 @@ impl Event {
                 scope,
                 by,
                 at,
+                option,
+                note,
             } => json!({
                 "v": 1,
                 "event": "answered",
@@ -182,6 +247,8 @@ impl Event {
                 "scope": scope.name(),
                 "by": by,
                 "at": at,
+                "option": option,
+                "note": note,
             }),
         };
         value.to_string()
@@ -212,6 +279,13 @@ impl Event {
                 action: text_of("action")?,
                 reason: text_of("reason")?,
                 at: text_of("at")?,
+                ask: match value.get("ask") {
+                    None | Some(Value::Null) => None,
+                    Some(ask) => Some(
+                        Ask::parse(ask)
+                            .map_err(|error| Fault::harness(format!("line {line}: {error}")))?,
+                    ),
+                },
             }),
             Some("answered") => {
                 let decision = match value["decision"].as_str() {
@@ -230,6 +304,8 @@ impl Event {
                     scope,
                     by: text_of("by")?,
                     at: text_of("at")?,
+                    option: value["option"].as_str().map(str::to_string),
+                    note: value["note"].as_str().map(str::to_string),
                 })
             }
             _ => Err(Fault::harness(format!("line {line}: unknown event"))),
@@ -246,6 +322,16 @@ impl Event {
 struct Ledger {
     asked: Vec<ApprovalRequest>,
     answers: BTreeMap<u64, Answer>,
+}
+
+/// The fields of one answer, grouped so the ledger's resolve call stays readable.
+struct Answering<'a> {
+    decision: Decision,
+    scope: Scope,
+    option: Option<&'a str>,
+    note: Option<&'a str>,
+    by: &'a str,
+    at: &'a str,
 }
 
 impl Ledger {
@@ -268,12 +354,14 @@ impl Ledger {
                 action,
                 reason,
                 at,
+                ask,
             } => self.asked.push(ApprovalRequest {
                 id,
                 session,
                 action,
                 reason,
                 at,
+                ask,
             }),
             Event::Answered {
                 id,
@@ -281,6 +369,8 @@ impl Ledger {
                 scope,
                 by,
                 at,
+                option,
+                note,
             } => {
                 self.answers.insert(
                     id.0,
@@ -289,6 +379,8 @@ impl Ledger {
                         scope,
                         by,
                         at,
+                        option,
+                        note,
                     },
                 );
             }
@@ -342,6 +434,7 @@ impl Ledger {
         session: &str,
         action: &str,
         reason: &str,
+        ask: Option<Ask>,
         at: &str,
     ) -> (Event, ApprovalRequest) {
         let event = Event::Asked {
@@ -350,6 +443,7 @@ impl Ledger {
             action: action.to_string(),
             reason: reason.to_string(),
             at: at.to_string(),
+            ask,
         };
         self.apply(event.clone());
         let request = self
@@ -376,21 +470,16 @@ impl Ledger {
         Ok(())
     }
 
-    fn resolve(
-        &mut self,
-        id: PendingId,
-        decision: Decision,
-        scope: Scope,
-        by: &str,
-        at: &str,
-    ) -> Result<(Event, Answer), Fault> {
+    fn resolve(&mut self, id: PendingId, answer: Answering<'_>) -> Result<(Event, Answer), Fault> {
         self.check_resolvable(id)?;
         let event = Event::Answered {
             id,
-            decision,
-            scope,
-            by: by.to_string(),
-            at: at.to_string(),
+            decision: answer.decision,
+            scope: answer.scope,
+            by: answer.by.to_string(),
+            at: answer.at.to_string(),
+            option: answer.option.map(str::to_string),
+            note: answer.note.map(str::to_string),
         };
         self.apply(event.clone());
         let answer = self.answer(id).expect("the answer was just added");
@@ -438,9 +527,15 @@ impl InMemory {
 }
 
 impl ApprovalBroker for InMemory {
-    fn request(&self, session: &str, action: &str, reason: &str) -> Result<ApprovalRequest, Fault> {
+    fn request_ask(
+        &self,
+        session: &str,
+        action: &str,
+        reason: &str,
+        ask: Option<Ask>,
+    ) -> Result<ApprovalRequest, Fault> {
         let at = self.clock.now();
-        let (_, request) = self.lock().ask(session, action, reason, &at);
+        let (_, request) = self.lock().ask(session, action, reason, ask, &at);
         Ok(request)
     }
 
@@ -456,15 +551,27 @@ impl ApprovalBroker for InMemory {
         Ok(self.lock().standing(session, action))
     }
 
-    fn resolve(
+    fn resolve_answer(
         &self,
         id: PendingId,
         decision: Decision,
         scope: Scope,
+        option: Option<&str>,
+        note: Option<&str>,
         by: &str,
     ) -> Result<Answer, Fault> {
         let at = self.clock.now();
-        let (_, answer) = self.lock().resolve(id, decision, scope, by, &at)?;
+        let (_, answer) = self.lock().resolve(
+            id,
+            Answering {
+                decision,
+                scope,
+                option,
+                note,
+                by,
+                at: &at,
+            },
+        )?;
         Ok(answer)
     }
 }
@@ -532,10 +639,16 @@ impl OnDisk {
 }
 
 impl ApprovalBroker for OnDisk {
-    fn request(&self, session: &str, action: &str, reason: &str) -> Result<ApprovalRequest, Fault> {
+    fn request_ask(
+        &self,
+        session: &str,
+        action: &str,
+        reason: &str,
+        ask: Option<Ask>,
+    ) -> Result<ApprovalRequest, Fault> {
         let at = self.clock.now();
         let mut ledger = OnDisk::read(&self.path)?;
-        let (event, request) = ledger.ask(session, action, reason, &at);
+        let (event, request) = ledger.ask(session, action, reason, ask, &at);
         self.append(&event)?;
         Ok(request)
     }
@@ -552,16 +665,28 @@ impl ApprovalBroker for OnDisk {
         Ok(OnDisk::read(&self.path)?.standing(session, action))
     }
 
-    fn resolve(
+    fn resolve_answer(
         &self,
         id: PendingId,
         decision: Decision,
         scope: Scope,
+        option: Option<&str>,
+        note: Option<&str>,
         by: &str,
     ) -> Result<Answer, Fault> {
         let at = self.clock.now();
         let mut ledger = OnDisk::read(&self.path)?;
-        let (event, answer) = ledger.resolve(id, decision, scope, by, &at)?;
+        let (event, answer) = ledger.resolve(
+            id,
+            Answering {
+                decision,
+                scope,
+                option,
+                note,
+                by,
+                at: &at,
+            },
+        )?;
         self.append(&event)?;
         Ok(answer)
     }
