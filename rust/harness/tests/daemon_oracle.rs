@@ -775,6 +775,50 @@ fn a_submitted_run_refuses_a_zero_token_budget() {
     run.stop();
 }
 
+#[test]
+fn a_strict_submit_is_refused_before_a_session_exists() {
+    let state = scratch("strict-model");
+    repo(&state);
+    let run = Running::start(&state);
+
+    let answer = ask(
+        &run.socket,
+        json!({
+            "op": "submit",
+            "goal": "make never.txt exist",
+            "root": state.join("repo").display().to_string(),
+            "state": state.display().to_string(),
+            "session": "strict",
+            "model": "strict-ghost",
+            "endpoint": "https://ollama.com/v1/chat/completions",
+            "key": "env:HADES_DAEMON_STRICT_KEY_NOT_SET",
+            "strict-model": true,
+        }),
+    )
+    .expect("an answer");
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    let error = answer["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("strict-ghost"),
+        "the refusal does not name the model: {answer}"
+    );
+    assert!(
+        error.contains("ollama-cloud"),
+        "the refusal does not name the provider: {answer}"
+    );
+
+    // A strict request that cannot reach its model leaves nothing behind: no session, no lease.
+    let status = ask(&run.socket, json!({"op": "status"})).expect("a status answer");
+    assert_eq!(
+        status["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "{status}"
+    );
+    assert!(!state.join("sessions/strict.jsonl").exists());
+
+    run.stop();
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:

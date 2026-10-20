@@ -162,7 +162,7 @@ hades — the harness, one turn or a whole graph
       an approval is an inline button. --once handles one batch and returns
 
   hades submit <goal> [--program <p>]... [--state <dir>] [--root <dir>] [--attempts <n>]
-      [--minutes m] [--budget-tokens n]
+      [--minutes m] [--budget-tokens n] [--strict-model]
       hand a run to the daemon and follow it. The budgets are the run's, not one call's: a
       budget of zero tokens is refused before the run is taken on
 
@@ -196,7 +196,8 @@ hades — the harness, one turn or a whole graph
   hades shutdown [--state <dir>]
       stop every run and end the daemon. Stopping is not undo
 
-  hades run <goal> --model <preset> [--attempts n] [--minutes m] [--budget-tokens n] [--branch n] [...]
+  hades run <goal> --model <preset> [--attempts n] [--minutes m] [--budget-tokens n] [--branch n]
+             [--strict-model] [...]
       walk the graph: try, accept a pass, retry a failure while the bounds hold, hand a
       refusal to a person. --budget-tokens caps the spend the endpoint reports for the whole
       run, prompt and generated together; the end names which bound ran out. --branch n runs
@@ -206,6 +207,7 @@ hades — the harness, one turn or a whole graph
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
       [--cage on|off] [--temperature t] [--max-tokens n] [--context n] [--thinking on|off]
+      [--strict-model]
       run one turn, with a model answering
 
   hades turn <goal> --program <program> [...]
@@ -222,6 +224,9 @@ vault, then creates ~/.hades/mneme. A run with no --model uses the config's pres
 override; `--config <file>` reads a different file. Secrets never go in the config: they stay in .env.
 `--thinking off` asks a local template for no thinking, which is what a thinking model needs before it can
 answer with one program instead of a paragraph about one.
+`--strict-model` holds a run to the one model it names. The endpoint and the key are checked before a
+session is opened, so a request that cannot work fails while it is free, and a fault from the first call
+names that model. Nothing is substituted for it.
 The cage is on by default: the program may read the system and write in the task's root and in the state
 directory's tmp, and it may not read your home directory or reach the network. --cage off turns it off.
 A shadow snapshot of the tree is taken before each program runs, so a change can be undone: --shadow off
@@ -255,6 +260,12 @@ fn dispatch(
 ) -> Result<(String, i32), String> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let rest = &args[1..];
+
+    // A command's own `--help` is the same answer as `hades help`. A person asking what flags a command
+    // takes should not be told that the flag they asked with is not one of them.
+    if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok((USAGE.to_string(), 0));
+    }
 
     match command {
         "help" | "--help" | "-h" => Ok((USAGE.to_string(), 0)),
@@ -321,7 +332,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
     }
     flags.positional.push(goal);
 
-    const NAMED: [&str; 17] = [
+    const NAMED: [&str; 18] = [
         "root",
         "profile",
         "policy",
@@ -339,6 +350,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
         "attempts",
         "minutes",
         "budget-tokens",
+        "strict-model",
     ];
     for key in NAMED {
         let Some(value) = request.get(key) else {
@@ -969,6 +981,27 @@ impl Answerer {
             Answerer::Scripted(_) => {
                 "scripted: the program came from --program, no model was asked".to_string()
             }
+        }
+    }
+
+    /// Hold the answerer to the model it names. The preflight is the whole point of the flag: a request
+    /// whose endpoint or key cannot work is refused here, while the refusal costs nothing, instead of
+    /// being discovered by the call it would have spent. The client keeps the flag so a fault from that
+    /// call names the model rather than leaving the reader to wonder what else was tried.
+    fn strict(self) -> Result<Self, String> {
+        match self {
+            Answerer::Model(open) => {
+                let open = open.with_strict();
+                open.preflight().map_err(|fault| {
+                    format!("the strict model request was refused: {}", fault.detail())
+                })?;
+                Ok(Answerer::Model(open))
+            }
+            Answerer::Scripted(_) => Err(
+                "`--strict-model` names no model: a --program answers instead of one. Pass \
+                 --model <preset>, or drop --strict-model"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -2740,6 +2773,14 @@ pub(crate) fn assemble(
         profile.id.as_str(),
     )?;
     let answerer = answerer(flags, config.as_ref(), Some(&harness))?;
+    // A strict request is checked while the check is free. An endpoint or a key that cannot work is
+    // refused here, with the model and the provider named, rather than by the first call: a call that
+    // cannot succeed is a call the caller was told would not be spent.
+    let answerer = if switched(flags, "strict-model") {
+        answerer.strict()?
+    } else {
+        answerer
+    };
     // The judge is the same client with a different prompt. A scripted turn has no judge, and the turn
     // records that honestly rather than pretending a person's program was judged.
     let judged = profile.judge;
@@ -2811,7 +2852,7 @@ pub(crate) fn assemble(
 }
 
 fn turn(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(
+    let flags = parse_with(
         args,
         &[
             "program",
@@ -2834,6 +2875,7 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
             "memory",
             "harness",
         ],
+        &["strict-model"],
     )?;
     let goal = goal(&flags)?;
     let (mut engine, answerer, harness, judge) = assemble(&flags, "cli")?;
@@ -3020,7 +3062,7 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
 /// Run the graph: attempts, the return path, and the declared way out. The command a person uses when the
 /// task is not one the model gets right first time.
 fn run_graph(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(
+    let flags = parse_with(
         args,
         &[
             "root",
@@ -3047,6 +3089,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             "memory",
             "harness",
         ],
+        &["strict-model"],
     )?;
     let goal = goal(&flags)?;
     let score_state = state_of(&flags)?;
@@ -3605,7 +3648,7 @@ fn status(args: &[String]) -> Result<(String, i32), String> {
 
 /// Hand a run to the daemon and print what comes back, entry by entry, as it is written.
 fn submit(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(
+    let flags = parse_with(
         args,
         &[
             "root",
@@ -3624,6 +3667,7 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
             "minutes",
             "budget-tokens",
         ],
+        &["strict-model"],
     )?;
     // Refused here as well as in the daemon: a person who typed a budget of zero should learn it from the
     // terminal they typed it in, not from a round trip.
