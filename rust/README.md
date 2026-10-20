@@ -80,8 +80,9 @@ Three decisions worth knowing before reading the code:
   person where the model goes: same turn, same policy, same log, same check. It is not a stub, it is the
   seam being used, and it is why the loop could be finished and proven before any model was wired in.
 - **Nothing says more than it knows.** A check that could not run is `could_not_run` and not a pass, a
-  judge that was asked and did not answer records `unjudged` with the reason rather than a verdict, and a
-  fault carries its class so an infrastructure failure is never charged to the model.
+  check that its deadline killed is `timed_out` and not a failure, a judge that was asked and did not
+  answer records `unjudged` with the reason rather than a verdict, and a fault carries its class so an
+  infrastructure failure is never charged to the model.
 
 ### The question that outlives the process
 
@@ -289,7 +290,8 @@ attempt --Passed-----> accept --Always--> done
    |
    +----Failed-------> attempt          (while the bounds hold)
    +----Exhausted----> gave_up          (the bounds are a condition, not a detour in the walk)
-   +----CouldNotRun--> gave_up
+   +----CouldNotRun--> gave_up          (no check: not evidence either way)
+   +----TimedOut-----> gave_up (2)      (killed before a verdict; a no-verdict exit, not a failure)
    +----Faulted------> gave_up          (a wrong endpoint does not fix itself)
    +----Refused------> gave_up          (a denial is not a question: no answer changes a policy)
    +----Asked--------> hand --Always--> awaiting

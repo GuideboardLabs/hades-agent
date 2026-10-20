@@ -426,6 +426,7 @@ impl<'a> Seams<'a> {
                         status: 0,
                         output: report,
                         truncated: false,
+                        timed_out: false,
                     },
                     Err(reason) => {
                         entries.push(session.append(
@@ -554,6 +555,9 @@ impl<'a> Seams<'a> {
             json!({
                 "check": verification.state.name(),
                 "command": verification.command,
+                "status": verification.status,
+                "truncated": verification.truncated,
+                "sha256": verification.output_digest,
                 "progress": verification.progress.as_ref().map(|progress| progress.json()),
                 "verdict": verdict.verdict.name(),
                 "reason": verdict.reason,
@@ -565,7 +569,7 @@ impl<'a> Seams<'a> {
             outcome: Outcome::Ran {
                 answer: answer.clone(),
                 run,
-                verification,
+                verification: Box::new(verification),
                 verdict,
             },
             usage,
@@ -688,6 +692,9 @@ impl<'a> Seams<'a> {
             json!({
                 "tool": VERIFY,
                 "state": verification.state.name(),
+                "status": verification.status,
+                "truncated": verification.truncated,
+                "sha256": verification.output_digest,
                 "output": verification.output,
                 "progress": verification.progress.as_ref().map(|progress| progress.json()),
             }),
@@ -715,7 +722,7 @@ pub enum Outcome {
     Ran {
         answer: ModelAnswer,
         run: crate::command::Run,
-        verification: Verification,
+        verification: Box<Verification>,
         verdict: Judgement,
     },
 }
@@ -739,6 +746,7 @@ impl Outcome {
                 let check = match verification.state {
                     State::Passed => "check passed".to_string(),
                     State::Failed => "check failed".to_string(),
+                    State::TimedOut => "check timed out without a verdict".to_string(),
                     State::CouldNotRun => format!("no check ran ({})", verification.output),
                 };
                 let judged = if verdict.verdict == Verdict::Unjudged {

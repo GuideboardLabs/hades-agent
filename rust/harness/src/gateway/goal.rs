@@ -117,6 +117,11 @@ pub enum Refusal {
     Check {
         result: String,
     },
+    /// The goal's check was killed before it reached a verdict. `done` is not available, and neither is a
+    /// claim that the work failed.
+    CheckTimedOut {
+        result: String,
+    },
     NoGoal {
         id: u64,
     },
@@ -135,6 +140,7 @@ impl Refusal {
             Refusal::NoChat => "chat",
             Refusal::Budget => "budget",
             Refusal::Check { .. } => "check",
+            Refusal::CheckTimedOut { .. } => "check_timeout",
             Refusal::NoGoal { .. } => "missing",
             Refusal::Store(_) => "store",
         }
@@ -165,6 +171,12 @@ impl fmt::Display for Refusal {
             Refusal::Budget => f.write_str("a goal needs a budget of at least one model call"),
             Refusal::Check { result } => {
                 write!(f, "the recorded check did not pass ({result})")
+            }
+            Refusal::CheckTimedOut { result } => {
+                write!(
+                    f,
+                    "the recorded check timed out without a verdict ({result})"
+                )
             }
             Refusal::NoGoal { id } => write!(f, "there is no goal {id}"),
             Refusal::Store(said) => f.write_str(said),
@@ -560,7 +572,8 @@ pub fn clear(state: &Path, id: u64, now: i64) -> Result<Goal, Refusal> {
 /// returned as a typed refusal, so the goal stays open with the reason it is still open.
 ///
 /// The check is bounded. The heartbeat is one thread, so a check that never returns would stop every
-/// goal behind it; a check that outlives [`CHECK_SECS`] is killed and recorded as failed.
+/// goal behind it; a check that outlives [`CHECK_SECS`] is killed and recorded as `timed_out`, which is
+/// missing evidence rather than a verdict about the work.
 pub fn complete(state: &Path, id: u64, root: &Path, now: i64) -> Result<Goal, Refusal> {
     complete_within(
         state,
@@ -606,8 +619,23 @@ pub fn complete_within(
         goal.updated = now;
         goal.reason = format!("the recorded check {outcome}");
         save_unlocked(state, &goal).map_err(Refusal::Store)?;
-        record(state, &goal, "check_failed");
-        Err(Refusal::Check { result: outcome })
+        // A killed check is not a failed one. The event says which happened, so a reader of the log does
+        // not have to parse `last_check` to know whether the work was judged at all.
+        let timed_out = outcome.starts_with("timed_out");
+        record(
+            state,
+            &goal,
+            if timed_out {
+                "check_timed_out"
+            } else {
+                "check_failed"
+            },
+        );
+        Err(if timed_out {
+            Refusal::CheckTimedOut { result: outcome }
+        } else {
+            Refusal::Check { result: outcome }
+        })
     }
 }
 
@@ -1592,10 +1620,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// A check that sleeps forever must not hold the only heartbeat thread. The deadline kills it and the
-    /// goal records the failure instead of hanging.
+    /// A check that sleeps forever must not hold the only heartbeat thread. The deadline kills it, the goal
+    /// records that it timed out, and the goal stays open: a killed check is missing evidence, not a verdict.
     #[test]
-    fn a_sleeping_check_is_killed_and_the_goal_records_the_failure() {
+    fn a_sleeping_check_is_killed_and_the_goal_records_the_timeout() {
         let state = scratch("slow-check");
         let root = state.join("work");
         std::fs::create_dir_all(&root).expect("a workspace");
@@ -1609,7 +1637,10 @@ mod tests {
             std::time::Duration::from_millis(300),
         )
         .expect_err("the sleeping check cannot pass");
-        assert!(matches!(refused, Refusal::Check { .. }), "{refused:?}");
+        assert!(
+            matches!(refused, Refusal::CheckTimedOut { .. }),
+            "{refused:?}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
             "the check was waited for: {:?}",
@@ -1618,9 +1649,23 @@ mod tests {
         let kept = load_one(&state, goal.id).expect("the goal");
         assert_eq!(kept.state, State::Open);
         assert!(
-            kept.last_check.contains("killed") || kept.last_check.contains("failed"),
+            kept.last_check.contains("timed_out"),
             "{:?}",
             kept.last_check
+        );
+        let text =
+            std::fs::read_to_string(state.join("sessions/tg-7-goals.jsonl")).expect("the goal log");
+        let entries: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one entry per line"))
+            .collect();
+        assert!(
+            entries.iter().any(|entry| {
+                entry["kind"] == "meta"
+                    && entry["payload"]["type"] == "goal"
+                    && entry["payload"]["action"] == "check_timed_out"
+            }),
+            "a killed check is logged as a timeout, not a failure: {text}"
         );
         assert!(
             kept.reason.contains("the recorded check"),

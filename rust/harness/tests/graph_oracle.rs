@@ -149,6 +149,40 @@ impl Rig {
 }
 
 #[test]
+fn a_check_that_times_out_ends_the_walk_without_spending_another_attempt() {
+    // The check is killed by its deadline. That is missing evidence, not a wrong answer: a second attempt
+    // would spend a model call to learn nothing, so the walk stops where the check did.
+    let mut rig = Rig::new(
+        "timeout-check",
+        "sleep 5",
+        open(),
+        ScriptedModel::new(["true", "true", "true"]),
+    );
+    rig.verifier = CommandVerifier::with_deadline(LIMIT, std::time::Duration::from_millis(200));
+    let mut session = rig.session("timeout-check");
+    let mut cache = Cache::new();
+    let mut runner =
+        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(3, 10));
+    let walked = runner.run().expect("a walk");
+
+    match &walked.ended {
+        Ended::GaveUp {
+            attempts,
+            exhausted,
+            reason,
+        } => {
+            assert_eq!(*attempts, 1, "the timeout spent another attempt: {reason}");
+            assert_eq!(*exhausted, Exhausted::TimedOut, "{reason}");
+            assert!(reason.contains("timed_out"), "{reason}");
+        }
+        other => panic!("expected a giving-up, got {other:?}"),
+    }
+    let nodes: Vec<&str> = walked.visits.iter().map(|v| v.node.as_str()).collect();
+    assert_eq!(nodes, ["attempt", "gave_up"], "{nodes:?}");
+    assert_eq!(walked.ended.code(), 2, "a no-verdict end, not a failure");
+}
+
+#[test]
 fn a_failed_attempt_is_followed_by_another_and_a_pass_is_accepted() {
     // The check is a file, so the first attempt can genuinely fail and the second can genuinely pass. This
     // is the whole point of the graph: the model is told what happened and tries again.

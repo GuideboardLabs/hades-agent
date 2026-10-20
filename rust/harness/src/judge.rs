@@ -140,12 +140,21 @@ impl Endpoint {
 
 impl Evaluator for Endpoint {
     fn judge(&self, report: &Report<'_>) -> Judgement {
+        // The exit status is stated rather than left for the judge to infer from the state: a check that
+        // was killed reports -1 and no verdict, and a judge that reads that as a wrong answer is wrong.
+        let mut check = report.verification.state_line();
+        if let Some(status) = report.verification.status {
+            check.push_str(&format!(", exit {status}"));
+        }
+        if report.verification.truncated {
+            check.push_str(", output truncated");
+        }
         let user = format!(
             "Goal: {}\n\nProgram:\n{}\n\nOutput:\n{}\n\nCheck: {}\n{}",
             report.goal,
             clip(report.program, 2_000),
             clip(report.output, 1_000),
-            report.verification.state.name(),
+            check,
             clip(&report.verification.output, 500),
         );
         let messages = serde_json::json!([
