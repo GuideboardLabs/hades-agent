@@ -30,6 +30,102 @@ use serde_json::{Value, json};
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 
+/// Which URL schemes this browser session may navigate to. Production denies `file://`; a fixture session
+/// that loads a local page opts in. The policy lives on the session, not in a `cfg(test)` constructor,
+/// because the fixture tests drive the same `act` -> `open` path the model uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserPolicy {
+    pub allow_local: bool,
+}
+
+impl BrowserPolicy {
+    /// What a session gets unless a caller says otherwise.
+    pub fn deny() -> BrowserPolicy {
+        BrowserPolicy { allow_local: false }
+    }
+
+    /// A session that may load `file://` pages. Only tests and fixtures have a reason to ask.
+    pub fn permit_local() -> BrowserPolicy {
+        BrowserPolicy { allow_local: true }
+    }
+
+    /// The whole rule. Called before `Page.navigate`, and again on the current tab after any navigation
+    /// (a click, a tab switch, or a redirect) because those never pass through `open`.
+    pub fn check(&self, url: &str) -> Result<(), String> {
+        let url = url.trim();
+        // An about-to-be-navigated tab has no URL yet. That is not a scheme, and refusing it would turn
+        // startup into a failure.
+        if url.is_empty() {
+            return Ok(());
+        }
+        let scheme = url
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        match scheme.as_deref() {
+            Some("http") | Some("https") => Ok(()),
+            Some("about") if url.eq_ignore_ascii_case("about:blank") => Ok(()),
+            Some("file") if self.allow_local => Ok(()),
+            Some("file") => Err(
+                "the browser is not allowed to read local files: `file://` is refused".to_string(),
+            ),
+            Some(other) => Err(format!(
+                "the browser refuses the `{other}:` scheme: only http, https and about:blank are allowed"
+            )),
+            None => Err(format!("`{url}` is not an absolute URL with a scheme")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy {
+    use super::BrowserPolicy;
+
+    #[test]
+    fn http_https_and_a_blank_page_are_allowed() {
+        let policy = BrowserPolicy::deny();
+        for url in [
+            "https://example.com",
+            "http://127.0.0.1:8000/x?y=1",
+            "about:blank",
+            "  https://example.com  ",
+        ] {
+            assert!(policy.check(url).is_ok(), "{url}");
+        }
+        // A tab that has not navigated yet has no URL. Startup must not be a refusal.
+        assert!(policy.check("").is_ok());
+    }
+
+    #[test]
+    fn a_local_file_is_refused_unless_the_session_opts_in() {
+        let deny = BrowserPolicy::deny();
+        let error = deny.check("file:///etc/passwd").expect_err("a refusal");
+        assert!(error.contains("file://"), "{error}");
+        assert!(BrowserPolicy::permit_local().check("file:///tmp/page.html").is_ok());
+        // The opt-in is for file only. It does not become a general permission.
+        assert!(BrowserPolicy::permit_local().check("data:text/html,x").is_err());
+    }
+
+    #[test]
+    fn data_and_script_schemes_are_refused() {
+        for url in [
+            "data:text/html,<h1>x</h1>",
+            "javascript:alert(1)",
+            "vbscript:msgbox(1)",
+            "chrome://settings",
+            "ftp://example.com/file",
+        ] {
+            let error = BrowserPolicy::deny().check(url).expect_err(url);
+            assert!(error.contains("scheme"), "{url}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_relative_url_is_not_a_navigation() {
+        assert!(BrowserPolicy::deny().check("/etc/passwd").is_err());
+        assert!(BrowserPolicy::deny().check("example.com").is_err());
+    }
+}
+
 const MAX_TEXT: usize = 6000;
 const MAX_ITEMS: usize = 60;
 const MAX_HEADINGS: usize = 10;
@@ -135,6 +231,8 @@ struct Session {
     dialog_accept: bool,
     downloads: PathBuf,
     events: VecDeque<Value>,
+    /// The schemes this session may navigate to. Checked in `open` and after every navigation.
+    policy: BrowserPolicy,
 }
 
 impl Drop for Session {
@@ -146,6 +244,10 @@ impl Drop for Session {
 
 impl Session {
     fn start(state: &Path) -> Result<Self, String> {
+        Session::start_with(state, BrowserPolicy::deny())
+    }
+
+    fn start_with(state: &Path, policy: BrowserPolicy) -> Result<Self, String> {
         let binary = find_chrome()?;
         let profile = state.join("browser").join("profile");
         let downloads = state.join("browser").join("downloads");
@@ -208,6 +310,24 @@ impl Session {
         command
             .args(&launch)
             .arg(format!("--user-data-dir={}", profile.display()));
+        // A minimal environment, because Chromium inherits whatever the harness was started with. It needs
+        // a home for its profile and a PATH to find helpers; it has no reason to see a provider key or a
+        // HADES_* variable. HOME points at the browser's own directory, so a page cannot read the harness'
+        // config through the default home path even if a scheme policy is ever loosened.
+        command.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        command
+            .env("HOME", state.join("browser"))
+            .env("TMPDIR", state.join("browser").join("tmp"))
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8");
+        if headed
+            && let Some(display) = std::env::var_os("DISPLAY")
+        {
+            command.env("DISPLAY", display);
+        }
         // The patched binary reads its fingerprint from the seed and the platform flag. A stock Chrome
         // ignores both arguments but still gives the same CDP surface.
         if is_patched(&binary) {
@@ -275,6 +395,7 @@ impl Session {
                 .unwrap_or(false),
             downloads: downloads.clone(),
             events: VecDeque::new(),
+            policy,
         };
 
         let version = session.call("Browser.getVersion", json!({}), None)?;
@@ -494,7 +615,19 @@ impl Session {
         if self.tabs[self.current].session_id.is_empty() {
             self.attach_current()?;
         }
+        // A click, a tab switch or a redirect all change the URL without calling `open`. The check runs
+        // here, on every refresh, so those paths are covered by the same rule.
+        self.guard_current()?;
         Ok(())
+    }
+
+    /// The scheme of the tab the harness would act on, checked against the session's policy.
+    fn guard_current(&self) -> Result<(), String> {
+        let tab = self
+            .tabs
+            .get(self.current)
+            .ok_or_else(|| "the browser has no current tab".to_string())?;
+        self.policy.check(&tab.url)
     }
 
     fn attach_current(&mut self) -> Result<(), String> {
@@ -1529,6 +1662,9 @@ impl Session {
     }
 
     fn open(&mut self, url: &str) -> Result<String, String> {
+        // Before `Page.navigate`, not after: a refused scheme must cost no request and leave no rendered
+        // text in the observation for a later turn to read.
+        self.policy.check(url)?;
         self.clear_frame();
         let reply = self.page_call("Page.navigate", json!({"url": url}))?;
         if let Some(error) = reply.get("errorText").and_then(Value::as_str) {
@@ -1568,6 +1704,9 @@ impl Session {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // The text is in this process, but it has not been returned. Refuse before it becomes an
+        // observation: a redirect into `file://` is as much a read as an `open` was.
+        self.policy.check(&url)?;
         let text = page
             .get("text")
             .and_then(Value::as_str)
@@ -2632,6 +2771,22 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
+    /// A fixture page is a `file://` URL. The session opts in explicitly; production never calls this.
+    fn allow_local(state: &std::path::Path) {
+        let mut held = match SESSION.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(session) = held.as_mut() {
+            session.policy = BrowserPolicy::permit_local();
+        } else {
+            match Session::start_with(state, BrowserPolicy::permit_local()) {
+                Ok(session) => *held = Some(session),
+                Err(said) => panic!("the fixture browser did not start: {said}"),
+            }
+        }
+    }
+
     static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -2665,6 +2820,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-actions");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
             &page,
@@ -2726,6 +2882,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-tabs");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         let second = state.join("second.html");
         std::fs::write(&second, "<title>second</title><p>second page</p>").expect("a page");
         let first = state.join("first.html");
@@ -2762,6 +2919,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-dialog");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
             &page,
@@ -2815,6 +2973,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-download");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
             &page,
@@ -2994,6 +3153,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-context");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(&page, "<title>default</title><p>default</p>").expect("a page");
         let opened = tool(
@@ -3046,6 +3206,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-iframe");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         std::fs::write(
             state.join("inner.html"),
             r#"<title>inner</title><button onclick="document.title='clicked'">Inside</button>"#,
@@ -3085,6 +3246,7 @@ mod tests {
         let state = crate::scratch::root().join("browser-live-human");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
+        allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
             &page,

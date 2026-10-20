@@ -793,6 +793,22 @@ const PAGE_WORDS: &[&str] = &[
 
 fn page(args: &Value) -> Option<Floor> {
     let action = args.get("action").and_then(Value::as_str)?;
+    // A URL scheme is a read primitive: `file://` renders the local filesystem, and the other three run
+    // code the harness never parsed. This is a floor beside the browser's own policy, not a replacement
+    // for it: the policy is what refuses before `Page.navigate`, and this is what an audit reads.
+    if action == "open" {
+        let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
+        let scheme = url
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(scheme.as_str(), "file" | "data" | "javascript" | "vbscript") {
+            return Some(Floor::new(
+                Category::Access,
+                format!("the URL scheme `{scheme}:` reads the local filesystem"),
+            ));
+        }
+    }
     if !matches!(action, "click" | "type" | "eval") {
         return None;
     }
@@ -830,6 +846,17 @@ mod tests {
 
     fn command(text: &str) -> Option<Floor> {
         check("shell", &json!({ "command": text }), Path::new("/work"))
+    }
+
+    #[test]
+    fn a_local_or_script_url_scheme_is_floored() {
+        for scheme in ["file", "data", "javascript", "vbscript"] {
+            let args = json!({ "action": "open", "url": format!("{scheme}:///etc/passwd") });
+            let floor = page(&args).unwrap_or_else(|| panic!("{scheme}: was not floored"));
+            assert_eq!(floor.category(), Category::Access, "{scheme}");
+            assert!(floor.reason().contains(scheme), "{}", floor.reason());
+        }
+        assert!(page(&json!({ "action": "open", "url": "https://example.com" })).is_none());
     }
 
     #[test]
