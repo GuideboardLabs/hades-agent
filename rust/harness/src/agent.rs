@@ -2080,7 +2080,7 @@ fn shell(args: &Value, world: &World) -> String {
     }
     let program = format!("timeout {seconds} sh -c {}", quote(command));
     let cage = crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network());
-    match crate::command::run(&program, &world.root, 6000, Some(&cage)) {
+    match crate::command::run_clean(&program, &world.root, 6000, Some(&cage)) {
         Ok(run) => {
             let mut text = run.output;
             if text.trim().is_empty() {

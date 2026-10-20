@@ -40,7 +40,43 @@ impl Run {
 /// Run `program` through `sh -c` in `root`, keeping at most `limit` bytes of output, confined by `cage`
 /// when there is one.
 pub fn run(program: &str, root: &Path, limit: usize, cage: Option<&Cage>) -> Result<Run, Fault> {
-    run_within(program, root, limit, cage, None)
+    run_inner(program, root, limit, cage, None, false)
+}
+
+/// Run a *model's* program with an environment it cannot read secrets out of.
+///
+/// The harness process holds provider keys, and a child inherits them unless something says otherwise.
+/// A model that runs `env` would then read a key it was never given, which is a read primitive the read
+/// boundary does not cover. The passlist is deliberate: a toolchain location is not a credential.
+pub fn run_clean(
+    program: &str,
+    root: &Path,
+    limit: usize,
+    cage: Option<&Cage>,
+) -> Result<Run, Fault> {
+    run_inner(program, root, limit, cage, None, true)
+}
+
+/// What a model-run program may see. Paths and locale only; no `*_KEY`, `*_TOKEN`, `*_SECRET`, and no
+/// `HADES_*`, because those name the harness' own configuration.
+pub fn clean_environment() -> Vec<(String, String)> {
+    let mut kept = Vec::new();
+    for key in [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "TERM",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            kept.push((key.to_string(), value.to_string_lossy().into_owned()));
+        }
+    }
+    kept
 }
 
 /// [`run`] with a wall-clock deadline. A program that outlives it is killed and the result says so, with
@@ -56,6 +92,17 @@ pub fn run_within(
     cage: Option<&Cage>,
     deadline: Option<std::time::Duration>,
 ) -> Result<Run, Fault> {
+    run_inner(program, root, limit, cage, deadline, false)
+}
+
+fn run_inner(
+    program: &str,
+    root: &Path,
+    limit: usize,
+    cage: Option<&Cage>,
+    deadline: Option<std::time::Duration>,
+    clean: bool,
+) -> Result<Run, Fault> {
     let plan = cage.map(|cage| cage.plan()).transpose()?;
     let mut command = Process::new("sh");
     command
@@ -65,6 +112,12 @@ pub fn run_within(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if clean {
+        command.env_clear();
+        for (key, value) in clean_environment() {
+            command.env(key, value);
+        }
+    }
 
     if let Some(plan) = plan {
         // SAFETY: the hook runs in the child between fork and exec, so it must not allocate, lock or print,
@@ -266,5 +319,44 @@ mod tests {
             "{cut:?}"
         );
         assert!(!cut.contains('\u{fffd}'), "{cut:?}");
+    }
+}
+
+#[cfg(test)]
+mod clean {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_model_shell_cannot_read_a_key_the_harness_holds() {
+        let _guard = ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+        // Planted in this process, exactly like a provider key the harness was started with.
+        unsafe {
+            std::env::set_var("HADES_TEST_SECRET", "sk-do-not-leak");
+            std::env::set_var("OPENAI_API_KEY", "sk-do-not-leak");
+            std::env::set_var("HADES_PROXY", "http://127.0.0.1:9");
+        }
+        let root = crate::scratch::root().join("clean-env");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        let clean = run_clean("env", &root, 100_000, None).expect("a clean run");
+        assert!(!clean.output.contains("sk-do-not-leak"), "{}", clean.output);
+        for name in ["HADES_TEST_SECRET", "OPENAI_API_KEY", "HADES_PROXY"] {
+            assert!(!clean.output.contains(name), "{name} reached the model's shell");
+        }
+        assert!(clean.output.contains("PATH="), "a shell still needs PATH: {}", clean.output);
+
+        // The contrast is the point: the same command inherits the key without `run_clean`.
+        let inherited = run("env", &root, 100_000, None).expect("an inherited run");
+        assert!(inherited.output.contains("sk-do-not-leak"));
+
+        unsafe {
+            std::env::remove_var("HADES_TEST_SECRET");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("HADES_PROXY");
+        }
     }
 }
