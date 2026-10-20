@@ -170,6 +170,34 @@ fn directories_with_skill(dir: &Path) -> Vec<Skill> {
     found
 }
 
+/// Every `SKILL.md` under the state's skills directory, recursively and sorted by path.
+///
+/// A skill is an instruction the agent loads, so it is part of the harness a generation records. The walk
+/// is depth-limited: a link that points at a directory above itself would otherwise be an endless capture.
+pub fn skill_files(state: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_skills(&state.join("skills"), 0, &mut found);
+    found.sort();
+    found
+}
+
+fn collect_skills(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skills(&path, depth + 1, found);
+        } else if path.file_name().is_some_and(|name| name == "SKILL.md") {
+            found.push(path);
+        }
+    }
+}
+
 /// Move a proposal into the directory the agent reads, flipping `status: proposed` to `status: active`.
 pub fn promote(state: &Path, name: &str) -> Result<PathBuf, String> {
     let from = proposed_dir(state).join(format!("{name}.md"));
@@ -282,6 +310,27 @@ mod tests {
         let text = std::fs::read_to_string(&target).expect("the promoted file");
         assert!(text.contains("status: active"), "{text}");
         assert!(proposed(&state).is_empty());
+    }
+
+    #[test]
+    fn every_skill_file_is_found_at_any_depth() {
+        let state = scratch("walk");
+        for at in ["skills/builtin/one", "skills/installed/two"] {
+            std::fs::create_dir_all(state.join(at)).expect("a skill directory");
+            std::fs::write(state.join(at).join("SKILL.md"), "body").expect("a skill");
+        }
+        std::fs::create_dir_all(state.join("skills/proposed")).expect("a proposal directory");
+        std::fs::write(state.join("skills/proposed/three.md"), "body").expect("a proposal");
+        let found = skill_files(&state);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found[0].ends_with("skills/builtin/one/SKILL.md"),
+            "{found:?}"
+        );
+        assert!(
+            found[1].ends_with("skills/installed/two/SKILL.md"),
+            "{found:?}"
+        );
     }
 
     #[test]

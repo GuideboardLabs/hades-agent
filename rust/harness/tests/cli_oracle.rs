@@ -49,7 +49,7 @@ fn the_help_lists_the_commands() {
     let (code, text) = hades(&["help"]);
     assert_eq!(code, 0);
     for command in [
-        "profiles", "route", "context", "audit", "turn", "service", "version",
+        "profiles", "route", "context", "audit", "turn", "service", "version", "refine",
     ] {
         assert!(text.contains(command), "{command} is missing from the help");
     }
@@ -2430,4 +2430,151 @@ fn run_help_lists_the_strict_model_flag() {
             "{command} --help does not document --strict-model: {text}"
         );
     }
+}
+
+// A generation is the harness an adoption replaced. `refine` reads the number back, and `--rollback` puts
+// those bytes where they belong: the prompt, and the skill file that was edited alongside it.
+#[test]
+fn refine_lists_generations_and_rolls_one_back() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let home = scratch("refine-home");
+    let harness = home.join("harness").join("fix");
+    let skill = home.join("skills").join("alpha").join("SKILL.md");
+    std::fs::create_dir_all(&harness).expect("the harness directory");
+    std::fs::create_dir_all(skill.parent().expect("the skill directory's parent"))
+        .expect("the skill directory");
+    std::fs::write(harness.join("system.md"), "before the edit").expect("the prompt");
+    let skill_before = "---\ndescription: alpha\n---\n\nDo it once.\n";
+    std::fs::write(&skill, skill_before).expect("the skill");
+
+    let generation = harness::tuning::capture(
+        &home,
+        "fix",
+        &harness,
+        &home,
+        "tune_1_other",
+        "passed",
+        &harness::tuning::guard_digest(),
+    )
+    .expect("a capture")
+    .expect("a generation");
+    assert_eq!(generation.id, 1);
+    // The adoption the generation makes undoable: a prompt edit and a skill description edit.
+    std::fs::write(harness.join("system.md"), "after the edit").expect("the adopted prompt");
+    std::fs::write(
+        &skill,
+        "---\ndescription: alpha, revised\n---\n\nDo it twice.\n",
+    )
+    .expect("the edited skill");
+
+    let listed = std::process::Command::new(exe)
+        .args(["refine", "--profile", "fix", "--state"])
+        .arg(&home)
+        .env("HADES_HOME", &home)
+        .output()
+        .expect("refine runs");
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.status.success(), "{text}");
+    assert!(text.contains("harness generations for `fix`"), "{text}");
+    assert!(
+        text.contains("tune_1_other"),
+        "the listing names the evidence: {text}"
+    );
+
+    let rolled = std::process::Command::new(exe)
+        .args(["refine", "--rollback", "1", "--profile", "fix", "--state"])
+        .arg(&home)
+        .env("HADES_HOME", &home)
+        .output()
+        .expect("refine runs");
+    let text = String::from_utf8_lossy(&rolled.stdout);
+    assert!(
+        rolled.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&rolled.stderr)
+    );
+    assert!(text.contains("restored generation 1"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(harness.join("system.md")).expect("the restored prompt"),
+        "before the edit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&skill).expect("the restored skill"),
+        skill_before
+    );
+
+    let missing = std::process::Command::new(exe)
+        .args(["refine", "--rollback", "9", "--profile", "fix", "--state"])
+        .arg(&home)
+        .env("HADES_HOME", &home)
+        .output()
+        .expect("refine runs");
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "a missing generation is a refusal"
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("there is no generation 9"),
+        "{}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+}
+
+// The guard runs before a probe, so a candidate that quotes the check costs nothing and leaves no evidence
+// of an adoption that never happened.
+#[test]
+fn a_candidate_that_quotes_the_check_is_refused_before_anything_runs() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let root = scratch("guard-root");
+    let home = scratch("guard-home");
+    let state = scratch("guard-state");
+    let harnesses = scratch("guard-harnesses");
+    let base = harnesses.join("base");
+    let leaky = harnesses.join("leaky");
+    std::fs::create_dir_all(&base).expect("the base harness");
+    std::fs::create_dir_all(&leaky).expect("the candidate");
+    std::fs::write(base.join("system.md"), "BASE").expect("the base prompt");
+    std::fs::write(
+        leaky.join("system.md"),
+        "Make `test -f ok.txt` pass, then say you are done.",
+    )
+    .expect("a candidate that quotes the check");
+
+    let output = std::process::Command::new(exe)
+        .args([
+            "tune",
+            "create ok.txt with ok",
+            "--root",
+            root.to_str().unwrap(),
+            "--verify",
+            "test -f ok.txt",
+            "--policy",
+            "open",
+            "--program",
+            "printf ok > ok.txt",
+            "--harness",
+            base.to_str().unwrap(),
+            "--candidate",
+            leaky.to_str().unwrap(),
+            "--state",
+            state.to_str().unwrap(),
+            "--adopt",
+        ])
+        .env("HADES_HOME", &home)
+        .output()
+        .expect("tune runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(2), "{text}");
+    assert!(text.contains("candidate `leaky` is refused"), "{text}");
+    assert!(text.contains("quotes the check"), "{text}");
+    assert!(
+        !home.join("control").join("harness").exists(),
+        "a refused candidate wrote a generation"
+    );
+    assert!(
+        !state.join("sessions").exists(),
+        "a refused candidate was probed: {}",
+        text
+    );
 }

@@ -55,7 +55,7 @@ pub mod index;
 pub mod note;
 pub mod permit;
 pub mod seams;
-mod sha256;
+pub mod sha256;
 pub mod sqlite;
 pub mod store;
 pub mod vault;
