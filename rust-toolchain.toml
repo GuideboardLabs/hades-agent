@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so a generation built months from now uses the compiler its patches
+# were written against. Changing this file is a core change: `rust-toolchain.toml`
+# is on the evolve path's protected list.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

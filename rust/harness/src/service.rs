@@ -49,13 +49,11 @@ pub fn render(prefix: &Path, home: &Path) -> Result<Units, String> {
     // own profiles name is broken, and the failure would look like the model's.
     for (key, value) in [
         ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("CARGO_HOME", std::env::var("CARGO_HOME").unwrap_or_default()),
+        ("RUSTUP_HOME", std::env::var("RUSTUP_HOME").unwrap_or_default()),
         (
-            "CARGO_HOME",
-            std::env::var("CARGO_HOME").unwrap_or_default(),
-        ),
-        (
-            "RUSTUP_HOME",
-            std::env::var("RUSTUP_HOME").unwrap_or_default(),
+            "CARGO_TARGET_DIR",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_default(),
         ),
     ] {
         if !value.is_empty() {
@@ -234,6 +232,32 @@ mod tests {
     #[test]
     fn a_newline_is_refused_rather_than_truncated() {
         assert!(systemd_arg("/home/a\nb").is_err());
+    }
+
+    /// A unit started from systemd must inherit the target directory the installer used, or a build
+    /// the agent starts from inside the service lands on the small root filesystem.
+    #[test]
+    fn the_units_carry_the_target_directory_when_one_is_set() {
+        // SAFETY: this test sets the variable only to read it back through `render`; no other test
+        // reads or writes `CARGO_TARGET_DIR`.
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", "/mnt/ssd/home-cold/hades-target");
+        }
+        let units = render(Path::new("/opt/hades"), Path::new("/home/a/.hades")).unwrap();
+        assert!(
+            units
+                .daemon
+                .contains("Environment=CARGO_TARGET_DIR=/mnt/ssd/home-cold/hades-target"),
+            "the daemon unit must carry the build directory:\n{}",
+            units.daemon
+        );
+        assert!(
+            units
+                .gateway
+                .contains("Environment=CARGO_TARGET_DIR=/mnt/ssd/home-cold/hades-target"),
+            "the gateway unit must carry the build directory:\n{}",
+            units.gateway
+        );
     }
 
     /// `%h` in a path is the user's home to systemd, not a directory named `%h`. A literal percent is `%%`.
