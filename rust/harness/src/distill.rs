@@ -45,8 +45,27 @@ pub struct Facts {
     pub exhausted: Option<String>,
     /// The human sentence the walk ended with, which is the only place a token or time overrun is explained.
     pub reason: Option<String>,
+    /// The last verdict the log recorded, by its written name. `None` for a log written before the
+    /// checkpoint carried one.
+    pub verdict: Option<String>,
     pub turns: Vec<Turn>,
     pub snapshot: Option<PathBuf>,
+}
+
+impl Facts {
+    /// The ladder's view of this log. Every fact is read from an entry the walk already wrote; nothing is
+    /// inferred from exit codes or from the sentence a surface printed.
+    pub fn claim(&self) -> crate::claim::Facts {
+        crate::claim::Facts {
+            attempted: !self.turns.is_empty(),
+            check: crate::verify::State::from_name(&self.check_state),
+            verdict: self
+                .verdict
+                .as_deref()
+                .and_then(crate::judge::Verdict::from_name),
+            accepted: self.accepted,
+        }
+    }
 }
 
 /// Load a session by id from `<state>/sessions/<id>.jsonl`.
@@ -63,6 +82,7 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
     let mut ended = None;
     let mut exhausted = None;
     let mut reason = None;
+    let mut verdict = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut open: Option<usize> = None;
 
@@ -138,6 +158,12 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
                 if let Some(value) = payload.get("check").and_then(Value::as_str) {
                     check_state = value.to_string();
                 }
+                // The last checkpoint's verdict is the verdict about the last attempt. A terminal
+                // checkpoint with no verdict leaves an earlier one in place, which is the attempt the
+                // run actually ended on when the terminal node did not judge.
+                if let Some(value) = payload.get("verdict").and_then(Value::as_str) {
+                    verdict = Some(value.to_string());
+                }
                 if let Some(value) = payload
                     .get("command")
                     .and_then(Value::as_str)
@@ -206,6 +232,7 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
         ended,
         exhausted,
         reason,
+        verdict,
         turns,
         snapshot,
     })

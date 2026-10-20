@@ -38,6 +38,18 @@ impl State {
     pub fn is_a_result(self) -> bool {
         !matches!(self, State::CouldNotRun | State::TimedOut)
     }
+
+    /// The state a log recorded, by the name `name()` writes. `None` for a name this build does not know:
+    /// a log from a newer build is not silently read as a state this one understands.
+    pub fn from_name(name: &str) -> Option<State> {
+        Some(match name {
+            "passed" => State::Passed,
+            "failed" => State::Failed,
+            "timed_out" => State::TimedOut,
+            "could_not_run" => State::CouldNotRun,
+            _ => return None,
+        })
+    }
 }
 
 /// The optional progress a check reports. A strict gate always outranks any amount of partial progress:

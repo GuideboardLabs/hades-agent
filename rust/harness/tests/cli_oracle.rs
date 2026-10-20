@@ -155,6 +155,7 @@ fn a_turn_runs_a_program_and_writes_a_log_that_reads_back() {
         kinds,
         vec![
             "meta",
+            "meta",
             "user",
             "tool_call",
             "tool_result",
@@ -164,11 +165,22 @@ fn a_turn_runs_a_program_and_writes_a_log_that_reads_back() {
         ]
     );
 
+    // The second meta entry is the prompt that produced the run: one size and one digest, no text.
+    assert_eq!(entries[1]["payload"]["type"], "harness");
+    assert!(entries[1]["payload"]["prompt_bytes"].is_number());
+    assert_eq!(
+        entries[1]["payload"]["prompt_sha256"]
+            .as_str()
+            .expect("a digest")
+            .len(),
+        64
+    );
+
     // The program that ran is in the log, and so is what it printed.
-    assert_eq!(entries[2]["payload"]["program"], "echo hello");
-    assert_eq!(entries[3]["payload"]["status"], 0);
+    assert_eq!(entries[3]["payload"]["program"], "echo hello");
+    assert_eq!(entries[4]["payload"]["status"], 0);
     assert!(
-        entries[3]["payload"]["output"]
+        entries[4]["payload"]["output"]
             .as_str()
             .expect("output")
             .contains("hello")
@@ -203,7 +215,11 @@ fn a_second_cli_turn_resumes_the_same_session() {
     }
 
     let entries = log_lines(&state, "again");
-    assert_eq!(entries.len(), 13, "two turns of six, after the meta entry");
+    assert_eq!(
+        entries.len(),
+        14,
+        "two turns of six, after the root and the harness meta entries"
+    );
     for (index, entry) in entries.iter().enumerate().skip(1) {
         assert_eq!(
             entry["parent"],
@@ -360,6 +376,7 @@ fn a_question_raised_by_one_invocation_is_answered_by_another() {
         kinds,
         vec![
             "meta",
+            "meta",
             "user",
             "approval_request",
             "user",
@@ -371,8 +388,8 @@ fn a_question_raised_by_one_invocation_is_answered_by_another() {
             "checkpoint",
         ]
     );
-    assert_eq!(entries[4]["payload"]["by"], "operator");
-    assert_eq!(entries[4]["payload"]["question"], 0);
+    assert_eq!(entries[5]["payload"]["by"], "operator");
+    assert_eq!(entries[5]["payload"]["question"], 0);
 
     // A second answer for the same question is refused rather than overwriting the first.
     let (code, text) = hades(&[
