@@ -208,9 +208,15 @@ impl Bounds {
     }
 }
 
+/// The completion cap one model call is given when the caller names none. [`budget_tokens`] is only true
+/// against the cap the client actually sends, so the default lives here beside that check; `OpenAi::new`
+/// (`model.rs`) holds the same value, and the two must move together.
+pub const DEFAULT_CALL_TOKENS: u64 = 4096;
+
 /// A token allowance, refused before it is used when it cannot mean what the caller thinks. Zero is not a
 /// budget: a run that may not spend is not a run. A budget below one call's completion cap is refused too,
-/// because that call would be allowed to spend more than the whole run before anything could stop it.
+/// because that call would be allowed to spend more than the whole run before anything could stop it. The
+/// cap is the declared `--max-tokens` when there is one, and [`DEFAULT_CALL_TOKENS`] when there is not.
 pub fn budget_tokens(tokens: u64, max_tokens: Option<u64>) -> Result<u64, String> {
     if tokens == 0 {
         return Err(
@@ -218,13 +224,21 @@ pub fn budget_tokens(tokens: u64, max_tokens: Option<u64>) -> Result<u64, String
                 .to_string(),
         );
     }
-    if let Some(call) = max_tokens.filter(|call| *call > tokens) {
+    let call = max_tokens.unwrap_or(DEFAULT_CALL_TOKENS);
+    if call > tokens {
         return Err(format!(
             "`--budget-tokens {tokens}` is less than `--max-tokens {call}`: one call could spend the whole \
              run's allowance"
         ));
     }
     Ok(tokens)
+}
+
+/// Which allowance a branch batch left the run on. The branch itself stops only on the clock, but the parent
+/// recomputes the cause from the totals the batch just spent, and attempts are asked before time: a batch
+/// that also reached the attempt allowance is not relabelled as a clock end.
+fn branch_cause(out: Option<Exhausted>) -> Exhausted {
+    out.unwrap_or(Exhausted::Minutes)
 }
 
 /// What a run ran out of. The first three are declared budgets; the rest are the ways a run stops that no
@@ -893,7 +907,9 @@ where
                             } else if when == When::Exhausted {
                                 // The branch stopped itself when the clock ran out: its loop checks time,
                                 // and the parent's token total is only read once the candidates are home.
-                                self.last_cause = Some(Exhausted::Minutes);
+                                // The totals decide the cause: attempts are asked before time, so a batch
+                                // that also reached the attempt allowance says attempts.
+                                self.last_cause = Some(branch_cause(out));
                                 when
                             } else if when == When::Refused {
                                 self.last_cause = Some(Exhausted::Refused);
@@ -1559,6 +1575,40 @@ mod tests {
             Some(Exhausted::Tokens)
         );
         assert_eq!(Bounds::new(3, 10).tokens(), None);
+    }
+
+    #[test]
+    fn a_branch_that_stopped_on_the_clock_keeps_the_cause_the_totals_name() {
+        // `branch` can only stop itself on the clock, but the parent recomputes the cause from the totals
+        // the batch just spent, and attempts are asked before time. A batch that reached the attempt
+        // allowance must be reported as attempts, not relabelled as a clock end.
+        let spent =
+            Bounds::new(2, 10)
+                .with_width(2)
+                .exhausted(2, std::time::Duration::from_secs(601), 0);
+        assert_eq!(spent, Some(Exhausted::Attempts));
+        assert_eq!(branch_cause(spent), Exhausted::Attempts);
+        // A branch that stopped with no other allowance spent is a clock end: that is the only way it
+        // stops itself.
+        assert_eq!(branch_cause(None), Exhausted::Minutes);
+        assert_eq!(
+            branch_cause(Some(Exhausted::Tokens)),
+            Exhausted::Tokens,
+            "a cause the totals computed is the cause the end carries"
+        );
+    }
+
+    #[test]
+    fn a_token_budget_must_cover_the_cap_one_call_can_spend() {
+        // The cap is the declared one when there is one, and the model client's default when there is
+        // not: a budget below either would let the first call spend more than the whole run.
+        assert!(budget_tokens(500, None).is_err());
+        assert_eq!(budget_tokens(4096, None), Ok(4096));
+        assert!(budget_tokens(500, Some(4096)).is_err());
+        // A cap the caller narrowed below the budget is the cap that call may spend, so the run fits.
+        assert_eq!(budget_tokens(500, Some(200)), Ok(500));
+        assert!(budget_tokens(500, Some(600)).is_err());
+        assert!(budget_tokens(0, Some(1)).is_err());
     }
 
     #[test]

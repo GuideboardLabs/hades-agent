@@ -651,6 +651,27 @@ fn a_token_budget_is_a_run_flag_and_a_budget_that_cannot_work_is_refused() {
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("`--max-tokens 200`"), "{text}");
 
+    // The cap is resolved even when nobody typed one: the model client's default completion cap is 4096,
+    // so a budget of 500 would let one call spend eight times the whole run's allowance.
+    let (code, text) = hades(&[
+        "run",
+        "make a thing",
+        "--budget-tokens",
+        "500",
+        "--program",
+        "true",
+        "--verify",
+        "test -f never.txt",
+        "--policy",
+        "open",
+        "--root",
+        &root_arg,
+        "--state",
+        &state_arg,
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("`--max-tokens 4096`"), "{text}");
+
     // A real budget is a bound like any other: it is stated in the header, and the run still stops at the
     // attempt bound because a scripted answer reports no spend to count.
     let (code, text) = hades(&[
@@ -2060,27 +2081,63 @@ fn explain_names_the_budget_that_ran_out() {
     // Reading a log has to answer "which allowance stopped it" from the record, not from a guess. A run
     // that ran out of tokens must not be reported as one that ran out of attempts: the two mean different
     // things to whoever decides whether to raise the budget, retry, or leave it alone.
+    //
+    // The sentence is the one the walk actually writes: `Bounds::declared` says which allowances were
+    // declared, so the fixture cannot drift into a sentence no run could produce.
     let state = scratch("explain-cause");
     std::fs::create_dir_all(state.join("sessions")).expect("a sessions dir");
-    let log = concat!(
-        r#"{"kind":"user","payload":{"goal":"make it pass","root":"/work","profile":"fix"}}"#,
-        "\n",
-        r#"{"kind":"checkpoint","payload":{"node":"attempt","condition":"Failed","edge":"attempt -> attempt","attempt":1}}"#,
-        "\n",
-        r#"{"kind":"checkpoint","payload":{"node":"gave_up","condition":"Exhausted","ended":true,"exhausted":"tokens","reason":"the token budget was spent and the check still failed","attempt":1}}"#,
-        "\n"
+    let bounds = harness::Bounds::new(2, 10).with_tokens(1200);
+    let reason = format!(
+        "the bounds were spent after 1 attempt(s) ({}), and the check still failed",
+        bounds.declared()
     );
-    std::fs::write(state.join("sessions/s1.jsonl"), log).expect("a session");
+    let log = [
+        serde_json::json!({
+            "kind": "user",
+            "payload": {"goal": "make it pass", "root": "/work", "profile": "fix"},
+        }),
+        serde_json::json!({
+            "kind": "checkpoint",
+            "payload": {
+                "node": "attempt",
+                "condition": "Failed",
+                "edge": "attempt -> attempt",
+                "attempt": 1,
+            },
+        }),
+        serde_json::json!({
+            "kind": "checkpoint",
+            "payload": {
+                "node": "gave_up",
+                "condition": "Exhausted",
+                "ended": true,
+                "exhausted": "tokens",
+                "reason": reason,
+                "attempt": 1,
+            },
+        }),
+    ]
+    .iter()
+    .map(|entry| entry.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(state.join("sessions/s1.jsonl"), format!("{log}\n")).expect("a session");
     let (code, text) = hades(&["explain", "s1", "--state", state.to_str().expect("utf-8")]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("cause: tokens"), "{text}");
     assert!(
-        text.contains("the token budget was spent"),
+        !text.contains("cause: attempts"),
+        "a token-exhausted run was blamed on the attempt count: {text}"
+    );
+    // The runner's whole sentence survives the read, including the bounds it names: that is what a person
+    // reading the end needs in order to know which allowance to raise.
+    assert!(
+        text.contains(&format!("why: {reason}")),
         "the human sentence is not in the log: {text}"
     );
     assert!(
-        !text.contains("attempts"),
-        "a token-exhausted run was blamed on the attempt count: {text}"
+        reason.contains("2 attempts, 10 minutes, 1200 tokens"),
+        "the fixture no longer says what the runner says: {reason}"
     );
 }
 
