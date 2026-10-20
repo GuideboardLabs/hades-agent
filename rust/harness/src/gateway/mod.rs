@@ -19,6 +19,7 @@
 //! in the Bot API URL, which means it is visible in the curl process's arguments for the length of a
 //! call. That is a limit of the Bot API's shape, recorded here rather than hidden.
 
+pub mod children;
 pub mod telegram;
 
 use std::collections::BTreeMap;
@@ -1466,6 +1467,16 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
     once: bool,
 ) -> Result<(), String> {
     let mut offset = load_offset(&state);
+    // A child is a thread in this process, so records a dead process left behind name work that ended
+    // with it. Recovery marks them lost before the gateway admits anything new; nothing is resumed.
+    let children = children::Registry::new(&state);
+    match children.recover() {
+        Ok(0) => {}
+        Ok(count) => {
+            eprintln!("children: {count} live child(ren) from a previous gateway are marked lost")
+        }
+        Err(said) => eprintln!("children: could not recover the registry: {said}"),
+    }
     // The old single-list shape becomes one file per job before anything schedules it.
     match crate::cron::migrate(&state) {
         Ok(0) => {}
