@@ -3,6 +3,7 @@ use super::{
     editor::Editor,
     quota::Quota,
 };
+use crate::approval::ApprovalBroker as _;
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
@@ -92,6 +93,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "Browse and resume conversations"),
     ("/model", "Choose a model preset"),
     ("/mode read", "Switch to read-only tools"),
+    (
+        "/mode plan",
+        "Investigate, ask at forks, then plan; no writes",
+    ),
     ("/mode act", "Enable action tools under the runtime's rules"),
     ("/run ", "Submit a checked run to the daemon"),
     ("/jobs", "Inspect scheduled work"),
@@ -147,6 +152,9 @@ pub struct App {
     pub visible_from: usize,
     pub chat_cache: Option<super::ui::ChatCache>,
     pub overlay_scroll: u16,
+    /// The pending question the bar renders, if any.
+    pub ask: super::ask::AskState,
+    last_ask_poll: Option<Instant>,
     sender: SyncSender<Event>,
     receiver: Receiver<Event>,
     stop_flag: Arc<AtomicBool>,
@@ -206,6 +214,8 @@ impl App {
             visible_from: 0,
             chat_cache: None,
             overlay_scroll: 0,
+            ask: super::ask::AskState::default(),
+            last_ask_poll: None,
             sender,
             receiver,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -246,6 +256,21 @@ impl App {
             activity: vec![Row { id:"1".into(), title:"shell: cargo test -p harness retry::tests".into(), detail:"The action passed the runtime's gates.".into(), status:"allow".into() }], ..Overview::default()
         };
         self.status = "DEMO · offline preview · no actions or model calls".into();
+        // A seeded question, so the bar can be seen and exercised without a provider.
+        self.ask.set(vec![crate::approval::Question {
+            request: crate::approval::ApprovalRequest {
+                id: crate::approval::PendingId(0),
+                session: self.id.clone(),
+                action: "shell: rm -rf build/".into(),
+                reason: "the path is generated but the delete is not reversible".into(),
+                at: "demo".into(),
+                ask: Some(crate::question::Ask::permission(
+                    "Delete 12 files under ./build?",
+                    "the directory is generated, but the delete cannot be undone",
+                )),
+            },
+            answer: None,
+        }]);
     }
     pub fn restore_initial(&mut self) -> Result<(), String> {
         if let Some(id) = self.options.resume.clone() {
@@ -320,6 +345,110 @@ impl App {
                 break;
             };
             self.apply(event);
+        }
+        self.poll_questions();
+    }
+
+    /// Read the shared approval record for this session. A question raised by the worker thread becomes
+    /// visible here without the worker holding the UI.
+    fn poll_questions(&mut self) {
+        if self.options.demo {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_ask_poll
+            .is_some_and(|at| now.duration_since(at) < Duration::from_millis(250))
+        {
+            return;
+        }
+        self.last_ask_poll = Some(now);
+        let Ok(broker) = crate::approval::OnDisk::open(self.options.state.join("approvals.jsonl"))
+        else {
+            return;
+        };
+        let Ok(questions) = broker.questions() else {
+            return;
+        };
+        let mine = questions
+            .into_iter()
+            .filter(|question| question.request.session == self.id)
+            .collect();
+        self.ask.set(mine);
+    }
+
+    /// Answer the question the bar is showing. `other` records the input text as the note; for a
+    /// permission that is a deny plus a steer, and for a choice it is the free-text answer.
+    fn answer_question(&mut self, key: &str) {
+        let Some(question) = self.ask.current().cloned() else {
+            return;
+        };
+        let note = if self.ask.is_other() || key == "other" {
+            Some(self.input.text.trim().to_string()).filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+        if self.options.demo {
+            self.ask
+                .questions
+                .retain(|pending| pending.request.id != question.request.id);
+            self.input.set(String::new());
+            self.status = format!("Demo answer: {key}");
+            return;
+        }
+        let Ok(broker) = crate::approval::OnDisk::open(self.options.state.join("approvals.jsonl"))
+        else {
+            self.status = "Could not open the approval record".into();
+            return;
+        };
+        let result = if key == "other" {
+            let choice = question
+                .request
+                .ask
+                .as_ref()
+                .is_some_and(|ask| ask.kind == crate::question::AskKind::Choice);
+            broker.resolve_answer(
+                question.request.id,
+                if choice {
+                    crate::policy::Decision::Allow
+                } else {
+                    crate::policy::Decision::Deny
+                },
+                crate::approval::Scope::Once,
+                Some("other"),
+                note.as_deref(),
+                "tui",
+            )
+        } else {
+            broker.resolve_choice(question.request.id, key, note.as_deref(), "tui")
+        };
+        match result {
+            Ok(answer) => {
+                self.ask
+                    .questions
+                    .retain(|pending| pending.request.id != question.request.id);
+                self.input.set(String::new());
+                self.last_ask_poll = None;
+                let label = question
+                    .request
+                    .ask
+                    .as_ref()
+                    .and_then(|ask| ask.option(key).map(|choice| choice.label.clone()))
+                    .unwrap_or_else(|| key.to_string());
+                self.status = format!(
+                    "Answered: {label} ({}). {}{}",
+                    answer.decision.name(),
+                    if self.busy {
+                        "Hades continues."
+                    } else {
+                        "The turn had ended."
+                    },
+                    note.as_deref()
+                        .map(|note| format!(" Note: {note}"))
+                        .unwrap_or_default()
+                );
+            }
+            Err(error) => self.status = format!("Could not answer: {error}"),
         }
     }
     pub fn apply(&mut self, event: Event) {
@@ -677,7 +806,7 @@ impl App {
                     self.mode = mode;
                     self.status = format!("Tool mode: {}", mode.name());
                 } else {
-                    self.status = "Usage: /mode read or /mode act".into();
+                    self.status = "Usage: /mode read, /mode plan or /mode act".into();
                 }
             }
             "/run" => {
@@ -826,6 +955,82 @@ impl App {
             _ => {}
         }
     }
+    /// Keys the ask bar owns. Returns true when it consumed the key. `Esc` collapses rather than stopping
+    /// the run, so a pending question cannot be lost by a reflex.
+    fn ask_key(&mut self, key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl {
+            return false;
+        }
+        if self.ask.collapsed {
+            return match key.code {
+                KeyCode::Enter => {
+                    self.ask.collapsed = false;
+                    true
+                }
+                KeyCode::Esc => true,
+                _ => false,
+            };
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.ask.toggle_collapsed();
+                true
+            }
+            KeyCode::Up => {
+                self.ask.up();
+                true
+            }
+            KeyCode::Down => {
+                self.ask.down();
+                true
+            }
+            KeyCode::Tab => {
+                self.ask.cycle();
+                true
+            }
+            KeyCode::Enter => {
+                let key = self.ask.selected_key().unwrap_or_else(|| "other".into());
+                self.answer_question(&key);
+                true
+            }
+            // Typing belongs to the person, always. The first printable key moves the caret into the
+            // input and selects `Other`, so a typed answer declines the recommendation by construction.
+            KeyCode::Char(_)
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End => {
+                self.ask.type_here();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn cycle_mode(&mut self) {
+        if self.busy {
+            self.status = "Finish the active turn before changing tool mode".into();
+            return;
+        }
+        self.mode = match self.mode {
+            crate::mode::Mode::Read => crate::mode::Mode::Plan,
+            crate::mode::Mode::Plan => crate::mode::Mode::Act,
+            crate::mode::Mode::Act => crate::mode::Mode::Read,
+        };
+        self.status = format!(
+            "Tool mode: {} · {}",
+            self.mode.name(),
+            match self.mode {
+                crate::mode::Mode::Read => "read-only",
+                crate::mode::Mode::Plan => "investigate, ask, then plan",
+                crate::mode::Mode::Act => "act under the floor",
+            }
+        );
+    }
+
     fn key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('q') {
@@ -844,6 +1049,9 @@ impl App {
         }
         if self.overlay.is_some() {
             self.overlay_key(key);
+            return;
+        }
+        if self.ask.is_open() && self.ask_key(&key) {
             return;
         }
         match key.code {
@@ -867,11 +1075,18 @@ impl App {
                     self.switch(View::Chat);
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => self.cycle_mode(),
+            KeyCode::BackTab => {
+                if self.view == View::Chat {
+                    self.cycle_mode();
+                } else {
+                    let index = View::ALL.iter().position(|v| v == &self.view).unwrap_or(0);
+                    self.switch(View::ALL[(index + 6) % 7]);
+                }
+            }
+            KeyCode::Tab => {
                 let index = View::ALL.iter().position(|v| v == &self.view).unwrap_or(0);
-                let previous =
-                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
-                self.switch(View::ALL[(index + if previous { 6 } else { 1 }) % 7]);
+                self.switch(View::ALL[(index + 1) % 7]);
             }
             KeyCode::PageUp => {
                 self.follow = false;

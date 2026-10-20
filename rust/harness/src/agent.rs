@@ -9,6 +9,7 @@ use crate::fault::Fault;
 use crate::gateway::children::{Admission, Event as ChildEvent, Refusal, Registry};
 use crate::memory::{Memory, MnemeMemory};
 use crate::model::{Feed, FeedFn, OpenAi};
+use crate::policy::Decision;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -82,6 +83,9 @@ pub struct World {
     pub mcp: std::sync::Arc<crate::mcp::Mcp>,
     /// The model calls this conversation and its workers may spend, counted once for the whole tree.
     pub allowance: std::sync::Arc<Allowance>,
+    /// The question surface, when a person can answer one. `None` on a surface with nobody to ask, which
+    /// is what makes a headless job refuse at the floor instead of waiting forever.
+    pub questions: Option<std::sync::Arc<crate::question::Desk>>,
 }
 
 /// A mailbox a caller can hand a running loop. The loop owns the type because the loop is what decides
@@ -537,6 +541,38 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
             }
         }));
     }
+    // Asking changes nothing, so it survives the read filter and is the main tool in plan mode.
+    list.as_array_mut().unwrap().push(json!({
+        "type": "function",
+        "function": {
+            "name": "ask",
+            "description": "Ask the person a question when the work genuinely forks: an engineering choice, a goal or scope change, or a preference where more than one way is valid. Give 2 to 4 options, mark exactly one recommended, and put what changes if it is picked in each detail. A blocking question stops until they answer; an advisory one takes the recommendation and continues. Do not ask about reversible details, and never ask for permission: the floor asks that.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The question, one line."},
+                    "why": {"type": "string", "description": "One sentence on why this is a real fork."},
+                    "blocking": {"type": "boolean", "description": "True only when the answer changes what may be touched or what the goal is. Default false."},
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {"type": "string", "description": "stable lowercase key, e.g. sqlite"},
+                                "label": {"type": "string", "description": "short label for the bar"},
+                                "detail": {"type": "string", "description": "what changes if this is picked"},
+                                "recommended": {"type": "boolean"}
+                            },
+                            "required": ["key", "label", "detail"]
+                        }
+                    }
+                },
+                "required": ["prompt", "why", "options"]
+            }
+        }
+    }));
     // A read surface is handed no tool that changes anything. Filtering here, after the list is built,
     // keeps one definition of "mutating" for the schema and the check in `execute`.
     if !mode.acts() {
@@ -569,7 +605,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-const TOOLS: [&str; 22] = [
+const TOOLS: [&str; 23] = [
     "shell",
     "read_file",
     "write_file",
@@ -592,6 +628,7 @@ const TOOLS: [&str; 22] = [
     "children",
     "result",
     "tell",
+    "ask",
 ];
 
 /// Record one decided action. Best effort: a ledger write that fails is reported, and the action it was
@@ -741,7 +778,8 @@ pub fn answer_stoppable(
                 activity(Activity::End, &label);
                 continue;
             }
-            let result = execute(&call.name, &call.arguments, world, client, activity);
+            let result =
+                execute_with_stop(&call.name, &call.arguments, world, client, activity, stop);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -852,12 +890,33 @@ fn pre_tool_hook(world: &World, name: &str, args: &Value) -> Option<String> {
     None
 }
 
+/// How long a blocking question waits before the recommended option is taken. Tests use a short
+/// deadline so a missed answer fails fast instead of stalling the suite.
+#[cfg(not(test))]
+const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(test)]
+const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The test and library entry point for a tool call with no stop flag. The loop uses the stop-aware
+/// variant, so a question wait can be interrupted by the same flag that stops the turn.
+#[cfg(test)]
 fn execute(
     name: &str,
     arguments: &str,
     world: &World,
     client: &OpenAi,
     activity: &dyn Fn(Activity, &str),
+) -> String {
+    execute_with_stop(name, arguments, world, client, activity, None)
+}
+
+fn execute_with_stop(
+    name: &str,
+    arguments: &str,
+    world: &World,
+    client: &OpenAi,
+    activity: &dyn Fn(Activity, &str),
+    stop: Option<&AtomicBool>,
 ) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let what = crate::activity::action(name, &args);
@@ -893,18 +952,81 @@ fn execute(
             world.role.name()
         );
     }
-    // The hard floor, before the tool does anything. A chat has no approval surface, so the refusal
-    // goes back to the model as the result: it says what was refused, and that a person decides.
+    // The hard floor, before the tool does anything. A surface with a person attached raises a question
+    // and waits; a surface with nobody to ask refuses into the model's result, as it always has.
     if let Some(floor) = crate::floor::check(name, &args, &world.root) {
-        decided(
-            world,
-            "floor",
-            &what,
-            "refuse",
+        let Some(desk) = &world.questions else {
+            decided(
+                world,
+                "floor",
+                &what,
+                "refuse",
+                floor.category().phrase(),
+                &artifact,
+            );
+            return floor.refusal();
+        };
+        let ask = crate::question::Ask::permission(
+            format!("Allow {}?", clip(&what, 100)),
             floor.category().phrase(),
-            &artifact,
         );
-        return floor.refusal();
+        let request = match desk.permission(&world.session, floor.action(), &floor.reason(), ask) {
+            Ok(request) => request,
+            Err(said) => {
+                decided(
+                    world,
+                    "floor",
+                    &what,
+                    "refuse",
+                    &format!("the question could not be recorded: {said}"),
+                    &artifact,
+                );
+                return floor.refusal();
+            }
+        };
+        let answer = desk.wait(request.id, ASK_TIMEOUT, stop).ok().flatten();
+        match answer {
+            Some(answer) if answer.decision == Decision::Allow => {
+                decided(
+                    world,
+                    "floor",
+                    &what,
+                    "allow",
+                    &format!("answered by {}", answer.by),
+                    &artifact,
+                );
+            }
+            Some(answer) => {
+                decided(
+                    world,
+                    "floor",
+                    &what,
+                    "deny",
+                    &format!("answered by {}", answer.by),
+                    &artifact,
+                );
+                let note = answer.note.unwrap_or_default();
+                return if note.is_empty() {
+                    floor.refusal()
+                } else {
+                    format!("{}\n\nThe person said: {note}", floor.refusal())
+                };
+            }
+            None => {
+                decided(
+                    world,
+                    "floor",
+                    &what,
+                    "deny",
+                    "no answer before the deadline",
+                    &artifact,
+                );
+                return format!(
+                    "{}\n\nNo answer arrived, so the action was not taken. Continue without it, or ask again later.",
+                    floor.refusal()
+                );
+            }
+        }
     }
     if !TOOLS.contains(&name) {
         decided(world, "surface", &what, "refuse", "no such tool", &artifact);
@@ -949,11 +1071,82 @@ fn execute(
         "tell" => tell_child(&args, world),
         "cron" => crate::agent::cron(&args, world),
         "goal" => goal_tool(&args, world),
+        "ask" => ask_tool(&args, world, stop),
         "mcp" => world
             .mcp
             .run(&args)
             .unwrap_or_else(|said| format!("MCP: {said}")),
         other => format!("there is no tool called {other}"),
+    }
+}
+
+/// Ask the person a question with options. The model supplies the fork; the shape is validated here, so a
+/// malformed question is refused with the reason rather than rendered as a broken bar.
+fn ask_tool(args: &Value, world: &World, stop: Option<&AtomicBool>) -> String {
+    let Some(desk) = &world.questions else {
+        return "No person is attached to this surface, so there is nobody to ask. Decide with the best option and say which you assumed.".into();
+    };
+    let mut options = Vec::new();
+    for option in args["options"].as_array().into_iter().flatten() {
+        let mut choice = crate::question::Choice::new(
+            option["key"].as_str().unwrap_or(""),
+            option["label"].as_str().unwrap_or(""),
+            option["detail"].as_str().unwrap_or(""),
+            crate::question::Effect::Free,
+        );
+        choice.recommended = option["recommended"].as_bool().unwrap_or(false);
+        options.push(choice);
+    }
+    let blocking = args["blocking"].as_bool().unwrap_or(false);
+    let mut ask = crate::question::Ask::choice(
+        args["prompt"].as_str().unwrap_or(""),
+        args["why"].as_str().unwrap_or(""),
+        blocking,
+        options,
+    );
+    if blocking && ask.default.is_none() {
+        ask.default = ask.recommended().map(|choice| choice.key.clone());
+    }
+    if let Err(said) = ask.validate() {
+        return format!(
+            "The question was refused: {said}. Fix it and ask again, or decide yourself and say which you assumed."
+        );
+    }
+    let request = match desk.choice(&world.session, "question", &ask.prompt, ask.clone()) {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            return "The question budget for this turn is spent. Decide with the recommended option and say which you assumed.".into();
+        }
+        Err(said) => {
+            return format!("The question could not be recorded: {said}. Decide yourself.");
+        }
+    };
+    let answer = if blocking {
+        desk.wait(request.id, ASK_TIMEOUT, stop).ok().flatten()
+    } else {
+        None
+    };
+    let key = answer
+        .as_ref()
+        .and_then(|answer| answer.option.clone())
+        .filter(|key| key == "other" || ask.option(key).is_some())
+        .unwrap_or_else(|| ask.fallback());
+    let label = ask
+        .option(&key)
+        .map(|choice| choice.label.clone())
+        .unwrap_or_else(|| "something else".into());
+    if blocking {
+        let mut said = json!({"option": key, "label": label});
+        if let Some(note) = answer
+            .and_then(|answer| answer.note)
+            .filter(|note| !note.is_empty())
+        {
+            said["note"] = json!(note);
+        }
+        said.to_string()
+    } else {
+        json!({"assumed": key, "label": label, "note": "the person can change this in the next turn"})
+            .to_string()
     }
 }
 
@@ -1231,6 +1424,7 @@ fn delegate(
             inbox: None,
             mcp: std::sync::Arc::clone(&world.mcp),
             allowance: std::sync::Arc::clone(&world.allowance),
+            questions: world.questions.clone(),
         };
         let client = client.clone();
         activity(
@@ -1367,6 +1561,7 @@ fn spawn(
         inbox: None,
         mcp: std::sync::Arc::clone(&world.mcp),
         allowance: std::sync::Arc::clone(&world.allowance),
+        questions: world.questions.clone(),
     };
     activity(Activity::Start, &format!("spawn: {}", clip(&goal, 60)));
 
@@ -1695,6 +1890,7 @@ fn cron(args: &Value, world: &World) -> String {
                     crate::cron::relative(state, &path),
                     match mode {
                         crate::mode::Mode::Read => "read-only",
+                        crate::mode::Mode::Plan => "read-only, then a plan",
                         crate::mode::Mode::Act => "may act, under the hard floor",
                     }
                 ),
@@ -2415,6 +2611,7 @@ pub fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalBroker as _;
     use crate::mode::Mode;
 
     fn names(list: &Value) -> Vec<String> {
@@ -2604,6 +2801,7 @@ mod tests {
             inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         };
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -2763,6 +2961,7 @@ mod tests {
             inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         }
     }
 
@@ -2854,6 +3053,7 @@ mod tests {
             inbox: None,
             mcp: mcp_with(&dir, &["echo"]),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         };
         let client = crate::model::OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -2894,6 +3094,7 @@ mod tests {
             inbox: None,
             mcp: mcp_with(&dir, &["echo"]),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         };
         let client = crate::model::OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -2928,6 +3129,7 @@ mod tests {
             inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         };
         let first = remember(
             &json!({"text": "the port is 8101", "title": "Port"}),
@@ -2994,6 +3196,7 @@ mod tests {
             inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         };
         let said = cron(
             &json!({
@@ -3063,6 +3266,7 @@ mod tests {
             inbox: None,
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
+            questions: None,
         };
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -4615,6 +4819,94 @@ mod tests {
             written.contains("deep"),
             "the grandchild finished and wrote its report: {written}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The floor asks the TUI, the TUI answers, and the action that was asked about actually runs.
+    /// This is the whole loop across three independent readers of one append-only file.
+    #[test]
+    fn a_floor_action_asks_and_runs_only_after_the_person_allows_it() {
+        let dir = crate::scratch::root().join("agent-floor-ask");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build")).expect("a build directory");
+        std::fs::write(dir.join("build/junk.txt"), "generated").expect("a file to delete");
+        let mut world = world_at(&dir, Mode::Act, "chat:test");
+        let record = dir.join("state/approvals.jsonl");
+        let broker = crate::approval::OnDisk::open(&record).expect("the approval record");
+        world.questions = Some(crate::question::Desk::new(std::sync::Arc::new(broker), 3));
+        let worker = std::thread::spawn(move || {
+            let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+            execute(
+                "shell",
+                r#"{"command":"rm -rf build"}"#,
+                &world,
+                &client,
+                &|_, _| {},
+            )
+        });
+        let reader = crate::approval::OnDisk::open(&record).expect("a second reader");
+        let mut asked = None;
+        for _ in 0..200 {
+            let questions = reader.questions().unwrap_or_default();
+            if let Some(question) = questions.into_iter().find(|q| q.answer.is_none()) {
+                assert!(
+                    question.request.action.contains("delete"),
+                    "{}",
+                    question.request.action
+                );
+                asked = Some(question.request.id);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let id = asked.expect("the floor asked before it touched anything");
+        assert!(dir.join("build").exists(), "nothing ran before the answer");
+        reader
+            .resolve_choice(id, "allow-once", None, "tui")
+            .expect("the answer is recorded");
+        let said = worker.join().expect("the tool thread");
+        assert!(!dir.join("build").exists(), "an allowed delete ran: {said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model question with options reaches the same record and the answer comes back as the tool
+    /// result, which is the path plan mode depends on.
+    #[test]
+    fn a_model_question_returns_the_option_the_person_picked() {
+        let dir = crate::scratch::root().join("agent-ask-tool");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).expect("a state directory");
+        let mut world = world_at(&dir, Mode::Plan, "chat:test");
+        let record = dir.join("state/approvals.jsonl");
+        let broker = crate::approval::OnDisk::open(&record).expect("the approval record");
+        world.questions = Some(crate::question::Desk::new(std::sync::Arc::new(broker), 6));
+        let worker = std::thread::spawn(move || {
+            let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+            execute(
+                "ask",
+                r#"{"prompt":"Which store should this use?","why":"both fit the requirements","blocking":true,"options":[{"key":"sqlite","label":"SQLite","detail":"one file, no server","recommended":true},{"key":"postgres","label":"Postgres","detail":"a server to run"}]}"#,
+                &world,
+                &client,
+                &|_, _| {},
+            )
+        });
+        let reader = crate::approval::OnDisk::open(&record).expect("a second reader");
+        let mut asked = None;
+        for _ in 0..200 {
+            let questions = reader.questions().unwrap_or_default();
+            if let Some(question) = questions.into_iter().find(|q| q.answer.is_none()) {
+                asked = Some(question.request.id);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let id = asked.expect("the model asked");
+        reader
+            .resolve_choice(id, "postgres", Some("we already run one"), "tui")
+            .expect("the answer is recorded");
+        let said = worker.join().expect("the tool thread");
+        assert!(said.contains("\"option\":\"postgres\""), "{said}");
+        assert!(said.contains("we already run one"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

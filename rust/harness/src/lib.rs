@@ -69,6 +69,7 @@ pub mod patch;
 pub mod path;
 pub mod policy;
 pub mod profile;
+pub mod question;
 pub mod repomap;
 pub mod retry;
 pub mod route;

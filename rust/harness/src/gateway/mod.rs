@@ -1500,6 +1500,8 @@ fn world_for(
         inbox: None,
         mcp: Arc::clone(mcp),
         allowance: crate::agent::Allowance::new(64),
+        // A gateway chat has a person behind it, but no ask bar yet: the floor refuses rather than waits.
+        questions: None,
     }
 }
 
@@ -1535,6 +1537,9 @@ fn job_messages(job: &crate::cron::Job, workspace: &Path, step: &crate::retry::S
     let mode_line = match job.mode {
         crate::mode::Mode::Read => {
             "This job is read-only: it has no shell, no file writes, no browser and no scheduling. Read and answer with what you found."
+        }
+        crate::mode::Mode::Plan => {
+            "This job is read-only and produces a plan: no shell, no file writes, no browser and no scheduling. Investigate, ask at real forks, then answer with the plan and the checks it would run."
         }
         crate::mode::Mode::Act => {
             "This job may act on the machine. The hard floor still applies: no permanent delete, money movement, credential or permission change, new security access, or message to a person without a person deciding."

@@ -1,5 +1,6 @@
 //! Native terminal client. Rendering never performs network or model work.
 mod app;
+mod ask;
 mod backend;
 mod editor;
 mod mascot;
