@@ -1,0 +1,6 @@
+[build]
+# The target directory lives on the big drive, deliberately. The root
+# filesystem on the build box is small; a workspace build that lands there
+# fills it. `CARGO_TARGET_DIR` in the environment still overrides this, so a
+# machine without `/mnt/ssd` can point it somewhere else.
+target-dir = "/mnt/ssd/home-cold/hades-target"
