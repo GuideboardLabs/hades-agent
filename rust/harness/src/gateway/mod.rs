@@ -564,6 +564,10 @@ fn follow<T: Transport + Clone + Send + 'static>(
         .map_err(|error| format!("could not send the request: {error}"))?;
 
     let started = transport.send(chat, "<b>Hades</b> · working", &[])?;
+    // The first typing claim is made here, not left to the ticker's thread: a run whose daemon answers
+    // in a few milliseconds would otherwise finish before that thread was ever scheduled, and the chat
+    // would never have been told the run was alive.
+    let _ = transport.typing(chat);
     let mut status = Status::new(chat, started);
     let mut asked = false;
     let stop = Arc::new(AtomicBool::new(false));
@@ -877,6 +881,8 @@ fn chat<T: Transport + Clone + Send + 'static>(
         Vec::<String>::new(),
     )));
     let stop = Arc::new(AtomicBool::new(false));
+    // See `relay`: the claim is made once on this thread before the ticker owns it.
+    let _ = transport.typing(update.chat);
     let ticker = {
         let mut beat = transport.clone();
         let shared = Arc::clone(&shared);
