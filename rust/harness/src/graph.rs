@@ -110,12 +110,15 @@ pub struct Edge {
     why: String,
 }
 
-/// How long a whole run may take and how many times it may ask the model. Declared, because a graph
-/// without bounds is a loop with extra steps.
+/// How long a whole run may take, how many times it may ask the model, and how many tokens it may spend.
+/// Declared, because a graph without bounds is a loop with extra steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {
     attempts: u32,
     millis: u128,
+    /// The token allowance for the whole run, when the caller declared one. `None` is an allowance nobody
+    /// declared, not a free one: a bound nobody set is not a bound of zero.
+    tokens: Option<u64>,
     /// How many candidate turns one visit to the attempt node may run. One is the ordinary loop; more is a
     /// speculative branch that keeps the first candidate the check accepts.
     width: u32,
@@ -126,8 +129,16 @@ impl Bounds {
         Bounds {
             attempts: attempts.max(1),
             millis: minutes as u128 * 60_000,
+            tokens: None,
             width: 1,
         }
+    }
+
+    /// A token allowance for the whole run. The sum is what the endpoint reported, prompt and generated,
+    /// because a budget that counted only the answer would let a run spend its whole allowance on context.
+    pub fn with_tokens(mut self, tokens: u64) -> Self {
+        self.tokens = Some(tokens);
+        self
     }
 
     /// Candidates per attempt visit, bounded at four. A wider branch is not a better branch: the budget is
@@ -145,16 +156,116 @@ impl Bounds {
         self.attempts
     }
 
+    /// The token allowance, when one was declared.
+    pub fn tokens(&self) -> Option<u64> {
+        self.tokens
+    }
+
     /// The wall clock allowance, in minutes, for a header that has to state the bounds it ran under.
     pub fn minutes(&self) -> u64 {
         (self.millis / 60_000) as u64
     }
 
-    /// Whether the run has spent its allowance, given how many attempts it has made and how long it has
-    /// been going.
-    pub fn spent(&self, attempts: u32, elapsed: std::time::Duration) -> bool {
-        attempts >= self.attempts || elapsed.as_millis() >= self.millis
+    /// The declared bounds as one phrase, so a sentence stating them cannot drift from the values.
+    pub fn declared(&self) -> String {
+        match self.tokens {
+            Some(tokens) => format!(
+                "{} attempts, {} minutes, {tokens} tokens",
+                self.attempts,
+                self.minutes()
+            ),
+            None => format!("{} attempts, {} minutes", self.attempts, self.minutes()),
+        }
     }
+
+    /// Which allowance the run has spent, given how many attempts it has made, how long it has been going
+    /// and what the endpoint said it spent. `None` means the run may go on.
+    ///
+    /// One cause is named at a time, and attempts and time are asked before tokens: a run that reached an
+    /// attempt bound it set is not relabelled by the spend that came with it.
+    pub fn exhausted(
+        &self,
+        attempts: u32,
+        elapsed: std::time::Duration,
+        tokens: u64,
+    ) -> Option<Exhausted> {
+        if attempts >= self.attempts {
+            return Some(Exhausted::Attempts);
+        }
+        if elapsed.as_millis() >= self.millis {
+            return Some(Exhausted::Minutes);
+        }
+        if self.tokens.is_some_and(|budget| tokens >= budget) {
+            return Some(Exhausted::Tokens);
+        }
+        None
+    }
+
+    /// Whether the run has spent its allowance, given how many attempts it has made, how long it has been
+    /// going and what it has spent.
+    pub fn spent(&self, attempts: u32, elapsed: std::time::Duration, tokens: u64) -> bool {
+        self.exhausted(attempts, elapsed, tokens).is_some()
+    }
+}
+
+/// A token allowance, refused before it is used when it cannot mean what the caller thinks. Zero is not a
+/// budget: a run that may not spend is not a run. A budget below one call's completion cap is refused too,
+/// because that call would be allowed to spend more than the whole run before anything could stop it.
+pub fn budget_tokens(tokens: u64, max_tokens: Option<u64>) -> Result<u64, String> {
+    if tokens == 0 {
+        return Err(
+            "`--budget-tokens 0` is not a budget: a run that may not spend is not a run"
+                .to_string(),
+        );
+    }
+    if let Some(call) = max_tokens.filter(|call| *call > tokens) {
+        return Err(format!(
+            "`--budget-tokens {tokens}` is less than `--max-tokens {call}`: one call could spend the whole \
+             run's allowance"
+        ));
+    }
+    Ok(tokens)
+}
+
+/// What a run ran out of. The first three are declared budgets; the rest are the ways a run stops that no
+/// budget describes, kept typed so a reader never has to parse the human sentence to know which happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exhausted {
+    /// The attempt allowance was spent.
+    Attempts,
+    /// The wall clock allowance was spent.
+    Minutes,
+    /// The token allowance was spent.
+    Tokens,
+    /// The model, the tool or the endpoint broke. A wrong endpoint does not fix itself.
+    Fault,
+    /// Policy denied the action outright. No answer would change it.
+    Refused,
+    /// The check could not run, which is not evidence either way.
+    CouldNotRun,
+}
+
+impl Exhausted {
+    /// The cause as a word, for the log and for `hades explain`. The sentence in `reason` says the rest.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Exhausted::Attempts => "attempts",
+            Exhausted::Minutes => "minutes",
+            Exhausted::Tokens => "tokens",
+            Exhausted::Fault => "a fault",
+            Exhausted::Refused => "a refusal",
+            Exhausted::CouldNotRun => "a check that could not run",
+        }
+    }
+}
+
+/// What a run has spent, in tokens, as the endpoint reported it. Prompt and generated together, because
+/// both are spent and a bound that counted only the answer would under-report every call.
+fn tokens(spent: &[crate::task::Usage]) -> u64 {
+    spent
+        .iter()
+        .map(|usage| usage.prompt_tokens + usage.generated_tokens)
+        .sum()
 }
 
 impl Default for Bounds {
@@ -346,8 +457,13 @@ pub struct Visit {
 pub enum Ended {
     /// The check passed and the result was accepted.
     Accepted { attempts: u32, program: String },
-    /// The run stopped without a pass, and this is why.
-    GaveUp { attempts: u32, reason: String },
+    /// The run stopped without a pass, and this is why. The typed cause names the allowance that ran out,
+    /// so a reader does not have to parse `reason` to know whether raising `--attempts` would help.
+    GaveUp {
+        attempts: u32,
+        reason: String,
+        exhausted: Exhausted,
+    },
     /// A person has to answer before this can go further.
     Awaiting {
         attempts: u32,
@@ -359,6 +475,14 @@ pub enum Ended {
 }
 
 impl Ended {
+    /// The typed cause of a giving-up, when there was one. `None` for the ends that are not a giving-up.
+    pub fn cause(&self) -> Option<Exhausted> {
+        match self {
+            Ended::GaveUp { exhausted, .. } => Some(*exhausted),
+            _ => None,
+        }
+    }
+
     pub fn code(&self) -> i32 {
         match self {
             Ended::Accepted { .. } => 0,
@@ -373,7 +497,9 @@ impl Ended {
             Ended::Accepted { attempts, .. } => {
                 format!("accepted after {attempts} attempt(s)")
             }
-            Ended::GaveUp { attempts, reason } => {
+            Ended::GaveUp {
+                attempts, reason, ..
+            } => {
                 format!("gave up after {attempts} attempt(s): {reason}")
             }
             Ended::Awaiting { attempts, question } => format!(
@@ -490,6 +616,9 @@ where
     asked: Option<String>,
     /// What the last node that stopped something said, so the terminal node can repeat it.
     last_reason: Option<String>,
+    /// Which allowance the last stopping node ran out of, so the giving-up end carries a typed cause rather
+    /// than a sentence someone has to parse.
+    last_cause: Option<Exhausted>,
     /// The question a refused or pending attempt produced, carried to the awaiting node.
     last_question: Option<ApprovalRequest>,
     /// The last judge's verdict, for a receipt. The session log remains the record; this is so `hades run`
@@ -529,6 +658,7 @@ where
             session,
             asked: None,
             last_reason: None,
+            last_cause: None,
             last_question: None,
             last_verdict: None,
             scoreboard: None,
@@ -624,6 +754,13 @@ where
                 });
                 // An end, not a transition: nothing was taken, so there is no edge to name. What the record
                 // keeps is the reason the walk stopped.
+                // The typed cause and the sentence it came with go into the record: `hades explain` reads
+                // the log, and a cause that only lived in this process would die with the process.
+                let exhausted = ended.cause().map(|cause| cause.name());
+                let reason = match &ended {
+                    Ended::GaveUp { reason, .. } => Some(reason.as_str()),
+                    _ => None,
+                };
                 self.session.append(
                     session_tree::Kind::Checkpoint,
                     json!({
@@ -631,6 +768,8 @@ where
                         "condition": format!("{when:?}"),
                         "ended": true,
                         "why": why,
+                        "reason": reason,
+                        "exhausted": exhausted,
                         "attempt": attempts,
                     }),
                 )?;
@@ -691,6 +830,13 @@ where
                             passed,
                             attempts: used,
                             millis: started.elapsed().as_millis() as u64,
+                            // What the endpoints said this walk spent, summed over every attempt and every
+                            // candidate: the scoreboard's job is to reconcile with the model's own numbers.
+                            prompt_tokens: spent.iter().map(|usage| usage.prompt_tokens).sum(),
+                            generated_tokens: spent
+                                .iter()
+                                .map(|usage| usage.generated_tokens)
+                                .sum(),
                             at,
                         },
                     );
@@ -731,21 +877,37 @@ where
                             if when == When::Passed {
                                 self.asked = Some(program);
                             }
-                            // The last candidate that could run was the last the budget allowed.
-                            if when == When::Failed
-                                && self.bounds.spent(attempts, started.elapsed())
-                            {
-                                When::Exhausted
+                            // The last candidate that could run was the last the budget allowed. The spend is
+                            // read here because the candidates' own usage is what the endpoint reported.
+                            let out =
+                                self.bounds
+                                    .exhausted(attempts, started.elapsed(), tokens(&spent));
+                            if when == When::Failed {
+                                match out {
+                                    Some(cause) => {
+                                        self.last_cause = Some(cause);
+                                        When::Exhausted
+                                    }
+                                    None => when,
+                                }
+                            } else if when == When::Exhausted {
+                                // The branch stopped itself when the clock ran out: its loop checks time,
+                                // and the parent's token total is only read once the candidates are home.
+                                self.last_cause = Some(Exhausted::Minutes);
+                                when
+                            } else if when == When::Refused {
+                                self.last_cause = Some(Exhausted::Refused);
+                                when
                             } else {
                                 when
                             }
                         } else {
                             attempts += 1;
-                            // Whether another attempt is allowed is part of the condition, so the bound is
-                            // expressed as an edge rather than as a detour inside the walk.
-                            let exhausted = self.bounds.spent(attempts, started.elapsed());
+                            // The token total is only known after the call, so the allowance is read inside
+                            // the attempt: a run cannot be told it is out of tokens it has not spent yet.
+                            let before = tokens(&spent);
                             let (when, program, usage) =
-                                self.attempt(attempts, exhausted, &mut learned)?;
+                                self.attempt(attempts, before, started.elapsed(), &mut learned)?;
                             if let Some(usage) = usage {
                                 spent.push(usage);
                             }
@@ -815,12 +977,22 @@ where
                 attempts,
                 program: self.asked.take().unwrap_or_default(),
             }),
-            Work::GaveUp => Some(Ended::GaveUp {
-                attempts,
-                reason: self.last_reason.clone().unwrap_or_else(|| {
-                    "the run stopped and the node that stopped it said nothing".to_string()
-                }),
-            }),
+            Work::GaveUp => {
+                let exhausted = self.last_cause.take().ok_or_else(|| {
+                    Fault::harness(
+                        "the run reached the giving-up node without a cause, which is a bug in the walk: \
+                         nothing recorded which allowance it ran out of"
+                            .to_string(),
+                    )
+                })?;
+                Some(Ended::GaveUp {
+                    attempts,
+                    reason: self.last_reason.clone().unwrap_or_else(|| {
+                        "the run stopped and the node that stopped it said nothing".to_string()
+                    }),
+                    exhausted,
+                })
+            }
             Work::Awaiting => Some(Ended::Awaiting {
                 attempts,
                 question: Box::new(self.last_question.clone().ok_or_else(|| {
@@ -1105,10 +1277,14 @@ where
 
     /// One turn, with the run's learned context in front of it. Returns the condition the attempt was left
     /// in, and the program it ran (empty when there was none).
+    ///
+    /// `before` is what the earlier attempts spent, in tokens, because the token bound can only be decided
+    /// once this call reports its own cost: reading it beforehand would spend a call past the allowance.
     fn attempt(
         &mut self,
         attempt: u32,
-        spent: bool,
+        before: u64,
+        elapsed: std::time::Duration,
         learned: &mut Learned,
     ) -> Result<(When, String, Option<crate::task::Usage>), Fault> {
         let mut sections = context::sections(
@@ -1158,6 +1334,7 @@ where
             Err(fault) => {
                 // A fault ends the attempt and is reported rather than swallowed into a retry.
                 self.last_reason = Some(format!("{} fault: {}", fault.class(), fault.detail()));
+                self.last_cause = Some(Exhausted::Fault);
                 return Ok((When::Faulted, String::new(), None));
             }
         };
@@ -1171,12 +1348,24 @@ where
             } => {
                 self.last_verdict = Some(verdict);
                 let program = answer.rendered();
+                // The call has reported what it cost, so now the whole run's spend is known.
+                let usage = answer.usage();
+                let cost =
+                    before + usage.map_or(0, |usage| usage.prompt_tokens + usage.generated_tokens);
+                let out = self.bounds.exhausted(attempt, elapsed, cost);
                 let when = match verification.state {
                     State::Passed => When::Passed,
-                    State::Failed if spent => When::Exhausted,
+                    State::Failed if out.is_some() => When::Exhausted,
                     State::Failed => When::Failed,
                     State::CouldNotRun => When::CouldNotRun,
                 };
+                if verification.state == State::CouldNotRun {
+                    // A check that could not run is not a budget end: the run stops because the evidence is
+                    // missing, and no allowance was involved.
+                    self.last_cause = Some(Exhausted::CouldNotRun);
+                } else if when == When::Exhausted {
+                    self.last_cause = out;
+                }
                 if verification.state != State::Passed {
                     learned.tried(
                         Try::new(
@@ -1187,12 +1376,10 @@ where
                         .observed(run.status, run.output.trim().is_empty())
                         .progressed(verification.progress.clone()),
                     );
-                    self.last_reason = Some(if spent {
+                    self.last_reason = Some(if when == When::Exhausted {
                         format!(
-                            "the bounds were spent after {attempt} attempt(s) ({} attempts or {} minutes), \
-                             and the check still {}",
-                            self.bounds.attempts(),
-                            self.bounds.minutes(),
+                            "the bounds were spent after {attempt} attempt(s) ({}), and the check still {}",
+                            self.bounds.declared(),
                             verification.state_line()
                         )
                     } else {
@@ -1202,13 +1389,16 @@ where
                         )
                     });
                 }
-                Ok((when, program, answer.usage()))
+                Ok((when, program, usage))
             }
             Outcome::Unwritten { reason } => {
-                let when = if spent {
+                let out = self.bounds.exhausted(attempt, elapsed, before);
+                let when = if out.is_some() {
+                    self.last_cause = out;
                     self.last_reason = Some(format!(
-                        "the bounds were spent after {attempt} attempt(s) and the last answer wrote \
-                         nothing: {reason}"
+                        "the bounds were spent after {attempt} attempt(s) ({}) and the last answer wrote \
+                         nothing: {reason}",
+                        self.bounds.declared()
                     ));
                     When::Exhausted
                 } else {
@@ -1227,6 +1417,7 @@ where
             }
             Outcome::Refused { reason } => {
                 self.last_reason = Some(reason);
+                self.last_cause = Some(Exhausted::Refused);
                 Ok((When::Refused, String::new(), None))
             }
             Outcome::Stopped => {
@@ -1355,11 +1546,19 @@ mod tests {
     #[test]
     fn the_bounds_stop_a_run_that_keeps_failing() {
         let bounds = Bounds::new(3, 10);
-        assert!(!bounds.spent(2, std::time::Duration::from_secs(1)));
-        assert!(bounds.spent(3, std::time::Duration::from_secs(1)));
-        assert!(bounds.spent(1, std::time::Duration::from_secs(600)));
+        assert!(!bounds.spent(2, std::time::Duration::from_secs(1), 0));
+        assert!(bounds.spent(3, std::time::Duration::from_secs(1), 0));
+        assert!(bounds.spent(1, std::time::Duration::from_secs(600), 0));
         // A bound of zero attempts is still one attempt: a run that cannot try is not a run.
         assert_eq!(Bounds::new(0, 1).attempts(), 1);
+        // A token bound is spent at the allowance, not past it, and only when one was declared.
+        let budgeted = Bounds::new(3, 10).with_tokens(1500);
+        assert_eq!(budgeted.exhausted(1, std::time::Duration::ZERO, 1499), None);
+        assert_eq!(
+            budgeted.exhausted(1, std::time::Duration::ZERO, 1500),
+            Some(Exhausted::Tokens)
+        );
+        assert_eq!(Bounds::new(3, 10).tokens(), None);
     }
 
     #[test]
@@ -1375,7 +1574,8 @@ mod tests {
         assert_eq!(
             Ended::GaveUp {
                 attempts: 3,
-                reason: "never passed".into()
+                reason: "never passed".into(),
+                exhausted: Exhausted::Attempts
             }
             .code(),
             1
@@ -1383,7 +1583,8 @@ mod tests {
         assert!(
             Ended::GaveUp {
                 attempts: 3,
-                reason: "never passed".into()
+                reason: "never passed".into(),
+                exhausted: Exhausted::Attempts
             }
             .line()
             .contains("3 attempt")

@@ -11,8 +11,8 @@ use harness::patch::FileEdit;
 use harness::repomap::Cache;
 use harness::route::RoutingReason;
 use harness::{
-    Bounds, CommandVerifier, Decision, Effort, Ended, ModelAnswer, Parts, Policy, Profile,
-    ProfileId, Role, Rule, Runner, ScriptedModel, Shadows, Shell, TaskSpec,
+    Bounds, CommandVerifier, Decision, Effort, Ended, Exhausted, ModelAnswer, Parts, Policy,
+    Profile, ProfileId, Role, Rule, Runner, ScriptedModel, Shadows, Shell, TaskSpec, Usage,
 };
 use session_tree::{Clock, FileStore, Kind, Session, SessionId};
 
@@ -213,6 +213,107 @@ fn the_second_attempt_is_told_what_the_first_one_tried() {
     assert!(
         contexts[1] > contexts[0],
         "the second attempt got no more context than the first: {contexts:?}"
+    );
+}
+
+#[test]
+fn a_run_that_spends_its_token_budget_stops_after_the_call_that_spent_it() {
+    // The endpoint reported 1,000 prompt and 500 generated tokens and the run was given 1,200, so the
+    // token bound is spent after one call while the attempt bound still has room. The check fails, which is
+    // what makes the token budget the only reason to stop: a pass would still be accepted.
+    let rig = Rig::new(
+        "tokens",
+        "test -f never.txt",
+        open(),
+        ScriptedModel::answers([
+            ModelAnswer::new("true").with_usage(Usage {
+                prompt_tokens: 1000,
+                generated_tokens: 500,
+                millis: 5,
+                reasoning_chars: 0,
+            }),
+            ModelAnswer::new("true"),
+        ]),
+    );
+    let mut session = rig.session("tokens");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10).with_tokens(1200));
+    let walked = runner.run().expect("a walk");
+
+    assert_eq!(
+        walked.attempts(),
+        1,
+        "the token budget stopped the second call"
+    );
+    assert_eq!(
+        walked.spent.len(),
+        1,
+        "the one call that was made is on the record"
+    );
+    assert_eq!(walked.spent[0].prompt_tokens, 1000);
+    assert_eq!(walked.spent[0].generated_tokens, 500);
+    // The predicate has to see the sum of both halves: a budget that counted only the answer would call
+    // this run 500 tokens and let it spend twenty more calls' worth of prompt.
+    let bounds = Bounds::new(3, 10).with_tokens(1200);
+    assert_eq!(
+        bounds.exhausted(1, std::time::Duration::from_secs(1), 1500),
+        Some(Exhausted::Tokens)
+    );
+    assert_eq!(
+        bounds.exhausted(1, std::time::Duration::from_secs(1), 1199),
+        None
+    );
+    // A run with no declared token budget is not a run with a budget of zero.
+    assert_eq!(
+        Bounds::new(3, 10).exhausted(1, std::time::Duration::from_secs(1), u64::MAX),
+        None
+    );
+    let nodes: Vec<&str> = walked.visits.iter().map(|v| v.node.as_str()).collect();
+    assert_eq!(nodes, ["attempt", "gave_up"], "{nodes:?}");
+    // And the end says which allowance it was, not merely that something ran out.
+    assert_eq!(walked.ended.cause(), Some(Exhausted::Tokens));
+}
+
+#[test]
+fn every_giving_up_carries_the_cause_it_stopped_for() {
+    // A run that spends its attempts says so. Not the sentence: the type, so a surface can print "attempts"
+    // without parsing prose that a later wording change would break.
+    let rig = Rig::new(
+        "cause-attempts",
+        "test -f never.txt",
+        open(),
+        ScriptedModel::new(["true", "true"]),
+    );
+    let mut session = rig.session("cause-attempts");
+    let mut cache = Cache::new();
+    let mut runner =
+        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(2, 10));
+    let walked = runner.run().expect("a walk");
+    assert_eq!(
+        walked.ended.cause(),
+        Some(Exhausted::Attempts),
+        "{:?}",
+        walked.ended
+    );
+
+    // A fault is a cause too, and it is not an attempt count: nothing was retried because nothing could be.
+    let rig = Rig::new(
+        "cause-fault",
+        "test -f never.txt",
+        open(),
+        ScriptedModel::new(Vec::<String>::new()),
+    );
+    let mut session = rig.session("cause-fault");
+    let mut cache = Cache::new();
+    let mut runner =
+        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(3, 10));
+    let walked = runner.run().expect("a walk");
+    assert_eq!(
+        walked.ended.cause(),
+        Some(Exhausted::Fault),
+        "{:?}",
+        walked.ended
     );
 }
 

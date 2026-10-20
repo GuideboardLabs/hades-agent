@@ -38,6 +38,13 @@ pub struct Facts {
     pub check: String,
     pub check_state: String,
     pub accepted: bool,
+    /// The terminal node the log recorded, when it recorded one.
+    pub ended: Option<String>,
+    /// The typed cause of a giving-up, as the walk wrote it. `None` when the run did not give up, and for a
+    /// log written before the cause was recorded.
+    pub exhausted: Option<String>,
+    /// The human sentence the walk ended with, which is the only place a token or time overrun is explained.
+    pub reason: Option<String>,
     pub turns: Vec<Turn>,
     pub snapshot: Option<PathBuf>,
 }
@@ -53,6 +60,9 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
     let mut check = String::new();
     let mut check_state = String::new();
     let mut accepted = false;
+    let mut ended = None;
+    let mut exhausted = None;
+    let mut reason = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut open: Option<usize> = None;
 
@@ -147,6 +157,17 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
                     if condition == "Passed" || node == "done" {
                         accepted = true;
                     }
+                    // The last terminal checkpoint wins: a forked or branched session can carry a candidate's
+                    // end before its own, and the run that was asked about is the one at the end of the log.
+                    ended = Some(node.to_string());
+                    exhausted = payload
+                        .get("exhausted")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    reason = payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                 }
             }
             _ => {}
@@ -182,6 +203,9 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
         check,
         check_state,
         accepted,
+        ended,
+        exhausted,
+        reason,
         turns,
         snapshot,
     })

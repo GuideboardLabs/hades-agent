@@ -162,7 +162,9 @@ hades — the harness, one turn or a whole graph
       an approval is an inline button. --once handles one batch and returns
 
   hades submit <goal> [--program <p>]... [--state <dir>] [--root <dir>] [--attempts <n>]
-      hand a run to the daemon and follow it
+      [--minutes m] [--budget-tokens n]
+      hand a run to the daemon and follow it. The budgets are the run's, not one call's: a
+      budget of zero tokens is refused before the run is taken on
 
   hades attach <session> [--state <dir>]
       print a session's entries, then follow the ones that are written next
@@ -194,11 +196,12 @@ hades — the harness, one turn or a whole graph
   hades shutdown [--state <dir>]
       stop every run and end the daemon. Stopping is not undo
 
-  hades run <goal> --model <preset> [--attempts n] [--minutes m] [--branch n] [...]
+  hades run <goal> --model <preset> [--attempts n] [--minutes m] [--budget-tokens n] [--branch n] [...]
       walk the graph: try, accept a pass, retry a failure while the bounds hold, hand a
-      refusal to a person. --branch n runs n candidate turns from the same tree and keeps
-      the first pass (1 to 4); the attempts budget is shared, so width is model calls, not
-      a second budget
+      refusal to a person. --budget-tokens caps the spend the endpoint reports for the whole
+      run, prompt and generated together; the end names which bound ran out. --branch n runs
+      n candidate turns from the same tree and keeps the first pass (1 to 4); the attempts
+      budget is shared, so width is model calls, not a second budget
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
@@ -318,7 +321,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
     }
     flags.positional.push(goal);
 
-    const NAMED: [&str; 16] = [
+    const NAMED: [&str; 17] = [
         "root",
         "profile",
         "policy",
@@ -335,6 +338,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
         "context",
         "attempts",
         "minutes",
+        "budget-tokens",
     ];
     for key in NAMED {
         let Some(value) = request.get(key) else {
@@ -1685,6 +1689,18 @@ fn explain(args: &[String]) -> Result<(String, i32), String> {
     let state = state_of(&flags)?;
     let facts = crate::distill::load(&state, session)?;
     let mut text = crate::distill::turn_table(&facts);
+    // How it ended, in the walk's own terms. The cause is printed as the word the walk recorded rather than
+    // inferred from the sentence: a run that ran out of tokens must not be read as a run that ran out of
+    // attempts.
+    if let Some(node) = &facts.ended {
+        text.push_str(&format!("\nended: {node}\n"));
+    }
+    if let Some(cause) = &facts.exhausted {
+        text.push_str(&format!("cause: {cause}\n"));
+    }
+    if let Some(reason) = &facts.reason {
+        text.push_str(&format!("why: {reason}\n"));
+    }
     text.push_str(&format!(
         "\nroot: {}\nsnapshot: {}\n",
         facts.root.display(),
@@ -3024,6 +3040,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             "thinking",
             "attempts",
             "minutes",
+            "budget-tokens",
             "branch",
             "shadow",
             "config",
@@ -3033,6 +3050,25 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
     )?;
     let goal = goal(&flags)?;
     let score_state = state_of(&flags)?;
+    // The budget is read and refused before the engine is assembled or the model is asked: a run that
+    // cannot spend what it was told to is a mistake worth reporting while it costs nothing.
+    let budget_tokens = match flags.named.get("budget-tokens") {
+        Some(value) => {
+            let tokens = value
+                .parse::<u64>()
+                .map_err(|_| format!("`--budget-tokens {value}` is not a number"))?;
+            let max_tokens = match flags.named.get("max-tokens") {
+                Some(value) => Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("`--max-tokens {value}` is not a number"))?,
+                ),
+                None => None,
+            };
+            Some(crate::graph::budget_tokens(tokens, max_tokens)?)
+        }
+        None => None,
+    };
     let (mut engine, answerer, harness, judge) = assemble(&flags, "run")?;
     let mut session = engine.session()?;
 
@@ -3063,6 +3099,10 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         None => 1,
     };
     let bounds = Bounds::new(attempts, minutes).with_width(branch);
+    let bounds = match budget_tokens {
+        Some(tokens) => bounds.with_tokens(tokens),
+        None => bounds,
+    };
 
     let before = session.len();
     let memo = remembered(
@@ -3137,7 +3177,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         None => "unjudged (the profile did not ask)".to_string(),
     };
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\ncontext: {} tokens\nbounds:  {}, {} minutes\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\ncontext: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
         session.id(),
         session.len(),
         session.len() - before,
@@ -3150,11 +3190,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             None => "none".to_string(),
         },
         engine.profile().context_tokens,
-        match bounds.attempts() {
-            1 => "1 attempt".to_string(),
-            other => format!("{other} attempts"),
-        },
-        bounds.minutes(),
+        bounds.declared(),
         if compacted {
             "yes, by the harness"
         } else {
@@ -3171,6 +3207,9 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         ));
     }
     text.push_str(&format!("\n{}\n", walked.ended.line()));
+    if let Some(cause) = walked.ended.cause() {
+        text.push_str(&format!("cause: {}\n", cause.name()));
+    }
     let memory_line = match (&walked.recorded, &walked.memory_error) {
         (Some(path), _) => format!("recalled {}, recorded {}", memo.recalled, path.display()),
         (None, Some(said)) if memo.memory.is_some() => {
@@ -3569,10 +3608,31 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
     let flags = parse(
         args,
         &[
-            "root", "profile", "policy", "verify", "state", "session", "cage", "shadow", "model",
-            "endpoint", "key", "program", "attempts", "minutes",
+            "root",
+            "profile",
+            "policy",
+            "verify",
+            "state",
+            "session",
+            "cage",
+            "shadow",
+            "model",
+            "endpoint",
+            "key",
+            "program",
+            "attempts",
+            "minutes",
+            "budget-tokens",
         ],
     )?;
+    // Refused here as well as in the daemon: a person who typed a budget of zero should learn it from the
+    // terminal they typed it in, not from a round trip.
+    if let Some(value) = flags.named.get("budget-tokens") {
+        let tokens = value
+            .parse::<u64>()
+            .map_err(|_| format!("`--budget-tokens {value}` is not a number"))?;
+        crate::graph::budget_tokens(tokens, None)?;
+    }
     let state = state_of(&flags)?;
     let socket = crate::daemon::live(&state).ok_or_else(|| {
         format!(

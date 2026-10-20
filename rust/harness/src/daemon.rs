@@ -452,6 +452,19 @@ impl Daemon {
     /// Take a run on. The lease is the whole concurrency story: two runs on one session id would be two
     /// writers on one log, and the log has no lock to stop them.
     fn submit(&self, request: &Value, stream: &mut UnixStream) -> Result<Value, Fault> {
+        // The bounds are read and refused before the lease and before any model call. A budget that cannot
+        // mean anything is not a run to take on and then fail at.
+        let attempts = count(request, "attempts").unwrap_or(3) as u32;
+        let minutes = count(request, "minutes").unwrap_or(10);
+        let mut bounds = Bounds::new(attempts, minutes);
+        if let Some(tokens) = count(request, "budget-tokens") {
+            let tokens = match crate::graph::budget_tokens(tokens, count(request, "max-tokens")) {
+                Ok(tokens) => tokens,
+                Err(said) => return Ok(json!({"ok": false, "error": said})),
+            };
+            bounds = bounds.with_tokens(tokens);
+        }
+
         let flags = crate::cli::flags_from(request).map_err(Fault::harness)?;
         let (mut engine, answerer, _, judge) =
             crate::cli::assemble(&flags, "daemon").map_err(Fault::harness)?;
@@ -499,10 +512,6 @@ impl Daemon {
             json!({"run": run, "session": session_id, "started": true})
         )
         .map_err(send_failed)?;
-
-        let attempts = number(request, "attempts").unwrap_or(3) as u32;
-        let minutes = number(request, "minutes").unwrap_or(10);
-        let bounds = Bounds::new(attempts, minutes);
 
         // The log is followed by a thread of its own while the walk runs here, so an entry reaches a watching
         // client as soon as it is written rather than when the whole run is over.
@@ -593,6 +602,7 @@ impl Daemon {
                         "entries": (session.len() - before) as u64,
                         "attempts": walked.attempts(),
                         "ended": ended,
+                        "exhausted": walked.ended.cause().map(|cause| cause.name()),
                         "code": walked.ended.code(),
                         "map_hits": hits,
                         "map_misses": misses,
@@ -841,7 +851,9 @@ pub fn live(state: &Path) -> Option<PathBuf> {
 fn ended_line(ended: &Ended) -> String {
     match ended {
         Ended::Accepted { attempts, .. } => format!("accepted after {attempts} attempt(s)"),
-        Ended::GaveUp { attempts, reason } => {
+        Ended::GaveUp {
+            attempts, reason, ..
+        } => {
             format!("gave up after {attempts} attempt(s): {reason}")
         }
         Ended::Awaiting { attempts, question } => format!(
@@ -875,6 +887,16 @@ fn text(payload: &Value, key: &str) -> String {
 
 fn number(payload: &Value, key: &str) -> Option<u64> {
     payload.get(key).and_then(Value::as_u64)
+}
+
+/// A count from a request. The command line sends its flags as strings and a socket client may send a
+/// number; both describe the same budget, so both are read here.
+fn count(payload: &Value, key: &str) -> Option<u64> {
+    match payload.get(key)? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 fn send_failed(error: std::io::Error) -> Fault {
