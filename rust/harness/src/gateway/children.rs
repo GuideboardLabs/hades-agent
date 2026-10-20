@@ -1279,6 +1279,27 @@ mod tests {
         (url, observed, go, server)
     }
 
+    /// Wait until the registry holds no unfinished handle. A child writes its final record just before
+    /// its thread returns, so `state == done` is not the same instant as `is_finished()`; the prune under
+    /// test is about the handle, so the test waits for the handle.
+    fn wait_finished(registry: &Registry) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let live = registry
+                .inner
+                .threads
+                .lock()
+                .expect("the threads")
+                .values()
+                .any(|handle| !handle.is_finished());
+            if !live {
+                return;
+            }
+            assert!(Instant::now() < deadline, "a child thread never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn wait_for(registry: &Registry, id: &str, state: &str) -> Record {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1754,6 +1775,7 @@ mod tests {
             "the finished handle is still there to be joined"
         );
 
+        wait_finished(&registry);
         registry
             .admit(admission("spawn-second"), world(&state), unreachable())
             .expect("the second child");
