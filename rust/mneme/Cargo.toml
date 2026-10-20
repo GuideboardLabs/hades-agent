@@ -1,6 +1,6 @@
 [package]
 name = "mneme"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 description = "Mneme, the second brain: five areas, topics as notes, governed writes. Port of the Python spec, same oracle."
 license = "MIT"

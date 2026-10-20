@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.7-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.8-blue">
   <img alt="Tests" src="https://img.shields.io/badge/tests-812%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.7 |
+| **Version** | 0.0.8 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,41 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 812 passing, 13 ignored live tests |
+| **Tests** | 842 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.8 adds
+
+Truth, boundary and cost: a result cannot be bought by moving the check, a model cannot read what it was
+never given, and a pass now carries what it cost.
+
+- **The check is frozen before the first write.** The check command and every file the profile declares
+  protected are hashed before the baseline run and re-hashed after every passing check. A change ends the
+  run as `RulerChanged`, exit 1, with no accepted claim; the claim ladder refuses at `Attempted` before it
+  reads the check, and a distilled case reads the ruler checkpoint from the log rather than trusting a
+  green line. `--protect <path>` adds a file or directory for one run. A file ruler cannot see inside an
+  inline `#[cfg(test)]` module in `src/`, which the help text says rather than pretends otherwise.
+- **The browser has a scheme policy.** HTTP, HTTPS and `about:blank` only; `file://` is refused unless a
+  fixture opts in. The policy is checked before `Page.navigate`, on every tab refresh (clicks, tab switches,
+  redirects) and before observation text is returned. Chromium starts with a cleared environment and a HOME
+  inside the state directory. The floor records `file:`, `data:`, `javascript:` and `vbscript:` opens as
+  security access.
+- **A model-run shell cannot read the harness' keys.** The child starts from `env_clear` plus PATH, HOME,
+  TMPDIR, locale and the toolchain locations; the checker keeps the caller's environment because it is the
+  caller's own command.
+- **State is private.** One `state_dir` creator makes 0700 directories and tightens existing ones; scoreboard
+  rows and shadow manifests are 0600. Snapshots skip credential names (`.env`, `.netrc`, `.npmrc`,
+  `.git-credentials`, `id_*`, `*.pem`, `*.key`) and the manifest names what it skipped.
+- **The HTTP surface has no open mode.** Every bind needs a token, loopback included. With none configured
+  the server generates one at `<state>/http.token` (0600) and reuses it on restart; the path is printed,
+  never the token. Behind it, a present `Origin` must name the connected address and a POST must be
+  `application/json`.
+- **A call reserves its prompt and its cap.** The token budget was checked only after a call reported its
+  cost, so a run could overshoot by one completion cap. The runner now estimates the prompt, adds the call
+  cap, and refuses to start a call the allowance cannot cover.
+- **Cost sits beside the result.** The tuning receipt prints prompt and generated tokens beside the check,
+  and the scoreboard reports tokens per pass rather than only a total.
 
 ## What 0.0.7 adds
 

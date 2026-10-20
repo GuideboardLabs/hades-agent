@@ -172,3 +172,21 @@ fn an_empty_protect_list_still_freezes_the_check() {
     let after = Ruler::take("false", &root, &[]).expect("a ruler");
     assert!(before.diff(&after).expect("a change").contains("check"));
 }
+
+#[test]
+fn an_inline_test_module_is_outside_a_file_ruler() {
+    // The limit the help text states: `cargo test` also runs `#[cfg(test)]` modules inside `src/*.rs`,
+    // and a file ruler cannot name a region of a file the model must edit. This test pins the limit
+    // rather than pretending it away: the edit is real and the ruler is unchanged.
+    let root = scratch("inline");
+    write(&root, "src/lib.rs", "fn answer() -> u32 { 42 }\n");
+    write(&root, "tests/gate.rs", "assert_eq!(answer(), 42);\n");
+    let ruler = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+    write(&root, "src/lib.rs", "fn answer() -> u32 { 41 }\n");
+    let after = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+    assert_eq!(
+        ruler.diff(&after),
+        None,
+        "a file ruler must report unchanged, which is exactly the hole the help text names"
+    );
+}
