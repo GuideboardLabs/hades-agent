@@ -40,10 +40,15 @@ impl Verdict {
 
 /// A verdict and the reason for it. The reason is not optional: a verdict without one cannot be argued
 /// with, and a judge that cannot be argued with is a judge that gets trusted for the wrong reasons.
+///
+/// `usage` is what asking the judge cost. It is on the judgement rather than beside it because the
+/// judge is a model call like any other, and a run that counted every call except this one would end
+/// with a spend the endpoint's own numbers do not reconcile with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Judgement {
     pub verdict: Verdict,
     pub reason: String,
+    pub usage: Option<Box<crate::task::Usage>>,
 }
 
 impl Judgement {
@@ -51,11 +56,18 @@ impl Judgement {
         Judgement {
             verdict,
             reason: reason.into(),
+            usage: None,
         }
     }
 
     pub fn unjudged(reason: impl Into<String>) -> Self {
         Judgement::new(Verdict::Unjudged, reason)
+    }
+
+    /// The same judgement with the cost of the call that produced it.
+    pub fn with_usage(mut self, usage: crate::task::Usage) -> Self {
+        self.usage = Some(Box::new(usage));
+        self
     }
 }
 
@@ -145,7 +157,13 @@ impl Evaluator for Endpoint {
             None,
             &|_, _| {},
         ) {
-            Ok(reply) => parse(&reply.content),
+            Ok(reply) => {
+                let said = parse(&reply.content);
+                match reply.usage {
+                    Some(usage) => said.with_usage(usage),
+                    None => said,
+                }
+            }
             Err(fault) => Judgement::unjudged(format!(
                 "the judge could not be asked: {} fault: {}",
                 fault.class(),

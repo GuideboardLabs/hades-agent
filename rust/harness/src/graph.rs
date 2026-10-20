@@ -1345,8 +1345,8 @@ where
             None => seams,
         };
 
-        let outcome = match seams.turn(self.session) {
-            Ok(turn) => turn.outcome,
+        let (outcome, usage) = match seams.turn(self.session) {
+            Ok(turn) => (turn.outcome, turn.usage),
             Err(fault) => {
                 // A fault ends the attempt and is reported rather than swallowed into a retry.
                 self.last_reason = Some(format!("{} fault: {}", fault.class(), fault.detail()));
@@ -1364,8 +1364,8 @@ where
             } => {
                 self.last_verdict = Some(verdict);
                 let program = answer.rendered();
-                // The call has reported what it cost, so now the whole run's spend is known.
-                let usage = answer.usage();
+                // Every call this turn made reported what it cost — the answer's call and the judge's,
+                // which is why the total comes from the turn rather than from the answer alone.
                 let cost =
                     before + usage.map_or(0, |usage| usage.prompt_tokens + usage.generated_tokens);
                 let out = self.bounds.exhausted(attempt, elapsed, cost);
@@ -1408,7 +1408,9 @@ where
                 Ok((when, program, usage))
             }
             Outcome::Unwritten { reason } => {
-                let out = self.bounds.exhausted(attempt, elapsed, before);
+                let cost =
+                    before + usage.map_or(0, |usage| usage.prompt_tokens + usage.generated_tokens);
+                let out = self.bounds.exhausted(attempt, elapsed, cost);
                 let when = if out.is_some() {
                     self.last_cause = out;
                     self.last_reason = Some(format!(
@@ -1429,7 +1431,9 @@ where
                     self.last_reason = Some(format!("attempt {attempt} wrote nothing: {reason}"));
                     When::Unwritten
                 };
-                Ok((when, String::new(), None))
+                // An answer that wrote nothing still cost a call. Dropping its usage here is how a
+                // token budget ends up firing one call later than the call that spent it.
+                Ok((when, String::new(), usage))
             }
             Outcome::Refused { reason } => {
                 self.last_reason = Some(reason);
@@ -1438,7 +1442,7 @@ where
             }
             Outcome::Stopped => {
                 self.last_reason = Some("stopped by a person".to_string());
-                Ok((When::Stopped, String::new(), None))
+                Ok((When::Stopped, String::new(), usage))
             }
             Outcome::Awaiting { question } => {
                 self.last_question = Some(question);

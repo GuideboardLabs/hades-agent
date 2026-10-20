@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use harness::approval::{ApprovalBroker, InMemory, OnDisk, Scope};
 use harness::command::Run;
 use harness::context::Section;
-use harness::judge::Verdict;
+use harness::judge::{Evaluator, Judgement, Report, Verdict};
 use harness::patch::FileEdit;
 use harness::{
     Budgeted, Call, Class, CommandVerifier, Decision, Effort, Fault, ModelAnswer, Outcome, Policy,
@@ -775,7 +775,7 @@ fn scratch_base() -> std::path::PathBuf {
     // by the store, and the snapshot's never-touch test is a prefix test. The first run of this helper put the
     // store inside the tree it was copying, and the copy recursed into itself until the kernel refused the
     // file name.
-    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }
@@ -1177,4 +1177,85 @@ fn a_profile_that_accepts_programs_only_refuses_an_edit_before_writing() {
         call.payload["refused"],
         "this profile accepts a program, not edit answers"
     );
+}
+
+/// A judge that reports what asking it cost, the way the endpoint judge does. The judgement carries the
+/// usage because the judge is a model call, and a run that counted every call except this one would end
+/// with a spend the endpoint's own numbers do not reconcile with.
+struct Costly;
+
+impl Evaluator for Costly {
+    fn judge(&self, _report: &Report<'_>) -> Judgement {
+        Judgement::new(Verdict::Met, "the script says so").with_usage(harness::Usage {
+            prompt_tokens: 40,
+            generated_tokens: 2,
+            millis: 1,
+            reasoning_chars: 0,
+        })
+    }
+}
+
+#[test]
+fn a_judged_turn_carries_the_judge_call_in_its_usage() {
+    let root = scratch("judge-usage");
+    let task = TaskSpec::new("list the files", &root);
+    let work = profile("true", true);
+    let policy = allow();
+    let model =
+        ScriptedModel::answers([ModelAnswer::new("echo hello").with_usage(harness::Usage {
+            prompt_tokens: 100,
+            generated_tokens: 10,
+            millis: 4,
+            reasoning_chars: 0,
+        })]);
+    let shell = Shell::new(&root, LIMIT);
+    let verifier = CommandVerifier::new(LIMIT);
+    let builder = context(&task);
+    let mut log = session(&root, "judge-usage");
+
+    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
+        .judging(&Costly)
+        .turn(&mut log)
+        .expect("a turn");
+
+    let usage = turn.usage.expect("the turn reports its spend");
+    assert_eq!(
+        usage.prompt_tokens, 140,
+        "the answer's call and the judge's call are both spent"
+    );
+    assert_eq!(usage.generated_tokens, 12);
+    assert!(matches!(turn.outcome, Outcome::Ran { .. }));
+}
+
+#[test]
+fn an_unwritten_turn_carries_the_call_it_paid_for() {
+    // The answer was refused, so nothing ran and nothing was checked. The call still happened, and a
+    // token budget that only counted turns that ran would fire one call later than the call that spent it.
+    let root = scratch("unwritten-usage");
+    let task = TaskSpec::new("list the files", &root);
+    let work = profile("true", false);
+    let policy = allow();
+    let model = ScriptedModel::answers([ModelAnswer::refused("not a program").with_usage(
+        harness::Usage {
+            prompt_tokens: 250,
+            generated_tokens: 5,
+            millis: 3,
+            reasoning_chars: 0,
+        },
+    )]);
+    let shell = Shell::new(&root, LIMIT);
+    let verifier = CommandVerifier::new(LIMIT);
+    let builder = context(&task);
+    let mut log = session(&root, "unwritten-usage");
+
+    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
+        .turn(&mut log)
+        .expect("a turn");
+
+    assert!(matches!(turn.outcome, Outcome::Unwritten { .. }));
+    let usage = turn
+        .usage
+        .expect("an unwritten turn still paid for its call");
+    assert_eq!(usage.prompt_tokens, 250);
+    assert_eq!(usage.generated_tokens, 5);
 }
