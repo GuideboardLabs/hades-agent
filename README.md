@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
   <img alt="Version" src="https://img.shields.io/badge/version-0.0.8-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-849%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-855%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 849 passing, 13 ignored live tests |
+| **Tests** | 855 passing, 13 ignored live tests |
 
 ---
 
@@ -74,12 +74,14 @@ never given, and a pass now carries what it cost.
   protected are hashed before the baseline run and re-hashed after every passing check. A change ends the
   run as `RulerChanged`, exit 1, with no accepted claim; the claim ladder refuses at `Attempted` before it
   reads the check, and a distilled case reads the ruler checkpoint from the log rather than trusting a
-  green line. `--protect <path>` adds a file or directory for one run. The shipped `fix` and `sweep`
-  profiles also freeze the build configuration (`Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml`,
-  `build.rs`), because those decide what the check runs: a `[target.*] runner` entry or a `[[test]] path`
-  is a way to move the verifier without touching a test file. Symlinks are entries in their own right, so a
-  link added under a protected directory is a change. A file ruler cannot see inside an inline
-  `#[cfg(test)]` module in `src/`, which the help text says rather than pretends otherwise.
+  green line. `--protect <path>` adds a file or directory for one run; `--protect inline-tests` adds every
+  `#[cfg(test)]` item in every `*.rs`, and `--protect manifest:<path>` freezes a manifest's structure. The
+  shipped `fix` and `sweep` profiles carry all three, plus `.cargo/config.toml`, `rust-toolchain.toml` and
+  `build.rs`: those decide what the check runs, so a `[target.*] runner` entry or a `[[test]] path` cannot
+  move the verifier without touching a test file. Inline test modules are frozen where they live, keyed by
+  file and item name so an edit above them is not a change, and a manifest keeps its dependency tables free
+  so `cargo add` stays a normal fix. Symlinks are entries in their own right and a symlinked directory is
+  entered, so a link added under a protected path, or an edit to what it points at, is a change.
 - **The browser has a scheme policy.** HTTP, HTTPS and `about:blank` only; `file://` is refused unless a
   fixture opts in. The policy is checked before `Page.navigate`, on every tab refresh (clicks, tab switches,
   redirects) and before observation text is returned; `upload` reads local files only under the same opt-in
@@ -655,7 +657,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **849 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **855 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

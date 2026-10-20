@@ -119,6 +119,20 @@ pub enum Protect {
     File(String),
     /// Every file whose name ends with this suffix, anywhere under the root.
     Suffix(String),
+    /// A manifest, frozen except for its dependency tables.
+    ///
+    /// `cargo test` decides what to build from this file: a `[[test]]` target with `path` or
+    /// `harness = false`, `[lib] test = false`, a `[patch]` that swaps a crate for a stub. Those have to be
+    /// frozen or the ruler protects a check the model can redirect. Adding a dependency is a normal fix,
+    /// though, so `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and their dotted forms are
+    /// projected out of the digest: `cargo add` is not a change, a redirected test target is.
+    Manifest(String),
+    /// Every `#[cfg(test)]` item in every `*.rs` under the root.
+    ///
+    /// A file ruler cannot name a region, so a test module inside `src/lib.rs` used to sit outside it and a
+    /// weakened assertion there passed the check with every protected file unchanged. The regions are keyed
+    /// by file and item name, not by offset, so an edit above a test module is not a change.
+    InlineTests,
 }
 
 impl Protect {
@@ -150,6 +164,16 @@ impl Protect {
         if spec.is_empty() {
             return Err("`--protect` needs a path".to_string());
         }
+        // Two rules do not name one path: a manifest that may still gain dependencies, and the
+        // `#[cfg(test)]` items scattered through the source tree.
+        if spec.eq_ignore_ascii_case("inline-tests") || spec.eq_ignore_ascii_case("cfg(test)") {
+            return Ok(Protect::InlineTests);
+        }
+        if let Some(spec) = spec.strip_prefix("manifest:") {
+            let rule = Protect::Manifest(spec.trim().to_string());
+            rule.validate()?;
+            return Ok(rule);
+        }
         let trailing = spec.ends_with('/') || spec.ends_with('\\');
         let bare = spec.trim_end_matches(['/', '\\']);
         // `./tests` is the same path as `tests`. Refusing it taught a person that their correct path was
@@ -171,7 +195,8 @@ impl Protect {
     pub fn matches(&self, relative: &Path) -> bool {
         match self {
             Protect::Dir(dir) => relative.starts_with(dir),
-            Protect::File(file) => relative == Path::new(file),
+            Protect::File(file) | Protect::Manifest(file) => relative == Path::new(file),
+            Protect::InlineTests => false,
             Protect::Suffix(suffix) => relative
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -181,7 +206,12 @@ impl Protect {
 
     fn spec(&self) -> &str {
         match self {
-            Protect::Dir(spec) | Protect::File(spec) | Protect::Suffix(spec) => spec,
+            Protect::Dir(spec)
+            | Protect::File(spec)
+            | Protect::Manifest(spec)
+            | Protect::Suffix(spec) => spec,
+            // A rule that names no path; `validate` lets it through because there is nothing to escape.
+            Protect::InlineTests => "cfg(test)",
         }
     }
 
@@ -219,6 +249,8 @@ impl std::fmt::Display for Protect {
         match self {
             Protect::Dir(spec) => write!(f, "{spec}/"),
             Protect::File(spec) => write!(f, "{spec}"),
+            Protect::Manifest(spec) => write!(f, "{spec} (dependencies excluded)"),
+            Protect::InlineTests => write!(f, "cfg(test) modules"),
             Protect::Suffix(spec) => write!(f, "*{spec}"),
         }
     }
@@ -274,21 +306,25 @@ impl Profile {
 
 /// What the shipped editing profiles freeze: the files whose contents decide what the check runs.
 ///
-/// `tests/` and `benches/` are the verifier itself. The four build-configuration files are here because a
-/// file ruler that hashes only the test tree can still be moved: `[target.*] runner` in `.cargo/config.toml`
-/// turns `cargo test` into a no-op that exits zero, and a `[[test]] path`/`harness = false` in `Cargo.toml`
-/// points the check at a file that always passes. The cost is deliberate and stated in the help text: a fix
-/// that must change the manifest is two steps - change it, then run - because a manifest edited during a run
-/// is a check whose meaning moved.
+/// `tests/` and `benches/` are the verifier itself, and `InlineTests` covers the modules `cargo test` runs
+/// from inside `src/`. The build-configuration files are here because a file ruler that hashes only the test
+/// tree can still be moved: `[target.*] runner` in `.cargo/config.toml` turns `cargo test` into a no-op that
+/// exits zero, and a `[[test]] path` or `harness = false` points the check at a file that always passes. The
+/// manifest is a `Manifest` rule rather than a `File` rule, so its dependency tables stay writable and
+/// `cargo add` remains a normal fix; everything that decides what the check builds is frozen.
 fn build_config() -> Vec<Protect> {
     vec![
         Protect::Dir("tests".to_string()),
         Protect::Dir("benches".to_string()),
         Protect::Suffix("_test.rs".to_string()),
-        Protect::File("Cargo.toml".to_string()),
+        // The manifest's structure is frozen, its dependency tables are not: `cargo add` is a normal
+        // fix, a redirected test target is a moved verifier.
+        Protect::Manifest("Cargo.toml".to_string()),
         Protect::File(".cargo/config.toml".to_string()),
         Protect::File("rust-toolchain.toml".to_string()),
         Protect::File("build.rs".to_string()),
+        // `cargo test` also runs the modules inside `src/`, so they are frozen where they live.
+        Protect::InlineTests,
     ]
 }
 
@@ -452,7 +488,7 @@ mod tests {
                 .protect
                 .iter()
                 .filter_map(|rule| match rule {
-                    Protect::File(spec) => Some(spec.clone()),
+                    Protect::File(spec) | Protect::Manifest(spec) => Some(spec.clone()),
                     _ => None,
                 })
                 .collect();

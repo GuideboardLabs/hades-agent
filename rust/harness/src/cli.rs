@@ -232,13 +232,14 @@ hades — the harness, one turn or a whole graph
       default) runs the check before the first write and refuses a run whose check already
       passes; use off for a refactor that keeps a green check green. --protect <path> is
       repeatable: the check command and every protected file are hashed before the first
-      write and again after the check, and an edit ends the run as refused. A file ruler
-      does not cover inline `#[cfg(test)]` modules inside `src/*.rs`; move the tests to
-      `tests/` or name the script the check runs. With no protected path the receipt says
-      `ruler: command only`. The shipped fix and sweep profiles also freeze the build
-      configuration - `Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml`, `build.rs` -
-      because those decide what the check runs: a fix that must change the manifest is two
-      steps, change it and then run.
+      write and again after the check, and an edit ends the run as refused. `--protect
+      inline-tests` freezes every `#[cfg(test)]` item in every `*.rs`, which is how the
+      shipped profiles cover tests that live inside `src/`. `--protect manifest:<path>` freezes
+      a manifest except its dependency tables, so `cargo add` is not a change and a
+      redirected `[[test]]` target is. With no protected path the receipt says `ruler:
+      command only`. The shipped fix and sweep profiles freeze `tests/`, the build
+      configuration (`.cargo/config.toml`, `rust-toolchain.toml`, `build.rs`), the manifest's
+      structure, and every inline test module.
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]

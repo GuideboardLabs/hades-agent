@@ -174,20 +174,41 @@ fn an_empty_protect_list_still_freezes_the_check() {
 }
 
 #[test]
-fn an_inline_test_module_is_outside_a_file_ruler() {
-    // The limit the help text states: `cargo test` also runs `#[cfg(test)]` modules inside `src/*.rs`,
-    // and a file ruler cannot name a region of a file the model must edit. This test pins the limit
-    // rather than pretending it away: the edit is real and the ruler is unchanged.
+fn a_file_rule_alone_does_not_see_inline_tests_and_the_shipped_rule_does() {
+    // Two facts worth pinning together. A rule set that names files cannot see a region of a file, which is
+    // why the shipped profiles carry `InlineTests`; and with that rule the same edit is a change. The
+    // contrast is the point: without it the help text would promise coverage the profile does not ask for.
     let root = scratch("inline");
     write(&root, "src/lib.rs", "fn answer() -> u32 { 42 }\n");
     write(&root, "tests/gate.rs", "assert_eq!(answer(), 42);\n");
-    let ruler = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
-    write(&root, "src/lib.rs", "fn answer() -> u32 { 41 }\n");
-    let after = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+    let files_only = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
+    let shipped = Ruler::take(
+        "cargo test",
+        &root,
+        &[protected(), vec![Protect::InlineTests]].concat(),
+    )
+    .expect("a ruler");
+
+    write(
+        &root,
+        "src/lib.rs",
+        "fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a() { assert_eq!(super::answer(), 40); }\n}\n",
+    );
+    let after_files_only = Ruler::take("cargo test", &root, &protected()).expect("a ruler");
     assert_eq!(
-        ruler.diff(&after),
+        after_files_only.diff(&files_only),
         None,
-        "a file ruler must report unchanged, which is exactly the hole the help text names"
+        "a file rule is blind to this"
+    );
+    let after_shipped = Ruler::take(
+        "cargo test",
+        &root,
+        &[protected(), vec![Protect::InlineTests]].concat(),
+    )
+    .expect("a ruler");
+    assert!(
+        after_shipped.diff(&shipped).is_some(),
+        "the shipped rule missed an added test module"
     );
 }
 
@@ -232,4 +253,168 @@ fn a_change_to_the_file_a_frozen_symlink_points_at_is_a_change() {
         .diff(&after)
         .expect("the target's contents are frozen");
     assert!(change.contains("tests/gate.rs"), "{change}");
+}
+
+#[test]
+fn a_weakened_assertion_inside_a_cfg_test_module_is_a_change() {
+    // The limit this test closes: `cargo test` runs the modules inside `src/`, and a file ruler over
+    // `tests/` could not see them. The assertion is weakened, every `tests/` file is untouched, and the
+    // check goes green.
+    let root = scratch("inline-weakened");
+    write(
+        &root,
+        "src/lib.rs",
+        "pub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_adds() { assert_eq!(answer() + 1, 43); }\n}\n",
+    );
+    write(&root, "tests/gate.rs", "#[test]\nfn gate() {}\n");
+    let rules = vec![Protect::dir("tests").expect("a rule"), Protect::InlineTests];
+    let before = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+
+    write(
+        &root,
+        "src/lib.rs",
+        "pub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_adds() { assert_eq!(answer() + 1, 43 + 1); }\n}\n",
+    );
+    let after = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    let change = before.diff(&after).expect("the inline assertion is frozen");
+    assert!(change.contains("#cfg(test)::tests"), "{change}");
+}
+
+#[test]
+fn an_edit_above_a_cfg_test_module_is_not_a_change() {
+    // The region is keyed by name, not by byte offset, so fixing the code above the tests must not read as
+    // a moved verifier. A ruler that refused this would be unusable on a repo whose tests live at the
+    // bottom of every file, which is most of them.
+    let root = scratch("inline-above");
+    let body = "pub fn answer() -> u32 { %s }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_is_42() { assert_eq!(super::answer(), 42); }\n}\n";
+    write(
+        &root,
+        "src/lib.rs",
+        &format!("// a header\n{}", body.replace("%s", "42")),
+    );
+    let rules = vec![Protect::InlineTests];
+    let before = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    let moved = format!(
+        "// a header\n// one more line of it\n{}",
+        body.replace("%s", "42")
+    );
+    write(&root, "src/lib.rs", &moved);
+    let after = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    assert_eq!(before.diff(&after), None, "{:?}", after.files);
+}
+
+#[test]
+fn a_new_cfg_test_module_is_a_change() {
+    let root = scratch("inline-added");
+    write(&root, "src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    let rules = vec![Protect::InlineTests];
+    let before = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    write(
+        &root,
+        "src/lib.rs",
+        "pub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod extra {\n    #[test]\n    fn always_passes() {}\n}\n",
+    );
+    let after = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    let change = before
+        .diff(&after)
+        .expect("an added test module is a change");
+    assert!(change.contains("#cfg(test)::extra"), "{change}");
+}
+
+#[test]
+fn a_dependency_may_be_added_but_a_test_target_may_not() {
+    // The cost this removes: freezing the whole manifest made `cargo add` a refusal. The structure that
+    // decides what the check runs stays frozen.
+    let root = scratch("manifest");
+    write(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"gated\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    );
+    let rules = vec![Protect::Manifest("Cargo.toml".to_string())];
+    let before = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+
+    write(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"gated\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\nanyhow = \"1\"\n",
+    );
+    let added = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    assert_eq!(
+        before.diff(&added),
+        None,
+        "a dependency is not a moved verifier"
+    );
+
+    write(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"gated\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n\n[[test]]\nname = \"gate\"\npath = \"src/lib.rs\"\n",
+    );
+    let redirected = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    assert!(
+        before.diff(&redirected).is_some(),
+        "a test target pointed at another file is a moved verifier"
+    );
+}
+
+#[test]
+fn a_change_under_a_symlinked_protected_directory_is_a_change() {
+    // A pre-existing `tests -> ../shared` used to be recorded as a link and not entered, so editing the
+    // target left every entry identical. The check follows the link, so the ruler has to.
+    let root = scratch("symlink-dir");
+    let shared = scratch("symlink-dir-shared");
+    write(
+        &shared,
+        "gate.rs",
+        "#[test]\nfn gate() { assert!(true); }\n",
+    );
+    std::os::unix::fs::symlink(&shared, root.join("tests")).expect("a directory link");
+
+    let rules = vec![Protect::dir("tests").expect("a rule")];
+    let before = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    assert!(
+        before.files.keys().any(|key| key.ends_with("gate.rs")),
+        "the contents of the linked directory were not hashed: {:?}",
+        before.files
+    );
+
+    write(&shared, "gate.rs", "#[test]\nfn gate() {}\n");
+    let after = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    let change = before
+        .diff(&after)
+        .expect("the target's contents are frozen");
+    assert!(change.contains("gate.rs"), "{change}");
+}
+
+#[test]
+fn a_source_file_with_multibyte_text_does_not_panic_the_scan() {
+    // The scanner advances one byte at a time, so a comment with an accent used to slice through a
+    // character and abort the whole run. A crash on a normal file is worse than a missed region.
+    let root = scratch("inline-utf8");
+    write(
+        &root,
+        "src/lib.rs",
+        "// café: naïve résumé — the tests below are frozen\npub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_is_42() { assert_eq!(super::answer(), 42); }\n}\n",
+    );
+    let rules = vec![Protect::InlineTests];
+    let before = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    assert!(
+        before
+            .files
+            .keys()
+            .any(|key| key.ends_with("#cfg(test)::tests")),
+        "{:?}",
+        before.files
+    );
+    write(
+        &root,
+        "src/lib.rs",
+        "// café: naïve résumé — the tests below are frozen\npub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_is_42() { assert_eq!(super::answer(), 41); }\n}\n",
+    );
+    let after = Ruler::take("cargo test", &root, &rules).expect("a ruler");
+    assert!(
+        before.diff(&after).is_some(),
+        "the weakened assertion was missed"
+    );
 }
