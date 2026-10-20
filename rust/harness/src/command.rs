@@ -27,6 +27,8 @@ pub struct Run {
     pub output: String,
     /// Whether the output was cut, so a reader never has to guess whether it is complete.
     pub truncated: bool,
+    /// Whether the wall-clock deadline ended the program. A killed run has no verdict about the work.
+    pub timed_out: bool,
 }
 
 impl Run {
@@ -141,6 +143,7 @@ pub fn run_within(
         status,
         output,
         truncated,
+        timed_out,
     })
 }
 
@@ -222,6 +225,23 @@ mod tests {
         let run = run("definitely-not-a-command-anywhere", &here(), 1024, None).expect("run");
         assert_eq!(run.status, 127);
         assert!(!run.output.is_empty());
+    }
+
+    #[test]
+    fn a_deadline_marks_the_run_timed_out() {
+        // `sleep 5` cannot finish inside 200 ms. The run must say it was killed, and its status must not be
+        // mistaken for the program's own answer.
+        let run = run_within(
+            "sleep 5",
+            &here(),
+            1024,
+            None,
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .expect("run");
+        assert!(run.timed_out, "{run:?}");
+        assert_eq!(run.status, -1);
+        assert!(run.output.contains("wall-clock deadline"), "{}", run.output);
     }
 
     #[test]

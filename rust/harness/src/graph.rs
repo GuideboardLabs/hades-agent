@@ -257,6 +257,8 @@ pub enum Exhausted {
     Refused,
     /// The check could not run, which is not evidence either way.
     CouldNotRun,
+    /// The check was killed by its deadline before it reached a verdict.
+    TimedOut,
 }
 
 impl Exhausted {
@@ -269,6 +271,7 @@ impl Exhausted {
             Exhausted::Fault => "a fault",
             Exhausted::Refused => "a refusal",
             Exhausted::CouldNotRun => "a check that could not run",
+            Exhausted::TimedOut => "a check that timed out",
         }
     }
 }
@@ -500,6 +503,9 @@ impl Ended {
     pub fn code(&self) -> i32 {
         match self {
             Ended::Accepted { .. } => 0,
+            // A giving-up is a failure (1), except when the check never reached a verdict: a timeout
+            // reported as 1 would read as "the work is wrong" to every script that checks the code.
+            Ended::GaveUp { exhausted, .. } if *exhausted == Exhausted::TimedOut => 2,
             Ended::GaveUp { .. } => 1,
             Ended::Awaiting { .. } => 2,
             Ended::Stopped { .. } => 1,
@@ -1373,14 +1379,16 @@ where
                     State::Passed => When::Passed,
                     State::Failed if out.is_some() => When::Exhausted,
                     State::Failed => When::Failed,
+                    State::TimedOut => When::CouldNotRun,
                     State::CouldNotRun => When::CouldNotRun,
                 };
-                if verification.state == State::CouldNotRun {
-                    // A check that could not run is not a budget end: the run stops because the evidence is
-                    // missing, and no allowance was involved.
-                    self.last_cause = Some(Exhausted::CouldNotRun);
-                } else if when == When::Exhausted {
-                    self.last_cause = out;
+                match verification.state {
+                    // A check that never reached a verdict is not a budget end and not a wrong answer: the
+                    // run stops because the evidence is missing, and no allowance was involved.
+                    State::TimedOut => self.last_cause = Some(Exhausted::TimedOut),
+                    State::CouldNotRun => self.last_cause = Some(Exhausted::CouldNotRun),
+                    _ if when == When::Exhausted => self.last_cause = out,
+                    _ => {}
                 }
                 if verification.state != State::Passed {
                     learned.tried(

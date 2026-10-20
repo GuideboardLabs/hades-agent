@@ -3329,6 +3329,7 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
         Outcome::Ran { verification, .. } => match verification.state {
             State::Passed => 0,
             State::Failed => 1,
+            State::TimedOut => 2,
             State::CouldNotRun => 2,
         },
         Outcome::Awaiting { .. } => 0,

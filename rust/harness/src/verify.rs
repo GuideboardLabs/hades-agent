@@ -18,6 +18,9 @@ use crate::task::TaskSpec;
 pub enum State {
     Passed,
     Failed,
+    /// The check ran past its wall-clock bound and was killed. It is not a failure of the work: the check
+    /// never reached a verdict, and reporting it as `Failed` states a judgement nobody made.
+    TimedOut,
     /// The check never ran: no command configured, or the harness could not start it. Not a result.
     CouldNotRun,
 }
@@ -27,12 +30,13 @@ impl State {
         match self {
             State::Passed => "passed",
             State::Failed => "failed",
+            State::TimedOut => "timed_out",
             State::CouldNotRun => "could_not_run",
         }
     }
 
     pub fn is_a_result(self) -> bool {
-        !matches!(self, State::CouldNotRun)
+        !matches!(self, State::CouldNotRun | State::TimedOut)
     }
 }
 
@@ -113,16 +117,29 @@ pub struct Verification {
     pub command: String,
     pub state: State,
     pub output: String,
+    /// The exit status the check returned, when it returned one. `None` means nothing ran, which is not
+    /// the same as a non-zero status and must not be read as one. `Some(-1)` means the process ended
+    /// without a status of its own: a signal, or the deadline killing it.
+    pub status: Option<i32>,
+    /// Whether `output` is a slice of what the check wrote rather than all of it.
+    pub truncated: bool,
+    /// The sha256 of `output` exactly as recorded here, so a later reader can check the record against
+    /// the bytes it holds. A truncated output is digested as the slice it is, and `truncated` says so.
+    pub output_digest: String,
     /// Present only when the check opted into the progress contract. A missing value is not zero progress.
     pub progress: Option<Progress>,
 }
 
 impl Verification {
     pub fn could_not_run(command: &str, why: impl Into<String>) -> Self {
+        let why = why.into();
         Verification {
             command: command.to_string(),
             state: State::CouldNotRun,
-            output: why.into(),
+            output_digest: mneme::sha256::hex(why.as_bytes()),
+            output: why,
+            status: None,
+            truncated: false,
             progress: None,
         }
     }
@@ -188,7 +205,9 @@ impl Verifier for CommandVerifier {
             Ok(run) => {
                 let progress = Progress::parse(&run.output);
                 let gate_ok = progress.as_ref().map(|p| p.gate).unwrap_or(true);
-                let state = if run.passed() && gate_ok {
+                let state = if run.timed_out {
+                    State::TimedOut
+                } else if run.passed() && gate_ok {
                     State::Passed
                 } else {
                     State::Failed
@@ -203,7 +222,10 @@ impl Verifier for CommandVerifier {
                 Verification {
                     command: command.to_string(),
                     state,
+                    output_digest: mneme::sha256::hex(output.as_bytes()),
                     output,
+                    status: Some(run.status),
+                    truncated: run.truncated,
                     progress,
                 }
             }
@@ -241,6 +263,60 @@ mod tests {
         assert!(Progress::parse("HADES-CHECK {").is_none());
         assert!(Progress::parse("HADES-CHECK {\"gate\":true,\"passed\":6,\"total\":5}").is_none());
         assert!(Progress::parse("HADES-CHECK {\"gate\":true,\"passed\":0,\"total\":0}").is_none());
+    }
+
+    #[test]
+    fn a_sleeping_check_is_timed_out_not_failed() {
+        let root = scratch("timeout");
+        let task = TaskSpec::new("make it pass", root);
+        let verifier = CommandVerifier::with_deadline(8_000, std::time::Duration::from_millis(200));
+        let verification = verifier.verify(&task, "sleep 5");
+        assert_eq!(verification.state, State::TimedOut);
+        assert_eq!(verification.status, Some(-1));
+        assert!(!verification.state.is_a_result());
+        assert_eq!(verification.output_digest.len(), 64);
+        assert!(
+            verification
+                .output_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+    }
+
+    #[test]
+    fn a_passing_check_records_its_status_and_digest() {
+        let root = scratch("status");
+        let task = TaskSpec::new("make it pass", root);
+        let verifier = CommandVerifier::new(8_000);
+        let verification = verifier.verify(&task, "printf ok; exit 0");
+        assert_eq!(verification.state, State::Passed);
+        assert_eq!(verification.status, Some(0));
+        assert!(!verification.truncated);
+        assert_eq!(verification.output_digest, mneme::sha256::hex(b"ok"));
+    }
+
+    #[test]
+    fn a_truncated_check_says_the_output_is_a_slice_and_digests_what_it_kept() {
+        let root = scratch("truncated");
+        let task = TaskSpec::new("make it pass", root);
+        let verifier = CommandVerifier::new(200);
+        let verification = verifier.verify(&task, "seq 1 4000");
+        assert!(verification.truncated);
+        assert_eq!(
+            verification.output_digest,
+            mneme::sha256::hex(verification.output.as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_check_that_never_ran_has_no_status() {
+        let root = scratch("none");
+        let task = TaskSpec::new("make it pass", root);
+        let verification = CommandVerifier::new(8_000).verify(&task, "  ");
+        assert_eq!(verification.state, State::CouldNotRun);
+        assert_eq!(verification.status, None);
+        assert!(!verification.truncated);
+        assert!(!verification.state.is_a_result());
     }
 
     #[test]
