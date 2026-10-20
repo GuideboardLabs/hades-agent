@@ -2455,6 +2455,87 @@ mod tests {
         assert_ne!(one[preamble.len()..], two[preamble.len()..]);
     }
 
+    /// Every object key, sorted, at every depth. serde_json's default map is a BTreeMap, which is why the
+    /// serialization is already canonical; this pins that against a future `preserve_order` feature or a
+    /// switch to a map that keeps insertion order.
+    fn canonical(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for key in keys {
+                    out.insert(key.clone(), canonical(&map[key]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn the_tool_surface_is_byte_stable_and_key_sorted() {
+        for depth in [0u8, 1] {
+            for mode in [Mode::Read, Mode::Act] {
+                for role in [crate::profile::Role::Survey, crate::profile::Role::Patch] {
+                    let one = schemas_for(depth, mode, role);
+                    let two = schemas_for(depth, mode, role);
+                    let first = serde_json::to_string(&one).expect("a schema");
+                    let second = serde_json::to_string(&two).expect("a schema");
+                    assert_eq!(first, second, "the tool surface changed between calls");
+                    assert_eq!(
+                        first,
+                        serde_json::to_string(&canonical(&one)).expect("canonical"),
+                        "the serialization is not key-sorted"
+                    );
+                    assert_eq!(names(&one), names(&two), "the tool order is not stable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changes_travel_as_appended_messages_not_a_rewritten_prefix() {
+        let dir = admission_scratch("agent-prefix-stable");
+        let (url, seen, server) = free_script(vec![
+            json!({"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "list_dir", "arguments": "{\"path\":\".\"}"}}]}),
+            answer("done"),
+        ]);
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let client = OpenAi::new(&url, "stub");
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are terse."}),
+            json!({"role": "user", "content": "go"}),
+        ];
+        let said = answer_stoppable(
+            &client,
+            &mut messages,
+            &world,
+            &|_, _| {},
+            &|_, _| {},
+            4,
+            None,
+        )
+        .expect("an answer");
+        assert_eq!(said.as_deref(), Some("{\"report\":\"done\"}"));
+        let first = seen
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first call");
+        let second = seen
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second call");
+        assert_eq!(
+            first[0], second[0],
+            "the system message was rewritten mid-run"
+        );
+        assert_eq!(first[0]["content"], "You are terse.");
+        // What changed travels behind the prefix: one assistant call and one tool result were appended.
+        assert_eq!(second.len(), first.len() + 2, "{second:?}");
+        assert_eq!(second[1..first.len()], first[1..], "{second:?}");
+        server.join().expect("the endpoint");
+    }
+
     #[test]
     fn only_the_persons_conversation_can_delegate() {
         let top = names(&schemas(0, Mode::Act));
@@ -3635,6 +3716,41 @@ mod tests {
             write_answer(&mut stream, &answer);
         });
         (url, server)
+    }
+
+    /// An endpoint that answers each script entry without a barrier: for tests that drive one synchronous
+    /// call through several steps and read the requests only after it returns.
+    fn free_script(
+        answers: Vec<Value>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Vec<Value>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        let (report, requests) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for answer in answers {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream);
+                let messages = request
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if report.send(messages).is_err() {
+                    return;
+                }
+                write_answer(&mut stream, &answer);
+            }
+        });
+        (url, requests, server)
     }
 
     fn script(state: PathBuf, answers: Vec<Value>) -> Stub {

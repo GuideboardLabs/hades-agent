@@ -436,4 +436,68 @@ mod tests {
         assert!(text.contains("guidance: none (omitted)"), "{text}");
         assert!(text.contains("effective: "), "{text}");
     }
+
+    #[test]
+    fn the_prefix_is_byte_stable_across_calls() {
+        let dir = scratch("stable-prefix");
+        std::fs::write(dir.join("system.md"), "You are terse.").expect("system");
+        std::fs::write(dir.join("tool_guidance.md"), "Read before writing.").expect("guidance");
+        let files = Files::load(Some(dir.to_str().unwrap()), "test").expect("loaded");
+        let first = files.prompt();
+        let second = files.prompt();
+        assert_eq!(first.text, second.text);
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.blocks, second.blocks);
+    }
+
+    /// A four-digit year followed by a month and a day. Hand-rolled because a regex engine for one check is
+    /// a dependency, and this is the only place it would be used.
+    fn carries_a_date(text: &str) -> bool {
+        text.as_bytes().windows(10).any(|window| {
+            window[..4].iter().all(u8::is_ascii_digit)
+                && window[4] == b'-'
+                && window[5..7].iter().all(u8::is_ascii_digit)
+                && window[7] == b'-'
+                && window[8..10].iter().all(u8::is_ascii_digit)
+        })
+    }
+
+    #[test]
+    fn the_prompt_carries_no_volatile_bytes() {
+        let one = scratch("volatile-one");
+        let two = scratch("volatile-two");
+        for dir in [&one, &two] {
+            std::fs::write(dir.join("system.md"), "You are terse.").expect("system");
+            std::fs::write(dir.join("tool_guidance.md"), "Read before writing.").expect("guidance");
+        }
+        let first = Files::load(Some(one.to_str().unwrap()), "test")
+            .expect("loaded")
+            .prompt();
+        let second = Files::load(Some(two.to_str().unwrap()), "test")
+            .expect("loaded")
+            .prompt();
+        // Two directories, same text: the prompt must not remember where it was read from.
+        assert_eq!(first.text, second.text);
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(
+            first.text,
+            "You are terse.\n\n# Tool guidance\n\nRead before writing."
+        );
+        // The things a future `format!` would be tempted to add above the fold.
+        assert!(!carries_a_date(&first.text), "{}", first.text);
+        assert!(
+            !first.text.contains(one.to_str().unwrap()),
+            "{}",
+            first.text
+        );
+        assert!(!first.text.contains("session"), "{}", first.text);
+        assert!(!first.text.contains("token"), "{}", first.text);
+        if let Ok(cwd) = std::env::current_dir() {
+            assert!(
+                !first.text.contains(cwd.to_str().unwrap()),
+                "{}",
+                first.text
+            );
+        }
+    }
 }
