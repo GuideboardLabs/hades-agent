@@ -70,9 +70,9 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 0.0.4 is Part I of the 0.0.3 plan: five changes to the runtime itself, with the session format unchanged.
 
 - **Admission handles.** `spawn` returns `{child_id, session, state:"admitted"}` before the child's first model call. A gateway-owned registry caps live children at 16, records them under `<state>/children/`, and marks a crashed gateway's children `lost` on restart instead of resuming them silently. `tell`, `children` and `result` are the tools a parent uses to work with a live child.
-- **Goals that outlive a turn.** A goal is session state (`open`, `paused`, `done`, `cleared`) with its chat, model, check and budget. The gateway heartbeat re-enters an idle session on schedule. A goal closes when its recorded check passes, when a person closes it, or when its budget is spent, and the reason is recorded.
+- **Goals that outlive a turn.** A goal is session state (`open`, `paused`, `done`, `cleared`) with its chat, model, check and budget. The gateway heartbeat re-enters an idle session on schedule. A goal closes when its recorded check passes or when a person closes it. When its total budget of model calls is spent it pauses with `budget` recorded, and `hades goal resume` puts it back to work.
 - **Budgets that name their cause.** `hades run` and `hades submit` take `--budget-tokens`; the end of a run names `attempts`, `minutes` or `tokens`, and the scoreboard sums the spend the endpoint reported.
-- **Numbered harness generations.** Every `tune --adopt` writes `<state>/control/harness/<profile>/<n>/` with a manifest naming every captured file and its hash. `hades refine --rollback <n>` restores exactly those files in two passes, and refuses to cross a floor change. The floor and policy guard lists are enumerated by the type system rather than by hand.
+- **Numbered harness generations.** Every `tune --adopt` writes `~/.hades/control/harness/<profile>/<n>/` (under `HADES_HOME`) with a manifest naming every captured file, its hash, and the harness and state roots it came from. `hades refine --rollback <n>` restores exactly those files in two passes, and refuses to cross a floor change. The floor and policy guard lists are enumerated by the type system rather than by hand.
 - **Strict model requests.** `--strict-model` preflights the endpoint and key before a session exists. A configured but unreachable endpoint fails on the first call naming the model instead of substituting another.
 
 Part II of the plan, which covers the satellite transport broker, generations in service and the evolve loop, is not in this release. It is the next stage.
@@ -225,7 +225,7 @@ depth caps at two, and the same allowance pays for the whole tree. A failed chil
 
 ## Jobs that stop
 
-Standing goals live under `<state>/jobs` and are re-read on every scheduler tick.
+Standing jobs live under `<state>/jobs` and are re-read on every scheduler tick. A chat's standing goal is a different record, under `<state>/goals`, and the gateway's heartbeat continues it.
 
 - `read` or `act` mode.
 - Intent fields: `inputs`, `outputs`, `done_when`, `stop_when`, `until`, `never`.
@@ -539,7 +539,10 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 ├── .env               provider keys and the Telegram token, mode 600
 ├── sessions/          append-only JSONL session trees
 ├── mneme/             SQLite record and markdown export
-├── jobs/              standing goals and schedules
+├── jobs/              standing jobs and schedules
+├── goals/             standing goals for chats, one file each
+├── children/          admitted child records for the gateway
+├── control/           numbered harness generations
 ├── approvals/         append-only approval ledger
 ├── skills/            built-in, installed and proposed skills
 └── work/              default working tree for runs

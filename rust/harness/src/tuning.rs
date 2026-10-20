@@ -16,7 +16,7 @@
 //! edit. The generation records the floor, policy and profile defaults it was captured under, so a rollback
 //! cannot cross a change to any of the three. `hades refine --rollback <n>` puts one back.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -473,6 +473,9 @@ pub struct Generation {
     pub id: u64,
     pub parent: Option<u64>,
     pub harness: Option<String>,
+    /// The absolute state root the skills were captured from. A restore into another `--state` would
+    /// rewrite a tree this generation never held, so it is compared and refused, exactly like `harness`.
+    pub state: Option<String>,
     pub files: Vec<GenerationFile>,
     pub source_session: String,
     pub check: String,
@@ -548,6 +551,10 @@ fn read_generation(home: &Path, profile: &str, id: u64) -> Result<Option<Generat
             .get("harness")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        state: value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         files,
         source_session: string(value.get("source_session")),
         check: string(value.get("check")),
@@ -596,7 +603,7 @@ fn captured(harness: &Path, state: &Path) -> Result<Vec<(String, Vec<u8>)>, Stri
         }
     }
     let skills = state.join("skills");
-    for path in crate::skills::skill_files(state) {
+    for path in captured_skills(&skills) {
         let bytes = std::fs::read(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let Some(relative) = relative_posix(&skills, &path) else {
@@ -610,6 +617,39 @@ fn captured(harness: &Path, state: &Path) -> Result<Vec<(String, Vec<u8>)>, Stri
     }
     found.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(found)
+}
+
+/// The skill files under one root, skipping a symlinked directory. A generation records bytes to put
+/// back; following a symlink would record another tree's file under this tree's name and a restore
+/// would then write through the link.
+fn captured_skills(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_skills(dir, 0, &mut found);
+    found.sort();
+    found
+}
+
+fn collect_skills(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_skills(&path, depth + 1, found);
+        } else if path.file_name().is_some_and(|name| name == "SKILL.md") {
+            found.push(path);
+        }
+    }
 }
 
 fn relative_posix(base: &Path, path: &Path) -> Option<String> {
@@ -695,6 +735,7 @@ pub fn capture(
         id,
         parent,
         harness: Some(absolute(harness).display().to_string()),
+        state: Some(absolute(state).display().to_string()),
         files,
         source_session: source_session.to_string(),
         check: check.to_string(),
@@ -733,6 +774,7 @@ fn manifest_text(generation: &Generation) -> String {
         "id": generation.id,
         "parent": generation.parent,
         "harness": generation.harness,
+        "state": generation.state,
         "files": files,
         "source_session": generation.source_session,
         "check": generation.check,
@@ -838,6 +880,15 @@ pub fn restore(
             "generation {id} was captured from {recorded}, and {} is a different harness; restoring \
              it would put those bytes in a tree that never held them, so it is refused",
             harness.display()
+        ));
+    }
+    if let Some(recorded) = &generation.state
+        && absolute(Path::new(recorded)) != absolute(state)
+    {
+        return Err(format!(
+            "generation {id} was captured with the skills under {recorded}, and {} is a different \
+             state; restoring it would rewrite another tree's skills, so it is refused",
+            state.display()
         ));
     }
     if keeps_harness && !harness.join("system.md").is_file() {
@@ -1064,9 +1115,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn log(name: &str, body: &str) -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("hades-tune-{name}-{}", std::process::id()));
+        let dir = crate::scratch::root().join(format!("hades-tune-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let path = dir.join("session.jsonl");
         std::fs::write(&path, body).expect("log");
@@ -1205,9 +1254,7 @@ mod tests {
 
     #[test]
     fn adoption_copies_the_prompt_and_drops_stale_guidance() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("hades-adopt-{}", std::process::id()));
+        let root = crate::scratch::root().join(format!("hades-adopt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let source = root.join("source");
         let target = root.join("target");
@@ -1249,9 +1296,7 @@ mod version_tests {
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("versions-{name}-{}", std::process::id()));
+        let dir = crate::scratch::root().join(format!("versions-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         dir
@@ -1285,9 +1330,7 @@ mod generation_tests {
     use std::path::{Path, PathBuf};
 
     fn place(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("generations-{name}-{}", std::process::id()));
+        let dir = crate::scratch::root().join(format!("generations-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch home");
         dir
@@ -1878,6 +1921,103 @@ mod generation_tests {
                 .next()
                 .is_none(),
             "a refused rollback left files in the empty directory"
+        );
+    }
+
+    /// A generation names the state root its skills came from. A restore into another `--state` would
+    /// rewrite a tree that never held those files, so it is refused and nothing is written.
+    #[test]
+    fn a_generation_refuses_a_restore_into_another_state() {
+        let home = place("other-state");
+        let harness = seeded(&home);
+        let state_a = home.join("state-a");
+        std::fs::create_dir_all(state_a.join("skills/alpha")).expect("a second state's skills");
+        std::fs::write(state_a.join("skills/alpha/SKILL.md"), "the A tree's skill")
+            .expect("the A skill");
+        std::fs::write(harness.join("system.md"), "prompt A").expect("a prompt");
+        let generation = capture(
+            &home,
+            "fix",
+            &harness,
+            &state_a,
+            "session-1",
+            "passed",
+            &guard_digest(),
+        )
+        .expect("a capture")
+        .expect("a generation");
+
+        let state_b = home.join("state-b");
+        std::fs::create_dir_all(state_b.join("skills/alpha")).expect("the B tree's skills");
+        std::fs::write(state_b.join("skills/alpha/SKILL.md"), "the B tree's skill")
+            .expect("the B skill");
+        let before = std::fs::read_to_string(state_b.join("skills/alpha/SKILL.md")).expect("read");
+
+        let refused = restore(
+            &home,
+            "fix",
+            &harness,
+            &state_b,
+            generation.id,
+            &guard_digest(),
+        )
+        .expect_err("another state's skills are not this generation's");
+        assert!(
+            refused.contains("state") || refused.contains("skills"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_b.join("skills/alpha/SKILL.md")).expect("read"),
+            before,
+            "a refused rollback writes nothing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                generation_dir(&home, "fix", generation.id).join("skills/alpha/SKILL.md")
+            )
+            .expect("the captured bytes"),
+            "the A tree's skill"
+        );
+    }
+
+    /// A symlinked skill directory is not captured: a generation records bytes to put back, and
+    /// following a link would record another tree's file under this tree's name.
+    #[test]
+    fn a_symlinked_skill_directory_is_not_captured() {
+        let home = place("symlink");
+        let harness = seeded(&home);
+        let outside = home.join("outside");
+        std::fs::create_dir_all(&outside).expect("a tree outside the state");
+        std::fs::write(outside.join("SKILL.md"), "not this state's skill").expect("a skill");
+        let skills = home.join("skills");
+        std::os::unix::fs::symlink(&outside, skills.join("linked")).expect("a symlinked skill dir");
+
+        let generation = capture(
+            &home,
+            "fix",
+            &harness,
+            &home,
+            "session-1",
+            "passed",
+            &guard_digest(),
+        )
+        .expect("a capture")
+        .expect("a generation");
+        assert!(
+            generation
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with("skills/linked/")),
+            "{:?}",
+            generation.files
+        );
+        assert!(
+            generation
+                .files
+                .iter()
+                .any(|file| file.path == "skills/alpha/SKILL.md"),
+            "the real skill is still captured: {:?}",
+            generation.files
         );
     }
 }
