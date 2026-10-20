@@ -235,9 +235,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("scoreboard-{name}-{}", std::process::id()));
+        let dir = crate::scratch::root().join(format!("scoreboard-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

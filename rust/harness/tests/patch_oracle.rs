@@ -13,7 +13,7 @@ use harness::patch::{Edit, FileEdit, apply, plan_all, tool, write_all};
 use harness::path::PathPolicy;
 
 fn scratch(name: &str) -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
     let base = std::fs::canonicalize(&base).unwrap_or(base);
     let dir = base.join(format!("hades-patch-{name}-{}", std::process::id()));

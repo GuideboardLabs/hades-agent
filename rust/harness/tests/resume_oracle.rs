@@ -276,7 +276,7 @@ fn scratch_base() -> std::path::PathBuf {
     // by the store, and the snapshot's never-touch test is a prefix test. The first run of this helper put the
     // store inside the tree it was copying, and the copy recursed into itself until the kernel refused the
     // file name.
-    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }

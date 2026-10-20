@@ -158,12 +158,9 @@ mod tests {
     }
 
     fn scratch_base() -> PathBuf {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
+        let base = crate::scratch::root()
             .canonicalize()
-            .unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch")
-            });
+            .unwrap_or_else(|_| crate::scratch::root());
         std::fs::create_dir_all(&base).expect("the scratch base");
         base
     }

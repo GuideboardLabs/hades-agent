@@ -231,7 +231,7 @@ fn an_unknown_service_verb_says_what_exists() {
 }
 
 fn scratch_base() -> PathBuf {
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).expect("the scratch base");
     base.canonicalize().unwrap_or(base)
 }

@@ -15,9 +15,7 @@ struct Acp {
 
 impl Acp {
     fn start(name: &str, program: &str, verify: &str) -> (Acp, PathBuf, PathBuf) {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(format!("hades-acp-{name}-{}", std::process::id()));
+        let dir = harness::scratch::root().join(format!("hades-acp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let root = dir.join("root");
         let state = dir.join("state");
