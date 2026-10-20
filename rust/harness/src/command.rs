@@ -323,11 +323,8 @@ mod tests {
         );
         assert!(!cut.contains('\u{fffd}'), "{cut:?}");
     }
-}
 
-#[cfg(test)]
-mod clean {
-    use super::*;
+    // A model-run shell sees only the passlist, even when the harness holds a key.
     use std::sync::Mutex;
 
     static ENV: Mutex<()> = Mutex::new(());

@@ -152,9 +152,10 @@ hades — the harness, one turn or a whole graph
       own the sessions under one state directory, in the foreground
 
   hades http [--bind 127.0.0.1:8787] [--state <dir>] [--token-file <path>] [--once]
-      one read-and-control API over the daemon, for a local client. A bind that is not
-      loopback is refused unless HADES_HTTP_TOKEN or --token-file gives it a token; the
-      token is never taken as an argument because argv is visible in `ps`
+      one read-and-control API over the daemon, for a local client. Every bind needs a
+      token: HADES_HTTP_TOKEN, --token-file, or one generated at <state>/http.token and
+      reused on restart. The token is never taken as an argument because argv is visible
+      in `ps`; the generated file is 0600
 
   hades status [--state <dir>]
       what the daemon knows, or what the logs say when none is running
@@ -4077,15 +4078,10 @@ fn http(args: &[String]) -> Result<(String, i32), String> {
         })?,
         None => std::net::SocketAddr::from(([127, 0, 0, 1], 8787)),
     };
-    let token = token_of(&flags)?;
-    // A listen address a stranger can reach is a different trust decision from the unix socket, so it is
-    // refused unless a token was configured. The refusal names both ways to give one.
-    if !bind.ip().is_loopback() && token.is_none() {
-        return Err(format!(
-            "refusing to listen on {bind}: it is not loopback and no token is configured. Set \
-             HADES_HTTP_TOKEN or pass --token-file <path>."
-        ));
-    }
+    // Mandatory on every bind, loopback included: a page the browser visits can POST to 127.0.0.1, so
+    // loopback is not a trust boundary. A missing token is generated once and reused, so a restart does
+    // not break every client.
+    let token = token_of(&flags, &state)?;
     let once = flags.named.contains_key("once");
     crate::httpd::Server {
         state,
@@ -4099,25 +4095,59 @@ fn http(args: &[String]) -> Result<(String, i32), String> {
 
 /// A token from the environment or from a file's first line, never from argv: argv is visible in `ps` for
 /// the life of the process, so a token passed as a flag would be a token in every process listing.
-fn token_of(flags: &Flags) -> Result<Option<String>, String> {
+fn token_of(flags: &Flags, state: &std::path::Path) -> Result<String, String> {
     if let Ok(token) = std::env::var("HADES_HTTP_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
-            return Ok(Some(token));
+            return Ok(token);
         }
     }
-    let Some(path) = flags.named.get("token-file") else {
-        return Ok(None);
-    };
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("could not read {path}: {error}"))?;
-    let token = text.lines().next().unwrap_or_default().trim().to_string();
-    if token.is_empty() {
-        return Err(format!(
-            "{path} is empty; its first line has to be the token"
-        ));
+    if let Some(path) = flags.named.get("token-file") {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("could not read {path}: {error}"))?;
+        let token = text.lines().next().unwrap_or_default().trim().to_string();
+        if token.is_empty() {
+            return Err(format!(
+                "{path} is empty; its first line has to be the token"
+            ));
+        }
+        return Ok(token);
     }
-    Ok(Some(token))
+    // Reuse before generate: rotating on every start would break every client on every restart.
+    let path = state.join("http.token");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let token = text.lines().next().unwrap_or_default().trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+    let token = new_token()?;
+    crate::scratch::state_dir(state)
+        .map_err(|error| format!("could not make {}: {error}", state.display()))?;
+    std::fs::write(&path, format!("{token}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    crate::scratch::private_file(&path)
+        .map_err(|error| format!("could not protect {}: {error}", path.display()))?;
+    eprintln!(
+        "hades http: no token configured; generated one at {} (mode 0600)",
+        path.display()
+    );
+    Ok(token)
+}
+
+/// A fresh token from the kernel's random source. Hex, because a token is pasted into a header and a
+/// shell by hand as often as it is read by a program.
+fn new_token() -> Result<String, String> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|error| format!("could not read /dev/urandom for a token: {error}"))?;
+    let mut text = String::with_capacity(64);
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    Ok(text)
 }
 
 /// What the daemon knows; or, when none is running, what the logs say. The state is on disk either way, so

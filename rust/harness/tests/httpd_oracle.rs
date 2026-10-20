@@ -34,6 +34,9 @@ fn isolated_home() -> PathBuf {
     dir
 }
 
+/// The token every helper sends unless a test deliberately provides another one.
+const TEST_TOKEN: &str = "test-token";
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_hades")
 }
@@ -46,17 +49,26 @@ struct Http {
 
 impl Http {
     fn start(state: &Path, extra: &[&str], envs: &[(&str, &str)]) -> Http {
+        Http::start_on(state, "127.0.0.1:0", extra, envs)
+    }
+
+    fn start_on(state: &Path, bind: &str, extra: &[&str], envs: &[(&str, &str)]) -> Http {
         let mut command = Command::new(binary());
         command
             .args(["http", "--state"])
             .arg(state)
-            .args(["--bind", "127.0.0.1:0"])
+            .args(["--bind", bind])
             .args(extra)
             .env("HADES_HOME", isolated_home())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         for (name, value) in envs {
             command.env(name, value);
+        }
+        // A token is mandatory on every bind now. Give the helper one unless the test chose its own, so
+        // the eighteen tests about other behavior do not all become tests about authentication.
+        if !envs.iter().any(|(name, _)| *name == "HADES_HTTP_TOKEN") {
+            command.env("HADES_HTTP_TOKEN", TEST_TOKEN);
         }
         let mut child = command.spawn().expect("the server starts");
         let stderr = child.stderr.take().expect("stderr is piped");
@@ -100,7 +112,20 @@ impl Http {
     }
 
     fn raw(&self, text: &str) -> Answer {
-        request(self.address, text)
+        // The request helpers carry the helper's token. A test that wants an unauthenticated request
+        // calls `request` directly; that is the one place the gate is asked without a key.
+        let mut text = text.to_string();
+        if !text.to_ascii_lowercase().contains("authorization:") {
+            text = text.replacen(
+                "\r\n\r\n",
+                &format!("\r\nAuthorization: Bearer {TEST_TOKEN}\r\n\r\n"),
+                1,
+            );
+        }
+        if text.starts_with("POST") && !text.to_ascii_lowercase().contains("content-type:") {
+            text = text.replacen("\r\n\r\n", "\r\nContent-Type: application/json\r\n\r\n", 1);
+        }
+        request(self.address, &text)
     }
 
     fn wait(&mut self) -> std::process::ExitStatus {
@@ -387,27 +412,100 @@ fn a_token_is_the_whole_gate() {
 }
 
 #[test]
-fn a_non_loopback_bind_without_a_token_is_refused() {
+fn a_non_loopback_bind_also_needs_a_token() {
     let state = scratch("bind");
-    let output = Command::new(binary())
+    let server = Http::start_on(&state, "0.0.0.0:0", &[], &[]);
+    // The helper would add its own token, so ask without one directly.
+    let anonymous = request(
+        server.address,
+        "GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_eq!(
+        anonymous.status, 401,
+        "loopback or not, there is no open mode"
+    );
+}
+
+#[test]
+fn a_generated_token_is_private_and_survives_a_restart() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = scratch("generated");
+    let mut first = Command::new(binary())
         .args(["http", "--state"])
         .arg(&state)
-        .args(["--bind", "0.0.0.0:0"])
+        .args(["--bind", "127.0.0.1:0"])
         .env("HADES_HOME", isolated_home())
         .env_remove("HADES_HTTP_TOKEN")
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .expect("the binary runs");
-    assert_eq!(output.status.code(), Some(2));
-    // The CLI writes its answer to stdout by design (`run_with` takes the sink), so read both streams.
-    let shown = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let path = state.join("http.token");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "no token was generated");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mode = std::fs::metadata(&path)
+        .expect("the token")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the token is not private");
+    let token = std::fs::read_to_string(&path).expect("the token");
+    let _ = first.kill();
+    let _ = first.wait();
+
+    // A second start reuses it rather than rotating every client out.
+    let mut second = Command::new(binary())
+        .args(["http", "--state"])
+        .arg(&state)
+        .args(["--bind", "127.0.0.1:0"])
+        .env("HADES_HOME", isolated_home())
+        .env_remove("HADES_HTTP_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = second.kill();
+    let _ = second.wait();
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the token"),
+        token,
+        "a restart rotated the token"
     );
-    assert!(
-        shown.contains("HADES_HTTP_TOKEN"),
-        "the refusal has to name the environment variable: {shown}"
+}
+
+#[test]
+fn a_cross_origin_post_and_a_form_post_are_refused() {
+    let state = scratch("origin");
+    let server = Http::start(&state, &[], &[]);
+    let cross = request(
+        server.address,
+        &format!(
+            "POST /api/submit HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\nAuthorization: Bearer {TEST_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
     );
+    assert_eq!(cross.status, 403, "{:?}", cross.body);
+    let form = request(
+        server.address,
+        &format!(
+            "POST /api/submit HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TEST_TOKEN}\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+    );
+    assert_eq!(form.status, 415, "{:?}", form.body);
+    // Same-origin with a JSON body still reaches the endpoint.
+    let allowed = request(
+        server.address,
+        &format!(
+            "POST /api/submit HTTP/1.1\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nAuthorization: Bearer {TEST_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+            server.address.port(),
+            server.address.port()
+        ),
+    );
+    assert_ne!(allowed.status, 403, "{:?}", allowed.body);
+    assert_ne!(allowed.status, 415, "{:?}", allowed.body);
 }
 
 #[test]

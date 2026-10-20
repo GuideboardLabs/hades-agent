@@ -58,7 +58,8 @@ const ACTIVITY_LIMIT_MAX: usize = 1000;
 pub struct Server {
     pub state: PathBuf,
     pub bind: SocketAddr,
-    pub token: Option<String>,
+    /// Mandatory. Every bind needs one, including loopback, so there is no unauthenticated mode.
+    pub token: String,
     /// Accept one request and return. A scripted probe should not leave a server behind.
     pub once: bool,
 }
@@ -109,6 +110,9 @@ impl Server {
 
     fn route(&self, request: Request) -> Reply {
         if let Err(reply) = self.authorise(&request) {
+            return reply;
+        }
+        if let Err(reply) = self.same_origin(&request) {
             return reply;
         }
 
@@ -196,9 +200,7 @@ impl Server {
     /// A token, when one is configured, is the whole gate. Missing and wrong are the same answer: a client
     /// that guesses wrong learns nothing except that it guessed wrong.
     fn authorise(&self, request: &Request) -> Result<(), Reply> {
-        let Some(expected) = &self.token else {
-            return Ok(());
-        };
+        let expected = &self.token;
         let shown = request
             .headers
             .get("authorization")
@@ -219,6 +221,41 @@ impl Server {
             )
             .header("WWW-Authenticate", "Bearer"))
         }
+    }
+
+    /// Defense in depth behind the token: a page in a browser can POST to loopback, and a form or a
+    /// `fetch` with a token a page should not have is still a request this API never wanted. An absent
+    /// Origin is a command-line client; a present one must name the address the client connected to.
+    fn same_origin(&self, request: &Request) -> Result<(), Reply> {
+        if let Some(origin) = request.headers.get("origin") {
+            let host = request.headers.get("host").cloned().unwrap_or_default();
+            let port = host.rsplit_once(':').map(|(_, port)| port).unwrap_or("80");
+            let allowed = [
+                format!("http://{host}"),
+                format!("http://127.0.0.1:{port}"),
+                format!("http://localhost:{port}"),
+            ];
+            if !allowed.iter().any(|name| name.eq_ignore_ascii_case(origin)) {
+                return Err(Reply::new(
+                    403,
+                    json!({"ok": false, "error": "this API does not accept cross-origin requests"}),
+                ));
+            }
+        }
+        if request.method == "POST" {
+            let kind = request
+                .headers
+                .get("content-type")
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !kind.starts_with("application/json") {
+                return Err(Reply::new(
+                    415,
+                    json!({"ok": false, "error": "a POST needs `Content-Type: application/json`"}),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Health answers even when the daemon is down: a check that fails when a dependency is down cannot
