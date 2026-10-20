@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use session_tree::{FileStore, Kind, Session, SessionId, SystemClock};
+use session_tree::{FileStore, Kind, Session, SystemClock};
 
 use crate::agent::{Activity, Inbox, World, child_prompt, fits, parse_json_answer};
 use crate::model::{Feed, OpenAi};
@@ -383,30 +383,11 @@ pub fn append_event(log: &mut Log, event: &Event) -> Result<(), String> {
 }
 
 /// Append an event to a session log by id, creating the log when it does not exist yet. Callers may
-/// run on different threads: the per-session lock below covers the load and the append, because the
-/// session tree numbers an entry from the handle's own length and two handles that load at once
-/// compute the same next id. That is why `admit` writes the child's log and the parent's log through
-/// this function rather than through `append_event` on a handle it happens to hold.
+/// run on different threads and in different parts of the gateway, so the append goes through the one
+/// per-session lock in [`crate::gateway::session`]: the session tree numbers an entry from the handle's
+/// own length, and two handles that load at once compute the same next id.
 pub fn record_event(state: &Path, session: &str, event: &Event) -> Result<(), String> {
-    let lock = log_lock(state, session);
-    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut log = open_log(state, session)?;
-    append_event(&mut log, event)
-}
-
-/// One lock per session log, for the life of the process. Keyed on the state directory too, so two
-/// gateways with different state directories never wait on each other.
-type Locks = Mutex<BTreeMap<(PathBuf, String), Arc<Mutex<()>>>>;
-
-fn log_lock(state: &Path, session: &str) -> Arc<Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<Locks> = std::sync::OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(|held| held.into_inner());
-    Arc::clone(
-        locks
-            .entry((state.to_path_buf(), session.to_string()))
-            .or_default(),
-    )
+    crate::gateway::session::append_meta(state, session, event.payload())
 }
 
 /// A child is finished when no executor will write to its record again.
@@ -1139,20 +1120,6 @@ fn write_result(
     )
 }
 
-/// Open a session log, creating it when the file does not exist. A corrupt log is an error, not a
-/// reason to overwrite it: append-only history is never clobbered.
-fn open_log(state: &Path, session: &str) -> Result<Log, String> {
-    let store = FileStore::new(state.join("sessions"));
-    match Session::load(store.clone(), SystemClock, SessionId::new(session)) {
-        Ok(log) => Ok(log),
-        Err(session_tree::Fault::Io { .. }) => {
-            Session::create(store, SystemClock, SessionId::new(session))
-                .map_err(|fault| fault.to_string())
-        }
-        Err(fault) => Err(fault.to_string()),
-    }
-}
-
 /// What a child is told. The blocking path's prompt is the contract; this function exists so the
 /// gateway executor and `spawn`/`delegate` cannot drift into two prompts for one child.
 fn child_messages(goal: &str, schema: &Value) -> Vec<Value> {
@@ -1165,6 +1132,7 @@ fn child_messages(goal: &str, schema: &Value) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use session_tree::SessionId;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::process::Command;

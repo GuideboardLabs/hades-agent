@@ -21,6 +21,7 @@
 
 pub mod children;
 pub mod goal;
+pub mod session;
 pub mod telegram;
 
 use std::collections::BTreeMap;
@@ -1453,6 +1454,14 @@ fn child_busy(state: &Path, chat: i64) -> bool {
     })
 }
 
+/// The child-lifecycle log a chat's surface writes to. Kept apart from `tg-<chat>`, which the daemon
+/// appends to from another process for a run, and from `tg-<chat>-goals`, which the goal store owns.
+/// The key is one function so the prompt, the registry and the continuation cannot drift apart: a
+/// heartbeat-spawned child that named any other session would be invisible to the chat that owns it.
+pub fn child_session(chat: i64) -> String {
+    format!("tg-{chat}-children")
+}
+
 /// The one place this surface builds a `World`. The person's chat runs as `act`; a scheduled job carries
 /// the mode it was created with. Two literals drifted once already, and the mode is exactly the kind of
 /// field that goes missing from one of them.
@@ -1479,8 +1488,9 @@ fn world_for(
         actor: actor.to_string(),
         // The chat's child-lifecycle log. Kept apart from `tg-<chat>`, which the daemon appends to from
         // another process for a run: two processes writing one log can compute the same next id, and
-        // the session tree refuses a log with a duplicate id outright.
-        session: format!("tg-{chat}-children"),
+        // the session tree refuses a log with a duplicate id outright. The goal store has its own log
+        // (`tg-<chat>-goals`) for the same reason.
+        session: child_session(chat),
         inbox: None,
         mcp: Arc::clone(mcp),
         allowance: crate::agent::Allowance::new(64),
