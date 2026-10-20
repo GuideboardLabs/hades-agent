@@ -1239,7 +1239,7 @@ fn scratch_base() -> std::path::PathBuf {
     // by the store, and the snapshot's never-touch test is a prefix test. The first run of this helper put the
     // store inside the tree it was copying, and the copy recursed into itself until the kernel refused the
     // file name.
-    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }
@@ -2752,5 +2752,39 @@ fn a_goal_is_set_then_paused_and_graph_is_refused() {
         "{text}"
     );
     assert!(!state.join("goals/2-graph-work.json").exists());
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+// A paused goal must be resumable, including one the heartbeat paused because its budget was spent.
+// Without this the only way out of a pause was to clear the goal and write it again.
+#[test]
+fn a_paused_goal_can_be_resumed() {
+    let state = scratch("goal-resume");
+    let state_arg = state.display().to_string();
+    let (code, text) = hades(&[
+        "goal", "set", "write", "the", "report", "--chat", "7", "--check", "true", "--budget", "3",
+        "--state", &state_arg,
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let (code, text) = hades(&[
+        "goal", "pause", "1", "--reason", "budget", "--state", &state_arg,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 is paused: budget"), "{text}");
+
+    let (code, text) = hades(&["goal", "resume", "1", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 is open"), "{text}");
+
+    let (code, text) = hades(&["goal", "list", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 · open"), "{text}");
+    assert!(text.contains("reason: resumed"), "{text}");
+
+    // Resuming an open goal is a refusal, not a second, quieter open.
+    let (code, text) = hades(&["goal", "resume", "1", "--state", &state_arg]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("transition"), "{text}");
     let _ = std::fs::remove_dir_all(&state);
 }

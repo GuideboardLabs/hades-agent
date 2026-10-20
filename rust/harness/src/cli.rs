@@ -193,9 +193,11 @@ hades — the harness, one turn or a whole graph
                  [--budget <calls>] [--executor chat] [--state <dir>]
   hades goal list [--state <dir>]
   hades goal pause <id> [--reason <text>] [--state <dir>]
+  hades goal resume <id> [--state <dir>]
   hades goal clear <id> [--state <dir>]
       a goal kept for one chat: the gateway heartbeat continues it when the session is idle,
-      and the recorded check decides when it is done. `list` reads files and calls no model
+      and the recorded check decides when it is done. A spent budget pauses it, and `resume`
+      puts a paused goal back to work. `list` reads files and calls no model
 
   hades activity [--state <dir>] [--limit n]
       the last decided actions, one line each, oldest first
@@ -762,7 +764,7 @@ fn goal_cmd(args: &[String]) -> Result<(String, i32), String> {
             }
             Ok((text, 0))
         }
-        "pause" | "clear" => {
+        "pause" | "resume" | "clear" => {
             let id: u64 = flags
                 .positional
                 .first()
@@ -778,6 +780,7 @@ fn goal_cmd(args: &[String]) -> Result<(String, i32), String> {
                         .unwrap_or_else(|| "paused by a person".to_string());
                     crate::gateway::goal::pause(&state, id, &reason, now)
                 }
+                "resume" => crate::gateway::goal::resume(&state, id, now),
                 _ => crate::gateway::goal::clear(&state, id, now),
             };
             match outcome {
@@ -798,7 +801,7 @@ fn goal_cmd(args: &[String]) -> Result<(String, i32), String> {
             }
         }
         other => Err(format!(
-            "`{other}` is not a goal action: say set, list, pause or clear"
+            "`{other}` is not a goal action: say set, list, pause, resume or clear"
         )),
     }
 }
