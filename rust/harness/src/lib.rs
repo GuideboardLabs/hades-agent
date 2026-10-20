@@ -91,7 +91,9 @@ pub use context::{Budgeted, Bundle, Constraint, Context, Learned, Section, Try, 
 pub use daemon::{Daemon, ask, live};
 pub use engine::{Assembly, Engine, LIMIT};
 pub use fault::{Class, Fault};
-pub use graph::{Bounds, Edge, Ended, Graph, Node, Parts, Run, Runner, Visit, When, Work};
+pub use graph::{
+    Bounds, Edge, Ended, Exhausted, Graph, Node, Parts, Run, Runner, Visit, When, Work,
+};
 pub use judge::{Evaluator, Judgement, Report, Verdict};
 pub use model::{
     Harness, Key, OpenAi, Preset, Scripted as ScriptedModel, from_preset, preset, presets,

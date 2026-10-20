@@ -23,6 +23,10 @@ pub struct Record {
     pub passed: bool,
     pub attempts: u32,
     pub millis: u64,
+    /// What the endpoint reported for this run, in the two halves it reports: prompt and generated are kept
+    /// apart so a total can be checked against the model's own numbers rather than trusted as one.
+    pub prompt_tokens: u64,
+    pub generated_tokens: u64,
     pub at: u64,
 }
 
@@ -33,6 +37,8 @@ pub struct Standing {
     pub runs: usize,
     pub passes: usize,
     pub mean_ms: u64,
+    pub prompt_tokens: u64,
+    pub generated_tokens: u64,
 }
 
 impl Standing {
@@ -44,15 +50,21 @@ impl Standing {
         }
     }
 
+    /// What the profile's runs spent in total, as the endpoints reported it.
+    pub fn tokens(&self) -> u64 {
+        self.prompt_tokens + self.generated_tokens
+    }
+
     pub fn line(&self) -> String {
         format!(
-            "{:<10} {:>3} run(s)  {:>3}/{:<3}  {:>5.1}%  {:>6} ms mean{}",
+            "{:<10} {:>3} run(s)  {:>3}/{:<3}  {:>5.1}%  {:>6} ms mean  {:>7} tokens{}",
             self.profile,
             self.runs,
             self.passes,
             self.runs,
             self.rate() * 100.0,
             self.mean_ms,
+            self.tokens(),
             if self.runs < MIN_RUNS {
                 "  (too few to choose)"
             } else {
@@ -80,6 +92,8 @@ pub fn record(state: &Path, record: &Record) -> std::io::Result<()> {
             "passed": record.passed,
             "attempts": record.attempts,
             "millis": record.millis,
+            "prompt_tokens": record.prompt_tokens,
+            "generated_tokens": record.generated_tokens,
             "at": record.at,
         })
     )
@@ -96,6 +110,16 @@ pub fn load(state: &Path) -> Vec<Record> {
                 passed: entry.get("passed")?.as_bool()?,
                 attempts: entry.get("attempts")?.as_u64()? as u32,
                 millis: entry.get("millis")?.as_u64()?,
+                // A row written before spend was recorded is a row that reported nothing, which is zero,
+                // not a corrupt line: the scoreboard must keep reading its own history.
+                prompt_tokens: entry
+                    .get("prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                generated_tokens: entry
+                    .get("generated_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 at: entry.get("at")?.as_u64()?,
             })
         })
@@ -109,6 +133,8 @@ pub fn standings(records: &[Record]) -> Vec<Standing> {
         runs: usize,
         passes: usize,
         millis: u64,
+        prompt_tokens: u64,
+        generated_tokens: u64,
     }
     let mut by_profile: BTreeMap<String, Tally> = BTreeMap::new();
     for record in records {
@@ -116,6 +142,8 @@ pub fn standings(records: &[Record]) -> Vec<Standing> {
         tally.runs += 1;
         tally.passes += usize::from(record.passed);
         tally.millis += record.millis;
+        tally.prompt_tokens += record.prompt_tokens;
+        tally.generated_tokens += record.generated_tokens;
     }
     by_profile
         .into_iter()
@@ -124,6 +152,8 @@ pub fn standings(records: &[Record]) -> Vec<Standing> {
             runs: tally.runs,
             passes: tally.passes,
             mean_ms: tally.millis / tally.runs.max(1) as u64,
+            prompt_tokens: tally.prompt_tokens,
+            generated_tokens: tally.generated_tokens,
         })
         .collect()
 }
@@ -159,7 +189,7 @@ pub fn report(records: &[Record]) -> String {
         return "no finished runs yet: the scoreboard is written by `hades run`\n".to_string();
     }
     let mut text = format!(
-        "profile    runs    passes   rate      mean{}\n",
+        "profile    runs    passes   rate      mean           tokens{}\n",
         if records.len() == 1 {
             " (1 record)"
         } else {
@@ -189,13 +219,52 @@ mod tests {
     use super::*;
 
     fn row(profile: &str, passed: bool, millis: u64) -> Record {
+        spent(profile, passed, millis, 0, 0)
+    }
+
+    fn spent(profile: &str, passed: bool, millis: u64, prompt: u64, generated: u64) -> Record {
         Record {
             profile: profile.to_string(),
             passed,
             attempts: 1,
             millis,
+            prompt_tokens: prompt,
+            generated_tokens: generated,
             at: 0,
         }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/scratch")
+            .join(format!("scoreboard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_fixture_run_adds_to_the_totals_without_moving_the_pass_rate() {
+        let state = scratch("spend");
+        // Three finished runs, each reporting what the endpoint said. The spend is written and read back
+        // through the file the scoreboard actually uses, not held in the test's own arithmetic.
+        for (passed, prompt, generated) in [(true, 1000u64, 500u64), (false, 200, 50), (true, 0, 0)]
+        {
+            record(&state, &spent("sweep", passed, 100, prompt, generated)).expect("a row");
+        }
+        let records = load(&state);
+        assert_eq!(records.len(), 3, "{records:#?}");
+        let mut standings = standings(&records);
+        let standing = standings.remove(0);
+        assert_eq!(standing.runs, 3);
+        assert_eq!(standing.passes, 2);
+        assert_eq!(standing.rate(), 2.0 / 3.0);
+        assert_eq!(standing.prompt_tokens, 1200);
+        assert_eq!(standing.generated_tokens, 550);
+        assert_eq!(standing.tokens(), 1750);
+        let table = report(&records);
+        assert!(table.contains("1750 tokens"), "{table}");
+        // The rate the table states is still the pass count over the run count, not a spend-weighted one.
+        assert!(table.contains("66.7%"), "{table}");
     }
 
     #[test]

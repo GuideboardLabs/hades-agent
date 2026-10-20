@@ -732,6 +732,49 @@ fn a_shutdown_stops_the_run_and_ends_the_daemon() {
     run.stop();
 }
 
+/// A submitted run with a budget that cannot mean anything is refused before a lease or a model call.
+#[test]
+fn a_submitted_run_refuses_a_zero_token_budget() {
+    let state = scratch("budget-zero");
+    repo(&state);
+    let run = Running::start(&state);
+
+    let answer = ask(
+        &run.socket,
+        json!({
+            "op": "submit",
+            "goal": "make never.txt exist",
+            "root": state.join("repo").display().to_string(),
+            "state": state.display().to_string(),
+            "session": "zero",
+            "program": ["true"],
+            "verify": "test -f never.txt",
+            "policy": "open",
+            "budget-tokens": 0,
+        }),
+    )
+    .expect("an answer");
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("`--budget-tokens 0`"),
+        "{answer}"
+    );
+
+    // Nothing was taken on: a refused budget leaves no lease and no log behind.
+    let status = ask(&run.socket, json!({"op": "status"})).expect("a status answer");
+    assert_eq!(
+        status["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "{status}"
+    );
+    assert!(!state.join("sessions/zero.jsonl").exists());
+
+    run.stop();
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:

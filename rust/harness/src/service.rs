@@ -49,8 +49,14 @@ pub fn render(prefix: &Path, home: &Path) -> Result<Units, String> {
     // own profiles name is broken, and the failure would look like the model's.
     for (key, value) in [
         ("PATH", std::env::var("PATH").unwrap_or_default()),
-        ("CARGO_HOME", std::env::var("CARGO_HOME").unwrap_or_default()),
-        ("RUSTUP_HOME", std::env::var("RUSTUP_HOME").unwrap_or_default()),
+        (
+            "CARGO_HOME",
+            std::env::var("CARGO_HOME").unwrap_or_default(),
+        ),
+        (
+            "RUSTUP_HOME",
+            std::env::var("RUSTUP_HOME").unwrap_or_default(),
+        ),
         (
             "CARGO_TARGET_DIR",
             std::env::var("CARGO_TARGET_DIR").unwrap_or_default(),

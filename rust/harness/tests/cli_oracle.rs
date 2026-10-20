@@ -600,6 +600,94 @@ fn run_tries_again_after_a_check_fails_and_says_so_in_its_walk() {
 }
 
 #[test]
+fn a_token_budget_is_a_run_flag_and_a_budget_that_cannot_work_is_refused() {
+    let dir = scratch("budget-tokens");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).expect("a root");
+    let root_arg = root.display().to_string();
+    let state = dir.join("state");
+    let state_arg = state.display().to_string();
+
+    // Zero is not a budget: a run that may not spend is not a run. The refusal comes before the model is
+    // asked, so a typo costs nothing.
+    let (code, text) = hades(&[
+        "run",
+        "make a thing",
+        "--budget-tokens",
+        "0",
+        "--program",
+        "true",
+        "--verify",
+        "test -f never.txt",
+        "--policy",
+        "open",
+        "--root",
+        &root_arg,
+        "--state",
+        &state_arg,
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("`--budget-tokens 0`"), "{text}");
+
+    // A budget smaller than one call's completion cap would let the first call overrun the whole run.
+    let (code, text) = hades(&[
+        "run",
+        "make a thing",
+        "--budget-tokens",
+        "100",
+        "--max-tokens",
+        "200",
+        "--program",
+        "true",
+        "--verify",
+        "test -f never.txt",
+        "--policy",
+        "open",
+        "--root",
+        &root_arg,
+        "--state",
+        &state_arg,
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("`--max-tokens 200`"), "{text}");
+
+    // A real budget is a bound like any other: it is stated in the header, and the run still stops at the
+    // attempt bound because a scripted answer reports no spend to count.
+    let (code, text) = hades(&[
+        "run",
+        "make a thing",
+        "--budget-tokens",
+        "50000",
+        "--program",
+        "true",
+        "--program",
+        "true",
+        "--verify",
+        "test -f never.txt",
+        "--policy",
+        "open",
+        "--root",
+        &root_arg,
+        "--state",
+        &state_arg,
+        "--attempts",
+        "2",
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("50000 tokens"), "{text}");
+    assert!(text.contains("cause: attempts"), "{text}");
+
+    // `turn` has no budget: --max-tokens there is the per-call completion cap, and a run budget under the
+    // same name would be a second meaning for one flag.
+    let (code, text) = hades(&["turn", "make a thing", "--budget-tokens", "100"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("`--budget-tokens` is not a flag this command takes"),
+        "{text}"
+    );
+}
+
+#[test]
 fn run_gives_up_at_the_bound_and_exits_one() {
     let root = scratch("run-bounds");
     let state = root.join("state");
@@ -1965,6 +2053,35 @@ fn explain_reads_a_session_without_a_model() {
     assert!(text.contains("verify"), "{text}");
     assert!(text.contains("the check"), "{text}");
     assert!(text.contains("accepted true"), "{text}");
+}
+
+#[test]
+fn explain_names_the_budget_that_ran_out() {
+    // Reading a log has to answer "which allowance stopped it" from the record, not from a guess. A run
+    // that ran out of tokens must not be reported as one that ran out of attempts: the two mean different
+    // things to whoever decides whether to raise the budget, retry, or leave it alone.
+    let state = scratch("explain-cause");
+    std::fs::create_dir_all(state.join("sessions")).expect("a sessions dir");
+    let log = concat!(
+        r#"{"kind":"user","payload":{"goal":"make it pass","root":"/work","profile":"fix"}}"#,
+        "\n",
+        r#"{"kind":"checkpoint","payload":{"node":"attempt","condition":"Failed","edge":"attempt -> attempt","attempt":1}}"#,
+        "\n",
+        r#"{"kind":"checkpoint","payload":{"node":"gave_up","condition":"Exhausted","ended":true,"exhausted":"tokens","reason":"the token budget was spent and the check still failed","attempt":1}}"#,
+        "\n"
+    );
+    std::fs::write(state.join("sessions/s1.jsonl"), log).expect("a session");
+    let (code, text) = hades(&["explain", "s1", "--state", state.to_str().expect("utf-8")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("cause: tokens"), "{text}");
+    assert!(
+        text.contains("the token budget was spent"),
+        "the human sentence is not in the log: {text}"
+    );
+    assert!(
+        !text.contains("attempts"),
+        "a token-exhausted run was blamed on the attempt count: {text}"
+    );
 }
 
 #[test]
