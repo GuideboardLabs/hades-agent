@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.4-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-738%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.7-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-812%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,22 +52,54 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.4 |
+| **Version** | 0.0.7 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
-| **State** | `~/.hades`: config, sessions, memory, jobs, approvals, ledger |
+| **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
 | **Work profiles** | `survey`, `fix`, `sweep`, `verify`, `record` |
 | **Isolation** | Landlock cage plus a deterministic safety floor |
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 738 passing, 13 ignored live tests |
+| **Tests** | 812 passing, 13 ignored live tests |
 
 ---
 
-## What 0.0.4 adds
+## What 0.0.7 adds
 
-0.0.4 is Part I of the 0.0.3 plan: five changes to the runtime itself, with the session format unchanged.
+The ask bar: a question is part of the input, not a modal, and the answer is one record any surface can
+read.
+
+- **A question anchored to the composer.** A floor refusal or a model fork draws on the input's top edge:
+  the reason in one line, ranked options, one recommended and preselected, and `Other` reached by moving
+  past the last row. Enter takes the selection. Typing moves into the input and selects `Other`, so a typed
+  answer declines the recommendation by construction. `Esc` collapses the bar to one line; it never stops
+  the run.
+- **Two axes, kept separate.** The floor decides whether an action may run. A per-run budget decides
+  whether the model may interrupt: two blocking and three advisory questions, enforced in code. A spent
+  budget tells the model to decide and name its assumption instead of asking again.
+- **Advisory questions continue the run.** The recommendation is taken, the assumption is recorded, and a
+  later answer is delivered at the next step boundary with the assumption it replaces. Nothing already
+  done is rewound.
+- **Plan mode.** Read → Plan → Act, cycled with `Shift+Tab` or `/mode plan`. Plan mode has no mutating
+  tools and asks at real forks before writing a plan: goal or scope, architecture, and how a step should be
+  done when more than one way is valid.
+- **One record, any surface.** Questions live in `approvals.jsonl`. `hades approvals` prints every option
+  and the recommendation, `hades answer <id> <key|other>` answers from another terminal, and
+  `hades log --asks <session>` prints one session. The F4 Approvals view lists the same options; Enter
+  opens the bar on that row. A live daemon remains the only writer.
+- **Taste, small and inspectable.** `state/taste.jsonl` records one line per answered question, scoped to
+  its root. Three consistent choices move the recommendation; five agreeing choices stop that family being
+  asked; permissions are never silenced; two `Other` declines are printed as a proposal, not applied.
+  `hades taste` shows counts, recommendation, streak and proposals; `hades taste forget <n|all>` removes
+  lines.
+
+It follows 0.0.4's admission handles, goals and budgets. The session format is unchanged.
+
+<details>
+<summary>Earlier: what 0.0.4 added</summary>
+
+0.0.4 was Part I of the 0.0.3 plan: five changes to the runtime itself, with the session format unchanged.
 
 - **Admission handles.** `spawn` returns `{child_id, session, state:"admitted"}` before the child's first model call. A gateway-owned registry caps live children at 16, records them under `<state>/children/`, and marks a crashed gateway's children `lost` on restart instead of resuming them silently. `tell`, `children` and `result` are the tools a parent uses to work with a live child.
 - **Goals that outlive a turn.** A goal is session state (`open`, `paused`, `done`, `cleared`) with its chat, model, check and budget. The gateway heartbeat re-enters an idle session on schedule. A goal closes when its recorded check passes or when a person closes it. When its total budget of model calls is spent it pauses with `budget` recorded, and `hades goal resume` puts it back to work.
@@ -75,7 +107,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 - **Numbered harness generations.** Every `tune --adopt` writes `~/.hades/control/harness/<profile>/<n>/` (under `HADES_HOME`) with a manifest naming every captured file, its hash, and the harness and state roots it came from. `hades refine --rollback <n>` restores exactly those files in two passes, and refuses to cross a floor change. The floor and policy guard lists are enumerated by the type system rather than by hand.
 - **Strict model requests.** `--strict-model` preflights the endpoint and key before a session exists. A configured but unreachable endpoint fails on the first call naming the model instead of substituting another.
 
-Part II of the plan, which covers the satellite transport broker, generations in service and the evolve loop, is not in this release. It is the next stage.
+</details>
 
 ## Why this exists
 
@@ -337,30 +369,31 @@ through the runtime's tools and CLI.
 
 | Key | Action |
 |---|---|
-| Enter | Send a message or open the selected item |
+| Enter | Send a message, take the selected question option, or open the selected item |
 | Alt+Enter / Ctrl+J | Insert a newline |
 | Ctrl+P | Search commands |
 | F2 | Choose a model preset for this session |
-| Tab / Shift+Tab | Move between views |
+| Tab | Move between views |
+| Shift+Tab | Cycle Read → Plan → Act in Conversation; move back a view elsewhere |
 | F3 / F4 / F5 | Sessions / approvals / refresh |
 | Page Up / Page Down | Scroll conversation or overlay |
 | Ctrl+Home / Ctrl+End | Conversation start / follow latest output |
 | Ctrl+F | Highlight matching conversation lines |
 | Ctrl+T / Ctrl+B | Tool details / workspace inspector |
 | Ctrl+N / Ctrl+E | New conversation / export |
-| Esc | Close overlay, clear search, or request cancellation |
+| Esc | Collapse a question; close overlay, clear search, or request cancellation |
 | Ctrl+C | Request cancellation while busy; quit when idle |
 | Ctrl+Q | Save and quit; wait for a running operation's cancellation boundary |
 | F1 | Help; Page Up / Page Down scroll it |
 
-Direct conversation uses Hades' existing tool loop, initially in `act` mode. `/mode read` removes
-mutating tools, and `/mode act` enables them under the runtime's existing checks. `/run GOAL` submits
-a guarded run through an already-running `hades daemon`. Pending decisions appear in Approvals:
-Enter opens the request, `y` allows once, `s` allows for that session, and `n` denies. The current daemon
-parks a run at an approval question; after answering it, resubmit `/run GOAL` in the same conversation
-to continue with the recorded decision. A stop affects that conversation's run. An operation already
-in flight may finish before cancellation is observed. The TUI does not change the executor's isolation
-or approval guarantees.
+Direct conversation uses Hades' existing tool loop. `Shift+Tab` cycles Read → Plan → Act; Plan mode has
+no mutating tools and asks at real forks before proposing a plan. `/mode read`, `/mode plan` and
+`/mode act` do the same. When a question is open the bar owns the composer: Up/Down selects, Enter answers,
+Esc collapses it, and typing moves into the input and selects `Other`. `Other` on a permission is deny
+plus a steer, never an allow. `/run GOAL` submits a guarded run through an already-running `hades daemon`.
+The same questions appear in Approvals; Enter there opens the bar on that row. A stop affects that
+conversation's run. An operation already in flight may finish before cancellation is observed. The TUI
+does not change the executor's isolation or approval guarantees.
 
 Conversations and drafts are checkpointed under `STATE/tui/sessions/` at turn start, every five seconds
 while working, on completion, and on exit. Writes use a private temporary file, fsync, and atomic rename.
@@ -517,6 +550,10 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 | `hades jobs` | List scheduled jobs |
 | `hades goal set\|list\|pause\|clear` | A goal kept for one chat; the gateway heartbeat continues it when idle |
 | `hades profiles` | Show the five profiles and their parameters |
+| `hades approvals` | Every question with its options, recommendation and answer |
+| `hades answer <id> <key\|other>` | Answer from any process; `--note` carries a steer |
+| `hades log --asks <session>` | One session's questions and answers |
+| `hades taste [forget <n\|all>]` | What the answers taught, and how to forget it |
 | `hades route <goal>` | Show which profile the rules pick, and why |
 | `hades scoreboard` | What finished runs say per profile |
 | `hades skills list\|seed\|promote\|reject` | Manage built-in and proposed skills |
@@ -578,7 +615,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **738 passing, 0 failing, 13 ignored** across 31 suites.
+Current state: **812 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -599,7 +636,9 @@ These are current limits, not aspirations hidden in a roadmap:
 - Telegram is the only messaging transport.
 - The network is open or closed per role. There is no per-domain egress proxy.
 - Harness rollback restores the files named in a generation manifest. It does not roll back the model, the sessions or the state directory.
-- Part II of the 0.0.3 plan (satellite transport, generation swap in service, the evolve loop) is not shipped in 0.0.4.
+- Part II of the 0.0.3 plan (satellite transport, generation swap in service, the evolve loop) is not shipped.
+- The `preferences.md` prompt block and `taste adopt` are not shipped. A CLI answer can only teach a root when the session log supplies it; a TUI answer always knows its root.
+- Taste adapts a recommendation and can stop asking a choice. It does not infer a preference the person never chose.
 - The browser needs an external Chromium binary. Vision is optional and needs local GGUF model files.
 - `eval` can act outside the textual safety floor. It is an explicit escape hatch.
 
