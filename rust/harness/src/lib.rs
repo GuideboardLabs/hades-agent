@@ -41,6 +41,7 @@ pub mod boundary;
 pub mod browser;
 pub mod builtin;
 pub mod cage;
+pub mod claim;
 pub mod cli;
 pub mod command;
 pub mod compact;

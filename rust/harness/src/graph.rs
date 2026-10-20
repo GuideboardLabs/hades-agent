@@ -548,6 +548,9 @@ pub struct Run {
     pub memory_error: Option<String>,
     /// What the judge said about the last attempt, when the profile asked for one.
     pub verdict: Option<crate::judge::Judgement>,
+    /// The last attempt's check state, whether it passed or not. `learned` only carries failures forward,
+    /// so a passing attempt leaves no try behind and the state has to be kept here to be reportable.
+    pub check: Option<crate::verify::State>,
 }
 
 /// One candidate of a speculative attempt: its own session, its own check result, and the program it ran.
@@ -576,6 +579,17 @@ impl Run {
     /// The programs tried, with what the check said, in order. This is the run's own account of itself.
     pub fn tried(&self) -> &[Try] {
         self.learned.tries()
+    }
+
+    /// The ladder's view of this walk. The check state is the last attempt's, because the run ended on
+    /// that attempt; the verdict is the last one the judge gave.
+    pub fn claim_facts(&self) -> crate::claim::Facts {
+        crate::claim::Facts {
+            attempted: self.attempts() > 0,
+            check: self.check,
+            verdict: self.verdict.as_ref().map(|judged| judged.verdict),
+            accepted: matches!(self.ended, Ended::Accepted { .. }),
+        }
     }
 }
 
@@ -644,6 +658,9 @@ where
     /// The last judge's verdict, for a receipt. The session log remains the record; this is so `hades run`
     /// can print what the judge said without reading its own log back.
     last_verdict: Option<crate::judge::Judgement>,
+    /// The last attempt's check state, for the same reason as the verdict: the receipt carries the fact
+    /// rather than making the caller read the log back for it.
+    last_check: Option<crate::verify::State>,
     /// Where a finished walk is scored. Every entry point that walks gets this, because a scoreboard the
     /// daemon does not write is a scoreboard the live bot never feeds.
     scoreboard: Option<&'a Path>,
@@ -681,6 +698,7 @@ where
             last_cause: None,
             last_question: None,
             last_verdict: None,
+            last_check: None,
             scoreboard: None,
         }
     }
@@ -870,6 +888,7 @@ where
                     recorded,
                     memory_error,
                     verdict: self.last_verdict.clone(),
+                    check: self.last_check,
                 });
             }
 
@@ -1369,6 +1388,7 @@ where
                 verdict,
             } => {
                 self.last_verdict = Some(verdict);
+                self.last_check = Some(verification.state);
                 let program = answer.rendered();
                 // Every call this turn made reported what it cost — the answer's call and the judge's,
                 // which is why the total comes from the turn rather than from the answer alone.

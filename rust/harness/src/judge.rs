@@ -36,6 +36,18 @@ impl Verdict {
     pub fn is_a_verdict(self) -> bool {
         !matches!(self, Verdict::Unjudged)
     }
+
+    /// The verdict a log recorded, by the name `name()` writes. `None` for a name this build does not
+    /// know, which the ladder then reports as no judge rather than as a verdict it cannot read.
+    pub fn from_name(name: &str) -> Option<Verdict> {
+        Some(match name {
+            "met" => Verdict::Met,
+            "not_yet" => Verdict::NotYet,
+            "impossible" => Verdict::Impossible,
+            "unjudged" => Verdict::Unjudged,
+            _ => return None,
+        })
+    }
 }
 
 /// A verdict and the reason for it. The reason is not optional: a verdict without one cannot be argued

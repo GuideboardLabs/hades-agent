@@ -2014,6 +2014,10 @@ fn explain(args: &[String]) -> Result<(String, i32), String> {
     if let Some(reason) = &facts.reason {
         text.push_str(&format!("why: {reason}\n"));
     }
+    // What the log supports, stated rather than left for a reader to infer from the exit code. A run
+    // whose check passed and whose judge said `not_yet` is accepted; this line is where that shows.
+    let claim = crate::claim::ladder(&facts.claim());
+    text.push_str(&format!("\n{}\n", claim.line()));
     text.push_str(&format!(
         "\nroot: {}\nsnapshot: {}\n",
         facts.root.display(),
@@ -3532,6 +3536,12 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         ));
     }
     text.push_str(&format!("\n{}\n", walked.ended.line()));
+    // A run that cannot claim acceptance says so on its end line: the difference between a check that
+    // passed and a result a judge accepted is a fact about the run, not something the exit code hides.
+    let claim = crate::claim::ladder(&walked.claim_facts());
+    if !claim.accepted() {
+        text.push_str(&format!("{}\n", claim.line()));
+    }
     if let Some(cause) = walked.ended.cause() {
         text.push_str(&format!("cause: {}\n", cause.name()));
     }
