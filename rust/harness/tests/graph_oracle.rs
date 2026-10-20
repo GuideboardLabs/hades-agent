@@ -11,8 +11,8 @@ use harness::patch::FileEdit;
 use harness::repomap::Cache;
 use harness::route::RoutingReason;
 use harness::{
-    Bounds, CommandVerifier, Decision, Effort, Ended, Exhausted, ModelAnswer, Parts, Policy,
-    Profile, ProfileId, Role, Rule, Runner, ScriptedModel, Shadows, Shell, TaskSpec, Usage,
+    BaselineGate, Bounds, CommandVerifier, Decision, Effort, Ended, Exhausted, ModelAnswer, Parts,
+    Policy, Profile, ProfileId, Role, Rule, Runner, ScriptedModel, Shadows, Shell, TaskSpec, Usage,
 };
 use session_tree::{Clock, FileStore, Kind, Session, SessionId};
 
@@ -161,8 +161,11 @@ fn a_check_that_times_out_ends_the_walk_without_spending_another_attempt() {
     rig.verifier = CommandVerifier::with_deadline(LIMIT, std::time::Duration::from_millis(200));
     let mut session = rig.session("timeout-check");
     let mut cache = Cache::new();
-    let mut runner =
-        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(3, 10));
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10))
+        // The deadline belongs to the check after an attempt; a baseline would time out before the walk
+        // starts, which is a different failure than the one this test is about.
+        .with_baseline(BaselineGate::Off);
     let walked = runner.run().expect("a walk");
 
     match &walked.ended {
@@ -607,8 +610,11 @@ fn a_refused_edit_is_not_accepted_because_the_check_already_passes() {
     );
     let mut session = rig.session("unwritten");
     let mut cache = Cache::new();
-    let mut runner =
-        Runner::new(rig.parts(None, &mut cache), &mut session).with_bounds(Bounds::new(1, 10));
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(1, 10))
+        // This test is about an unwritten answer, not about the gate. With the gate on, a green check
+        // would end the run before the refusal, so the condition under test would never be reached.
+        .with_baseline(BaselineGate::Off);
     let walked = runner.run().expect("a walk");
 
     let nodes: Vec<&str> = walked.visits.iter().map(|v| v.node.as_str()).collect();
@@ -960,4 +966,118 @@ fn a_run_that_writes_nothing_still_pays_for_every_call() {
         1200
     );
     assert_eq!(walked.ended.cause(), Some(Exhausted::Tokens));
+}
+
+/// Whether the session recorded a baseline, and what it said.
+fn baseline_entry(session: &Session<FileStore, FixedClock>) -> Option<&session_tree::Entry> {
+    session.entries().iter().find(|entry| {
+        entry.kind == Kind::Meta
+            && entry.payload.get("type").and_then(|value| value.as_str()) == Some("baseline")
+    })
+}
+
+#[test]
+fn a_green_check_is_refused_before_any_model_call() {
+    // The check passes on an untouched tree. Nothing needs doing, and asking a model to change a passing
+    // tree is how a run ends up accepting a no-op.
+    let rig = Rig::new(
+        "green-baseline",
+        "true",
+        open(),
+        ScriptedModel::new(["touch should-not-exist"]),
+    );
+    let mut session = rig.session("green-baseline");
+    let mut cache = Cache::new();
+    let walked = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10))
+        .run()
+        .expect("a walk");
+
+    assert!(
+        matches!(walked.ended, Ended::Satisfied),
+        "{:?}",
+        walked.ended
+    );
+    assert_eq!(walked.attempts(), 0);
+    assert_eq!(
+        walked.ended.code(),
+        2,
+        "nothing was done, and nothing failed"
+    );
+    assert!(
+        !rig.root.join("should-not-exist").exists(),
+        "the model was asked despite a green check"
+    );
+    let nodes: Vec<&str> = walked
+        .visits
+        .iter()
+        .map(|visit| visit.node.as_str())
+        .collect();
+    assert_eq!(nodes, ["baseline"], "{nodes:?}");
+    let baseline = walked.baseline.expect("the baseline was kept");
+    assert_eq!(baseline.state, harness::State::Passed);
+
+    let entry = baseline_entry(&session).expect("a baseline entry");
+    assert_eq!(entry.payload["state"], "passed");
+    assert_eq!(
+        entry.payload["output_digest"].as_str().unwrap().len(),
+        64,
+        "the check's output is digested"
+    );
+}
+
+#[test]
+fn a_red_baseline_is_recorded_and_the_walk_proceeds() {
+    let rig = Rig::new(
+        "red-baseline",
+        "test -f made.txt",
+        open(),
+        ScriptedModel::new(["touch made.txt"]),
+    );
+    let mut session = rig.session("red-baseline");
+    let mut cache = Cache::new();
+    let walked = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10))
+        .run()
+        .expect("a walk");
+
+    assert!(
+        matches!(walked.ended, Ended::Accepted { attempts: 1, .. }),
+        "{:?}",
+        walked.ended
+    );
+    let baseline = walked.baseline.expect("the baseline was kept");
+    assert_eq!(baseline.state, harness::State::Failed);
+    assert_eq!(baseline.status, Some(1));
+    let entry = baseline_entry(&session).expect("a baseline entry");
+    assert_eq!(entry.payload["state"], "failed");
+    assert_eq!(entry.payload["status"], 1);
+    let nodes: Vec<&str> = walked
+        .visits
+        .iter()
+        .map(|visit| visit.node.as_str())
+        .collect();
+    assert_eq!(nodes, ["attempt", "accept", "done"], "{nodes:?}");
+}
+
+#[test]
+fn baseline_off_runs_a_green_check_anyway() {
+    // A refactor keeps a green check green. The flag is the only way to say so, and it leaves no baseline
+    // in the record because no baseline ran.
+    let rig = Rig::new("gate-off", "true", open(), ScriptedModel::new(["true"]));
+    let mut session = rig.session("gate-off");
+    let mut cache = Cache::new();
+    let walked = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10))
+        .with_baseline(BaselineGate::Off)
+        .run()
+        .expect("a walk");
+
+    assert!(
+        matches!(walked.ended, Ended::Accepted { attempts: 1, .. }),
+        "{:?}",
+        walked.ended
+    );
+    assert!(walked.baseline.is_none());
+    assert!(baseline_entry(&session).is_none(), "no baseline ran");
 }

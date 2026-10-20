@@ -207,7 +207,11 @@ fn acp_initializes_opens_a_session_and_runs_a_prompt_with_a_permission_round_tri
 
 #[test]
 fn acp_cancel_stops_the_run_and_nothing_after_it_runs() {
-    let (mut acp, root, _state) = Acp::start("cancel", "sleep 5; printf done > done.txt", "true");
+    let (mut acp, root, _state) = Acp::start(
+        "cancel",
+        "sleep 5; printf done > done.txt",
+        "test -f never.txt",
+    );
     initialize(&mut acp);
     let session = new_session(&mut acp, &root);
     acp.send(json!({

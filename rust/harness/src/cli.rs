@@ -27,7 +27,7 @@ use crate::boundary;
 use crate::config;
 use crate::context::{self, Budgeted, Context, Learned, Section};
 use crate::fault::Fault;
-use crate::graph::{Bounds, Ended, Remembering, Runner};
+use crate::graph::{BaselineGate, Bounds, Ended, Remembering, Runner};
 use crate::memory::{Memory, MnemeMemory, OutcomeNote};
 use crate::model::{self, Key, OpenAi};
 use crate::policy::{self, Decision};
@@ -176,9 +176,10 @@ hades — the harness, one turn or a whole graph
       an approval is an inline button. --once handles one batch and returns
 
   hades submit <goal> [--program <p>]... [--state <dir>] [--root <dir>] [--attempts <n>]
-      [--minutes m] [--budget-tokens n] [--strict-model]
+      [--minutes m] [--budget-tokens n] [--baseline red|off] [--strict-model]
       hand a run to the daemon and follow it. The budgets are the run's, not one call's: a
-      budget of zero tokens is refused before the run is taken on
+      budget of zero tokens is refused before the run is taken on. The baseline gate is the
+      run's too: a green check is refused before the first write unless --baseline off
 
   hades attach <session> [--state <dir>]
       print a session's entries, then follow the ones that are written next
@@ -221,12 +222,14 @@ hades — the harness, one turn or a whole graph
       stop every run and end the daemon. Stopping is not undo
 
   hades run <goal> --model <preset> [--attempts n] [--minutes m] [--budget-tokens n] [--branch n]
-             [--strict-model] [...]
+             [--baseline red|off] [--strict-model] [...]
       walk the graph: try, accept a pass, retry a failure while the bounds hold, hand a
       refusal to a person. --budget-tokens caps the spend the endpoint reports for the whole
       run, prompt and generated together; the end names which bound ran out. --branch n runs
       n candidate turns from the same tree and keeps the first pass (1 to 4); the attempts
-      budget is shared, so width is model calls, not a second budget
+      budget is shared, so width is model calls, not a second budget. --baseline red (the
+      default) runs the check before the first write and refuses a run whose check already
+      passes; use off for a refactor that keeps a green check green
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
@@ -360,7 +363,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
     }
     flags.positional.push(goal);
 
-    const NAMED: [&str; 18] = [
+    const NAMED: [&str; 19] = [
         "root",
         "profile",
         "policy",
@@ -378,6 +381,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
         "attempts",
         "minutes",
         "budget-tokens",
+        "baseline",
         "strict-model",
     ];
     for key in NAMED {
@@ -1341,6 +1345,9 @@ fn probe(
     if !flags.named.contains_key("minutes") {
         command.arg("--minutes").arg("3");
     }
+    // A tune measures what a harness does with a model. A check that is already green would let the probe
+    // pass without asking one, which is a measurement of nothing: the gate is for a fix, not for a probe.
+    command.arg("--baseline").arg("off");
     if let Some(harness) = harness {
         command.arg("--harness").arg(harness);
     }
@@ -3355,6 +3362,16 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
     Ok((text, code))
 }
 
+/// The baseline gate a run was asked for. Red is the default: a patching run that cannot show the check
+/// failing first cannot show that it fixed anything.
+pub(crate) fn baseline_of(flags: &Flags) -> Result<BaselineGate, String> {
+    match flags.named.get("baseline").map(String::as_str) {
+        None | Some("red") => Ok(BaselineGate::Red),
+        Some("off") => Ok(BaselineGate::Off),
+        Some(other) => Err(format!("`--baseline {other}`: say red or off")),
+    }
+}
+
 /// Run the graph: attempts, the return path, and the declared way out. The command a person uses when the
 /// task is not one the model gets right first time.
 fn run_graph(args: &[String]) -> Result<(String, i32), String> {
@@ -3380,6 +3397,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             "minutes",
             "budget-tokens",
             "branch",
+            "baseline",
             "shadow",
             "config",
             "memory",
@@ -3408,6 +3426,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         }
         None => None,
     };
+    let gate = baseline_of(&flags)?;
     let (mut engine, answerer, harness, judge) = assemble(&flags, "run")?;
     let mut session = engine.session()?;
 
@@ -3459,6 +3478,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         &mut session,
     )
     .with_bounds(bounds)
+    .with_baseline(gate)
     .with_scoreboard(&score_state);
     if let (Some(section), Some(writer)) = (memo.section.clone(), memo.memory.as_ref()) {
         runner = runner.with_memory(Remembering {
@@ -3515,8 +3535,19 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         None if engine.profile().judge => "unjudged (no judged attempt)".to_string(),
         None => "unjudged (the profile did not ask)".to_string(),
     };
+    let baseline_line = match &walked.baseline {
+        Some(baseline) => format!(
+            "baseline: {} (exit {})\n",
+            baseline.state.name(),
+            baseline
+                .status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        None => String::new(),
+    };
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\ncontext: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}context: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
         session.id(),
         session.len(),
         session.len() - before,
@@ -4149,6 +4180,7 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
             "attempts",
             "minutes",
             "budget-tokens",
+            "baseline",
         ],
         &["strict-model"],
     )?;

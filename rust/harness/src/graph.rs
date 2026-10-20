@@ -29,7 +29,7 @@ use crate::context::{self, Budgeted, Learned, Section, Try};
 use crate::fault::Fault;
 use crate::model::Harness;
 use crate::policy::Policy;
-use crate::profile::Profile;
+use crate::profile::{Profile, Role};
 use crate::repomap::Cache;
 use crate::route::RoutingReason;
 use crate::shadow::{Checkpointer, Snapshot, Subject};
@@ -489,6 +489,9 @@ pub enum Ended {
     /// A person stopped the run. Not a pass and not a failure: the work was ended, and the count says how
     /// many attempts had actually been made when it stopped.
     Stopped { attempts: u32 },
+    /// The check passed before any change, so there was nothing to do. No model was asked and no attempt
+    /// was made: this is a precondition the run refused, not a result of work.
+    Satisfied,
 }
 
 impl Ended {
@@ -509,6 +512,9 @@ impl Ended {
             Ended::GaveUp { .. } => 1,
             Ended::Awaiting { .. } => 2,
             Ended::Stopped { .. } => 1,
+            // Nothing was attempted and nothing was changed. A script that reads 2 as "the harness could
+            // not do it" is right: it could not, because the task was already done.
+            Ended::Satisfied => 2,
         }
     }
 
@@ -527,8 +533,21 @@ impl Ended {
                 question.id.0
             ),
             Ended::Stopped { attempts } => format!("stopped after {attempts} attempt(s)"),
+            Ended::Satisfied => {
+                "the check already passed before any change; nothing to do (use --baseline off to run anyway)"
+                    .to_string()
+            }
         }
     }
+}
+
+/// Whether a run proves the check was failing before it wrote anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineGate {
+    /// The check must fail before the first attempt. A check that already passes refuses the run.
+    Red,
+    /// Do not run the check first. For a refactor that keeps a green check green.
+    Off,
 }
 
 /// Everything one walk of the graph produced.
@@ -551,6 +570,9 @@ pub struct Run {
     /// The last attempt's check state, whether it passed or not. `learned` only carries failures forward,
     /// so a passing attempt leaves no try behind and the state has to be kept here to be reportable.
     pub check: Option<crate::verify::State>,
+    /// The check as it was before the first write. `None` when no check ran first, which is what
+    /// `--baseline off` and a read-only profile produce.
+    pub baseline: Option<crate::verify::Verification>,
 }
 
 /// One candidate of a speculative attempt: its own session, its own check result, and the program it ran.
@@ -573,6 +595,7 @@ impl Run {
             | Ended::GaveUp { attempts, .. }
             | Ended::Awaiting { attempts, .. }
             | Ended::Stopped { attempts } => *attempts,
+            Ended::Satisfied => 0,
         }
     }
 
@@ -664,6 +687,10 @@ where
     /// Where a finished walk is scored. Every entry point that walks gets this, because a scoreboard the
     /// daemon does not write is a scoreboard the live bot never feeds.
     scoreboard: Option<&'a Path>,
+    /// Whether the check must be red before the first attempt.
+    gate: BaselineGate,
+    /// The check as it was before the first write, for the receipt.
+    baseline: Option<crate::verify::Verification>,
 }
 
 impl<'a, S, C> Runner<'a, S, C>
@@ -700,6 +727,8 @@ where
             last_verdict: None,
             last_check: None,
             scoreboard: None,
+            gate: BaselineGate::Red,
+            baseline: None,
         }
     }
 
@@ -751,6 +780,54 @@ where
         self
     }
 
+    /// Require a red check before the first write, or turn that requirement off for a refactor.
+    pub fn with_baseline(mut self, gate: BaselineGate) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// Run the check once before anything is written, and record what it said. `None` when this surface
+    /// does not gate: no check, a read-only role, or `--baseline off`.
+    ///
+    /// The gate is deliberately not a graph node. A node would have to be declared in every graph and
+    /// every replay; the precondition is the same for all of them, and a green check is not a step in the
+    /// work, it is the absence of work.
+    fn baseline(&mut self) -> Result<Option<crate::verify::Verification>, Fault> {
+        if self.gate == BaselineGate::Off {
+            return Ok(None);
+        }
+        if !matches!(self.profile.role, Role::Patch | Role::Sweep) {
+            return Ok(None);
+        }
+        let command = self.profile.verify.trim();
+        if command.is_empty() {
+            return Ok(None);
+        }
+        let verification = self.verifier.verify(self.task, command);
+        self.session.append(
+            session_tree::Kind::Meta,
+            json!({
+                "type": "baseline",
+                "check": command,
+                "state": verification.state.name(),
+                "status": verification.status,
+                "output_digest": verification.output_digest,
+                "output_bytes": verification.output.len(),
+                "truncated": verification.truncated,
+            }),
+        )?;
+        match verification.state {
+            State::Passed | State::Failed => Ok(Some(verification)),
+            // The same check would run again at the end and say the same thing. Spending a model call to
+            // learn it is the waste this gate exists to prevent.
+            State::TimedOut | State::CouldNotRun => Err(Fault::harness(format!(
+                "the baseline check `{command}` {}: {}",
+                verification.state.name(),
+                verification.output.lines().next().unwrap_or("").trim()
+            ))),
+        }
+    }
+
     /// Walk the graph until a terminal node. Every step is recorded, and the log is the session's.
     pub fn run(&mut self) -> Result<Run, Fault> {
         let started = Instant::now();
@@ -761,6 +838,43 @@ where
         // Where this run's own constraints begin. The log carries earlier runs, and a note that cites all
         // of them repeats history instead of saying what this walk established.
         let prior = learned.constraints().len();
+        // The gate: a check that already passes means there is no work to do. It runs before the loop, so
+        // a green baseline costs one check and zero model calls.
+        if let Some(baseline) = self.baseline()? {
+            if baseline.state == State::Passed {
+                let why = format!(
+                    "the check `{}` already passed before any change",
+                    self.profile.verify
+                );
+                self.session.append(
+                    session_tree::Kind::Checkpoint,
+                    json!({
+                        "node": "baseline",
+                        "condition": "Passed",
+                        "ended": true,
+                        "reason": why,
+                        "attempt": 0,
+                    }),
+                )?;
+                return Ok(Run {
+                    visits: vec![Visit {
+                        node: "baseline".to_string(),
+                        when: When::Passed,
+                        why: Some(why),
+                    }],
+                    ended: Ended::Satisfied,
+                    learned,
+                    spent: Vec::new(),
+                    branches: Vec::new(),
+                    recorded: None,
+                    memory_error: None,
+                    verdict: None,
+                    check: Some(State::Passed),
+                    baseline: Some(baseline),
+                });
+            }
+            self.baseline = Some(baseline);
+        }
         let mut visits = Vec::new();
         let mut branches: Vec<Candidate> = Vec::new();
         let mut attempts = 0u32;
@@ -850,12 +964,18 @@ where
                         Err(said) => memory_error = Some(said),
                     }
                 }
-                if let Some(state) = self.scoreboard {
+                // A satisfied run made no attempt, so there is no outcome to score. Recording it with zero
+                // attempts would quietly lower the profile's pass rate for a run that did nothing wrong.
+                if let Some(state) = self
+                    .scoreboard
+                    .filter(|_| !matches!(ended, Ended::Satisfied))
+                {
                     let (used, passed) = match &ended {
                         Ended::Accepted { attempts, .. } => (*attempts, true),
                         Ended::GaveUp { attempts, .. }
                         | Ended::Awaiting { attempts, .. }
                         | Ended::Stopped { attempts } => (*attempts, false),
+                        Ended::Satisfied => (0, false),
                     };
                     let at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -889,6 +1009,7 @@ where
                     memory_error,
                     verdict: self.last_verdict.clone(),
                     check: self.last_check,
+                    baseline: self.baseline.clone(),
                 });
             }
 
@@ -1069,7 +1190,12 @@ where
             cache: self.cache,
             reason: self.reason.clone(),
         };
-        let mut runner = Runner::new(parts, fork).with_bounds(Bounds::new(1, minutes));
+        let mut runner = Runner::new(parts, fork)
+            .with_bounds(Bounds::new(1, minutes))
+            // A candidate is checked after its own edit. Gating it first would run the parent's check
+            // against a tree another candidate already shaped, and could turn a real attempt into a
+            // "nothing to do" that the batch would then report as a pass.
+            .with_baseline(BaselineGate::Off);
         if let Some(feed) = self.feed {
             runner = runner.with_feed(feed);
         }
@@ -1209,6 +1335,7 @@ where
                         Ended::Awaiting { .. } => "a question is open".to_string(),
                         Ended::Stopped { .. } => "stopped".to_string(),
                         Ended::Accepted { .. } => "passed".to_string(),
+                        Ended::Satisfied => "already satisfied".to_string(),
                     })
             };
             let program = match &walked.ended {

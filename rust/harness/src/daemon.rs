@@ -577,6 +577,7 @@ impl Daemon {
             .with_bounds(bounds)
             .with_feed(&feed)
             .with_stop(cancel.as_ref())
+            .with_baseline(crate::cli::baseline_of(&flags).map_err(Fault::harness)?)
             .with_scoreboard(&self.state);
             if let (Some(section), Some(writer)) = (memo.section.clone(), memo.memory.as_ref()) {
                 runner = runner.with_memory(crate::graph::Remembering {
@@ -880,6 +881,7 @@ fn ended_line(ended: &Ended) -> String {
             question.id.0, question.action
         ),
         Ended::Stopped { attempts } => format!("stopped after {attempts} attempt(s)"),
+        Ended::Satisfied => "the check already passed before any change; nothing to do".to_string(),
     }
 }
 

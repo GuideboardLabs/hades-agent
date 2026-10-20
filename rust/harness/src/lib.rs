@@ -98,7 +98,8 @@ pub use daemon::{Daemon, ask, live};
 pub use engine::{Assembly, Engine, LIMIT};
 pub use fault::{Class, Fault};
 pub use graph::{
-    Bounds, Edge, Ended, Exhausted, Graph, Node, Parts, Run, Runner, Visit, When, Work,
+    BaselineGate, Bounds, Edge, Ended, Exhausted, Graph, Node, Parts, Run, Runner, Visit, When,
+    Work,
 };
 pub use judge::{Evaluator, Judgement, Report, Verdict};
 pub use model::{

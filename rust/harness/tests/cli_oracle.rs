@@ -901,6 +901,8 @@ fn the_walk_and_the_turn_build_the_same_cage() {
         "1",
         "--cage",
         "on",
+        "--baseline",
+        "off",
     ]);
     assert_eq!(code, 0, "{text}");
 
@@ -946,6 +948,8 @@ fn the_cage_lets_a_language_runtime_start() {
         "1",
         "--cage",
         "on",
+        "--baseline",
+        "off",
     ]);
     assert_eq!(code, 0, "{text}");
 
@@ -1632,6 +1636,8 @@ fn a_run_receipt_names_the_judge_it_did_or_did_not_have() {
         state.to_str().unwrap(),
         "--session",
         "judge-receipt",
+        "--baseline",
+        "off",
     ]);
     assert_eq!(code, 0, "{text}");
     assert!(
@@ -1658,6 +1664,8 @@ fn a_run_receipt_names_the_judge_it_did_or_did_not_have() {
         state.to_str().unwrap(),
         "--session",
         "judge-receipt-2",
+        "--baseline",
+        "off",
     ]);
     assert_eq!(code, 0, "{text}");
     assert!(
@@ -2910,4 +2918,12 @@ fn taste_prints_the_recommendation_it_learned_and_forget_clears_it() {
     let (_, text) = hades(&["taste", "--state", &state_arg]);
     assert!(text.contains("no answers recorded"), "{text}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn baseline_has_to_be_red_or_off() {
+    // The flag is read before the engine is assembled, so a typo costs nothing and cannot reach a model.
+    let (code, text) = hades(&["run", "make it pass", "--baseline", "maybe"]);
+    assert_eq!(code, 2);
+    assert!(text.contains("say red or off"), "{text}");
 }
