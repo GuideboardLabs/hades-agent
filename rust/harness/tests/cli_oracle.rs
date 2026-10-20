@@ -2676,3 +2676,81 @@ fn a_candidate_that_quotes_the_check_is_refused_before_anything_runs() {
         text
     );
 }
+
+// A goal is session state, and the listing is the surface a person uses to see what Hades is still
+// working on. It must read the files without a config and without a model: the isolated home used by
+// these tests has no config, no key and no endpoint, so a listing that needed one could not succeed.
+#[test]
+fn goals_are_listed_from_files_without_a_model() {
+    let state = scratch("goal-list");
+    let folder = state.join("goals");
+    std::fs::create_dir_all(&folder).expect("the goals folder");
+    std::fs::write(
+        folder.join("2-ship.json"),
+        r#"{"id":2,"text":"ship the report","state":"open","session":"tg-7","chat":7,
+            "model":"","check":"test -f out.txt","budget":3,"executor":"chat",
+            "created":100,"updated":100,"heartbeat":0,"reason":"","last_check":""}"#,
+    )
+    .expect("a goal file");
+    std::fs::write(folder.join("3-broken.json"), "{not json").expect("a broken file");
+
+    let (code, text) = hades(&["goal", "list", "--state", &state.display().to_string()]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("ship the report"), "{text}");
+    assert!(text.contains("goal 2 · open"), "{text}");
+    assert!(text.contains("last heartbeat: never"), "{text}");
+    assert!(text.contains("not read: goals/3-broken.json"), "{text}");
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[test]
+fn a_goal_is_set_then_paused_and_graph_is_refused() {
+    let state = scratch("goal-set");
+    let state_arg = state.display().to_string();
+    let (code, text) = hades(&[
+        "goal", "set", "write", "the", "report", "--chat", "7", "--check", "true", "--budget", "3",
+        "--state", &state_arg,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 is open for chat 7"), "{text}");
+    assert!(text.contains("last heartbeat: never"), "{text}");
+    assert!(state.join("goals/1-write-the-report.json").exists());
+
+    let (code, text) = hades(&[
+        "goal", "pause", "1", "--reason", "waiting", "--state", &state_arg,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 is paused: waiting"), "{text}");
+
+    let (code, text) = hades(&["goal", "list", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 · paused"), "{text}");
+    assert!(text.contains("reason: waiting"), "{text}");
+
+    let (code, text) = hades(&["goal", "clear", "1", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 is cleared"), "{text}");
+    let (code, text) = hades(&["goal", "list", "--state", &state_arg]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("goal 1 · cleared"), "{text}");
+
+    let (code, text) = hades(&[
+        "goal",
+        "set",
+        "graph",
+        "work",
+        "--chat",
+        "7",
+        "--executor",
+        "graph",
+        "--state",
+        &state_arg,
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(
+        text.contains("executor `graph` is not implemented"),
+        "{text}"
+    );
+    assert!(!state.join("goals/2-graph-work.json").exists());
+    let _ = std::fs::remove_dir_all(&state);
+}

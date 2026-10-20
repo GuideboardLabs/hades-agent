@@ -443,6 +443,21 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
         list.as_array_mut().unwrap().push(json!({
             "type": "function",
             "function": {
+                "name": "goal",
+                "description": "The standing goal this chat is keeping. `status` reports it. `done` claims the goal is finished, and the goal's own recorded check decides: a failing check leaves the goal open and records the result, so the work continues. `pause` stops the heartbeat until a person resumes it. A chat with no goal has nothing to report.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["status", "done", "pause"]},
+                        "reason": {"type": "string", "description": "For pause: why the goal should stop being continued."}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }));
+        list.as_array_mut().unwrap().push(json!({
+            "type": "function",
+            "function": {
                 "name": "delegate",
                 "description": "Hand one or more independent tasks to workers that each run their own loop with the same tools, in parallel, and report back. Use it when a job splits into parts that do not need each other, or when a search would flood this conversation. Give each task everything the worker needs: it cannot see this conversation.",
                 "parameters": {
@@ -554,7 +569,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-const TOOLS: [&str; 21] = [
+const TOOLS: [&str; 22] = [
     "shell",
     "read_file",
     "write_file",
@@ -570,6 +585,7 @@ const TOOLS: [&str; 21] = [
     "skills",
     "web_search",
     "cron",
+    "goal",
     "mcp",
     "delegate",
     "spawn",
@@ -932,6 +948,7 @@ fn execute(
         "result" => child_result(&args, world),
         "tell" => tell_child(&args, world),
         "cron" => crate::agent::cron(&args, world),
+        "goal" => goal_tool(&args, world),
         "mcp" => world
             .mcp
             .run(&args)
@@ -1703,6 +1720,64 @@ fn cron(args: &Value, world: &World) -> String {
                 lines.join("\n")
             }
         }
+    }
+}
+
+/// The standing goal this chat is keeping. The chat is where the goal lives, so the tool reads it from
+/// `world.chat` rather than taking an id: a model cannot close somebody else's goal by naming it.
+///
+/// `done` is a claim, not a close. The goal's own recorded check runs in the workspace, and a failing or
+/// missing check leaves the goal open with the verdict recorded, which is the only honest way to keep the
+/// work going after a model says it has finished.
+fn goal_tool(args: &Value, world: &World) -> String {
+    let state = &world.state;
+    let Some(goal) = crate::gateway::goal::active(state, world.chat) else {
+        return "there is no open or paused goal in this chat".to_string();
+    };
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("status");
+    match action {
+        "status" => crate::gateway::goal::describe(&goal),
+        "pause" => {
+            let reason =
+                argument(args, "reason").unwrap_or_else(|| "paused by the agent".to_string());
+            match crate::gateway::goal::pause(state, goal.id, &reason, epoch()) {
+                Ok(paused) => format!("goal {} is paused: {reason}", paused.id),
+                Err(refusal) => {
+                    format!(
+                        "Refused ({}): {refusal}. The goal is unchanged.",
+                        refusal.name()
+                    )
+                }
+            }
+        }
+        "done" => {
+            if goal.state != crate::gateway::goal::State::Open {
+                return format!(
+                    "goal {} is {}, so there is no open work to claim done",
+                    goal.id,
+                    goal.state.name()
+                );
+            }
+            match crate::gateway::goal::complete(state, goal.id, &world.root, epoch()) {
+                Ok(done) => format!(
+                    "goal {} is done: the recorded check passed ({})",
+                    done.id,
+                    if done.check.is_empty() {
+                        "no check".to_string()
+                    } else {
+                        done.check.clone()
+                    }
+                ),
+                Err(refusal) => format!(
+                    "Refused ({}): {refusal}. The goal stays open; keep working or say what is missing.",
+                    refusal.name()
+                ),
+            }
+        }
+        other => format!("there is no goal action called {other}: say status, done or pause"),
     }
 }
 
@@ -4169,6 +4244,54 @@ mod tests {
                 )),
                 "{id} has no result in the parent log"
             );
+        }
+    }
+
+    // ---- B3: a done claim is not a close until the recorded check passes --------------------------
+
+    #[test]
+    fn a_done_claim_with_a_failing_check_leaves_the_goal_open_and_records_it() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-goal-done");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a dir");
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let new = crate::gateway::goal::NewGoal {
+            text: "make the report".to_string(),
+            session: String::new(),
+            chat: 7,
+            model: String::new(),
+            check: "false".to_string(),
+            budget: 4,
+            executor: "chat".to_string(),
+        };
+        let goal = crate::gateway::goal::set(&world.state, new, 100).expect("a goal");
+        let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+        let said = execute("goal", r#"{"action":"done"}"#, &world, &client, &|_, _| {});
+        assert!(said.contains("stays open"), "{said}");
+        assert!(said.contains("check"), "{said}");
+        let kept = crate::gateway::goal::load_one(&world.state, goal.id).expect("the goal");
+        assert_eq!(kept.state, crate::gateway::goal::State::Open);
+        assert!(kept.last_check.contains("failed"), "{:?}", kept.last_check);
+
+        // The same claim closes the goal when the goal's own check passes.
+        let passing = new_goal_for("true");
+        let passing = crate::gateway::goal::set(&world.state, passing, 200).expect("a second goal");
+        let said = execute("goal", r#"{"action":"done"}"#, &world, &client, &|_, _| {});
+        assert!(said.contains("is done"), "{said}");
+        let kept = crate::gateway::goal::load_one(&world.state, passing.id).expect("the goal");
+        assert_eq!(kept.state, crate::gateway::goal::State::Done);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn new_goal_for(check: &str) -> crate::gateway::goal::NewGoal {
+        crate::gateway::goal::NewGoal {
+            text: "make the report".to_string(),
+            session: String::new(),
+            chat: 7,
+            model: String::new(),
+            check: check.to_string(),
+            budget: 4,
+            executor: "chat".to_string(),
         }
     }
 }
