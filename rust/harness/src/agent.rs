@@ -1356,9 +1356,13 @@ fn spawn(
     };
     activity(Activity::Start, &format!("spawn: {}", clip(&goal, 60)));
 
-    // Inside a gateway the child outlives this call. The registry counted the slot, wrote the record
-    // and started the executor before this returns, so the handle is a fact and not a promise.
-    if let Some(registry) = Registry::existing(&world.state) {
+    // Inside a gateway the child outlives this call — but only for the person's own conversation. A
+    // delegated worker (depth > 0) takes the blocking path even when a registry exists: `delegate`
+    // joins its workers, and an async spawn from inside one would outlive the join and orphan a
+    // grandchild nobody is holding.
+    if world.depth == 0
+        && let Some(registry) = Registry::existing(&world.state)
+    {
         let admission = Admission {
             id: name.clone(),
             parent: world.session.clone(),
@@ -1374,8 +1378,8 @@ fn spawn(
         };
     }
 
-    // No gateway: run it here. `hades turn` and the tests take this path, and it blocks for the whole
-    // child, which is the honest behaviour when there is no process to own it.
+    // No gateway, or a worker: run it here. `hades turn`, the tests and every delegated worker take this
+    // path, and it blocks for the whole child, which is the honest behaviour when the caller joins it.
     let artifact = world
         .state
         .join("artifacts")
@@ -1484,7 +1488,7 @@ fn gateway_registry(world: &World) -> Result<Registry, String> {
 /// `children`: what this parent has out. Scoped to `world.session`, because two chats in one gateway
 /// must not see each other's work, and the cap is the only fact they share. A surface with no gateway
 /// gets an empty list: it has no children, and a sentence is not a list.
-fn list_children(world: &World) -> String {
+pub(crate) fn list_children(world: &World) -> String {
     let Ok(registry) = gateway_registry(world) else {
         return "[]".to_string();
     };
@@ -1521,7 +1525,7 @@ fn owned(registry: &Registry, id: &str, world: &World) -> Result<(), String> {
 
 /// `result`: the child's checked JSON, or its status and why it has none. The wait is this tool's own
 /// clock (see `Registry::wait`); a timeout says so and never claims the child was killed.
-fn child_result(args: &Value, world: &World) -> String {
+pub(crate) fn child_result(args: &Value, world: &World) -> String {
     let Some(id) = argument(args, "child_id") else {
         return "result needs a child_id".to_string();
     };
@@ -2459,7 +2463,7 @@ mod tests {
 
     #[test]
     fn a_read_job_refuses_a_mutating_call_that_arrives_anyway() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-read");
+        let dir = crate::scratch::root().join("agent-read");
         std::fs::create_dir_all(&dir).expect("a repo-local scratch directory");
         let world = World {
             root: dir.clone(),
@@ -2494,7 +2498,7 @@ mod tests {
 
     #[test]
     fn a_patch_edits_one_anchor_and_a_read_surface_has_none() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-patch");
+        let dir = crate::scratch::root().join("agent-patch");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a repo-local scratch directory");
         std::fs::write(dir.join("note.txt"), "alpha\nbeta\ngamma\n").expect("a file to patch");
@@ -2532,7 +2536,7 @@ mod tests {
 
     #[test]
     fn a_chat_shell_cannot_read_outside_its_root() {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-cage");
+        let base = crate::scratch::root().join("agent-cage");
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("root");
         std::fs::create_dir_all(root.join("state")).expect("a scratch home");
@@ -2641,7 +2645,7 @@ mod tests {
 
     #[test]
     fn the_chat_seam_writes_one_line_for_every_decision() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-activity");
+        let dir = crate::scratch::root().join("agent-activity");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a repo-local scratch directory");
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
@@ -2707,7 +2711,7 @@ mod tests {
 
     #[test]
     fn an_mcp_tool_not_on_the_allowlist_is_refused_and_recorded() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-mcp-blocked");
+        let dir = crate::scratch::root().join("agent-mcp-blocked");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a repo-local scratch directory");
         let dir = std::fs::canonicalize(&dir).expect("a real path");
@@ -2747,7 +2751,7 @@ mod tests {
 
     #[test]
     fn an_allowed_mcp_tool_reaches_the_server() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-mcp-allowed");
+        let dir = crate::scratch::root().join("agent-mcp-allowed");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a repo-local scratch directory");
         let dir = std::fs::canonicalize(&dir).expect("a real path");
@@ -2781,7 +2785,7 @@ mod tests {
 
     #[test]
     fn remember_can_retire_the_note_it_corrects() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-supersede");
+        let dir = crate::scratch::root().join("agent-supersede");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a repo-local scratch directory");
         let dir = std::fs::canonicalize(&dir).expect("a real path");
@@ -2848,7 +2852,7 @@ mod tests {
 
     #[test]
     fn a_job_created_from_chat_is_a_goal_file_with_its_fields() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-job");
+        let dir = crate::scratch::root().join("agent-job");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a repo-local scratch directory");
         let world = World {
@@ -2916,7 +2920,7 @@ mod tests {
 
     #[test]
     fn the_chat_loop_refuses_a_permanent_delete_before_the_shell_runs() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-floor");
+        let dir = crate::scratch::root().join("agent-floor");
         std::fs::create_dir_all(&dir).expect("a repo-local scratch directory");
         let keep = dir.join("keep.txt");
         std::fs::write(&keep, "still here").expect("a file to delete");
@@ -2971,7 +2975,7 @@ mod tests {
 
     #[test]
     fn a_pre_tool_hook_can_refuse_a_call_the_policy_allowed() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-hooks");
+        let dir = crate::scratch::root().join("agent-hooks");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a scratch state");
         std::fs::write(dir.join("inside.txt"), "readable").expect("a file");
@@ -3007,7 +3011,7 @@ mod tests {
 
     #[test]
     fn a_delegation_leaves_a_child_session_and_a_bundle() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-delegate");
+        let dir = crate::scratch::root().join("agent-delegate");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state/sessions")).expect("a sessions dir");
         let world = world_at(&dir, Mode::Act, "chat:7");
@@ -3048,7 +3052,7 @@ mod tests {
 
     #[test]
     fn archived_skills_are_not_offered_and_one_name_resolves_once() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-skills");
+        let dir = crate::scratch::root().join("agent-skills");
         let _ = std::fs::remove_dir_all(&dir);
         let own = dir.join("state/skills");
         let inherited = dir.join("inherited");
@@ -3080,7 +3084,7 @@ mod tests {
 
     #[test]
     fn a_role_is_a_permission_not_a_prompt() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-role");
+        let dir = crate::scratch::root().join("agent-role");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a scratch state");
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
@@ -3138,7 +3142,7 @@ mod tests {
 
     #[test]
     fn a_delegation_is_refused_when_the_shared_allowance_cannot_cover_it() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-budget");
+        let dir = crate::scratch::root().join("agent-budget");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a dir");
         let mut world = world_at(&dir, Mode::Act, "chat:7");
@@ -3172,7 +3176,7 @@ mod tests {
 
     #[test]
     fn a_graph_at_the_depth_limit_cannot_spawn() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-spawn-depth");
+        let dir = crate::scratch::root().join("agent-spawn-depth");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a dir");
         let mut world = world_at(&dir, Mode::Act, "chat:7");
@@ -3184,8 +3188,7 @@ mod tests {
 
     #[test]
     fn a_spawn_without_allowance_is_refused_before_a_child_exists() {
-        let dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-spawn-budget");
+        let dir = crate::scratch::root().join("agent-spawn-budget");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a dir");
         let mut world = world_at(&dir, Mode::Act, "chat:7");
@@ -3198,7 +3201,7 @@ mod tests {
 
     #[test]
     fn a_failed_spawn_still_returns_a_typed_artifact() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-spawn-fail");
+        let dir = crate::scratch::root().join("agent-spawn-fail");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a dir");
         let world = world_at(&dir, Mode::Act, "chat:7");
@@ -3246,7 +3249,7 @@ mod tests {
     /// A scratch tree with the workspace at `<base>/work`, so something can sit beside the root. Built
     /// on `world_at`, the module's one `World` helper.
     fn world_beside_outside(name: &str) -> (PathBuf, World) {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../target/scratch/{name}"));
+        let base = crate::scratch::root().join(name);
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("work");
         std::fs::create_dir_all(&root).expect("a scratch workspace");
@@ -3696,9 +3699,7 @@ mod tests {
 
     /// A scratch directory under the repo's target, cleared first, so two runs cannot share a registry.
     fn admission_scratch(name: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/scratch")
-            .join(name);
+        let dir = crate::scratch::root().join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("state")).expect("a scratch state");
         dir
@@ -4251,7 +4252,7 @@ mod tests {
 
     #[test]
     fn a_done_claim_with_a_failing_check_leaves_the_goal_open_and_records_it() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/scratch/agent-goal-done");
+        let dir = crate::scratch::root().join("agent-goal-done");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a dir");
         let world = world_at(&dir, Mode::Act, "chat:7");
@@ -4293,5 +4294,169 @@ mod tests {
             budget: 4,
             executor: "chat".to_string(),
         }
+    }
+
+    /// A model endpoint that answers by what it is asked. The grandchild's answer is delayed so the test
+    /// can tell "delegate joined it" from "delegate returned while it was still running".
+    fn routing_worker_stub() -> (
+        String,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&served);
+        listener
+            .set_nonblocking(true)
+            .expect("a nonblocking listener");
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while counted.load(std::sync::atomic::Ordering::SeqCst) < 3
+                && std::time::Instant::now() < deadline
+            {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                stream.set_nonblocking(false).expect("a blocking stream");
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("a header");
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).expect("a body");
+                let request: Value = serde_json::from_slice(&body).expect("a request");
+                let messages = request["messages"].as_array().cloned().unwrap_or_default();
+                let text: String = messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let saw_tool = messages.iter().any(|message| message["role"] == "tool");
+                let delta = if text.contains("check the inner file") {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    json!({"content": "{\"report\":\"deep\"}"})
+                } else if text.contains("audit the tree") {
+                    if saw_tool {
+                        json!({"content": "{\"report\":\"worker\"}"})
+                    } else {
+                        json!({
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call-1",
+                                "function": {
+                                    "name": "spawn",
+                                    "arguments": "{\"goal\":\"check the inner file\"}"
+                                }
+                            }]
+                        })
+                    }
+                } else if saw_tool {
+                    json!({"content": "finished"})
+                } else {
+                    json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {
+                                "name": "delegate",
+                                "arguments": "{\"tasks\":[{\"goal\":\"audit the tree\"}]}"
+                            }
+                        }]
+                    })
+                };
+                let frame = json!({"choices": [{"delta": delta}]}).to_string();
+                let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("a response");
+            }
+        });
+        (url, server, served)
+    }
+
+    /// A delegated worker's `spawn` used to be admitted asynchronously even though `delegate` joins its
+    /// workers: the join returned and the grandchild kept running with nobody holding it. A worker now
+    /// takes the blocking path, so when `delegate` returns the grandchild has finished and its result is
+    /// on disk.
+    #[test]
+    fn a_grandchild_from_a_delegate_finishes_before_delegate_returns() {
+        let dir = crate::scratch::root().join("agent-grandchild");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state/sessions")).expect("a state");
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let registry = crate::gateway::children::Registry::new(&world.state);
+        let (url, server, served) = routing_worker_stub();
+        let client = OpenAi::new(&url, "stub");
+
+        let said = execute(
+            "delegate",
+            r#"{"tasks":[{"goal":"audit the tree"}]}"#,
+            &world,
+            &client,
+            &|_, _| {},
+        );
+        server.join().expect("the endpoint");
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the parent, the worker and the grandchild each asked once"
+        );
+        assert!(said.contains("status: ok"), "the delegate's report: {said}");
+        assert!(said.contains("worker"), "the delegate's report: {said}");
+
+        // The registry is here and would have been used at depth zero. The worker's spawn still took the
+        // blocking path: no record was handed to the gateway, and both children's artifacts exist
+        // already, so the grandchild was finished when `delegate` returned and not still running.
+        assert!(
+            crate::gateway::children::Registry::existing(&world.state).is_some(),
+            "the test's registry is the one spawn would see"
+        );
+        assert!(
+            registry.records().expect("the records").is_empty(),
+            "a delegated worker's child is not the gateway's to run"
+        );
+        assert_eq!(registry.live(), 0, "nothing is still running");
+
+        let artifacts = world.state.join("artifacts");
+        let mut names: Vec<String> = std::fs::read_dir(&artifacts)
+            .expect("the artifact tree")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "the worker and its grandchild: {names:?}");
+        let deep = names
+            .iter()
+            .find(|name| name.starts_with("spawn-"))
+            .unwrap_or_else(|| panic!("no grandchild artifact in {names:?}"));
+        let written =
+            std::fs::read_to_string(artifacts.join(deep).join("result.json")).expect("a result");
+        assert!(
+            written.contains("deep"),
+            "the grandchild finished and wrote its report: {written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
