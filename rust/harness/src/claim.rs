@@ -49,6 +49,9 @@ pub struct Facts {
     pub check: Option<State>,
     pub verdict: Option<Verdict>,
     pub accepted: bool,
+    /// The check or a file it depends on changed during the run. Read before `check`, because a green
+    /// check from a moved verifier is not evidence of a pass.
+    pub ruler_changed: bool,
 }
 
 /// The highest rung the facts support, and the first rung they refuse, with a reason a person can read.
@@ -81,6 +84,15 @@ impl Claim {
 pub fn ladder(facts: &Facts) -> Claim {
     if !facts.attempted {
         return refused(Rung::Nothing, Rung::Attempted, "no turn ran");
+    }
+    // Before the check is read: a tampered verifier can produce a green result, and the ladder must never
+    // climb on one.
+    if facts.ruler_changed {
+        return refused(
+            Rung::Attempted,
+            Rung::Checked,
+            "the check changed during the run",
+        );
     }
     let Some(check) = facts.check else {
         return refused(
@@ -134,6 +146,22 @@ fn refused(rung: Rung, next: Rung, why: &str) -> Claim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_moved_verifier_cannot_climb_on_a_green_check() {
+        let facts = Facts {
+            attempted: true,
+            check: Some(State::Passed),
+            verdict: Some(Verdict::Met),
+            accepted: true,
+            ruler_changed: true,
+        };
+        let claim = ladder(&facts);
+        assert_eq!(claim.rung, Rung::Attempted);
+        let (next, why) = claim.refused.expect("a refusal");
+        assert_eq!(next, Rung::Checked);
+        assert!(why.contains("changed during the run"), "{why}");
+    }
 
     #[test]
     fn no_turn_is_nothing() {
@@ -195,6 +223,7 @@ mod tests {
             check: Some(State::Passed),
             verdict: Some(Verdict::Unjudged),
             accepted: true,
+            ruler_changed: false,
         };
         let claim = ladder(&facts);
         assert_eq!(claim.rung, Rung::Passed);
@@ -215,6 +244,7 @@ mod tests {
             check: Some(State::Passed),
             verdict: Some(Verdict::NotYet),
             accepted: true,
+            ruler_changed: false,
         };
         let claim = ladder(&facts);
         assert_eq!(claim.rung, Rung::Passed);
@@ -231,6 +261,7 @@ mod tests {
             check: Some(State::Passed),
             verdict: Some(Verdict::Met),
             accepted: false,
+            ruler_changed: false,
         };
         let claim = ladder(&facts);
         assert_eq!(claim.rung, Rung::Judged);
@@ -247,6 +278,7 @@ mod tests {
             check: Some(State::Passed),
             verdict: Some(Verdict::Met),
             accepted: true,
+            ruler_changed: false,
         };
         let claim = ladder(&facts);
         assert_eq!(claim.rung, Rung::Accepted);

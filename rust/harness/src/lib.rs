@@ -73,6 +73,7 @@ pub mod question;
 pub mod repomap;
 pub mod retry;
 pub mod route;
+pub mod ruler;
 pub mod scoreboard;
 /// Where a test writes: never inside the source tree's `target/`. Public because the integration
 /// tests are separate crates and need the same root as the unit tests.

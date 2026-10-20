@@ -5,6 +5,7 @@
 //! compared across them, and the comparison is the point.
 
 use std::fmt;
+use std::path::Path;
 
 use crate::task::Budget;
 
@@ -108,6 +109,115 @@ impl Role {
     }
 }
 
+/// One declared protected path, as a rule rather than a glob: this crate takes no glob dependency, and a
+/// closed rule set is a set the help text can describe exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protect {
+    /// Every file under a directory, relative to the run's root.
+    Dir(String),
+    /// One file, relative to the run's root.
+    File(String),
+    /// Every file whose name ends with this suffix, anywhere under the root.
+    Suffix(String),
+}
+
+impl Protect {
+    pub fn dir(spec: impl Into<String>) -> Result<Protect, String> {
+        let rule = Protect::Dir(spec.into());
+        rule.validate()?;
+        Ok(rule)
+    }
+
+    pub fn file(spec: impl Into<String>) -> Result<Protect, String> {
+        let rule = Protect::File(spec.into());
+        rule.validate()?;
+        Ok(rule)
+    }
+
+    /// A suffix is a file-name ending, not a path: it has no separator and never escapes the root.
+    pub fn suffix(suffix: impl Into<String>) -> Result<Protect, String> {
+        let suffix = suffix.into();
+        if suffix.is_empty() || suffix.contains('/') || suffix.contains('\\') {
+            return Err(format!("`{suffix}` is not a file-name suffix"));
+        }
+        Ok(Protect::Suffix(suffix))
+    }
+
+    /// A `--protect` value: a trailing slash or an existing directory under `root` is a directory rule,
+    /// anything else is a file rule. There is no wildcard syntax to learn or misread.
+    pub fn parse(spec: &str, root: &Path) -> Result<Protect, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("`--protect` needs a path".to_string());
+        }
+        let trailing = spec.ends_with('/') || spec.ends_with('\\');
+        let bare = spec.trim_end_matches(['/', '\\']);
+        let rule = if trailing || root.join(bare).is_dir() {
+            Protect::Dir(bare.to_string())
+        } else {
+            Protect::File(bare.to_string())
+        };
+        rule.validate()?;
+        Ok(rule)
+    }
+
+    /// Whether a relative path is covered by this rule.
+    pub fn matches(&self, relative: &Path) -> bool {
+        match self {
+            Protect::Dir(dir) => relative.starts_with(dir),
+            Protect::File(file) => relative == Path::new(file),
+            Protect::Suffix(suffix) => relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix.as_str())),
+        }
+    }
+
+    fn spec(&self) -> &str {
+        match self {
+            Protect::Dir(spec) | Protect::File(spec) | Protect::Suffix(spec) => spec,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let spec = self.spec();
+        if spec.is_empty() {
+            return Err("a protected path cannot be empty".to_string());
+        }
+        let path = Path::new(spec);
+        if path.is_absolute() {
+            return Err(format!(
+                "`{spec}` is absolute: a protected path is relative to the run's root"
+            ));
+        }
+        if path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "`{spec}` escapes the root or is not a plain relative path"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The same check the ruler relies on, callable when a rule was built without [`Protect::parse`].
+    pub fn check_inside(&self, _root: &Path) -> Result<(), String> {
+        self.validate()
+    }
+}
+
+/// Whether a protected rule names a directory, for a receipt that wants to say what was frozen.
+impl std::fmt::Display for Protect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Protect::Dir(spec) => write!(f, "{spec}/"),
+            Protect::File(spec) => write!(f, "{spec}"),
+            Protect::Suffix(spec) => write!(f, "*{spec}"),
+        }
+    }
+}
+
 /// The parameters of one kind of work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -141,6 +251,13 @@ pub struct Profile {
     /// Whether a governed program under this profile may reach the network. Read-only profiles close it by
     /// default; a patch profile needs it for a package index or a clone.
     pub network: bool,
+    /// The files whose contents decide the check. The ruler hashes them before the first write and again
+    /// after the check returns; an edit is a refused result rather than a pass.
+    ///
+    /// **Deliberately not part of [`parameter_text`].** That digest is recorded with every harness
+    /// generation, and adding a field there would make every generation captured before this one
+    /// unrestorable. This field names the files the ruler reads; it is not a permission the run acts under.
+    pub protect: Vec<Protect>,
 }
 
 impl Profile {
@@ -166,6 +283,11 @@ pub fn shipped() -> Vec<Profile> {
             shadow: true,
             attempts: 3,
             minutes: 10,
+            protect: vec![
+                Protect::Dir("tests".to_string()),
+                Protect::Dir("benches".to_string()),
+                Protect::Suffix("_test.rs".to_string()),
+            ],
             network: true,
         },
         Profile {
@@ -181,6 +303,11 @@ pub fn shipped() -> Vec<Profile> {
             shadow: true,
             attempts: 4,
             minutes: 30,
+            protect: vec![
+                Protect::Dir("tests".to_string()),
+                Protect::Dir("benches".to_string()),
+                Protect::Suffix("_test.rs".to_string()),
+            ],
             network: true,
         },
         Profile {
@@ -197,6 +324,7 @@ pub fn shipped() -> Vec<Profile> {
             shadow: false,
             attempts: 1,
             minutes: 5,
+            protect: Vec::new(),
             network: false,
         },
         Profile {
@@ -214,6 +342,7 @@ pub fn shipped() -> Vec<Profile> {
             shadow: false,
             attempts: 1,
             minutes: 5,
+            protect: Vec::new(),
             network: false,
         },
         Profile {
@@ -229,6 +358,7 @@ pub fn shipped() -> Vec<Profile> {
             shadow: false,
             attempts: 1,
             minutes: 5,
+            protect: Vec::new(),
             network: false,
         },
     ]
@@ -245,6 +375,9 @@ pub fn named(id: &str) -> Option<Profile> {
 /// default is refused instead of being applied to a harness that was measured under another one. Every
 /// field is in the line, including the ones nobody would miss, because those are the ones that change
 /// silently.
+///
+/// `protect` is the deliberate exception: it names the files the ruler reads, not a permission the run
+/// acts under, and including it would invalidate every generation captured before the field existed.
 pub fn parameter_text() -> String {
     let mut text = String::new();
     for profile in shipped() {
@@ -271,6 +404,26 @@ pub fn parameter_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_protect_list_is_not_part_of_the_harness_digest() {
+        // `protect` names the files the ruler reads, not a permission the run acts under. It is excluded
+        // from `parameter_text` so a generation captured before the field existed still restores.
+        let text = parameter_text();
+        assert!(!text.contains("protect"), "{text}");
+        assert!(
+            !text.contains("_test.rs"),
+            "a protect suffix reached the digest: {text}"
+        );
+        assert!(
+            !text.contains("benches"),
+            "a protect directory reached the digest: {text}"
+        );
+        assert!(
+            shipped().iter().any(|profile| !profile.protect.is_empty()),
+            "the absence above is vacuous if no profile protects anything"
+        );
+    }
 
     #[test]
     fn five_profiles_and_every_one_has_a_distinct_role() {

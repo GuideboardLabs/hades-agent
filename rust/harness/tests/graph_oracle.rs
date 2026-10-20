@@ -58,6 +58,7 @@ fn profile(verify: &str) -> Profile {
         shadow: true,
         attempts: 3,
         minutes: 10,
+        protect: Vec::new(),
         network: true,
     }
 }
@@ -183,6 +184,69 @@ fn a_check_that_times_out_ends_the_walk_without_spending_another_attempt() {
     let nodes: Vec<&str> = walked.visits.iter().map(|v| v.node.as_str()).collect();
     assert_eq!(nodes, ["attempt", "gave_up"], "{nodes:?}");
     assert_eq!(walked.ended.code(), 2, "a no-verdict end, not a failure");
+}
+
+#[test]
+fn a_green_check_from_a_verifier_the_model_edited_is_refused() {
+    // The hole the ruler exists for: the model writes the very script the check runs, so red becomes
+    // green without any fix. The run must end refused, not accepted, and the claim ladder must stop at
+    // `attempted` even though the check that ran at the end is green.
+    let rig = Rig::new(
+        "ruler-edited",
+        "sh tests/check.sh",
+        open(),
+        // The baseline finds no script and is red; the attempt creates one that passes.
+        ScriptedModel::new(["mkdir -p tests && printf 'exit 0\\n' > tests/check.sh"]),
+    );
+    let mut rig = rig;
+    rig.profile.protect = vec![harness::profile::Protect::dir("tests").expect("a rule")];
+    let mut session = rig.session("ruler-edited");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10))
+        .with_protect(rig.profile.protect.clone());
+    let walked = runner.run().expect("a walk");
+
+    match &walked.ended {
+        Ended::RulerChanged { detail, attempts } => {
+            assert_eq!(*attempts, 1, "the attempt ran before the refusal");
+            assert!(detail.contains("tests/check.sh"), "{detail}");
+        }
+        other => panic!("expected a ruler refusal, got {other:?}"),
+    }
+    assert_eq!(walked.ended.code(), 1);
+    assert!(walked.ruler.is_some(), "the ruler is on the record");
+    let claim = harness::claim::ladder(&walked.claim_facts());
+    assert_eq!(
+        claim.rung,
+        harness::claim::Rung::Attempted,
+        "{}",
+        claim.line()
+    );
+    assert!(
+        walked.visits.iter().any(|visit| visit.node == "ruler"),
+        "{:?}",
+        walked.visits
+    );
+}
+
+#[test]
+fn an_edit_outside_the_protected_set_still_accepts() {
+    let mut rig = Rig::new(
+        "ruler-clean",
+        "test -f made.txt",
+        open(),
+        ScriptedModel::new(["touch made.txt"]),
+    );
+    rig.profile.protect = vec![harness::profile::Protect::dir("tests").expect("a rule")];
+    let mut session = rig.session("ruler-clean");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10))
+        .with_protect(rig.profile.protect.clone());
+    let walked = runner.run().expect("a walk");
+    assert!(matches!(walked.ended, Ended::Accepted { .. }));
+    assert!(walked.ruler.is_some());
 }
 
 #[test]

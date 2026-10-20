@@ -229,7 +229,12 @@ hades — the harness, one turn or a whole graph
       n candidate turns from the same tree and keeps the first pass (1 to 4); the attempts
       budget is shared, so width is model calls, not a second budget. --baseline red (the
       default) runs the check before the first write and refuses a run whose check already
-      passes; use off for a refactor that keeps a green check green
+      passes; use off for a refactor that keeps a green check green. --protect <path> is
+      repeatable: the check command and every protected file are hashed before the first
+      write and again after the check, and an edit ends the run as refused. A file ruler
+      does not cover inline `#[cfg(test)]` modules inside `src/*.rs`; move the tests to
+      `tests/` or name the script the check runs. With no protected path the receipt says
+      `ruler: command only`
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
@@ -363,7 +368,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
     }
     flags.positional.push(goal);
 
-    const NAMED: [&str; 19] = [
+    const NAMED: [&str; 20] = [
         "root",
         "profile",
         "policy",
@@ -383,6 +388,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
         "budget-tokens",
         "baseline",
         "strict-model",
+        "protect",
     ];
     for key in NAMED {
         let Some(value) = request.get(key) else {
@@ -392,6 +398,18 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
             Value::String(text) => text.clone(),
             Value::Number(number) => number.to_string(),
             Value::Bool(flag) => flag.to_string(),
+            // `protect` is repeatable, like `program`: a list is the shape a caller uses when it has more
+            // than one path to freeze.
+            Value::Array(list) if key == "protect" => {
+                flags.repeated.insert(
+                    key.to_string(),
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                );
+                continue;
+            }
             _ => {
                 return Err(format!("`{key}` has to be a string or a number"));
             }
@@ -1175,6 +1193,21 @@ impl Answerer {
             ),
         }
     }
+}
+
+/// The `--protect` paths a run declared. A repeated flag is a list, and each value is a file or a
+/// directory rule relative to the run's root. Refused here, before the model is asked.
+pub(crate) fn protect_of(
+    flags: &Flags,
+    root: &std::path::Path,
+) -> Result<Vec<crate::profile::Protect>, String> {
+    let mut rules = Vec::new();
+    if let Some(values) = flags.repeated.get("protect") {
+        for value in values {
+            rules.push(crate::profile::Protect::parse(value, root)?);
+        }
+    }
+    Ok(rules)
 }
 
 fn root_of(flags: &Flags) -> Result<PathBuf, String> {
@@ -3402,6 +3435,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             "config",
             "memory",
             "harness",
+            "protect",
         ],
         &["strict-model"],
     )?;
@@ -3428,6 +3462,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
     };
     let gate = baseline_of(&flags)?;
     let (mut engine, answerer, harness, judge) = assemble(&flags, "run")?;
+    let protect = protect_of(&flags, engine.root())?;
     let mut session = engine.session()?;
 
     let attempts = match flags.named.get("attempts") {
@@ -3479,6 +3514,7 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
     )
     .with_bounds(bounds)
     .with_baseline(gate)
+    .with_protect(protect)
     .with_scoreboard(&score_state);
     if let (Some(section), Some(writer)) = (memo.section.clone(), memo.memory.as_ref()) {
         runner = runner.with_memory(Remembering {
@@ -3546,8 +3582,25 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         ),
         None => String::new(),
     };
+    // The ruler is what the green check is worth: a short digest, and how much was frozen beside the
+    // command. A run with no protected file says so rather than implying the check covered the tests.
+    let ruler_line = match &walked.ruler {
+        Some(ruler) if ruler.files.is_empty() && ruler.rules == 0 => {
+            format!("ruler:   {} (command only)\n", ruler.short())
+        }
+        Some(ruler) if ruler.files.is_empty() => format!(
+            "ruler:   {} (command only: no protected file matched)\n",
+            ruler.short()
+        ),
+        Some(ruler) => format!(
+            "ruler:   {} ({} protected file(s))\n",
+            ruler.short(),
+            ruler.files.len()
+        ),
+        None => String::new(),
+    };
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}context: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}{ruler_line}context: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
         session.id(),
         session.len(),
         session.len() - before,
@@ -4181,6 +4234,7 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
             "minutes",
             "budget-tokens",
             "baseline",
+            "protect",
         ],
         &["strict-model"],
     )?;
@@ -4221,6 +4275,10 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
     request.insert(
         "program".to_string(),
         serde_json::json!(flags.repeated.get("program").cloned().unwrap_or_default()),
+    );
+    request.insert(
+        "protect".to_string(),
+        serde_json::json!(flags.repeated.get("protect").cloned().unwrap_or_default()),
     );
 
     let (mut text, last) = follow_socket(&socket, &serde_json::Value::Object(request))?;

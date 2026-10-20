@@ -59,6 +59,7 @@ fn profile(verify: &str, judge: bool) -> Profile {
         shadow: true,
         attempts: 3,
         minutes: 10,
+        protect: Vec::new(),
         network: true,
     }
 }

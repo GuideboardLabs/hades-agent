@@ -50,6 +50,9 @@ pub struct Facts {
     pub verdict: Option<String>,
     pub turns: Vec<Turn>,
     pub snapshot: Option<PathBuf>,
+    /// The log recorded that the verifier moved during the run. Read from the `ruler` checkpoint, so a
+    /// distilled claim cannot climb on a tampered check.
+    pub ruler_changed: bool,
 }
 
 impl Facts {
@@ -64,6 +67,7 @@ impl Facts {
                 .as_deref()
                 .and_then(crate::judge::Verdict::from_name),
             accepted: self.accepted,
+            ruler_changed: self.ruler_changed,
         }
     }
 }
@@ -85,6 +89,7 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
     let mut verdict = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut open: Option<usize> = None;
+    let mut ruler_changed = false;
 
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -171,6 +176,17 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
                 {
                     check = value.to_string();
                 }
+                if payload
+                    .get("node")
+                    .and_then(Value::as_str)
+                    .is_some_and(|node| node == "ruler")
+                    && payload
+                        .get("condition")
+                        .and_then(Value::as_str)
+                        .is_some_and(|condition| condition == "Changed")
+                {
+                    ruler_changed = true;
+                }
                 if payload.get("ended").and_then(Value::as_bool) == Some(true) {
                     let node = payload
                         .get("node")
@@ -235,6 +251,7 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
         verdict,
         turns,
         snapshot,
+        ruler_changed,
     })
 }
 

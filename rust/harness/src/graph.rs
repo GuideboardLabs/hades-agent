@@ -29,6 +29,7 @@ use crate::context::{self, Budgeted, Learned, Section, Try};
 use crate::fault::Fault;
 use crate::model::Harness;
 use crate::policy::Policy;
+use crate::profile::Protect;
 use crate::profile::{Profile, Role};
 use crate::repomap::Cache;
 use crate::route::RoutingReason;
@@ -492,6 +493,10 @@ pub enum Ended {
     /// The check passed before any change, so there was nothing to do. No model was asked and no attempt
     /// was made: this is a precondition the run refused, not a result of work.
     Satisfied,
+    /// The check or a protected file changed during the run. This is not a pass even when the check that
+    /// ran at the end is green: the verifier is not the one the run started with, so the evidence does not
+    /// belong to this run.
+    RulerChanged { attempts: u32, detail: String },
 }
 
 impl Ended {
@@ -515,6 +520,9 @@ impl Ended {
             // Nothing was attempted and nothing was changed. A script that reads 2 as "the harness could
             // not do it" is right: it could not, because the task was already done.
             Ended::Satisfied => 2,
+            // A refused result is a failure of the evidence, not of the endpoint: exit 1 says the work is
+            // not accepted, which is exactly what happened.
+            Ended::RulerChanged { .. } => 1,
         }
     }
 
@@ -536,6 +544,9 @@ impl Ended {
             Ended::Satisfied => {
                 "the check already passed before any change; nothing to do (use --baseline off to run anyway)"
                     .to_string()
+            }
+            Ended::RulerChanged { detail, .. } => {
+                format!("the check changed during the run; the result is not accepted ({detail})")
             }
         }
     }
@@ -573,6 +584,8 @@ pub struct Run {
     /// The check as it was before the first write. `None` when no check ran first, which is what
     /// `--baseline off` and a read-only profile produce.
     pub baseline: Option<crate::verify::Verification>,
+    /// The frozen check and protected files the run started with. `None` when the profile has no check.
+    pub ruler: Option<crate::ruler::Ruler>,
 }
 
 /// One candidate of a speculative attempt: its own session, its own check result, and the program it ran.
@@ -594,6 +607,7 @@ impl Run {
             Ended::Accepted { attempts, .. }
             | Ended::GaveUp { attempts, .. }
             | Ended::Awaiting { attempts, .. }
+            | Ended::RulerChanged { attempts, .. }
             | Ended::Stopped { attempts } => *attempts,
             Ended::Satisfied => 0,
         }
@@ -612,6 +626,7 @@ impl Run {
             check: self.check,
             verdict: self.verdict.as_ref().map(|judged| judged.verdict),
             accepted: matches!(self.ended, Ended::Accepted { .. }),
+            ruler_changed: matches!(self.ended, Ended::RulerChanged { .. }),
         }
     }
 }
@@ -691,6 +706,12 @@ where
     gate: BaselineGate,
     /// The check as it was before the first write, for the receipt.
     baseline: Option<crate::verify::Verification>,
+    /// Extra protected paths declared for this run, from `--protect`. The profile's defaults are added
+    /// beside them; a flag can only add, never weaken, what the profile protects.
+    protect: Vec<Protect>,
+    /// The ruler taken before the baseline check. Re-hashed after each check; a difference is a refused
+    /// result rather than a pass.
+    ruler: Option<crate::ruler::Ruler>,
 }
 
 impl<'a, S, C> Runner<'a, S, C>
@@ -729,6 +750,8 @@ where
             scoreboard: None,
             gate: BaselineGate::Red,
             baseline: None,
+            protect: Vec::new(),
+            ruler: None,
         }
     }
 
@@ -786,6 +809,86 @@ where
         self
     }
 
+    /// Add protected paths for this run. Additive on purpose: a flag cannot remove the profile's defaults.
+    pub fn with_protect(mut self, protect: Vec<Protect>) -> Self {
+        self.protect.extend(protect);
+        self
+    }
+
+    /// Every rule the ruler reads: the profile's defaults, then the run's extra paths.
+    fn protected(&self) -> Vec<Protect> {
+        let mut rules = self.profile.protect.clone();
+        rules.extend(self.protect.iter().cloned());
+        rules
+    }
+
+    /// Freeze the check and the declared files. `None` when the profile has no check to freeze.
+    fn take_ruler(&self) -> Result<Option<crate::ruler::Ruler>, Fault> {
+        let check = self.profile.verify.trim();
+        if check.is_empty() {
+            return Ok(None);
+        }
+        crate::ruler::Ruler::take(check, self.task.root(), &self.protected())
+            .map(Some)
+            .map_err(Fault::harness)
+    }
+
+    /// Re-hash after a check and name the first difference, if the verifier moved under the run.
+    fn ruler_detail(&self) -> Result<Option<String>, Fault> {
+        let Some(before) = &self.ruler else {
+            return Ok(None);
+        };
+        let now = crate::ruler::Ruler::take(&before.check, self.task.root(), &self.protected())
+            .map_err(Fault::harness)?;
+        Ok(before.diff(&now))
+    }
+
+    /// End the walk on a moved verifier. The attempt happened and its cost is kept; what is refused is
+    /// the claim, so there is no acceptance, no scoreboard pass and no memory note.
+    #[allow(clippy::too_many_arguments)]
+    fn refuse_on_ruler(
+        &mut self,
+        mut visits: Vec<Visit>,
+        learned: Learned,
+        spent: Vec<crate::task::Usage>,
+        branches: Vec<Candidate>,
+        attempts: u32,
+        detail: String,
+    ) -> Result<Run, Fault> {
+        visits.push(Visit {
+            node: "attempt".to_string(),
+            when: When::Passed,
+            why: self.graph.why("attempt", When::Passed).map(str::to_string),
+        });
+        visits.push(Visit {
+            node: "ruler".to_string(),
+            when: When::Failed,
+            why: Some("the verifier is not the one the run started with".to_string()),
+        });
+        self.session.append(
+            session_tree::Kind::Checkpoint,
+            json!({
+                "node": "ruler",
+                "condition": "Changed",
+                "detail": detail,
+                "attempt": attempts,
+            }),
+        )?;
+        Ok(Run {
+            visits,
+            ended: Ended::RulerChanged { attempts, detail },
+            learned,
+            spent,
+            branches,
+            recorded: None,
+            memory_error: None,
+            verdict: self.last_verdict.clone(),
+            check: self.last_check,
+            baseline: self.baseline.clone(),
+            ruler: self.ruler.clone(),
+        })
+    }
+
     /// Run the check once before anything is written, and record what it said. `None` when this surface
     /// does not gate: no check, a read-only role, or `--baseline off`.
     ///
@@ -840,6 +943,10 @@ where
         let prior = learned.constraints().len();
         // The gate: a check that already passes means there is no work to do. It runs before the loop, so
         // a green baseline costs one check and zero model calls.
+        //
+        // The ruler is taken first: what the check means at the start is the thing the run will be held
+        // to, and hashing after a green baseline would record a verifier nobody ran.
+        self.ruler = self.take_ruler()?;
         if let Some(baseline) = self.baseline()? {
             if baseline.state == State::Passed {
                 let why = format!(
@@ -871,6 +978,7 @@ where
                     verdict: None,
                     check: Some(State::Passed),
                     baseline: Some(baseline),
+                    ruler: self.ruler.clone(),
                 });
             }
             self.baseline = Some(baseline);
@@ -974,6 +1082,7 @@ where
                         Ended::Accepted { attempts, .. } => (*attempts, true),
                         Ended::GaveUp { attempts, .. }
                         | Ended::Awaiting { attempts, .. }
+                        | Ended::RulerChanged { attempts, .. }
                         | Ended::Stopped { attempts } => (*attempts, false),
                         Ended::Satisfied => (0, false),
                     };
@@ -1010,6 +1119,7 @@ where
                     verdict: self.last_verdict.clone(),
                     check: self.last_check,
                     baseline: self.baseline.clone(),
+                    ruler: self.ruler.clone(),
                 });
             }
 
@@ -1035,6 +1145,11 @@ where
                             attempts += made;
                             spent.extend(usage);
                             if when == When::Passed {
+                                if let Some(detail) = self.ruler_detail()? {
+                                    return self.refuse_on_ruler(
+                                        visits, learned, spent, branches, attempts, detail,
+                                    );
+                                }
                                 self.asked = Some(program);
                             }
                             // The last candidate that could run was the last the budget allowed. The spend is
@@ -1074,6 +1189,14 @@ where
                                 spent.push(usage);
                             }
                             if when == When::Passed {
+                                // A green check is not evidence when the verifier moved under the run.
+                                // The comparison is against the ruler taken before the baseline, so an
+                                // edit made on an earlier failed attempt is caught here too.
+                                if let Some(detail) = self.ruler_detail()? {
+                                    return self.refuse_on_ruler(
+                                        visits, learned, spent, branches, attempts, detail,
+                                    );
+                                }
                                 // The pass is carried to the accept node by the walk; the program rides
                                 // along so the accepted constraint can name it.
                                 self.asked = Some(program);
@@ -1336,6 +1459,7 @@ where
                         Ended::Stopped { .. } => "stopped".to_string(),
                         Ended::Accepted { .. } => "passed".to_string(),
                         Ended::Satisfied => "already satisfied".to_string(),
+                        Ended::RulerChanged { detail, .. } => detail.clone(),
                     })
             };
             let program = match &walked.ended {

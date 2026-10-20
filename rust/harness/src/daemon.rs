@@ -564,6 +564,7 @@ impl Daemon {
             &goal,
             (engine.profile().context_tokens / 10).min(2_000),
         );
+        let protect = crate::cli::protect_of(&flags, engine.root()).map_err(Fault::harness)?;
         let walked = {
             let mut runner = crate::graph::Runner::new(
                 engine.parts(
@@ -578,6 +579,7 @@ impl Daemon {
             .with_feed(&feed)
             .with_stop(cancel.as_ref())
             .with_baseline(crate::cli::baseline_of(&flags).map_err(Fault::harness)?)
+            .with_protect(protect)
             .with_scoreboard(&self.state);
             if let (Some(section), Some(writer)) = (memo.section.clone(), memo.memory.as_ref()) {
                 runner = runner.with_memory(crate::graph::Remembering {
@@ -882,6 +884,9 @@ fn ended_line(ended: &Ended) -> String {
         ),
         Ended::Stopped { attempts } => format!("stopped after {attempts} attempt(s)"),
         Ended::Satisfied => "the check already passed before any change; nothing to do".to_string(),
+        Ended::RulerChanged { detail, .. } => {
+            format!("the check changed during the run; the result is not accepted ({detail})")
+        }
     }
 }
 
