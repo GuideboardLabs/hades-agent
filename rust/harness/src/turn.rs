@@ -217,6 +217,7 @@ impl<'a> Seams<'a> {
             return Ok(Turn {
                 entries,
                 outcome: Outcome::Stopped,
+                usage: None,
             });
         }
 
@@ -239,6 +240,7 @@ impl<'a> Seams<'a> {
                     outcome: Outcome::Refused {
                         reason: ruling.reason().to_string(),
                     },
+                    usage: None,
                 });
             }
             Decision::Ask => {
@@ -266,6 +268,7 @@ impl<'a> Seams<'a> {
                 return Ok(Turn {
                     entries,
                     outcome: Outcome::Stopped,
+                    usage: None,
                 });
             }
             if plan.trim().is_empty() {
@@ -274,6 +277,7 @@ impl<'a> Seams<'a> {
                     outcome: Outcome::Unwritten {
                         reason: "the plan came back empty".to_string(),
                     },
+                    usage: None,
                 });
             }
             entries.push(session.append(
@@ -291,6 +295,7 @@ impl<'a> Seams<'a> {
             return Ok(Turn {
                 entries,
                 outcome: Outcome::Stopped,
+                usage: answer.usage(),
             });
         }
 
@@ -318,6 +323,7 @@ impl<'a> Seams<'a> {
                 outcome: Outcome::Unwritten {
                     reason: reason.clone(),
                 },
+                usage: answer.usage(),
             });
         }
         match answer.draft() {
@@ -372,6 +378,7 @@ impl<'a> Seams<'a> {
                     outcome: Outcome::Unwritten {
                         reason: reason.clone(),
                     },
+                    usage: answer.usage(),
                 })
             }
             Draft::Edits(edits) => {
@@ -408,6 +415,7 @@ impl<'a> Seams<'a> {
                         return Ok(Turn {
                             entries,
                             outcome: Outcome::Unwritten { reason },
+                            usage: answer.usage(),
                         });
                     }
                 };
@@ -427,6 +435,7 @@ impl<'a> Seams<'a> {
                         return Ok(Turn {
                             entries,
                             outcome: Outcome::Unwritten { reason },
+                            usage: answer.usage(),
                         });
                     }
                 };
@@ -550,6 +559,7 @@ impl<'a> Seams<'a> {
                 "reason": verdict.reason,
             }),
         )?);
+        let usage = total(answer.usage(), verdict.usage.as_deref().copied());
         Ok(Turn {
             entries: std::mem::take(entries),
             outcome: Outcome::Ran {
@@ -558,6 +568,7 @@ impl<'a> Seams<'a> {
                 verification,
                 verdict,
             },
+            usage,
         })
     }
 
@@ -594,6 +605,7 @@ impl<'a> Seams<'a> {
             return Ok(Some(Turn {
                 entries: std::mem::take(entries),
                 outcome: Outcome::Refused { reason },
+                usage: None,
             }));
         };
         let session_id = session.id().as_str().to_string();
@@ -633,6 +645,7 @@ impl<'a> Seams<'a> {
                 Ok(Some(Turn {
                     entries: std::mem::take(entries),
                     outcome: Outcome::Refused { reason },
+                    usage: None,
                 }))
             }
             None => {
@@ -648,6 +661,7 @@ impl<'a> Seams<'a> {
                 Ok(Some(Turn {
                     entries: std::mem::take(entries),
                     outcome: Outcome::Awaiting { question },
+                    usage: None,
                 }))
             }
         }
@@ -738,9 +752,35 @@ impl Outcome {
     }
 }
 
-/// One turn: what it appended, and how it ended.
+/// One turn: what it appended, how it ended, and what every model call it made cost.
+///
+/// `usage` is on the turn rather than only on `Ran`'s answer on purpose. An `Unwritten` answer, a
+/// `Stopped` one and a judge call all spend tokens that the endpoint reported, and a budget that only
+/// counted the turns that ran would fire later than the call that actually exhausted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
     pub entries: Vec<EntryId>,
     pub outcome: Outcome,
+    pub usage: Option<crate::task::Usage>,
+}
+
+/// The sum of two calls' usage. `None` only when neither call reported anything, so an endpoint that
+/// says nothing stays distinguishable from one that reports zero.
+fn total(
+    left: Option<crate::task::Usage>,
+    right: Option<crate::task::Usage>,
+) -> Option<crate::task::Usage> {
+    match (left, right) {
+        (None, None) => None,
+        (left, right) => {
+            let left = left.unwrap_or_default();
+            let right = right.unwrap_or_default();
+            Some(crate::task::Usage {
+                prompt_tokens: left.prompt_tokens + right.prompt_tokens,
+                generated_tokens: left.generated_tokens + right.generated_tokens,
+                millis: left.millis + right.millis,
+                reasoning_chars: left.reasoning_chars + right.reasoning_chars,
+            })
+        }
+    }
 }

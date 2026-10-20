@@ -552,7 +552,7 @@ fn scratch_base() -> std::path::PathBuf {
     // by the store, and the snapshot's never-touch test is a prefix test. The first run of this helper put the
     // store inside the tree it was copying, and the copy recursed into itself until the kernel refused the
     // file name.
-    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/scratch");
+    let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }
@@ -829,4 +829,101 @@ fn a_branch_with_no_pass_names_the_best_partial() {
         Ended::GaveUp { reason, .. } => assert!(reason.contains("2/3"), "{reason}"),
         other => panic!("expected a give-up, got {other:?}"),
     }
+}
+
+/// A judge whose call costs tokens, as the endpoint judge does when it reports usage.
+struct CostlyJudge;
+
+impl harness::judge::Evaluator for CostlyJudge {
+    fn judge(&self, _report: &harness::judge::Report<'_>) -> harness::judge::Judgement {
+        harness::judge::Judgement::new(harness::judge::Verdict::NotYet, "not the file yet")
+            .with_usage(Usage {
+                prompt_tokens: 400,
+                generated_tokens: 0,
+                millis: 2,
+                reasoning_chars: 0,
+            })
+    }
+}
+
+#[test]
+fn a_judged_run_counts_the_judge_call_against_the_token_budget() {
+    // The answer costs 800 and the judge costs 400. A budget of 1,200 is spent after one attempt only if
+    // both calls are counted; counting the answer alone would let the judge spend for free.
+    let rig = Rig::new(
+        "judge-tokens",
+        "test -f never.txt",
+        open(),
+        ScriptedModel::answers([ModelAnswer::new("true").with_usage(Usage {
+            prompt_tokens: 800,
+            generated_tokens: 0,
+            millis: 3,
+            reasoning_chars: 0,
+        })]),
+    );
+    let mut rig = rig;
+    rig.profile.judge = true;
+    let mut session = rig.session("judge-tokens");
+    let mut cache = Cache::new();
+    let judge = CostlyJudge;
+    let mut runner = Runner::new(rig.parts_judged(&judge, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10).with_tokens(1200));
+    let walked = runner.run().expect("a walk");
+
+    assert_eq!(
+        walked.attempts(),
+        1,
+        "the judge's call spent the last of it"
+    );
+    assert_eq!(walked.spent.len(), 1, "one attempt, one total");
+    assert_eq!(walked.spent[0].prompt_tokens, 1200, "{:?}", walked.spent);
+    assert_eq!(walked.ended.cause(), Some(Exhausted::Tokens));
+}
+
+#[test]
+fn a_run_that_writes_nothing_still_pays_for_every_call() {
+    // Two answers that write nothing, 600 tokens each, against a budget of 1,200. The second call is the
+    // one that spends the budget, so the run must stop after it rather than take a third.
+    let rig = Rig::new(
+        "unwritten-tokens",
+        "test -f never.txt",
+        open(),
+        ScriptedModel::answers([
+            ModelAnswer::refused("not a program").with_usage(Usage {
+                prompt_tokens: 600,
+                generated_tokens: 0,
+                millis: 1,
+                reasoning_chars: 0,
+            }),
+            ModelAnswer::refused("still not a program").with_usage(Usage {
+                prompt_tokens: 600,
+                generated_tokens: 0,
+                millis: 1,
+                reasoning_chars: 0,
+            }),
+            ModelAnswer::refused("a third call that must not happen"),
+        ]),
+    );
+    let mut session = rig.session("unwritten-tokens");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(3, 10).with_tokens(1200));
+    let walked = runner.run().expect("a walk");
+
+    assert_eq!(walked.attempts(), 2, "the budget fired on the second call");
+    assert_eq!(
+        walked.spent.len(),
+        2,
+        "both calls are on the record: {:?}",
+        walked.spent
+    );
+    assert_eq!(
+        walked
+            .spent
+            .iter()
+            .map(|usage| usage.prompt_tokens)
+            .sum::<u64>(),
+        1200
+    );
+    assert_eq!(walked.ended.cause(), Some(Exhausted::Tokens));
 }
