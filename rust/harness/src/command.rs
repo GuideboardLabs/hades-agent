@@ -40,7 +40,7 @@ impl Run {
 /// Run `program` through `sh -c` in `root`, keeping at most `limit` bytes of output, confined by `cage`
 /// when there is one.
 pub fn run(program: &str, root: &Path, limit: usize, cage: Option<&Cage>) -> Result<Run, Fault> {
-    run_inner(program, root, limit, cage, None, false)
+    run_inner(program, root, limit, cage, None, false, None)
 }
 
 /// Run a *model's* program with an environment it cannot read secrets out of.
@@ -54,7 +54,23 @@ pub fn run_clean(
     limit: usize,
     cage: Option<&Cage>,
 ) -> Result<Run, Fault> {
-    run_inner(program, root, limit, cage, None, true)
+    run_clean_in(program, root, limit, cage, None)
+}
+
+/// [`run_clean`] with a temporary directory the program may actually write in.
+///
+/// A caged program that calls `tempfile` or writes `$TMPDIR/x` reads the variable the harness inherited,
+/// which points into the live install and is denied by the cage; the error then reads like a broken
+/// toolchain. The directory is made here, named in the environment, and expected to be granted writable by
+/// the caller's cage, which is the only arrangement in which the three agree.
+pub fn run_clean_in(
+    program: &str,
+    root: &Path,
+    limit: usize,
+    cage: Option<&Cage>,
+    tmp: Option<&Path>,
+) -> Result<Run, Fault> {
+    run_inner(program, root, limit, cage, None, true, tmp)
 }
 
 /// What a model-run program may see. Paths and locale only; no `*_KEY`, `*_TOKEN`, `*_SECRET`, and no
@@ -95,7 +111,7 @@ pub fn run_within(
     cage: Option<&Cage>,
     deadline: Option<std::time::Duration>,
 ) -> Result<Run, Fault> {
-    run_inner(program, root, limit, cage, deadline, false)
+    run_inner(program, root, limit, cage, deadline, false, None)
 }
 
 fn run_inner(
@@ -105,6 +121,7 @@ fn run_inner(
     cage: Option<&Cage>,
     deadline: Option<std::time::Duration>,
     clean: bool,
+    tmp: Option<&Path>,
 ) -> Result<Run, Fault> {
     let plan = cage.map(|cage| cage.plan()).transpose()?;
     let mut command = Process::new("sh");
@@ -124,6 +141,17 @@ fn run_inner(
         for (key, value) in clean_environment() {
             command.env(key, value);
         }
+    }
+    // After the passlist, so it is the last word: a model's program must find a temp directory it can
+    // write in, and the one this process inherited is inside the live install that the cage denies.
+    if let Some(tmp) = tmp {
+        std::fs::create_dir_all(tmp).map_err(|error| {
+            Fault::harness(format!("could not make {}: {error}", tmp.display()))
+        })?;
+        command
+            .env("TMPDIR", tmp)
+            .env("TMP", tmp)
+            .env("TEMP", tmp);
     }
 
     if let Some(plan) = plan {
@@ -451,6 +479,47 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_caged_program_has_a_writable_tmpdir() {
+        // `tempfile` and every `$TMPDIR` write read the variable the harness inherited, which points into
+        // the live install and is denied by the cage. Setting it is half the fix; the cage has to grant the
+        // same directory, or the program gets a path it still cannot write.
+        let state = crate::scratch::root().join("tmpdir-cage");
+        let _ = std::fs::remove_dir_all(&state);
+        let work = state.join("work");
+        let scratch = state.join("tmp");
+        std::fs::create_dir_all(&work).expect("a work root");
+        std::fs::create_dir_all(&scratch).expect("a scratch");
+        let cage = Cage::chat(&work, &scratch);
+        let run = run_clean_in(
+            "printf '%s\\n' \"$TMPDIR\"; touch \"$TMPDIR/probe\" && echo wrote",
+            &work,
+            4000,
+            Some(&cage),
+            Some(&scratch),
+        )
+        .expect("a run");
+        assert!(
+            run.output.contains(scratch.to_str().expect("utf8")),
+            "{}",
+            run.output
+        );
+        assert!(run.output.contains("wrote"), "{}", run.output);
+        assert!(scratch.join("probe").exists(), "the file did not land");
+
+        // The twin: without the variable the same write lands in a denied path, which is the failure this
+        // exists to stop a model from diagnosing as a broken toolchain.
+        let bare = run_clean_in(
+            "touch \"$TMPDIR/probe2\" && echo wrote",
+            &work,
+            4000,
+            Some(&cage),
+            None,
+        )
+        .expect("a run");
+        assert!(!bare.output.contains("wrote"), "{}", bare.output);
     }
 
     #[test]

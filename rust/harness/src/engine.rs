@@ -137,8 +137,10 @@ impl Engine {
             // `with_runtimes()` asks each interpreter where its own standard library lives, because a
             // Python whose prefix is outside the granted paths dies before it runs a line. Leaving it off
             // is the bug this module was extracted to stop repeating.
-            let cage = base.also_writable(scratch).with_runtimes();
-            Shell::new(spec.root.clone(), LIMIT).caged(cage)
+            let cage = base.also_writable(scratch.clone()).with_runtimes();
+            Shell::new(spec.root.clone(), LIMIT)
+                .caged(cage)
+                .with_tmp(scratch)
         } else {
             Shell::new(spec.root.clone(), LIMIT)
         };

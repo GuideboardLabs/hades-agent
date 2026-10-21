@@ -54,6 +54,9 @@ pub struct Shell {
     root: PathBuf,
     limit: usize,
     cage: Option<Cage>,
+    /// Where a model's program may write temporary files. `None` leaves the inherited `TMPDIR` alone, which
+    /// under a cage is a path the program cannot use.
+    tmp: Option<PathBuf>,
 }
 
 impl Shell {
@@ -64,12 +67,19 @@ impl Shell {
             root: root.into(),
             limit,
             cage: None,
+            tmp: None,
         }
     }
 
     /// The same shell, confined. This is what a run should use, and the CLI does.
     pub fn caged(mut self, cage: Cage) -> Self {
         self.cage = Some(cage);
+        self
+    }
+
+    /// The directory the program's `TMPDIR` points at. The caller's cage must grant it writable.
+    pub fn with_tmp(mut self, tmp: impl Into<PathBuf>) -> Self {
+        self.tmp = Some(tmp.into());
         self
     }
 
@@ -98,7 +108,13 @@ impl Tool for Shell {
     /// model was never given. The checker is not this tool; it runs as the caller's own command and keeps
     /// the caller's environment (`verify.rs`), which is the deliberate difference.
     fn call(&self, call: &Call) -> Result<Run, Fault> {
-        command::run_clean(&call.program, &self.root, self.limit, self.cage.as_ref())
+        command::run_clean_in(
+            &call.program,
+            &self.root,
+            self.limit,
+            self.cage.as_ref(),
+            self.tmp.as_deref(),
+        )
     }
 
     fn describe(&self) -> String {
