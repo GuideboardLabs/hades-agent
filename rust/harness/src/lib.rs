@@ -56,6 +56,8 @@ pub mod engine;
 pub mod eval;
 pub mod fault;
 pub mod fetch;
+// libcurl loaded at run time: one connection pool for a run, and a fallback when it is absent.
+mod fetch_pool;
 pub mod floor;
 pub mod gateway;
 pub mod graph;

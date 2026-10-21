@@ -496,7 +496,7 @@ fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, St
         let max_time = remaining_seconds(deadline)?;
         let target = Target::parse(&current)?;
         let address = resolve(&target, allow_private)?;
-        match call(&target, &current, address, max_time, ca)? {
+        match hop(&target, &current, address, max_time, ca)? {
             Outcome::Page(bytes) => return Ok(String::from_utf8_lossy(&bytes).to_string()),
             Outcome::Oversize => {
                 return Err(
@@ -602,6 +602,51 @@ fn call(
     })
 }
 
+/// One hop, through the shared libcurl handle when there is one and through a child process when there
+/// is not. The pool is an optimisation: anything it cannot do, or does without a sentence, is handed to
+/// the path that has been answering all along, so a missing `libcurl.so.4` changes the bill and not the
+/// behaviour.
+fn hop(
+    target: &Target,
+    url: &str,
+    address: IpAddr,
+    max_time: u64,
+    ca: Option<&Path>,
+) -> Result<Outcome, String> {
+    if let Some(result) = crate::fetch_pool::get(
+        url,
+        &target.host,
+        target.port,
+        address,
+        max_time,
+        BODY_CAP as usize,
+        ca,
+    ) {
+        return match result {
+            Ok((status, body, headers)) => {
+                let text = String::from_utf8_lossy(&headers);
+                match location_in(&text) {
+                    Some(value) => Ok(Outcome::Redirect(value)),
+                    // A `204`, a `304` or a `3xx` this tool does not follow: the body is the answer,
+                    // and a body is what the caller gets.
+                    None => {
+                        let _ = status;
+                        Ok(Outcome::Page(body))
+                    }
+                }
+            }
+            // `--max-filesize` in the process path reports 63; the pool reports the same trip as a
+            // short write. Both are the cap, and the wording belongs to this module, not to curl.
+            Err(reason) if reason == "cap" => Ok(Outcome::Oversize),
+            // No sentence means the failure has nothing the model can act on, so the process path
+            // answers instead and quotes curl itself.
+            Err(reason) if reason.is_empty() => call(target, url, address, max_time, ca),
+            Err(reason) => Err(clip_ref(&reason, 300)),
+        };
+    }
+    call(target, url, address, max_time, ca)
+}
+
 /// The argument vector one hop runs with, split out so a test can read exactly what curl is handed
 /// without a server. The protocol walls, the redirects-off switch, the clock, the two scratch files,
 /// the pin and - only for the TLS fixture - a CA file are all here; `call` adds only the process's
@@ -658,6 +703,12 @@ fn curl_args(
 fn read_location(headers: &Path) -> Result<Option<String>, String> {
     let text = std::fs::read_to_string(headers)
         .map_err(|error| format!("could not read curl's headers: {error}"))?;
+    Ok(location_in(&text))
+}
+
+/// The same reading, over header bytes already in memory. Two callers, one parser: a second copy is a
+/// second chance for the redirect rule to disagree with itself.
+fn location_in(text: &str) -> Option<String> {
     let mut redirected = false;
     let mut location: Option<String> = None;
     for line in text.lines() {
@@ -687,7 +738,7 @@ fn read_location(headers: &Path) -> Result<Option<String>, String> {
             location = Some(value.trim().to_string());
         }
     }
-    Ok(location.filter(|_| redirected))
+    location.filter(|_| redirected)
 }
 
 /// Resolve a `Location` against the URL it came from. The shapes that matter, in the order they are
@@ -1075,6 +1126,41 @@ mod tests {
 
     /// The scratch directory is `0700`, and `Drop` removes it: the same guard every exit path in
     /// `call` gets, exercised on its own first.
+    /// The pin has to be per transfer, which is exactly what the process path's `--resolve` cannot be.
+    ///
+    /// Two sites, both named `localhost`, both on loopback and both private: the only thing that tells
+    /// them apart is the port the pin names. If the pin were global (or applied once and left in place),
+    /// the second fetch would reach the first site and answer with its body.
+    #[test]
+    fn the_second_host_of_a_run_is_pinned_to_its_own_address() {
+        let first = site(&[(b"/", b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")]);
+        let second = site(&[(b"/", b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")]);
+        let one = run(&first.named("/"), 12_000, true);
+        let two = run(&second.named("/"), 12_000, true);
+        assert_eq!(one, "first\n");
+        assert_eq!(two, "second\n");
+        // And again in the other order, so a pin that only survives one direction does not pass.
+        assert_eq!(run(&second.named("/"), 12_000, true), "second\n");
+        assert_eq!(run(&first.named("/"), 12_000, true), "first\n");
+    }
+
+    /// The pool is an optimisation, so switching it off has to leave the tool working rather than degrade
+    /// it: this is the path a machine without `libcurl.so.4` takes.
+    #[test]
+    fn the_process_path_still_answers_when_the_pool_is_off() {
+        let fixture = site(&[(b"/", b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nback")]);
+        // SAFETY: no other test in this binary reads this variable concurrently; the fetches below are
+        // the only readers and they run on this thread.
+        unsafe {
+            std::env::set_var("HADES_FETCH_POOL", "off");
+        }
+        let pooled_off = run(&fixture.url("/"), 12_000, true);
+        unsafe {
+            std::env::remove_var("HADES_FETCH_POOL");
+        }
+        assert_eq!(pooled_off, "back\n");
+    }
+
     #[test]
     fn a_scratched_call_leaves_no_directory_behind() {
         let scratch = Scratch::new().expect("a scratch directory");
@@ -1114,10 +1200,9 @@ mod tests {
         let said = run(&fixture.url("/"), 12_000, true);
         assert!(said.contains("cap"), "{said}");
         let made = scratch_made();
-        assert!(
-            !made.is_empty(),
-            "the oversize call made a scratch directory"
-        );
+        // The pool path holds the body in memory and makes no directory at all; the child path makes one
+        // and removes it. Both are covered: `a_scratched_call_leaves_no_directory_behind` drives the
+        // child directly, so this test only has to prove that whatever was made is gone.
         for path in made {
             assert!(
                 !path.exists(),
@@ -1136,8 +1221,8 @@ mod tests {
         assert!(said.contains("curl: ("), "curl's stderr is missing: {said}");
         let made = scratch_made();
         assert!(
-            !made.is_empty(),
-            "the failing call made a scratch directory"
+            made.is_empty() || made.iter().all(|path| !path.exists()),
+            "the failing call left a scratch directory"
         );
         for path in made {
             assert!(
@@ -1468,6 +1553,11 @@ mod tests {
         /// The URL for one path on this site: loopback as the host, the port that was bound.
         fn url(&self, path: &str) -> String {
             format!("http://127.0.0.1:{}{path}", self.port)
+        }
+
+        /// The same site named by host, which is the shape that needs a pin.
+        fn named(&self, path: &str) -> String {
+            format!("http://localhost:{}{path}", self.port)
         }
     }
 

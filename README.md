@@ -952,11 +952,14 @@ These are current limits, not aspirations hidden in a roadmap:
 - The floor reads text. `--policy strict` is a deny list over the same text, so an obfuscated command
   (`r''m -rf`, `$(printf rm)`) is not caught by either. The cage is the bound the kernel enforces.
 - Crash recovery reports an interrupted run and does not replay it. The marker is in `<state>/inflight/`.
-- Every fetch is a `curl` process. Measured at 8.9 ms/fetch against 1.7 ms over one keep-alive
-  connection on a loopback fixture, so about 81% of fetch wall time is process startup. A persistent
-  client is deferred, with the guarantees it must keep, in [`docs/fetch-benchmark.md`](docs/fetch-benchmark.md).
-- Unix-socket connects are only refused by Landlock on ABI 9 (Linux 7.1). On ABI 8 the answer is
-  `--cage strict`, which is a path grant change, not a socket rule.
+- Fetches share one libcurl handle, loaded at run time, so a run keeps its connections and TLS sessions:
+  0.53 ms per fetch on a loopback fixture and 19.5 ms against a page on the internet, where a process per
+  fetch costs 9.2 ms and 67.5 ms. `libcurl.so.4` is optional; without it, or with `HADES_FETCH_POOL=off`,
+  the tool falls back to one `curl` process per fetch and behaves identically. The numbers and the
+  guarantees both paths keep are in [`docs/fetch-benchmark.md`](docs/fetch-benchmark.md).
+- Unix-socket connects are refused by Landlock only on ABI 9 (Linux 7.1). This is a property of the
+  kernel, not of the cage: on an ABI 8 kernel the same protection is `--cage strict`, which narrows the
+  paths a caged program may reach. `hades doctor` prints the ABI and names the flag.
 
 ---
 

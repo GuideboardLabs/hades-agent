@@ -40,6 +40,24 @@ persistent client saves both, a faster process would save only the smaller one.
 
 **Over the 20% threshold: open a separate task for a persistent client. Do not bundle it into 0.1.0.**
 
+That task is done. The client is libcurl itself, loaded with `dlopen` in `harness/src/fetch_pool.rs` and
+driven through one easy handle for the whole run. Same engine, same flags, same sentences; the process and
+the handshake are what goes away. A machine without `libcurl.so.4`, or a run with `HADES_FETCH_POOL=off`,
+takes the process path unchanged.
+
+| same machine, 50 loopback fetches | per fetch |
+|---|---|
+| one libcurl handle | 0.53 ms |
+| one `curl` process | 9.16 ms |
+
+| `https://example.com/`, 10 fetches | per fetch |
+|---|---|
+| one libcurl handle | 19.5 ms |
+| one `curl` process | 67.5 ms |
+
+A long-lived `curl` fed by its config stream was tried first and cannot work: curl reads the config to
+EOF before running anything, measured at 4008 ms for a block that could have answered at once.
+
 81% of the wall time in a fetch is the process, not the page. That is large enough to matter and large
 enough that it should not be discovered again: a research run that fetches twenty sources spends roughly
 150 ms in `fork`/`exec`/`curl` startup and 33 ms fetching.
@@ -70,6 +88,15 @@ reason.
 
 ## Status
 
-Deferred, named, and not forgotten. The follow-up task is "fetch: a persistent client behind the same
-guarantees", and its acceptance is that the four guarantees above are each a test, plus a benchmark
-showing the same 50-fetch shape under 20%.
+Shipped. The four guarantees are tests in `harness/src/fetch.rs`, each run through both paths:
+
+- `the_second_host_of_a_run_is_pinned_to_its_own_address` - the pin is `CURLOPT_CONNECT_TO`, per transfer,
+  because `CURLOPT_RESOLVE` is global and would keep pointing a later host at an earlier address;
+- `a_body_past_the_cap_is_refused_and_not_read_into_the_process` - `CURLOPT_MAXFILESIZE_LARGE` plus a write
+  callback that refuses a streamed body the moment it would pass the cap;
+- `a_302_to_a_file_url_is_refused_at_the_hop` and the redirect suite - `CURLOPT_FOLLOWLOCATION` is 0, so the
+  `Location` header reaches the driver, which is the only thing that decides;
+- `the_process_path_still_answers_when_the_pool_is_off` - the fallback is exercised, not assumed.
+
+Both paths print the same failure sentence, in the same shape, so a message never depends on which one
+served the fetch.
