@@ -13,10 +13,12 @@
 //! - `wait` waits for a condition with a deadline, instead of sleeping and hoping.
 //! - `eval` remains an escape hatch, and `screenshot` is for when text is not enough.
 //!
-//! One browser process is shared for the life of the harness. A call that fails kills it; the next call
-//! starts a clean one. The profile under `<state>/browser/profile` survives, so cookies and logins do.
+//! One browser process per state directory, shared for the life of the harness. A call that fails kills
+//! that state's process; the next call starts a clean one. A state's session sits unused for fifteen
+//! minutes and it is closed on the next call, so an abandoned tab does not hold a profile lock for the
+//! lifetime of the process. The profile under `<state>/browser/profile` survives, so cookies and logins do.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -24,11 +26,36 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+/// How long a state's browser may sit unused before it is closed on the next call. A session holds a child
+/// process, a profile lock and a pipe, so an abandoned one is not free.
+const IDLE: Duration = Duration::from_secs(15 * 60);
+
+/// One live session per state directory, keyed by the resolved path.
+///
+/// A single global session meant two state directories shared tabs, cookies and downloads: the second
+/// caller silently drove the first caller's page. The key is what keeps a test, a daemon and a replay from
+/// colliding without anyone having to remember they must not.
+struct Held {
+    session: Session,
+    last_used: Instant,
+}
+
+static SESSIONS: Mutex<BTreeMap<PathBuf, Held>> = Mutex::new(BTreeMap::new());
+
+/// The key a state directory is held under: the resolved path when it exists, the path as given when it
+/// does not, so two spellings of one directory never become two sessions.
+fn session_key(state: &Path) -> PathBuf {
+    std::fs::canonicalize(state).unwrap_or_else(|_| state.to_path_buf())
+}
+
+/// Whether a session has been unused long enough to close.
+fn stale(now: Instant, last_used: Instant) -> bool {
+    now.saturating_duration_since(last_used) >= IDLE
+}
 
 /// Which URL schemes this browser session may navigate to. Production denies `file://`; a fixture session
 /// that loads a local page opts in. The policy lives on the session, not in a `cfg(test)` constructor,
@@ -166,34 +193,63 @@ pub fn tool(args: &Value, state: &Path) -> String {
     if action.is_empty() {
         return "no action given".to_string();
     }
-    let mut held = match SESSION.lock() {
+    let key = session_key(state);
+    let mut held = match SESSIONS.lock() {
         Ok(held) => held,
         Err(poisoned) => poisoned.into_inner(),
     };
 
+    // Sweep before use, not on a timer: a session that is closed here is one whose next call has not come
+    // yet, and a call is the only moment this process knows it is still alive.
+    let now = Instant::now();
+    let idle: Vec<PathBuf> = held
+        .iter()
+        .filter(|(_, session)| stale(now, session.last_used))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in idle {
+        if let Some(mut session) = held.remove(&key) {
+            session.session.close();
+        }
+    }
+
     if action == "close" {
-        if let Some(mut session) = held.take() {
-            session.close();
+        if let Some(mut session) = held.remove(&key) {
+            session.session.close();
         }
         return "browser closed".to_string();
     }
 
-    if held.is_none() {
+    if !held.contains_key(&key) {
         match Session::start(state) {
-            Ok(session) => *held = Some(session),
+            Ok(session) => {
+                held.insert(
+                    key.clone(),
+                    Held {
+                        session,
+                        last_used: now,
+                    },
+                );
+            }
             Err(said) => return said,
         }
     }
-    let result = match held.as_mut() {
-        Some(session) => session.act(action, args),
+    let result = match held.get_mut(&key) {
+        Some(held) => held.session.act(action, args),
         None => Err("the browser did not start".to_string()),
     };
     match result {
-        Ok(said) => said,
+        Ok(said) => {
+            if let Some(held) = held.get_mut(&key) {
+                held.last_used = Instant::now();
+            }
+            said
+        }
         Err(said) => {
-            // The pipe or the page is no longer trustworthy. Drop the child; the next call starts clean.
-            if let Some(session) = held.take() {
-                drop(session);
+            // The pipe or the page is no longer trustworthy. Drop this state's child only; another state's
+            // session has nothing to do with this failure.
+            if let Some(mut held) = held.remove(&key) {
+                held.session.close();
             }
             format!("the browser failed: {said}")
         }
@@ -2906,15 +2962,25 @@ mod tests {
 
     /// A fixture page is a `file://` URL. The session opts in explicitly; production never calls this.
     fn allow_local(state: &std::path::Path) {
-        let mut held = match SESSION.lock() {
+        let key = session_key(state);
+        let mut held = match SESSIONS.lock() {
             Ok(held) => held,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(session) = held.as_mut() {
-            session.policy = BrowserPolicy::permit_local();
+        if let Some(session) = held.get_mut(&key) {
+            session.session.policy = BrowserPolicy::permit_local();
+            session.last_used = Instant::now();
         } else {
             match Session::start_with(state, BrowserPolicy::permit_local()) {
-                Ok(session) => *held = Some(session),
+                Ok(session) => {
+                    held.insert(
+                        key,
+                        Held {
+                            session,
+                            last_used: Instant::now(),
+                        },
+                    );
+                }
                 Err(said) => panic!("the fixture browser did not start: {said}"),
             }
         }
@@ -2967,6 +3033,29 @@ mod tests {
         std::os::unix::fs::symlink("/tmp", root.join("downloads")).expect("symlink");
         let said = state_paths(&state).expect_err("a link out of the root is not a download directory");
         assert!(said.contains("outside"), "{said}");
+    }
+
+    #[test]
+    fn two_states_get_two_session_keys() {
+        assert_ne!(
+            session_key(Path::new("/a/state")),
+            session_key(Path::new("/b/state"))
+        );
+        // One directory spelled two ways is one key once it exists.
+        let state = crate::scratch::root().join("browser-keys");
+        std::fs::create_dir_all(&state).expect("a state directory");
+        let resolved = std::fs::canonicalize(&state).expect("resolves");
+        assert_eq!(session_key(&resolved), session_key(&resolved));
+        assert_eq!(session_key(&state), session_key(&resolved));
+    }
+
+    #[test]
+    fn an_unused_session_goes_stale_at_the_idle_limit() {
+        let now = Instant::now();
+        assert!(!stale(now, now));
+        assert!(!stale(now, now - (IDLE - Duration::from_secs(1))));
+        assert!(stale(now, now - IDLE));
+        assert!(stale(now, now - (IDLE + Duration::from_secs(1))));
     }
 
     #[test]
