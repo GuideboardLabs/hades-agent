@@ -262,9 +262,9 @@ pub struct Profile {
     pub id: ProfileId,
     /// What the profile may do. Enforced in the tool schema and in `execute`.
     pub role: Role,
-    /// The model this kind of work asks for. Advisory until an independent verifier is chosen; a run
-    /// uses `--model`, then the config, and records this value in the session. See HADES.md.
-    pub model: String,
+    /// The model this profile asks for. `None` inherits the run's model; `Some` names a preset and
+    /// outranks the config, while `--model` outranks both.
+    pub model: Option<String>,
     pub effort: Effort,
     pub context_tokens: usize,
     /// The command that decides whether the work is done. A command, not a language server: a language
@@ -302,6 +302,11 @@ impl Profile {
     pub fn budget(&self) -> Budget {
         Budget::new(self.context_tokens)
     }
+
+    /// The model this profile asks for, or the run's model when it asks for none.
+    pub fn model_or<'a>(&'a self, run: &'a str) -> &'a str {
+        self.model.as_deref().unwrap_or(run)
+    }
 }
 
 /// What the shipped editing profiles freeze: the files whose contents decide what the check runs.
@@ -330,12 +335,16 @@ fn build_config() -> Vec<Protect> {
 
 /// The profiles this build ships. Rules name them, and nothing here is tuned: these are the starting
 /// parameters, listed in one place so that changing one is a visible act rather than a scattered edit.
+///
+/// No shipped profile pins a model. A profile may name a preset; when it does not, it runs the model
+/// the config names. That keeps the default honest: a profile is a shape for the work, not a second
+/// vendor account.
 pub fn shipped() -> Vec<Profile> {
     vec![
         Profile {
             id: ProfileId::new("fix"),
             role: Role::Patch,
-            model: "deepseek-v4.1-flash".to_string(),
+            model: None,
             effort: Effort::Medium,
             context_tokens: 32_000,
             verify: "cargo test --quiet".to_string(),
@@ -351,7 +360,7 @@ pub fn shipped() -> Vec<Profile> {
         Profile {
             id: ProfileId::new("sweep"),
             role: Role::Sweep,
-            model: "deepseek-v4.1-flash".to_string(),
+            model: None,
             effort: Effort::High,
             context_tokens: 96_000,
             verify: "cargo test --quiet".to_string(),
@@ -367,7 +376,7 @@ pub fn shipped() -> Vec<Profile> {
         Profile {
             id: ProfileId::new("survey"),
             role: Role::Survey,
-            model: "deepseek-v4.1-flash".to_string(),
+            model: None,
             effort: Effort::Low,
             context_tokens: 16_000,
             // A read-only profile's check is that nothing changed, so the check is the diff.
@@ -384,9 +393,7 @@ pub fn shipped() -> Vec<Profile> {
         Profile {
             id: ProfileId::new("verify"),
             role: Role::Verify,
-            // A different model from the one patch and sweep produce with: an independent check is not a
-            // second opinion from the same voice. This is the "sentinel never verifies itself" rule as data.
-            model: "glm-5.3-flash".to_string(),
+            model: None,
             effort: Effort::Medium,
             context_tokens: 32_000,
             verify: "git diff --exit-code".to_string(),
@@ -402,7 +409,7 @@ pub fn shipped() -> Vec<Profile> {
         Profile {
             id: ProfileId::new("record"),
             role: Role::Record,
-            model: "deepseek-v4.1-flash".to_string(),
+            model: None,
             effort: Effort::Low,
             context_tokens: 16_000,
             verify: "git diff --exit-code".to_string(),
@@ -439,7 +446,7 @@ pub fn parameter_text() -> String {
             "profile {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
             profile.id.as_str(),
             profile.role.name(),
-            profile.model,
+            profile.model.as_deref().unwrap_or("inherit"),
             profile.effort.name(),
             profile.context_tokens,
             profile.verify,
@@ -545,12 +552,21 @@ mod tests {
     }
 
     #[test]
-    fn the_verifier_does_not_run_on_the_producers_model() {
-        let patch = named("fix").expect("fix");
-        let sweep = named("sweep").expect("sweep");
-        let verify = named("verify").expect("verify");
-        assert_ne!(verify.model, patch.model);
-        assert_ne!(verify.model, sweep.model);
+    fn no_shipped_profile_pins_a_model_and_an_override_wins() {
+        for profile in shipped() {
+            assert!(
+                profile.model.is_none(),
+                "{} pins a model; the run's model is the default",
+                profile.id
+            );
+        }
+        let mut verify = named("verify").expect("verify");
+        assert_eq!(
+            verify.model_or("deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+        verify.model = Some("nanbeige-3b".to_string());
+        assert_eq!(verify.model_or("deepseek-v4.1-flash"), "nanbeige-3b");
         assert!(!verify.edits);
     }
 

@@ -306,7 +306,7 @@ fn profiles_lists_what_the_build_ships() {
     for id in ["fix", "sweep", "survey"] {
         assert!(text.contains(id), "{id} is missing");
     }
-    assert!(text.contains("deepseek-v4.1-flash"), "{text}");
+    assert!(text.contains("inherit"), "{text}");
     assert!(text.contains("cargo test --quiet"), "{text}");
 }
 
@@ -315,6 +315,7 @@ fn route_says_which_profile_and_why() {
     let (code, text) = hades(&["route", "fix the broken parser"]);
     assert_eq!(code, 0);
     assert!(text.contains("profile: fix"), "{text}");
+    assert!(text.contains("model:   inherit"), "{text}");
     assert!(text.contains("reason:"), "{text}");
 
     let (code, text) = hades(&["route", "make it nicer somehow"]);

@@ -233,7 +233,7 @@ fn a_run_with_no_model_reads_the_preset_from_the_config() {
     );
     assert_eq!(code, 2, "{text}");
     assert!(
-        text.contains("the config names model `not-a-preset`"),
+        text.contains("the model `not-a-preset` has no preset"),
         "{text}"
     );
 }

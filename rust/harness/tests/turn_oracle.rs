@@ -49,7 +49,7 @@ fn profile(verify: &str, judge: bool) -> Profile {
     Profile {
         id: ProfileId::new("test"),
         role: Role::Patch,
-        model: "scripted".to_string(),
+        model: Some("scripted".to_string()),
         effort: Effort::Medium,
         context_tokens: 4096,
         verify: verify.to_string(),

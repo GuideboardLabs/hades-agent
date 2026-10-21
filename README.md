@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.12-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-898%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.13-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-901%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.12 |
+| **Version** | 0.0.13 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,14 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 898 passing, 13 ignored live tests |
+| **Tests** | 901 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.13 adds
+
+- **Profiles can name a model, and inherit one when they do not.** `--model` still wins, then the profile's preset, then the config. No shipped profile pins a model, so `verify` no longer asks for a preset this build does not ship.
+- **`hades profiles` and `hades route` say `inherit`** where a profile has no model of its own.
 
 ## What 0.0.12 adds
 
@@ -72,7 +77,7 @@ The limits left by 0.0.11 are closed, or written down where they are decisions.
 - **An import is one transaction.** A failure after the first note rolls back every row it wrote, including the exported hash. The success path and the rollback path each have a test.
 - **`hades audit --refresh`** imports the config's vault, refreshes `INDEX.md` and audits what is on disk. It is refused with `--vault`, where the import already happens on a throwaway record.
 - **The clean-home acceptance script names six areas** and probes one creation verb, so the packaged install is checked against the vault the binary actually writes.
-- **The residual limits have a ledger** in `HADES.md`: `profile.model` is advisory, the TUI is a chat surface, Discord is deferred, the network is per role, WEFT stays read-only, and `skills report` does not estimate unmeasured numbers.
+- **The residual limits have a ledger** in `HADES.md`: the TUI is a chat surface, Discord is deferred, the network is per role, WEFT stays read-only, and `skills report` does not estimate unmeasured numbers.
 
 ## What 0.0.11 adds
 

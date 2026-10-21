@@ -1107,6 +1107,7 @@ fn answerer(
     flags: &Flags,
     config: Option<&config::Config>,
     harness: Option<&crate::harness_files::Files>,
+    profile_model: Option<&str>,
 ) -> Result<Answerer, String> {
     let mut open = match flags.named.get("model") {
         Some(model_id) => match flags.named.get("endpoint") {
@@ -1151,11 +1152,11 @@ fn answerer(
             // on: it was started with no arguments and has nobody to ask, but it does have a file.
             match config {
                 Some(config) => {
-                    let preset = model::preset(&config.model).ok_or_else(|| {
+                    let chosen = profile_model.unwrap_or(&config.model);
+                    let preset = model::preset(chosen).ok_or_else(|| {
                         format!(
-                            "the config names model `{}`, which this build has no preset for. Run \
-                             `hades init --model <preset>` again, or pass --model: {}",
-                            config.model,
+                            "the model `{chosen}` has no preset in this build. Run `hades init --model \
+                             <preset>` again, name a profile model that exists, or pass --model: {}",
                             model::presets()
                                 .iter()
                                 .map(|preset| preset.id)
@@ -1636,7 +1637,7 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
     let mut candidates: Vec<(String, std::path::PathBuf, String)> = Vec::new();
 
     if given.is_empty() {
-        let answerer = answerer(&flags, config.as_ref(), Some(&base))?;
+        let answerer = answerer(&flags, config.as_ref(), Some(&base), None)?;
         let open = match answerer {
             Answerer::Model(open) => open,
             Answerer::Scripted(_) => {
@@ -2063,7 +2064,7 @@ fn profiles(_args: &[String]) -> Result<(String, i32), String> {
             "{:<7} {:<7} {:<21} {:<7} {:<7} {:<5} {:<5} {:<5} {:<6} {:<8} {:<7} {:<4} {}\n",
             profile.id.as_str(),
             profile.role.name(),
-            profile.model,
+            profile.model.as_deref().unwrap_or("inherit"),
             profile.effort.name(),
             profile.context_tokens,
             profile.judge,
@@ -2734,7 +2735,7 @@ fn distill(args: &[String]) -> Result<(String, i32), String> {
         return Err("the session has no first snapshot, so a replay has no clean tree".to_string());
     }
     let config = config_of(&flags)?;
-    let answerer = answerer(&flags, config.as_ref(), None)?;
+    let answerer = answerer(&flags, config.as_ref(), None, None)?;
     let open = match answerer {
         Answerer::Model(open) => open,
         Answerer::Scripted(_) => {
@@ -3188,7 +3189,7 @@ fn route(args: &[String]) -> Result<(String, i32), String> {
         format!(
             "profile: {}\nmodel:   {}\nreason:  {}\n",
             found.id,
-            found.model,
+            found.model.as_deref().unwrap_or("inherit"),
             reason.as_str()
         ),
         0,
@@ -4142,7 +4143,12 @@ pub(crate) fn assemble(
         flags.named.get("harness").map(String::as_str),
         profile.id.as_str(),
     )?;
-    let answerer = answerer(flags, config.as_ref(), Some(&harness))?;
+    let answerer = answerer(
+        flags,
+        config.as_ref(),
+        Some(&harness),
+        profile.model.as_deref(),
+    )?;
     // A strict request is checked while the check is free. An endpoint or a key that cannot work is
     // refused here, with the model and the provider named, rather than by the first call: a call that
     // cannot succeed is a call the caller was told would not be spent.
@@ -5886,5 +5892,63 @@ mod gate_tests {
         assert!(regression.contains("breaks a pinned case"), "{regression}");
         let broken = super::gate_refusal(2).expect("a corpus that could not run refuses adoption");
         assert!(broken.contains("could not be replayed"), "{broken}");
+    }
+}
+
+#[cfg(test)]
+mod profile_model_tests {
+    use super::*;
+
+    fn config(model: &str) -> crate::config::Config {
+        crate::config::Config {
+            provider: "test".to_string(),
+            model: model.to_string(),
+            root: PathBuf::from("/tmp/hades-profile-model/root"),
+            vault: PathBuf::from("/tmp/hades-profile-model/vault"),
+            mcp: Default::default(),
+        }
+    }
+
+    fn flags(model: Option<&str>) -> Flags {
+        let mut named = std::collections::BTreeMap::new();
+        if let Some(model) = model {
+            named.insert("model".to_string(), model.to_string());
+        }
+        Flags {
+            positional: Vec::new(),
+            named,
+            repeated: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_profile_model_outranks_the_config() {
+        let answerer = answerer(
+            &flags(None),
+            Some(&config("not-a-preset")),
+            None,
+            Some("nanbeige-3b"),
+        )
+        .expect("the profile's preset resolves");
+        assert!(answerer.describe().contains("nanbeige-3b"));
+    }
+
+    #[test]
+    fn the_flag_outranks_the_profile_model() {
+        let answerer = answerer(
+            &flags(Some("bonsai-27b")),
+            Some(&config("not-a-preset")),
+            None,
+            Some("nanbeige-3b"),
+        )
+        .expect("the flag's preset resolves");
+        assert!(answerer.describe().contains("bonsai-27b"));
+    }
+
+    #[test]
+    fn with_no_profile_model_the_config_is_used() {
+        let answerer = answerer(&flags(None), Some(&config("nanbeige-3b")), None, None)
+            .expect("the config's preset resolves");
+        assert!(answerer.describe().contains("nanbeige-3b"));
     }
 }

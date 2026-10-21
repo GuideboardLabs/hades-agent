@@ -203,7 +203,7 @@ impl<'a> Seams<'a> {
                 "goal": self.task.goal(),
                 "root": self.task.root().display().to_string(),
                 "profile": self.profile.id.as_str(),
-                "model": self.profile.model,
+                "model": self.profile.model.as_deref().unwrap_or("inherit"),
                 "effort": self.profile.effort.name(),
                 "reason": self.reason.as_str(),
                 "context_tokens": bundle.tokens(),

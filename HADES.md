@@ -452,10 +452,9 @@ one flag at a path.
 
 These are decisions, not omissions. Each has a reason and the seam it would change.
 
-- **`profile.model` is advisory.** A run uses `--model`, then the config's model. The profile's model is
-  recorded in the session, not selected, because the only distinct value among the shipped profiles
-  (`verify` = `glm-5.3-flash`) is not a preset in this build and was retired by the account. Wiring the
-  field before choosing an independent verifier would silently make `verify` the same voice as `fix`.
+- **Verifier independence is a preset away.** No shipped profile pins a model: a profile inherits the
+  run's model and may name a preset instead. `verify` is a different role, but it is the same voice until
+  a second usable preset exists. The separation is data, not a second string that may not resolve.
 - **The TUI is a chat surface.** `cases`, `eval` and `skills verify` are CLI verbs with receipts. A palette
   entry that cannot show the receipt would be a weaker second surface, so the TUI links to `/run` and the
   terminal instead.
