@@ -226,7 +226,7 @@ impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
             report.counts.insert(area.key().to_string(), count);
         }
 
-        for area in DURABLE_AREAS {
+        for area in [Area::Research, Area::Projects, Area::Products] {
             for note in self.vault.iter_notes(Some(area), &self.fences)? {
                 if note.is_marker() {
                     continue;
@@ -253,6 +253,30 @@ impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
                         ProblemKind::MissingProvenance,
                         path.clone(),
                         "no source_url or provenance",
+                    ));
+                }
+                if area == Area::Projects {
+                    for (reference, outcome) in self
+                        .vault
+                        .resolve_research_all(&note.frontmatter.research)?
+                    {
+                        if let Some(reason) = outcome.reason(&reference) {
+                            report.problems.push(Problem::new(
+                                ProblemKind::DanglingResearch,
+                                path.clone(),
+                                reason,
+                            ));
+                        }
+                    }
+                }
+                if area == Area::Products
+                    && let Some(project) = note.frontmatter.from_project.as_deref()
+                    && let Some(reason) = self.vault.resolve_project(project)?.reason(project)
+                {
+                    report.problems.push(Problem::new(
+                        ProblemKind::DanglingProject,
+                        path.clone(),
+                        reason,
                     ));
                 }
             }

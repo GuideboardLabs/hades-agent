@@ -510,6 +510,171 @@ fn frontmatter_lists_and_scalars_round_trip() {
 }
 
 #[test]
+fn a_topic_project_and_product_are_created_with_their_links() {
+    let (vault, root) = vault("create-tree");
+    let topic = vault
+        .create_topic(
+            "technical",
+            "AI Inference",
+            None,
+            "How tokens are made.",
+            "hand",
+        )
+        .expect("topic");
+    assert_eq!(
+        mneme::relative_posix(&topic, &root),
+        "50 Topics/technical/ai-inference/index.md"
+    );
+    let subtopic = vault
+        .create_topic(
+            "technical",
+            "KV Cache",
+            Some("technical/ai-inference"),
+            "The keys and values a decoder keeps.",
+            "hand",
+        )
+        .expect("subtopic");
+    assert_eq!(
+        mneme::relative_posix(&subtopic, &root),
+        "50 Topics/technical/ai-inference/kv-cache/index.md"
+    );
+
+    let research = vault
+        .create_research(
+            "technical/ai-inference/kv-cache",
+            "KV cache at 32K",
+            None,
+            "24.2 GiB at q4_0.",
+            "measured",
+            None,
+        )
+        .expect("research");
+    assert_eq!(
+        mneme::relative_posix(&research, &root),
+        "20 Research/technical/ai-inference/kv-cache/kv-cache-at-32k.md"
+    );
+
+    let project = vault
+        .create_project(
+            "Loom",
+            "technical/ai-inference",
+            &["kv-cache-at-32k".to_string()],
+            "A serving stack.",
+            "planning",
+        )
+        .expect("project");
+    assert_eq!(
+        mneme::relative_posix(&project, &root),
+        "30 Projects/loom/index.md"
+    );
+    let note = vault.read_note(&project).expect("project note");
+    assert_eq!(
+        note.research(),
+        &["technical/ai-inference/kv-cache/kv-cache-at-32k".to_string()]
+    );
+
+    let product = vault
+        .create_product(
+            "Loom 1.0",
+            "loom",
+            None,
+            "frozen",
+            "The closed release.",
+            "release",
+        )
+        .expect("product");
+    assert_eq!(
+        mneme::relative_posix(&product, &root),
+        "40 Products/loom-1-0/index.md"
+    );
+    let note = vault.read_note(&product).expect("product note");
+    assert_eq!(note.from_project(), "loom");
+    assert_eq!(note.topic(), "technical/ai-inference");
+    assert_eq!(note.status(), "frozen");
+}
+
+#[test]
+fn a_project_refuses_a_research_reference_that_does_not_exist() {
+    let (vault, _) = vault("dangling-research");
+    vault
+        .create_topic("technical", "AI Inference", None, "How tokens are made.", "hand")
+        .expect("topic");
+    let error = vault
+        .create_project(
+            "Loom",
+            "technical/ai-inference",
+            &["missing-note".to_string()],
+            "A serving stack.",
+            "planning",
+        )
+        .unwrap_err();
+    assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("does not name an existing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn write_note_refuses_a_project_that_names_missing_research() {
+    let (vault, root) = vault("dangling-write");
+    let path = root.join("30 Projects/manual/index.md");
+    let frontmatter = Frontmatter {
+        title: Some("Manual".to_string()),
+        summary: Some("A manual project.".to_string()),
+        status: Some("durable".to_string()),
+        topic: Some("technical/ai-inference".to_string()),
+        topics: vec!["technical/ai-inference".to_string()],
+        research: vec!["missing-note".to_string()],
+        provenance: Some("hand".to_string()),
+        ..Frontmatter::default()
+    };
+    let error = vault
+        .write_note(&path, &frontmatter, "")
+        .expect_err("the reference is checked");
+    assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+    assert!(!vault.store().exists(&path));
+}
+
+#[test]
+fn write_note_refuses_a_product_that_names_a_missing_project() {
+    let (vault, root) = vault("dangling-product-write");
+    let path = root.join("40 Products/thing/index.md");
+    let frontmatter = Frontmatter {
+        title: Some("Thing".to_string()),
+        summary: Some("A release.".to_string()),
+        status: Some("frozen".to_string()),
+        topic: Some("technical/ai-inference".to_string()),
+        topics: vec!["technical/ai-inference".to_string()],
+        from_project: Some("missing".to_string()),
+        provenance: Some("hand".to_string()),
+        ..Frontmatter::default()
+    };
+    let error = vault
+        .write_note(&path, &frontmatter, "")
+        .expect_err("the project is checked");
+    assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+    assert!(error.to_string().contains("does not name an existing project"));
+    assert!(!vault.store().exists(&path));
+}
+
+#[test]
+fn an_outbox_note_is_not_recalled() {
+    let (vault, root) = vault("outbox-inert");
+    let path = root.join("10 Outbox/hello.md");
+    let frontmatter = Frontmatter {
+        title: Some("Hello".to_string()),
+        summary: Some("A message for another agent.".to_string()),
+        status: Some("durable".to_string()),
+        topics: vec!["agent-memory".to_string()],
+        provenance: Some("hand".to_string()),
+        ..Frontmatter::default()
+    };
+    vault.write_note(&path, &frontmatter, "body").expect("outbox note");
+    assert!(vault.recall(Some("agent-memory"), None).expect("recall").is_empty());
+}
+
+#[test]
 fn a_key_the_vault_does_not_name_survives_a_rewrite() {
     let (vault, _) = vault("extras");
     let path = vault

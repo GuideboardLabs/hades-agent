@@ -372,6 +372,54 @@ fn audit_flags_a_hand_written_note_with_no_provenance() {
 }
 
 #[test]
+fn audit_flags_a_project_whose_research_is_missing() {
+    let (curator, root) = fresh("dangling-research");
+    let path = root.join("30 Projects/manual/index.md");
+    curator
+        .vault()
+        .store()
+        .make_dirs(path.parent().expect("parent"))
+        .expect("dirs");
+    curator
+        .vault()
+        .store()
+        .write(
+            &path,
+            "---\ntitle: Manual\nsummary: A stack.\nstatus: durable\ntopic: technical/ai-inference\nresearch: [missing]\nprovenance: hand\n---\n\nbody\n",
+        )
+        .expect("write past the reference check");
+    let report = curator.audit().expect("audit");
+    assert!(!report.ok());
+    let problems = report.problems_of(ProblemKind::DanglingResearch);
+    assert_eq!(problems.len(), 1, "{:?}", report.problems);
+    assert!(problems[0].detail.contains("does not name an existing"));
+}
+
+#[test]
+fn audit_flags_a_product_whose_project_is_missing() {
+    let (curator, root) = fresh("dangling-product");
+    let path = root.join("40 Products/thing/index.md");
+    curator
+        .vault()
+        .store()
+        .make_dirs(path.parent().expect("parent"))
+        .expect("dirs");
+    curator
+        .vault()
+        .store()
+        .write(
+            &path,
+            "---\ntitle: Thing\nsummary: A release.\nstatus: frozen\ntopic: technical/ai-inference\nfrom_project: missing\nprovenance: hand\n---\n\nbody\n",
+        )
+        .expect("write past the reference check");
+    let report = curator.audit().expect("audit");
+    assert!(!report.ok());
+    let problems = report.problems_of(ProblemKind::DanglingProject);
+    assert_eq!(problems.len(), 1, "{:?}", report.problems);
+    assert!(problems[0].detail.contains("does not name an existing"));
+}
+
+#[test]
 fn a_durable_note_without_a_summary_or_a_topic_is_refused_at_the_store() {
     let (curator, root) = fresh("thin");
     let error = curator

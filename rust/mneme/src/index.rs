@@ -144,9 +144,10 @@ pub fn render(
                 .to_string(),
         );
     } else {
-        for note in outbox {
-            lines.push(entry_line(note, root, false));
-        }
+        lines.push(format!(
+            "{} message(s), not read. This folder is a channel nothing consumes yet.",
+            outbox.len()
+        ));
     }
     lines.push(String::new());
 

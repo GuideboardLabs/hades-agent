@@ -31,7 +31,11 @@ use crate::topic::Category;
 ///
 /// v2 adds Products, nested slugs (a topic tree), and the fields that make the graph enforceable:
 /// `category`, `topic`, `parent`, `research`, `from_project`.
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// v3 puts the CHECK constraints back on an upgraded note table and files a legacy flat topic under
+/// the `general` category. The v1 migration had rebuilt the table without them; a vault that had
+/// already opened once at v2 would never see the repair if the change lived only in v1.
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS note (
@@ -129,10 +133,44 @@ CREATE TABLE note (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     exported_hash TEXT,
-    UNIQUE (area, slug)
+    UNIQUE (area, slug),
+    CHECK (status IS NULL OR status <> 'durable' OR (ifnull(summary,'') <> '' AND
+           (ifnull(source_url,'') <> '' OR ifnull(provenance,'') <> ''))),
+    CHECK (status IS NULL OR status <> 'durable' OR area NOT IN ('research','projects','products')
+           OR ifnull(topic,'') <> ''),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'topics'
+           OR category IN ('sports','technical','medical','finance','history','general','science','math','politics','current_events','underground','business','law','education','travel','animal_care','food','gaming','books','real_estate','automotive','parenting','tv_shows','movies','music','art')),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'projects'
+           OR ifnull(research,'[]') NOT IN ('','[]')),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'products'
+           OR (ifnull(from_project,'') <> '' AND ifnull(topic,'') <> ''))
 );
-INSERT INTO note (id, area, slug, title, summary, status, source_url, provenance, captured, body, extra, created_at, updated_at, exported_hash)
-SELECT id, area, slug, title, summary, status, source_url, provenance, captured, body, extra, created_at, updated_at, exported_hash FROM note_v1;
+INSERT INTO note (id, area, slug, title, summary, status, category, topic, parent, source_url,
+                  provenance, captured, body, extra, research, from_project, created_at, updated_at, exported_hash)
+SELECT id, area, slug, title, summary,
+       CASE
+           WHEN status = 'durable' AND (
+                ifnull(summary,'') = '' OR
+                (ifnull(source_url,'') = '' AND ifnull(provenance,'') = '') OR
+                (area IN ('research','projects','products') AND ifnull((
+                    SELECT value FROM tag
+                    WHERE tag.note_id = note_v1.id AND kind = 'topic'
+                    ORDER BY ordinal LIMIT 1), '') = '') OR
+                area = 'projects')
+           THEN 'draft' ELSE status
+       END,
+       CASE WHEN area = 'topics' THEN 'general' ELSE NULL END,
+       CASE
+           WHEN area = 'topics' THEN 'general/' || slug
+           WHEN area IN ('research','projects','products') THEN (
+               SELECT value FROM tag
+               WHERE tag.note_id = note_v1.id AND kind = 'topic'
+               ORDER BY ordinal LIMIT 1)
+           ELSE NULL
+       END,
+       NULL,
+       source_url, provenance, captured, body, extra, '[]', NULL, created_at, updated_at, exported_hash
+FROM note_v1;
 ALTER TABLE tag RENAME TO tag_v1;
 CREATE TABLE tag (
     note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
@@ -144,6 +182,16 @@ CREATE TABLE tag (
 INSERT INTO tag (note_id, kind, ordinal, value) SELECT note_id, kind, ordinal, value FROM tag_v1;
 DROP TABLE tag_v1;
 DROP TABLE note_v1;
+-- A v1 topic was a flat file under `40 Topics`; it recorded no category. `general` is the honest
+-- default, and the topic note moves to its category folder so the path and the record agree. The
+-- tag rewrite has to happen before the primary-topic backfill below, or research keeps the old name.
+UPDATE tag SET value = 'general/' || value
+WHERE kind = 'topic' AND value IN (
+    SELECT slug FROM note WHERE area = 'topics' AND slug NOT LIKE '%/%'
+);
+UPDATE note SET topic = 'general/' || topic
+WHERE area IN ('research','projects','products')
+  AND topic IN (SELECT slug FROM note WHERE area = 'topics' AND slug NOT LIKE '%/%');
 -- A 0.0.9 research or project note already named its topics as ordered tags. The first tag becomes
 -- the primary topic, so an upgraded vault does not audit as if every note had lost its home.
 UPDATE note SET topic = (
@@ -151,6 +199,139 @@ UPDATE note SET topic = (
     WHERE tag.note_id = note.id AND tag.kind = 'topic'
     ORDER BY tag.ordinal LIMIT 1
 ) WHERE area IN ('research','projects','products') AND topic IS NULL;
+UPDATE note
+SET category = 'general',
+    topic = 'general/' || slug,
+    parent = NULL,
+    slug = 'general/' || slug || '/index'
+WHERE area = 'topics' AND slug NOT LIKE '%/%';
+CREATE VIRTUAL TABLE note_fts USING fts5(
+    title, summary, body,
+    content = 'note', content_rowid = 'id', tokenize = 'unicode61'
+);
+INSERT INTO note_fts(rowid, title, summary, body) SELECT id, title, summary, body FROM note;
+CREATE TRIGGER note_ai AFTER INSERT ON note BEGIN
+    INSERT INTO note_fts(rowid, title, summary, body)
+    VALUES (new.id, new.title, new.summary, new.body);
+END;
+CREATE TRIGGER note_ad AFTER DELETE ON note BEGIN
+    INSERT INTO note_fts(note_fts, rowid, title, summary, body)
+    VALUES ('delete', old.id, old.title, old.summary, old.body);
+END;
+CREATE TRIGGER note_au AFTER UPDATE ON note BEGIN
+    INSERT INTO note_fts(note_fts, rowid, title, summary, body)
+    VALUES ('delete', old.id, old.title, old.summary, old.body);
+    INSERT INTO note_fts(rowid, title, summary, body)
+    VALUES (new.id, new.title, new.summary, new.body);
+END;
+COMMIT;
+PRAGMA foreign_keys = ON;
+"#;
+
+/// v2 to v3. Rebuild the note table with the CHECKs the v1 rebuild omitted, and file any legacy flat
+/// topic under `general`. The transform is guarded by `category IS NULL`, so a v2 vault that already
+/// has categorized topics is untouched.
+const MIGRATION_V2: &str = r#"
+PRAGMA foreign_keys = OFF;
+BEGIN;
+DROP TRIGGER IF EXISTS note_ai;
+DROP TRIGGER IF EXISTS note_ad;
+DROP TRIGGER IF EXISTS note_au;
+DROP TABLE IF EXISTS note_fts;
+ALTER TABLE note RENAME TO note_v2;
+CREATE TABLE note (
+    id           INTEGER PRIMARY KEY,
+    area         TEXT NOT NULL CHECK (area IN ('inbox','outbox','research','projects','products','topics')),
+    slug         TEXT NOT NULL,
+    title        TEXT,
+    summary      TEXT,
+    status       TEXT,
+    category     TEXT,
+    topic        TEXT,
+    parent       TEXT,
+    source_url   TEXT,
+    provenance   TEXT,
+    captured     TEXT,
+    body         TEXT NOT NULL,
+    extra        TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(extra)),
+    research     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(research)),
+    from_project TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    exported_hash TEXT,
+    UNIQUE (area, slug),
+    CHECK (status IS NULL OR status <> 'durable' OR (ifnull(summary,'') <> '' AND
+           (ifnull(source_url,'') <> '' OR ifnull(provenance,'') <> ''))),
+    CHECK (status IS NULL OR status <> 'durable' OR area NOT IN ('research','projects','products')
+           OR ifnull(topic,'') <> ''),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'topics'
+           OR category IN ('sports','technical','medical','finance','history','general','science','math','politics','current_events','underground','business','law','education','travel','animal_care','food','gaming','books','real_estate','automotive','parenting','tv_shows','movies','music','art')),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'projects'
+           OR ifnull(research,'[]') NOT IN ('','[]')),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'products'
+           OR (ifnull(from_project,'') <> '' AND ifnull(topic,'') <> ''))
+);
+INSERT INTO note (id, area, slug, title, summary, status, category, topic, parent, source_url, provenance,
+                  captured, body, extra, research, from_project, created_at, updated_at, exported_hash)
+SELECT id, area, slug, title, summary,
+       CASE
+           WHEN status = 'durable' AND (
+                ifnull(summary,'') = '' OR
+                (ifnull(source_url,'') = '' AND ifnull(provenance,'') = '') OR
+                (area IN ('research','projects','products') AND coalesce(
+                    nullif(topic,''),
+                    (SELECT value FROM tag
+                     WHERE tag.note_id = note_v2.id AND kind = 'topic'
+                     ORDER BY ordinal LIMIT 1), '') = '') OR
+                (area = 'projects' AND ifnull(research,'[]') IN ('','[]')) OR
+                (area = 'products' AND ifnull(from_project,'') = ''))
+           THEN 'draft' ELSE status
+       END,
+       CASE
+           WHEN area = 'topics' THEN coalesce(nullif(category,''), 'general')
+           ELSE category
+       END,
+       CASE
+           WHEN area = 'topics' THEN coalesce(nullif(topic,''), 'general/' || slug)
+           WHEN area IN ('research','projects','products') THEN coalesce(
+               nullif(topic,''),
+               (SELECT value FROM tag
+                WHERE tag.note_id = note_v2.id AND kind = 'topic'
+                ORDER BY ordinal LIMIT 1))
+           ELSE topic
+       END,
+       parent, source_url, provenance,
+       captured, body, extra, research, from_project, created_at, updated_at, exported_hash
+FROM note_v2;
+ALTER TABLE tag RENAME TO tag_v2;
+CREATE TABLE tag (
+    note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL CHECK (kind IN ('topic','project')),
+    ordinal INTEGER NOT NULL,
+    value   TEXT NOT NULL CHECK (value <> ''),
+    PRIMARY KEY (note_id, kind, ordinal)
+) WITHOUT ROWID;
+INSERT INTO tag (note_id, kind, ordinal, value) SELECT note_id, kind, ordinal, value FROM tag_v2;
+DROP TABLE tag_v2;
+DROP TABLE note_v2;
+UPDATE tag SET value = 'general/' || value
+WHERE kind = 'topic' AND value IN (
+    SELECT slug FROM note WHERE area = 'topics' AND slug NOT LIKE '%/%'
+);
+UPDATE note SET topic = 'general/' || topic
+WHERE area IN ('research','projects','products')
+  AND topic IN (SELECT slug FROM note WHERE area = 'topics' AND slug NOT LIKE '%/%');
+UPDATE note SET topic = (
+    SELECT tag.value FROM tag
+    WHERE tag.note_id = note.id AND tag.kind = 'topic'
+    ORDER BY tag.ordinal LIMIT 1
+) WHERE area IN ('research','projects','products') AND topic IS NULL;
+UPDATE note
+SET category = 'general',
+    topic = 'general/' || slug,
+    parent = NULL,
+    slug = 'general/' || slug || '/index'
+WHERE area = 'topics' AND slug NOT LIKE '%/%';
 CREATE VIRTUAL TABLE note_fts USING fts5(
     title, summary, body,
     content = 'note', content_rowid = 'id', tokenize = 'unicode61'
@@ -255,6 +436,11 @@ impl SqliteStore {
                 .map_err(|error| io(db, error))?;
         } else if found == 1 {
             conn.execute_batch(MIGRATION_V1)
+                .map_err(|error| io(db, error))?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|error| io(db, error))?;
+        } else if found == 2 {
+            conn.execute_batch(MIGRATION_V2)
                 .map_err(|error| io(db, error))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|error| io(db, error))?;
@@ -688,7 +874,39 @@ impl SqliteStore {
     /// Read every note file under `source` into the record. Fenced paths are never read: they are
     /// skipped and reported, the same rule the vault applies.
     pub fn import_tree(&self, source: &Path, fences: &[String]) -> Result<ImportReport, Fault> {
+        self.import_tree_with(source, fences, true)
+    }
+
+    /// Import without checking project references. The audit uses this: it must be able to read a
+    /// hand-written tree and then report the dangling project, rather than aborting before the report.
+    pub fn import_tree_lenient(
+        &self,
+        source: &Path,
+        fences: &[String],
+    ) -> Result<ImportReport, Fault> {
+        self.import_tree_with(source, fences, false)
+    }
+
+    fn import_tree_with(
+        &self,
+        source: &Path,
+        fences: &[String],
+        strict_references: bool,
+    ) -> Result<ImportReport, Fault> {
+        struct Pending {
+            area: Area,
+            slug: String,
+            text: String,
+            frontmatter: crate::frontmatter::Frontmatter,
+            path: PathBuf,
+        }
+
         let mut report = ImportReport::default();
+        let mut pending: Vec<Pending> = Vec::new();
+        // References may point at research already in the record or at a note later in the same
+        // source tree, so resolve against the union after the whole tree has been read.
+        let mut research = self.slugs_in(Area::Research)?;
+
         for path in self.walk_disk(source, false)? {
             let relative = relative_posix(&path, source);
             if fenced(Path::new(&relative), fences) {
@@ -699,16 +917,72 @@ impl SqliteStore {
                 continue;
             };
             let text = fs::read_to_string(&path).map_err(|error| io(&path, error))?;
+            let (frontmatter, _) = crate::frontmatter::Frontmatter::parse(&text);
             // A marker is seeded signage, not knowledge. Importing a whole vault must not clone the
             // other vault's "start here" notes into this one, so they are skipped by status.
-            if Frontmatter::parse(&text).0.status.as_deref() == Some("marker") {
+            if frontmatter.status.as_deref() == Some("marker") {
                 continue;
             }
-            self.store_note(area, &slug, &text)?;
-            self.set_exported_hash(area, &slug, &sha256::hex(text.as_bytes()))?;
+            // Dry-run the structural rules for the whole tree before writing the first row. A bad
+            // note at the end must not leave the earlier half of the import committed.
+            crate::sqlite::normalize(&path, area, &slug, frontmatter.clone())?;
+            if area == Area::Research {
+                let canonical = slug.strip_suffix("/index").unwrap_or(&slug);
+                research.insert(canonical.to_string());
+            }
+            pending.push(Pending {
+                area,
+                slug,
+                text,
+                frontmatter,
+                path,
+            });
+        }
+
+        if strict_references {
+            for note in pending.iter().filter(|note| note.area == Area::Projects) {
+                if note.frontmatter.status.as_deref() != Some("durable") {
+                    continue;
+                }
+                for reference in &note.frontmatter.research {
+                    let outcome =
+                        crate::refs::resolve(&research, reference, Area::Research.folder());
+                    if !matches!(outcome, crate::refs::ResearchRef::Found(_)) {
+                        return Err(Fault::InvalidNote {
+                            path: note.path.display().to_string(),
+                            detail: outcome.reason(reference).unwrap_or_else(|| {
+                                format!("`{reference}` does not name a research note in the import")
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        for note in pending {
+            self.store_note(note.area, &note.slug, &note.text)?;
+            self.set_exported_hash(note.area, &note.slug, &sha256::hex(note.text.as_bytes()))?;
             report.imported += 1;
         }
         Ok(report)
+    }
+
+    /// The canonical slugs below one area, without `.md` and without a trailing `/index`.
+    fn slugs_in(&self, area: Area) -> Result<std::collections::BTreeSet<String>, Fault> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT slug FROM note WHERE area = ?1")
+            .map_err(|error| io(&self.root, error))?;
+        let rows = statement
+            .query_map([area.key()], |row| row.get::<_, String>(0))
+            .map_err(|error| io(&self.root, error))?;
+        let mut slugs = std::collections::BTreeSet::new();
+        for row in rows {
+            let slug = row.map_err(|error| io(&self.root, error))?;
+            let slug = slug.strip_suffix("/index").unwrap_or(&slug).to_string();
+            slugs.insert(slug);
+        }
+        Ok(slugs)
     }
 
     /// Write every row to `target`, refusing to overwrite a file whose hash proves a hand edit.
@@ -1014,6 +1288,35 @@ pub(crate) fn normalize(
         return Err(refuse(
             "this note needs a topic: file it under a topic folder or set `topic:`".to_string(),
         ));
+    }
+
+    // The same rule the fresh SQLite table carries. A file-backed vault has no CHECK, so the
+    // normalizer is the only place both backends can agree on what a durable note owes the reader.
+    if frontmatter.status.as_deref() == Some("durable") && !marker {
+        if frontmatter
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(refuse("a durable note needs a summary".to_string()));
+        }
+        let provenance = frontmatter
+            .provenance
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        let source = frontmatter
+            .source_url
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        if provenance.is_empty() && source.is_empty() {
+            return Err(refuse(
+                "a durable note needs provenance or a source_url".to_string(),
+            ));
+        }
     }
 
     if let Some(topic) = frontmatter.topic.clone()
@@ -1622,6 +1925,94 @@ mod tests {
     }
 
     #[test]
+    fn import_reads_the_whole_tree_before_writing_any_row() {
+        let (store, root) = fresh("import-order");
+        let source = root.parent().expect("scratch parent").join("import-source");
+        let _ = fs::remove_dir_all(&source);
+        let project_dir = source.join("30 Projects/loom");
+        let research_dir = source.join("20 Research/technical/ai-inference");
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::create_dir_all(&research_dir).expect("research dir");
+        fs::write(
+            project_dir.join("index.md"),
+            "---\ntitle: Loom\nsummary: A stack.\nstatus: durable\ntopic: technical/ai-inference\nresearch: [kv-cache]\nprovenance: planning\n---\n\nbody\n",
+        )
+        .expect("project");
+        fs::write(
+            research_dir.join("kv-cache.md"),
+            "---\ntitle: KV cache\nsummary: 24 GiB.\nstatus: durable\ntopic: technical/ai-inference\nprovenance: measured\n---\n\nbody\n",
+        )
+        .expect("research");
+
+        let report = store.import_tree(&source, &[]).expect("the tree is valid");
+        assert_eq!(report.imported, 2);
+        assert!(store.exists(&root.join("30 Projects/loom/index.md")));
+        assert!(store.exists(&root.join("20 Research/technical/ai-inference/kv-cache.md")));
+    }
+
+    #[test]
+    fn import_refuses_a_dangling_project_before_any_row_is_written() {
+        let (store, root) = fresh("import-dangling");
+        let source = root
+            .parent()
+            .expect("scratch parent")
+            .join("import-dangling-source");
+        let _ = fs::remove_dir_all(&source);
+        let project_dir = source.join("30 Projects/loom");
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(
+            project_dir.join("index.md"),
+            "---\ntitle: Loom\nsummary: A stack.\nstatus: durable\ntopic: technical/ai-inference\nresearch: [missing]\nprovenance: planning\n---\n\nbody\n",
+        )
+        .expect("project");
+
+        let error = store.import_tree(&source, &[]).expect_err("dangling");
+        assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+        assert!(error.to_string().contains("does not name an existing"));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM note", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "the refusal wrote a row");
+    }
+
+    #[test]
+    fn import_refuses_an_ambiguous_bare_research_name() {
+        let (store, root) = fresh("import-ambiguous");
+        let source = root
+            .parent()
+            .expect("scratch parent")
+            .join("import-ambiguous-source");
+        let _ = fs::remove_dir_all(&source);
+        for topic in ["technique-a", "technique-b"] {
+            let dir = source.join(format!("20 Research/technical/{topic}"));
+            fs::create_dir_all(&dir).expect("research dir");
+            fs::write(
+                dir.join("note.md"),
+                format!(
+                    "---\ntitle: Note\nsummary: s.\nstatus: durable\ntopic: technical/{topic}\nprovenance: measured\n---\n\nbody\n"
+                ),
+            )
+            .expect("research");
+        }
+        let project = source.join("30 Projects/loom");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            project.join("index.md"),
+            "---\ntitle: Loom\nsummary: A stack.\nstatus: durable\ntopic: technical/technique-a\nresearch: [note]\nprovenance: planning\n---\n\nbody\n",
+        )
+        .expect("project");
+
+        let error = store.import_tree(&source, &[]).expect_err("ambiguous");
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM note", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn a_v1_vault_migrates_and_keeps_its_rows_and_topics() {
         use rusqlite::Connection;
         let dir = scratch("migrate-v1");
@@ -1647,7 +2038,11 @@ mod tests {
              INSERT INTO note (id, area, slug, title, summary, status, source_url, body, created_at, updated_at)
              VALUES (1, 'research', 'legacy', 'Legacy', 's', 'durable', 'https://e.test', 'body',
                      '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
-             INSERT INTO tag (note_id, kind, ordinal, value) VALUES (1, 'topic', 0, 'agent-memory');",
+             INSERT INTO note (id, area, slug, title, summary, status, source_url, body, created_at, updated_at)
+             VALUES (2, 'topics', 'loom', 'Loom', 's', 'durable', 'https://e.test', 'body',
+                     '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+             INSERT INTO tag (note_id, kind, ordinal, value) VALUES (1, 'topic', 0, 'loom');
+             INSERT INTO tag (note_id, kind, ordinal, value) VALUES (2, 'topic', 0, 'loom');",
         )
         .expect("v1 schema");
         drop(conn);
@@ -1660,7 +2055,93 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         let stored = store.load(Area::Research, "legacy").unwrap().unwrap();
         assert_eq!(stored.summary.as_deref(), Some("s"));
-        assert_eq!(stored.topic.as_deref(), Some("agent-memory"));
+        assert_eq!(stored.topic.as_deref(), Some("general/loom"));
+        let topic = store
+            .load(Area::Topics, "general/loom/index")
+            .unwrap()
+            .expect("the flat topic moved under general");
+        assert_eq!(topic.category.as_deref(), Some("general"));
+        assert_eq!(topic.topic.as_deref(), Some("general/loom"));
+        let tags: Vec<String> = store
+            .connection()
+            .prepare("SELECT value FROM tag WHERE note_id = 1 AND kind = 'topic'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(tags, vec!["general/loom".to_string()]);
+
+        // The v1 rebuild omitted the CHECKs. The v3 migration puts them back, so a durable project
+        // with no research is refused by the table, not only by the normalizer.
+        let refused = store.connection().execute(
+            "INSERT INTO note (area, slug, title, summary, status, topic, provenance, body, created_at, updated_at)
+             VALUES ('projects', 'bad', 'Bad', 's', 'durable', 'general/loom', 'p', 'body',
+                     '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z')",
+            [],
+        );
+        assert!(refused.is_err(), "the durable-project CHECK is missing");
+    }
+
+    #[test]
+    fn a_v2_vault_gets_the_checks_and_the_flat_topic_move() {
+        use rusqlite::Connection;
+        let dir = scratch("migrate-v2");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let root = dir.join("vault");
+        fs::create_dir_all(&root).expect("root");
+        let db = dir.join("mneme.db");
+        let conn = Connection::open(&db).expect("v2 db");
+        conn.execute_batch(
+            "PRAGMA user_version = 2;
+             CREATE TABLE note (
+                id INTEGER PRIMARY KEY, area TEXT NOT NULL, slug TEXT NOT NULL, title TEXT,
+                summary TEXT, status TEXT, category TEXT, topic TEXT, parent TEXT, source_url TEXT,
+                provenance TEXT, captured TEXT, body TEXT NOT NULL, extra TEXT NOT NULL DEFAULT '{}',
+                research TEXT NOT NULL DEFAULT '[]', from_project TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, exported_hash TEXT, UNIQUE (area, slug)
+             );
+             CREATE TABLE tag (
+                note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL, ordinal INTEGER NOT NULL, value TEXT NOT NULL,
+                PRIMARY KEY (note_id, kind, ordinal)
+             ) WITHOUT ROWID;
+             INSERT INTO note (id, area, slug, title, summary, status, body, created_at, updated_at)
+             VALUES (1, 'research', 'legacy', 'Legacy', 's', 'durable', 'body',
+                     '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+             INSERT INTO note (id, area, slug, title, summary, status, body, created_at, updated_at)
+             VALUES (2, 'topics', 'loom', 'Loom', 's', 'durable', 'body',
+                     '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+             INSERT INTO tag (note_id, kind, ordinal, value) VALUES (1, 'topic', 0, 'loom');
+             INSERT INTO tag (note_id, kind, ordinal, value) VALUES (2, 'topic', 0, 'loom');",
+        )
+        .expect("v2 schema");
+        drop(conn);
+
+        let store = SqliteStore::open(&db, &root).expect("migrate v2");
+        let version: i64 = store
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let topic = store
+            .load(Area::Topics, "general/loom/index")
+            .unwrap()
+            .expect("the v2 flat topic moved");
+        assert_eq!(topic.category.as_deref(), Some("general"));
+        let research = store.load(Area::Research, "legacy").unwrap().unwrap();
+        assert_eq!(research.topic.as_deref(), Some("general/loom"));
+        let refused = store.connection().execute(
+            "INSERT INTO note (area, slug, title, summary, status, topic, provenance, body, created_at, updated_at)
+             VALUES ('projects', 'bad', 'Bad', 's', 'durable', 'general/loom', 'p', 'body',
+                     '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z')",
+            [],
+        );
+        assert!(
+            refused.is_err(),
+            "the durable-project CHECK is missing after v2"
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use mneme::NoteStore;
+
 use crate::Assembly;
 use crate::Engine;
 use crate::Harness;
@@ -145,11 +147,32 @@ hades — the harness, one turn or a whole graph
   hades version
       the version of this build (`--version` and `-V` are the same)
 
+  hades topic <category> <name...> [--parent <topic>] [--summary <text>]
+              [--provenance <text>] [--vault <dir>] [--db <file>] [--config <file>]
+      create a general topic under one of the 26 categories, or a subtopic with --parent
+
+  hades research <topic> <title...> [--slug <slug>] [--source-url <url>] [--summary <text>]
+                 [--provenance <text>] [--vault <dir>] [--db <file>] [--config <file>]
+      write one durable finding under an existing topic
+
+  hades project <name...> --topic <topic> --research <ref> [--research <ref>]...
+                [--summary <text>] [--provenance <text>] [--vault <dir>] [--db <file>]
+      create a project hub; every research reference must resolve to a note in the record
+
+  hades product <name...> --from <project> [--topic <topic>]
+                [--status active|closed|inactive|frozen] [--summary <text>]
+                [--provenance <text>] [--vault <dir>] [--db <file>]
+      freeze a project as a product; the topic is inherited from the project when omitted
+
   hades mneme import <dir> [--db <file>] [--vault <dir>]
       read a tree of markdown notes into the record; fenced paths are reported, never read
 
   hades mneme export [--force] [--db <file>] [--vault <dir>]
       write the record out as markdown; a file a hand edited is refused unless --force
+
+  hades mneme upgrade [--retire-old] [--force] [--db <file>] [--vault <dir>]
+      migrate a 0.0.9 vault to the six-area tree, seed the taxonomy and markers, and
+      export. --retire-old moves the stale 40 Topics folder beside the vault, never deletes
 
   hades approvals [--state <dir>]
       every question that has been asked, with its options and what came of it
@@ -355,6 +378,10 @@ fn dispatch(
         "context" => context(rest),
         "audit" => audit(rest),
         "init" => init(rest, out, input),
+        "topic" => create_topic_cmd(rest),
+        "research" => create_research_cmd(rest),
+        "project" => create_project_cmd(rest),
+        "product" => create_product_cmd(rest),
         "service" => service(rest),
         "mneme" => mneme(rest),
         "approvals" => approvals(rest),
@@ -3279,7 +3306,7 @@ fn audit(args: &[String]) -> Result<(String, i32), String> {
         let empty = store.is_empty().map_err(|fault| fault.to_string())?;
         if explicit || empty {
             store
-                .import_tree(&root, &[])
+                .import_tree_lenient(&root, &[])
                 .map_err(|fault| fault.to_string())?;
         }
         let vault = mneme::Vault::new(root.clone(), store, mneme::SystemClock);
@@ -3316,6 +3343,202 @@ fn record(
         store,
         mneme::SystemClock,
     ))
+}
+
+fn creation_root(flags: &Flags) -> Result<PathBuf, String> {
+    match flags.named.get("vault") {
+        Some(path) => guarded(Path::new(path)),
+        None => match config_of(flags)? {
+            Some(config) => guarded(&config.vault),
+            None => Err(
+                "this command needs a vault: pass `--vault <dir>`, or run `hades init` so \
+                 the config names one"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn required_summary(flags: &Flags) -> Result<&str, String> {
+    flags
+        .named
+        .get("summary")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "this note needs `--summary <text>`".to_string())
+}
+
+fn provenance(flags: &Flags) -> String {
+    flags
+        .named
+        .get("provenance")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("hand")
+        .to_string()
+}
+
+fn created_text(
+    vault: &mneme::Vault<mneme::SqliteStore, mneme::SystemClock>,
+    path: &Path,
+) -> String {
+    let relative = mneme::relative_posix(path, vault.root());
+    format!(
+        "created: {relative}\nindex: {}\n",
+        vault.root().join(mneme::INDEX_NAME).display()
+    )
+}
+
+/// `hades topic <category> <name>`: a general topic, or a subtopic with `--parent`.
+fn create_topic_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &["vault", "db", "config", "parent", "summary", "provenance"],
+        &[],
+    )?;
+    let category = flags
+        .positional
+        .first()
+        .ok_or_else(|| "topic needs a category and a name".to_string())?;
+    let name = flags.positional[1..].join(" ");
+    if name.trim().is_empty() {
+        return Err("topic needs a name after the category".to_string());
+    }
+    let summary = required_summary(&flags)?;
+    let root = creation_root(&flags)?;
+    let vault = record(&root, &db_path(&flags)?)?;
+    let path = vault
+        .create_topic(
+            category,
+            &name,
+            flags.named.get("parent").map(String::as_str),
+            summary,
+            &provenance(&flags),
+        )
+        .map_err(|fault| fault.to_string())?;
+    Ok((created_text(&vault, &path), 0))
+}
+
+/// `hades research <topic> <title>`: a durable finding under an existing topic.
+fn create_research_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "vault",
+            "db",
+            "config",
+            "summary",
+            "provenance",
+            "slug",
+            "source-url",
+        ],
+        &[],
+    )?;
+    let topic = flags
+        .positional
+        .first()
+        .ok_or_else(|| "research needs a topic and a title".to_string())?;
+    let title = flags.positional[1..].join(" ");
+    if title.trim().is_empty() {
+        return Err("research needs a title after the topic".to_string());
+    }
+    let summary = required_summary(&flags)?;
+    let root = creation_root(&flags)?;
+    let vault = record(&root, &db_path(&flags)?)?;
+    let path = vault
+        .create_research(
+            topic,
+            &title,
+            flags.named.get("slug").map(String::as_str),
+            summary,
+            &provenance(&flags),
+            flags.named.get("source-url").map(String::as_str),
+        )
+        .map_err(|fault| fault.to_string())?;
+    Ok((created_text(&vault, &path), 0))
+}
+
+/// `hades project <name> --topic <topic> --research <ref>`: a hub over existing research.
+fn create_project_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "vault",
+            "db",
+            "config",
+            "summary",
+            "provenance",
+            "topic",
+            "research",
+        ],
+        &[],
+    )?;
+    let name = flags.positional.join(" ");
+    if name.trim().is_empty() {
+        return Err("project needs a name".to_string());
+    }
+    let topic = flags
+        .named
+        .get("topic")
+        .ok_or_else(|| "project needs `--topic <topic>`".to_string())?;
+    let research = flags.repeated.get("research").cloned().unwrap_or_default();
+    if research.is_empty() {
+        return Err("project needs at least one `--research <ref>`".to_string());
+    }
+    let summary = required_summary(&flags)?;
+    let root = creation_root(&flags)?;
+    let vault = record(&root, &db_path(&flags)?)?;
+    let path = vault
+        .create_project(&name, topic, &research, summary, &provenance(&flags))
+        .map_err(|fault| fault.to_string())?;
+    Ok((created_text(&vault, &path), 0))
+}
+
+/// `hades product <name> --from <project>`: freeze a project as its own thing.
+fn create_product_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "vault",
+            "db",
+            "config",
+            "summary",
+            "provenance",
+            "topic",
+            "from",
+            "status",
+        ],
+        &[],
+    )?;
+    let name = flags.positional.join(" ");
+    if name.trim().is_empty() {
+        return Err("product needs a name".to_string());
+    }
+    let from = flags
+        .named
+        .get("from")
+        .ok_or_else(|| "product needs `--from <project>`".to_string())?;
+    let status = flags
+        .named
+        .get("status")
+        .map(String::as_str)
+        .unwrap_or("frozen");
+    let summary = required_summary(&flags)?;
+    let root = creation_root(&flags)?;
+    let vault = record(&root, &db_path(&flags)?)?;
+    let path = vault
+        .create_product(
+            &name,
+            from,
+            flags.named.get("topic").map(String::as_str),
+            status,
+            summary,
+            &provenance(&flags),
+        )
+        .map_err(|fault| fault.to_string())?;
+    Ok((created_text(&vault, &path), 0))
 }
 
 /// The record, when a config names a vault and `--memory` is not off. `None` is a machine without a
@@ -3420,7 +3643,7 @@ fn db_path(flags: &Flags) -> Result<PathBuf, String> {
 fn mneme(args: &[String]) -> Result<(String, i32), String> {
     let action = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[1..];
-    let flags = parse_with(rest, &["db", "config", "vault"], &["force"])?;
+    let flags = parse_with(rest, &["db", "config", "vault"], &["force", "retire-old"])?;
 
     let root = match flags.named.get("vault") {
         Some(path) => guarded(Path::new(path))?,
@@ -3481,10 +3704,82 @@ fn mneme(args: &[String]) -> Result<(String, i32), String> {
             let code = if report.refused.is_empty() { 0 } else { 1 };
             Ok((text, code))
         }
+        "upgrade" => {
+            // Seed the map and the marking posts, then write the six-area tree. The record has
+            // already migrated when `record` opened it, so a v1 topic is under `general` before the
+            // export runs.
+            vault.init(None).map_err(|fault| fault.to_string())?;
+            let report = vault
+                .store()
+                .export_tree(&root, switched(&flags, "force"))
+                .map_err(|fault| fault.to_string())?;
+            let mut text = format!(
+                "written: {}\nunchanged: {}\nrefused: {}\n",
+                report.written,
+                report.unchanged,
+                report.refused.len()
+            );
+            for path in &report.refused {
+                text.push_str(&format!(
+                    "  {} (hand edited; --force overwrites)\n",
+                    path.display()
+                ));
+            }
+            let old = root.join("40 Topics");
+            if old.is_dir() {
+                let files = vault
+                    .store()
+                    .walk(&old)
+                    .map(|paths| paths.len())
+                    .unwrap_or(0);
+                if switched(&flags, "retire-old") {
+                    let dest = retire_old_topics(&root)?;
+                    text.push_str(&format!(
+                        "old: moved {files} file(s) from 40 Topics to {}\n",
+                        dest.display()
+                    ));
+                } else {
+                    text.push_str(&format!(
+                        "old: {files} file(s) under 40 Topics kept; rerun with --retire-old to move \
+                         them out of the vault\n"
+                    ));
+                }
+            }
+            let code = if report.refused.is_empty() { 0 } else { 1 };
+            Ok((text, code))
+        }
         other => Err(format!(
-            "`mneme {other}` is not a command; try `hades mneme import` or `hades mneme export`"
+            "`mneme {other}` is not a command; try `hades mneme import`, `export` or `upgrade`"
         )),
     }
+}
+
+/// Move the pre-0.0.10 `40 Topics` export out of the vault. Never delete: the record is the source,
+/// but a hand edit that was never imported is still a person's file.
+fn retire_old_topics(root: &Path) -> Result<PathBuf, String> {
+    let old = root.join("40 Topics");
+    let parent = root
+        .parent()
+        .ok_or_else(|| format!("{} has no parent to archive beside", root.display()))?;
+    let archive = parent.join("mneme-archive");
+    fs::create_dir_all(&archive).map_err(|error| format!("{}: {error}", archive.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut dest = archive.join(format!("40-topics-{stamp}"));
+    let mut counter = 1;
+    while dest.exists() {
+        dest = archive.join(format!("40-topics-{stamp}-{counter}"));
+        counter += 1;
+    }
+    fs::rename(&old, &dest).map_err(|error| {
+        format!(
+            "{}: {error}; the old folder was left in place",
+            old.display()
+        )
+    })?;
+    Ok(dest)
 }
 
 /// `hades service install`: the two units, rendered for this install.

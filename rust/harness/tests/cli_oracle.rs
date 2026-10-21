@@ -74,6 +74,185 @@ fn the_binary_says_which_version_it_is() {
 }
 
 #[test]
+fn the_vault_can_be_built_from_the_cli() {
+    let dir = scratch("weft-create");
+    std::fs::create_dir_all(dir.join("work")).expect("work");
+    let config = dir.join("config.json").display().to_string();
+    let vault = dir.join("mneme").display().to_string();
+    let work = dir.join("work").display().to_string();
+
+    let (code, text) = hades(&[
+        "init",
+        "--config",
+        &config,
+        "--vault",
+        &vault,
+        "--root",
+        &work,
+        "--non-interactive",
+        "--name",
+        "Warden",
+        "--goal",
+        "keep the notes true",
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let (code, text) = hades(&[
+        "topic",
+        "technical",
+        "AI Inference",
+        "--summary",
+        "How tokens are made.",
+        "--config",
+        &config,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("50 Topics/technical/ai-inference/index.md"),
+        "{text}"
+    );
+
+    let (code, text) = hades(&[
+        "research",
+        "technical/ai-inference",
+        "KV cache at 32K",
+        "--summary",
+        "24.2 GiB at q4_0.",
+        "--config",
+        &config,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("20 Research/technical/ai-inference/kv-cache-at-32k.md"),
+        "{text}"
+    );
+
+    let (code, text) = hades(&[
+        "project",
+        "Loom",
+        "--topic",
+        "technical/ai-inference",
+        "--research",
+        "kv-cache-at-32k",
+        "--summary",
+        "A serving stack.",
+        "--config",
+        &config,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("30 Projects/loom/index.md"), "{text}");
+
+    let (code, text) = hades(&[
+        "product",
+        "Loom 1.0",
+        "--from",
+        "loom",
+        "--summary",
+        "The closed release.",
+        "--config",
+        &config,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("40 Products/loom-1-0/index.md"), "{text}");
+
+    let (code, text) = hades(&["audit", "--config", &config]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("projects: 1"), "{text}");
+    assert!(text.contains("products: 1"), "{text}");
+
+    let index = std::fs::read_to_string(dir.join("mneme/INDEX.md")).expect("index");
+    assert!(index.contains("AI Inference"), "{index}");
+    assert!(index.contains("Loom"), "{index}");
+    assert!(index.contains("Loom 1.0"), "{index}");
+
+    let (code, text) = hades(&[
+        "project",
+        "Broken",
+        "--topic",
+        "technical/ai-inference",
+        "--research",
+        "no-such-note",
+        "--summary",
+        "A broken project.",
+        "--config",
+        &config,
+    ]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("does not name an existing"), "{text}");
+}
+
+#[test]
+fn an_audit_reports_a_dangling_research_reference_instead_of_aborting() {
+    let dir = scratch("weft-dangling");
+    std::fs::create_dir_all(dir.join("work")).expect("work");
+    let config = dir.join("config.json").display().to_string();
+    let vault = dir.join("mneme").display().to_string();
+    let work = dir.join("work").display().to_string();
+    let (code, text) = hades(&[
+        "init",
+        "--config",
+        &config,
+        "--vault",
+        &vault,
+        "--root",
+        &work,
+        "--non-interactive",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let project = dir.join("mneme/30 Projects/manual/index.md");
+    std::fs::create_dir_all(project.parent().expect("parent")).expect("project dir");
+    std::fs::write(
+        &project,
+        "---\ntitle: Manual\nsummary: A stack.\nstatus: durable\ntopic: technical/ai-inference\nresearch: [missing]\nprovenance: hand\n---\n\nbody\n",
+    )
+    .expect("project");
+
+    let (code, text) = hades(&["audit", "--vault", &vault]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("dangling_research"), "{text}");
+    assert!(text.contains("does not name an existing"), "{text}");
+}
+
+#[test]
+fn mneme_upgrade_moves_the_old_topics_folder_out_of_the_vault() {
+    let dir = scratch("weft-upgrade");
+    std::fs::create_dir_all(dir.join("work")).expect("work");
+    let config = dir.join("config.json").display().to_string();
+    let vault = dir.join("mneme").display().to_string();
+    let work = dir.join("work").display().to_string();
+    let (code, text) = hades(&[
+        "init",
+        "--config",
+        &config,
+        "--vault",
+        &vault,
+        "--root",
+        &work,
+        "--non-interactive",
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let old = dir.join("mneme/40 Topics");
+    std::fs::create_dir_all(&old).expect("old topics");
+    std::fs::write(old.join("legacy.md"), "legacy\n").expect("old note");
+
+    let (code, text) = hades(&["mneme", "upgrade", "--retire-old", "--config", &config]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("old: moved 1 file(s)"), "{text}");
+    assert!(!old.exists(), "the old folder is still in the vault");
+    let archive = dir.join("mneme-archive");
+    let moved = std::fs::read_dir(&archive)
+        .expect("archive")
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.path().join("legacy.md").is_file());
+    assert!(moved, "the old note was not archived");
+    assert!(
+        dir.join("mneme/50 Topics/START HERE.md").is_file(),
+        "the new tree was not written"
+    );
+}
+
+#[test]
 fn profiles_lists_what_the_build_ships() {
     let (code, text) = hades(&["profiles"]);
     assert_eq!(code, 0);
@@ -2057,6 +2236,9 @@ fn update_reports_the_running_binary_and_refuses_a_missing_source() {
 fn init_seeds_the_eleven_builtin_skills() {
     isolate_home();
     let home = PathBuf::from(std::env::var("HADES_HOME").expect("the isolated home"));
+    // The home is process-wide for the CLI tests, and another test may have run `init` first. Clear
+    // the built-ins so this test still proves that a fresh install seeds them.
+    let _ = std::fs::remove_dir_all(home.join("skills").join("builtin"));
     let base = scratch("init-skills");
     let vault = base.join("vault");
     let config = base.join("config.json");
@@ -2068,8 +2250,9 @@ fn init_seeds_the_eleven_builtin_skills() {
         "--vault",
         vault.to_str().expect("a vault path"),
     ]);
+    // The count is "written this time", and another test in this binary may have seeded the shared
+    // home first. The proof is the files below, not the number in the receipt.
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains("11 built-in seeded"), "{text}");
 
     let builtin = home.join("skills").join("builtin");
     let mut names: Vec<String> = std::fs::read_dir(&builtin)

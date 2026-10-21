@@ -8,6 +8,10 @@ pub enum ProblemKind {
     MissingSummary,
     MissingTopic,
     MissingProvenance,
+    /// A project names a research note that is not in the record, or a bare name that two notes share.
+    DanglingResearch,
+    /// A product names a project that is not in the record, or a bare name that two projects share.
+    DanglingProject,
     /// Printed from [`crate::report::AuditReport::fenced`], never counted against `ok()`: the path is behind
     /// a fence, which is the boundary doing its job.
     FencedPath,
@@ -23,6 +27,8 @@ impl ProblemKind {
             ProblemKind::MissingSummary => "missing_summary",
             ProblemKind::MissingTopic => "missing_topic",
             ProblemKind::MissingProvenance => "missing_provenance",
+            ProblemKind::DanglingResearch => "dangling_research",
+            ProblemKind::DanglingProject => "dangling_project",
             ProblemKind::FencedPath => "fenced_path",
             ProblemKind::InboxOverCap => "inbox_over_cap",
             ProblemKind::StaleInbox => "stale_inbox",

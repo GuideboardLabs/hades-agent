@@ -77,12 +77,20 @@ note under `20 Research/technical/ai-inference/` takes that folder as its topic 
 The frontmatter is the graph; the folders are how a person navigates it, and the generated `INDEX.md` is
 the view that cannot drift from either.
 
-An existing 0.0.9 vault is upgraded on first open: the record migrates to schema v2 and each research or
-project note takes its first topic tag as its primary topic. Run `hades mneme export` to write the new
-tree (`40 Products` and `50 Topics`); the old `40 Topics` folder is then stale and can be removed.
+An existing 0.0.9 vault is upgraded when the record is opened: schema v3 adds the CHECK constraints the
+v1 rebuild dropped, files a legacy flat topic under `general`, and each research or project note takes
+its first topic tag as its primary topic. Run `hades mneme upgrade --retire-old` to write the new tree
+(`40 Products` and `50 Topics`) and move the stale `40 Topics` folder to `mneme-archive/`.
 
-`hades init` refuses a vault that already exists. `hades audit` with no flags reads the vault the config
-names, and a fresh home audits clean: six empty areas, a charter and an index.
+The vault is built with `hades topic`, `hades research`, `hades project` and `hades product`; each goes
+through `Vault`, so the command cannot author a note the store would refuse. A `research:` reference may
+be the full record path, the slug below `20 Research`, or a bare trailing name, and a bare name two notes
+share is refused. The audit reports a reference that resolves to nothing as `dangling_research` or
+`dangling_project` rather than aborting.
+
+`hades init` refuses a vault that already exists. `hades audit` reads the record the config names;
+`hades audit --vault <dir>` imports a markdown tree into a throwaway record and audits that, which is how
+a hand-edited tree is checked. A fresh home audits clean: six empty areas, a charter and an index.
 
 ## Installing
 

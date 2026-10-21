@@ -1,5 +1,6 @@
 //! The vault itself: the operations, and the value that holds a store, a clock and a root.
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::INBOX_EXPIRY_DAYS;
@@ -12,6 +13,7 @@ use crate::frontmatter::Frontmatter;
 use crate::index::{self, INDEX_NAME};
 use crate::note::{Note, slugify};
 use crate::permit::{Holder, WritePermit};
+use crate::refs::{self, ResearchRef};
 use crate::seams::{Clock, NoteStore};
 
 /// What is known about a note when it is filed. Empty means the vault leaves that key as it found it,
@@ -290,13 +292,356 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
         }
         // The structural rules live here as well as in the SQLite store: a file-backed vault has to
         // refuse the same note, or the rules would only exist on one of the two paths.
-        let frontmatter = match crate::sqlite::note_path(&self.root, path) {
-            Some((area, slug)) => crate::sqlite::normalize(path, area, &slug, frontmatter.clone())?,
+        let located = crate::sqlite::note_path(&self.root, path);
+        let frontmatter = match &located {
+            Some((area, slug)) => crate::sqlite::normalize(path, *area, slug, frontmatter.clone())?,
             None => frontmatter.clone(),
         };
+        // A project names the research it stands on, and naming a note that does not exist is a
+        // declaration with nothing behind it. Import checks the same rule against the source tree.
+        if let Some((Area::Projects, _)) = &located
+            && frontmatter.status.as_deref() == Some("durable")
+        {
+            let resolved = self.resolve_research_all(&frontmatter.research)?;
+            if let Some((reference, outcome)) = resolved
+                .iter()
+                .find(|(_, outcome)| !matches!(outcome, ResearchRef::Found(_)))
+            {
+                return Err(Fault::InvalidNote {
+                    path: path.display().to_string(),
+                    detail: outcome.reason(reference).unwrap_or_else(|| {
+                        format!("`{reference}` does not name an existing research note")
+                    }),
+                });
+            }
+        }
+        // A product names the project it came from. A name that resolves to nothing would make the
+        // release history a claim rather than a link, so it is refused here as well as in the audit.
+        if let Some((Area::Products, _)) = &located
+            && let Some(project) = frontmatter
+                .from_project
+                .as_deref()
+                .filter(|project| !project.trim().is_empty())
+            && !matches!(self.resolve_project(project)?, ResearchRef::Found(_))
+        {
+            return Err(Fault::InvalidNote {
+                path: path.display().to_string(),
+                detail: format!("`{project}` does not name an existing project"),
+            });
+        }
         let text = format!("{}\n{}\n", frontmatter.render(), body.trim());
         self.store.write(path, &text)?;
         Ok(path.to_path_buf())
+    }
+
+    /// The canonical slugs below one area, without `.md` and without a trailing `/index`.
+    fn slugs_in(&self, area: Area) -> Result<BTreeSet<String>, Fault> {
+        let mut slugs = BTreeSet::new();
+        for path in self.store.walk(&self.area_path(area))? {
+            if let Some((found, slug)) = crate::sqlite::note_path(&self.root, &path)
+                && found == area
+            {
+                let slug = slug.strip_suffix("/index").unwrap_or(&slug);
+                slugs.insert(slug.to_string());
+            }
+        }
+        Ok(slugs)
+    }
+
+    /// Resolve one research reference. See [`crate::refs`] for the accepted forms.
+    pub fn resolve_research(&self, reference: &str) -> Result<ResearchRef, Fault> {
+        let slugs = self.slugs_in(Area::Research)?;
+        Ok(refs::resolve(&slugs, reference, Area::Research.folder()))
+    }
+
+    /// Resolve every reference in one walk, keeping the input order and the outcome per reference.
+    pub fn resolve_research_all(
+        &self,
+        references: &[String],
+    ) -> Result<Vec<(String, ResearchRef)>, Fault> {
+        let slugs = self.slugs_in(Area::Research)?;
+        Ok(references
+            .iter()
+            .map(|reference| {
+                (
+                    reference.clone(),
+                    refs::resolve(&slugs, reference, Area::Research.folder()),
+                )
+            })
+            .collect())
+    }
+
+    /// Resolve a project reference to the project's slug below `30 Projects`.
+    pub fn resolve_project(&self, reference: &str) -> Result<ResearchRef, Fault> {
+        let slugs = self.slugs_in(Area::Projects)?;
+        Ok(refs::resolve(&slugs, reference, Area::Projects.folder()))
+    }
+
+    /// Whether a topic note exists. Accepts a full topic slug, `.../index.md`, or a path.
+    pub fn topic_exists(&self, topic: &str) -> Result<bool, Fault> {
+        let topic = refs::clean(topic, Area::Topics.folder());
+        let folder = self.area_path(Area::Topics);
+        Ok(self.store.exists(&folder.join(&topic).join("index.md"))
+            || self.store.exists(&folder.join(format!("{topic}.md"))))
+    }
+
+    /// The path of an existing project, preferring the `<name>/index.md` convention.
+    fn project_path(&self, project: &str) -> PathBuf {
+        let folder = self.area_path(Area::Projects);
+        let index = folder.join(project).join("index.md");
+        if self.store.exists(&index) {
+            index
+        } else {
+            folder.join(format!("{project}.md"))
+        }
+    }
+
+    /// Write, export and re-index one creation. Every creation verb ends here so the tree and the
+    /// record cannot disagree about a note that was just made.
+    fn created(&self, path: PathBuf, frontmatter: &Frontmatter) -> Result<PathBuf, Fault> {
+        let path = self.write_note(&path, frontmatter, "")?;
+        self.store.export(&path)?;
+        self.write_index(None, &[])?;
+        Ok(path)
+    }
+
+    fn clash(&self, path: &Path) -> Fault {
+        Fault::InvalidNote {
+            path: path.display().to_string(),
+            detail: "a note already exists at this path".to_string(),
+        }
+    }
+
+    /// Create a topic under one of the 26 categories, optionally beneath an existing topic.
+    pub fn create_topic(
+        &self,
+        category: &str,
+        name: &str,
+        parent: Option<&str>,
+        summary: &str,
+        provenance: &str,
+    ) -> Result<PathBuf, Fault> {
+        let Some(category) = crate::topic::Category::parse(category) else {
+            return Err(Fault::InvalidNote {
+                path: format!("{}", self.area_path(Area::Topics).display()),
+                detail: format!(
+                    "`{category}` is not one of the 26 categories; read TAXONOMY.md for the doors"
+                ),
+            });
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Fault::InvalidNote {
+                path: self.area_path(Area::Topics).display().to_string(),
+                detail: "a topic needs a name".to_string(),
+            });
+        }
+        let slug = slugify(name, 12);
+        let topic = match parent {
+            Some(parent) => {
+                let parent = refs::clean(parent, Area::Topics.folder());
+                if !parent.starts_with(&format!("{}/", category.key())) {
+                    return Err(Fault::InvalidNote {
+                        path: self.area_path(Area::Topics).display().to_string(),
+                        detail: format!(
+                            "parent `{parent}` is not under `{}`; a subtopic stays in its category",
+                            category.key()
+                        ),
+                    });
+                }
+                if !self.topic_exists(&parent)? {
+                    return Err(Fault::InvalidNote {
+                        path: self.area_path(Area::Topics).display().to_string(),
+                        detail: format!("parent topic `{parent}` does not exist"),
+                    });
+                }
+                format!("{parent}/{slug}")
+            }
+            None => format!("{}/{}", category.key(), slug),
+        };
+        let path = self.area_path(Area::Topics).join(&topic).join("index.md");
+        if self.store.exists(&path) {
+            return Err(self.clash(&path));
+        }
+        let frontmatter = Frontmatter {
+            title: Some(name.to_string()),
+            summary: Some(summary.trim().to_string()),
+            status: Some("durable".to_string()),
+            category: Some(category.key().to_string()),
+            topic: Some(topic.clone()),
+            parent: parent.map(|parent| refs::clean(parent, Area::Topics.folder())),
+            topics: vec![topic],
+            provenance: Some(provenance.to_string()),
+            ..Frontmatter::default()
+        };
+        self.created(path, &frontmatter)
+    }
+
+    /// Create a research note under an existing topic.
+    pub fn create_research(
+        &self,
+        topic: &str,
+        title: &str,
+        slug: Option<&str>,
+        summary: &str,
+        provenance: &str,
+        source_url: Option<&str>,
+    ) -> Result<PathBuf, Fault> {
+        let topic = refs::clean(topic, Area::Topics.folder());
+        if !self.topic_exists(&topic)? {
+            return Err(Fault::InvalidNote {
+                path: self.area_path(Area::Research).display().to_string(),
+                detail: format!(
+                    "topic `{topic}` does not exist; create it first with `hades topic`"
+                ),
+            });
+        }
+        let slug = slug
+            .map(str::to_string)
+            .filter(|slug| !slug.trim().is_empty())
+            .unwrap_or_else(|| slugify(title, 12));
+        if slug.is_empty() {
+            return Err(Fault::InvalidNote {
+                path: self.area_path(Area::Research).display().to_string(),
+                detail: "a research note needs a title or a slug".to_string(),
+            });
+        }
+        let path = self
+            .area_path(Area::Research)
+            .join(&topic)
+            .join(format!("{slug}.md"));
+        if self.store.exists(&path) {
+            return Err(self.clash(&path));
+        }
+        let frontmatter = Frontmatter {
+            title: Some(title.trim().to_string()),
+            summary: Some(summary.trim().to_string()),
+            status: Some("durable".to_string()),
+            topic: Some(topic.clone()),
+            topics: vec![topic],
+            source_url: source_url.map(str::to_string),
+            provenance: Some(provenance.to_string()),
+            ..Frontmatter::default()
+        };
+        self.created(path, &frontmatter)
+    }
+
+    /// Create a project hub that stands on at least one existing research note.
+    pub fn create_project(
+        &self,
+        name: &str,
+        topic: &str,
+        research: &[String],
+        summary: &str,
+        provenance: &str,
+    ) -> Result<PathBuf, Fault> {
+        let topic = refs::clean(topic, Area::Topics.folder());
+        if !self.topic_exists(&topic)? {
+            return Err(Fault::InvalidNote {
+                path: self.area_path(Area::Projects).display().to_string(),
+                detail: format!(
+                    "topic `{topic}` does not exist; create it first with `hades topic`"
+                ),
+            });
+        }
+        let resolved = self.resolve_research_all(research)?;
+        let mut canonical = Vec::new();
+        for (reference, outcome) in &resolved {
+            match outcome {
+                ResearchRef::Found(slug) => canonical.push(slug.clone()),
+                _ => {
+                    return Err(Fault::InvalidNote {
+                        path: self.area_path(Area::Projects).display().to_string(),
+                        detail: outcome.reason(reference).unwrap_or_else(|| {
+                            format!("`{reference}` does not name an existing research note")
+                        }),
+                    });
+                }
+            }
+        }
+        if canonical.is_empty() {
+            return Err(Fault::InvalidNote {
+                path: self.area_path(Area::Projects).display().to_string(),
+                detail: "a project names at least one research note".to_string(),
+            });
+        }
+        let slug = slugify(name, 12);
+        let path = self.area_path(Area::Projects).join(&slug).join("index.md");
+        if self.store.exists(&path) {
+            return Err(self.clash(&path));
+        }
+        let frontmatter = Frontmatter {
+            title: Some(name.trim().to_string()),
+            summary: Some(summary.trim().to_string()),
+            status: Some("durable".to_string()),
+            topic: Some(topic.clone()),
+            topics: vec![topic],
+            projects: vec![slug],
+            research: canonical,
+            provenance: Some(provenance.to_string()),
+            ..Frontmatter::default()
+        };
+        self.created(path, &frontmatter)
+    }
+
+    /// Freeze a project as a product. The topic is inherited from the project when not given.
+    pub fn create_product(
+        &self,
+        name: &str,
+        from_project: &str,
+        topic: Option<&str>,
+        status: &str,
+        summary: &str,
+        provenance: &str,
+    ) -> Result<PathBuf, Fault> {
+        let project = match self.resolve_project(from_project)? {
+            ResearchRef::Found(project) => project,
+            other => {
+                return Err(Fault::InvalidNote {
+                    path: self.area_path(Area::Products).display().to_string(),
+                    detail: other
+                        .reason(from_project)
+                        .unwrap_or_else(|| "that project does not exist".to_string()),
+                });
+            }
+        };
+        let project_note = self.read_note(&self.project_path(&project))?;
+        let topic = match topic {
+            Some(topic) => refs::clean(topic, Area::Topics.folder()),
+            None => {
+                let topic = project_note.topic().to_string();
+                if topic.is_empty() {
+                    return Err(Fault::InvalidNote {
+                        path: self.area_path(Area::Products).display().to_string(),
+                        detail: format!("project `{project}` has no topic to inherit"),
+                    });
+                }
+                topic
+            }
+        };
+        if !self.topic_exists(&topic)? {
+            return Err(Fault::InvalidNote {
+                path: self.area_path(Area::Products).display().to_string(),
+                detail: format!("topic `{topic}` does not exist"),
+            });
+        }
+        let slug = slugify(name, 12);
+        let path = self.area_path(Area::Products).join(&slug).join("index.md");
+        if self.store.exists(&path) {
+            return Err(self.clash(&path));
+        }
+        let frontmatter = Frontmatter {
+            title: Some(name.trim().to_string()),
+            summary: Some(summary.trim().to_string()),
+            status: Some(status.trim().to_string()),
+            topic: Some(topic.clone()),
+            topics: vec![topic],
+            projects: vec![project.clone()],
+            from_project: Some(project),
+            provenance: Some(provenance.to_string()),
+            ..Frontmatter::default()
+        };
+        self.created(path, &frontmatter)
     }
 
     /// Every note, in area order and then by name, skipping fenced paths. Read one folder at a time,
@@ -324,6 +669,12 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
     pub fn recall(&self, topic: Option<&str>, project: Option<&str>) -> Result<Vec<Note>, Fault> {
         let mut found: Vec<Note> = Vec::new();
         for note in self.iter_notes(None, &[])? {
+            // Recall is knowledge: research, projects and products. The Inbox is a queue, the Outbox is
+            // a channel nothing reads yet, and a topic is a door, not a finding.
+            let area = crate::sqlite::note_path(&self.root, &note.path).map(|(area, _)| area);
+            if !matches!(area, Some(Area::Research | Area::Projects | Area::Products)) {
+                continue;
+            }
             if let Some(topic) = topic
                 && !note.topics().iter().any(|held| held == topic)
             {
