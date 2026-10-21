@@ -29,9 +29,21 @@ fn write_harness(root: &Path, profile: &str, body: &str) {
 }
 
 fn write_case(root: &Path, profile: &str, id: &str, goal: &str, check: &str) -> String {
+    write_case_script(root, profile, id, goal, check, "#!/bin/sh\nexit 0\n")
+}
+
+/// The same, with the tree's script given, so a replacement can differ from what it replaces.
+fn write_case_script(
+    root: &Path,
+    profile: &str,
+    id: &str,
+    goal: &str,
+    check: &str,
+    script: &str,
+) -> String {
     let tree = root.join("cases").join(profile).join(id).join("tree");
     fs::create_dir_all(&tree).expect("tree");
-    fs::write(tree.join("run.sh"), "#!/bin/sh\nexit 0\n").expect("script");
+    fs::write(tree.join("run.sh"), script).expect("script");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -347,6 +359,200 @@ fn an_adapted_skill_is_accepted_only_as_a_proposal() {
     assert!(text.contains("status: proposed"), "{text}");
     assert!(text.contains("contract: TODO"), "{text}");
     assert!(skills::installed(&target).is_empty(), "nothing active yet");
+}
+
+/// A tar of `count` regular files with `name_len`-character names, written by hand so a listing over the
+/// cap can be built without putting forty thousand files on disk.
+fn tar_of_names(count: usize, name_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(count * 512 + 1024);
+    for index in 0..count {
+        let mut header = [0u8; 512];
+        let name = format!("{index:0width$}", width = name_len);
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(b"00000000000\0");
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let sum: u32 = header.iter().map(|byte| *byte as u32).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        out.extend_from_slice(&header);
+    }
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
+fn gzip_file(input: &Path, output: &Path) {
+    let handle = fs::File::create(output).expect("the archive");
+    let status = std::process::Command::new("gzip")
+        .arg("-c")
+        .arg(input)
+        .stdout(handle)
+        .status()
+        .expect("gzip runs");
+    assert!(status.success(), "gzip failed");
+}
+
+#[test]
+fn a_pack_larger_than_the_archive_cap_is_refused_before_read() {
+    let dir = state("pack-cap-archive");
+    let file = dir.join("huge.hadepack");
+    let handle = fs::File::create(&file).expect("the archive");
+    handle
+        .set_len(pack::MAX_ARCHIVE + 1)
+        .expect("a sparse file past the cap");
+    drop(handle);
+    let error = match pack::Pack::open(&file) {
+        Ok(_) => panic!("refused"),
+        Err(error) => error,
+    };
+    assert!(error.contains("archive cap"), "{error}");
+    assert!(error.contains(&pack::MAX_ARCHIVE.to_string()), "{error}");
+}
+
+#[test]
+fn a_listing_over_the_cap_is_refused() {
+    let dir = state("pack-cap-listing");
+    let tar = dir.join("listing.tar");
+    // 45_000 names of 100 characters is about 4.5 MB of `tar -t` output, past the 4 MB listing cap, with
+    // an archive small enough to reach the listing check.
+    fs::write(&tar, tar_of_names(45_000, 100)).expect("the tar");
+    let file = dir.join("listing.hadepack");
+    gzip_file(&tar, &file);
+    let error = match pack::Pack::open(&file) {
+        Ok(_) => panic!("refused"),
+        Err(error) => error,
+    };
+    assert!(error.contains("listing"), "{error}");
+    assert!(error.contains("the pack is refused"), "{error}");
+}
+
+#[test]
+fn an_archive_that_expands_over_the_cap_is_refused_before_extraction() {
+    let dir = state("pack-cap-expanded");
+    let raw = dir.join("payload.bin");
+    let handle = fs::File::create(&raw).expect("the payload");
+    // Sparse on disk, but gzip still has to read every byte, and the counter stops just past the cap.
+    handle
+        .set_len(pack::MAX_EXPANDED + 1)
+        .expect("a sparse payload past the cap");
+    drop(handle);
+    let file = dir.join("expands.hadepack");
+    gzip_file(&raw, &file);
+    let error = match pack::Pack::open(&file) {
+        Ok(_) => panic!("refused"),
+        Err(error) => error,
+    };
+    assert!(error.contains("expands past"), "{error}");
+    assert!(error.contains(&pack::MAX_EXPANDED.to_string()), "{error}");
+}
+
+#[test]
+fn a_failed_case_replacement_restores_the_old_case() {
+    // v1 lands, then a v2 replacement fails at the ledger append. Before this was transactional the old
+    // tree had already been renamed away and its ledger line retired, so a failed append left no case at
+    // all: not the old one, not the new one.
+    let source = state("pack-case-tx-source");
+    write_skill(&source, "pack-skill", "A procedure.");
+    write_harness(&source, "research", "A harness.");
+    // The case id is derived from profile, goal, check and tree, so the two versions keep the same goal
+    // and tree: what makes v2 different is its pack version, which the ledger line records.
+    let first_digest = write_case_script(
+        &source,
+        "research",
+        "research-f3e86460f834",
+        "Find the value",
+        "test -f run.sh",
+        "#!/bin/sh\nexit 0\n",
+    );
+    let one = source.join("one.hadepack");
+    let mut options = fit_options(&source, &one);
+    options.cases = vec!["research-f3e86460f834".to_string()];
+    pack::export(&options).expect("export v1");
+
+    let target = state("pack-case-tx-target");
+    let opened = pack::Pack::open(&one).expect("open v1");
+    let install = pack_fit::parse_decisions(
+        r#"{"items":[{"kind":"case","identity":"research-f3e86460f834","action":"install"}]}"#,
+    )
+    .expect("decisions");
+    pack_fit::apply(&opened, &target, &target, &install, false).expect("install v1");
+    let case_dir = target.join("cases/research/research-f3e86460f834");
+    // Something on disk that only the real case directory has, so a restore is distinguishable from a
+    // directory that was never moved at all.
+    fs::write(case_dir.join("installed-by-hand"), "v1\n").expect("marker");
+
+    // v2 of the pack, same case, exported as version 2.0.0.
+    write_case_script(
+        &source,
+        "research",
+        "research-f3e86460f834",
+        "Find the value",
+        "test -f run.sh",
+        "#!/bin/sh\nexit 0\n",
+    );
+    let two = source.join("two.hadepack");
+    let mut options = fit_options(&source, &two);
+    options.cases = vec!["research-f3e86460f834".to_string()];
+    options.version = "2.0.0".to_string();
+    pack::export(&options).expect("export v2");
+    let second = pack::Pack::open(&two).expect("open v2");
+
+    // The ledger is the failpoint: a file the process cannot append to. The old case must survive it.
+    let ledger = cases::ledger(&target, "research");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&ledger, fs::Permissions::from_mode(0o400)).expect("read-only ledger");
+    }
+
+    let replace = pack_fit::parse_decisions(
+        r#"{"items":[{"kind":"case","identity":"research-f3e86460f834","action":"replace"}]}"#,
+    )
+    .expect("decisions");
+    let error = pack_fit::apply(&second, &target, &target, &replace, false)
+        .expect_err("an append that cannot happen fails the replacement");
+    assert!(error.contains("could not open"), "{error}");
+
+    // The v1 tree is back, at the same path, with the marker that was only ever in the live directory.
+    let script = fs::read_to_string(case_dir.join("tree/run.sh")).expect("the old tree");
+    assert_eq!(script, "#!/bin/sh\nexit 0\n");
+    assert_eq!(
+        fs::read_to_string(case_dir.join("installed-by-hand")).expect("the marker"),
+        "v1\n"
+    );
+    assert_eq!(cases::tree_digest(&case_dir.join("tree")).expect("digest"), first_digest);
+
+    // The active ledger line is still v1: the append that failed is the only write attempted.
+    let case = cases::find(&target, "research", "research-f3e86460f834")
+        .expect("find")
+        .expect("the old case is still installed");
+    assert_eq!(case.source, "pack:test/pack@1.0.0");
+    assert_eq!(case.goal, "Find the value");
+    assert_eq!(case.status, "open");
+
+    // No half-staged copy and no stranded backup are left behind.
+    let leftovers: Vec<String> = fs::read_dir(target.join("cases/research"))
+        .expect("the case directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".staged-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let backups: Vec<String> = fs::read_dir(target.join("packs/replaced/test/pack"))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(backups.is_empty(), "a backup was left behind: {backups:?}");
 }
 
 #[test]

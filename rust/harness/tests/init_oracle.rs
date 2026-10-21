@@ -231,11 +231,12 @@ fn a_run_with_no_model_reads_the_preset_from_the_config() {
         ],
         "",
     );
+    // The refusal moved to the config load, where the bad name is still named and the alternatives are
+    // listed. What the test is about — a config that names a model nothing can reach is refused, not
+    // silently replaced — is unchanged.
     assert_eq!(code, 2, "{text}");
-    assert!(
-        text.contains("the model `not-a-preset` has no preset"),
-        "{text}"
-    );
+    assert!(text.contains("`not-a-preset`"), "{text}");
+    assert!(text.contains("neither a preset nor an endpoint"), "{text}");
 }
 
 #[test]

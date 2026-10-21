@@ -673,22 +673,26 @@ pub fn append_result(state: &Path, profile: &str, result: &ResultLine) -> Result
     )
 }
 
-/// Install a case that came from a pack. The tree is verified against the case's recorded digest before
-/// anything lands, and a ledger failure removes the copied tree so a case directory never exists without a
-/// line that names it.
-pub(crate) fn install_pack(
-    state: &Path,
-    case: &Case,
-    source_tree: &Path,
-    source: &str,
-) -> Result<PathBuf, String> {
+/// A verified copy of a case tree, made beside its target and not yet visible as the installed case.
+///
+/// Staging exists so a replacement can be validated and copied *before* the installed case is moved out of
+/// the way. Copying after the old tree has been renamed to a backup is the shape that loses the case: a
+/// failed copy or a failed ledger append leaves neither the old case nor a new one.
+pub(crate) struct Staged {
+    dir: PathBuf,
+}
+
+impl Staged {
+    /// Throw the copy away. Called on every path that does not end in a commit.
+    pub(crate) fn discard(self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Verify the recorded tree digest and copy the tree beside where it will land.
+pub(crate) fn stage(state: &Path, case: &Case, source_tree: &Path) -> Result<Staged, String> {
     if !valid_id(&case.id) {
         return Err(format!("`{}` is not a case id", case.id));
-    }
-    let base = profile_dir(state, &case.profile);
-    let dir = base.join(&case.id);
-    if dir.exists() {
-        return Err(format!("a case called `{}` is already installed", case.id));
     }
     let digest = tree_digest(source_tree)?;
     if digest != case.tree {
@@ -697,8 +701,32 @@ pub(crate) fn install_pack(
             case.id, case.tree
         ));
     }
-    let target = dir.join("tree");
-    copy_dir(source_tree, &target)?;
+    let base = profile_dir(state, &case.profile);
+    crate::scratch::state_dir(&base)
+        .map_err(|error| format!("could not make {}: {error}", base.display()))?;
+    let dir = base.join(format!(".staged-{}-{}", case.id, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    copy_dir(source_tree, &dir.join("tree"))?;
+    Ok(Staged { dir })
+}
+
+/// Move the staged tree into place and append the line that makes it active. A failed append removes the
+/// tree again, so an installed directory never exists without a line naming it.
+pub(crate) fn commit(
+    state: &Path,
+    case: &Case,
+    staged: Staged,
+    source: &str,
+) -> Result<PathBuf, String> {
+    let dir = profile_dir(state, &case.profile).join(&case.id);
+    if dir.exists() {
+        staged.discard();
+        return Err(format!("a case called `{}` is already installed", case.id));
+    }
+    if let Err(error) = fs::rename(&staged.dir, &dir) {
+        staged.discard();
+        return Err(format!("could not install {}: {error}", dir.display()));
+    }
     let mut installed = case.clone();
     installed.source = source.to_string();
     if let Err(error) = append(state, &case.profile, &installed.to_value()) {

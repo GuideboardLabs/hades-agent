@@ -924,19 +924,61 @@ fn install_harness(
 fn install_case(prepared: &Prepared, state: &Path, pack: &Pack) -> Result<Installed, String> {
     let case = read_case(&prepared.source)?;
     let tree = prepared.source.join("tree");
-    if let Some(backup) = &prepared.backup {
-        let existing = prepared
-            .existing
-            .as_ref()
-            .ok_or_else(|| "replace has no existing case path".to_string())?;
-        if let Err(error) = fs::rename(existing, backup) {
-            return Err(format!("could not back up {}: {error}", existing.display()));
-        }
-        // The ledger still names the old case; retire it before the new one lands.
-        let _ = cases::forget(state, &case.profile, &case.id);
-    }
     let source = format!("pack:{}@{}", pack.manifest.id, pack.manifest.version);
-    let dir = cases::install_pack(state, &case, &tree, &source)?;
+
+    // 1 and 2: verify the new tree and copy it beside the target before the installed case is touched.
+    let staged = cases::stage(state, &case, &tree)?;
+    let existing = match &prepared.backup {
+        Some(_) => Some(
+            prepared
+                .existing
+                .as_ref()
+                .ok_or_else(|| "replace has no existing case path".to_string())?
+                .clone(),
+        ),
+        None => None,
+    };
+
+    // 3: move the old case aside. The ledger still names it, so a failure below can put it back whole.
+    let mut restored = None;
+    if let (Some(backup), Some(existing)) = (&prepared.backup, &existing)
+        && let Err(error) = fs::rename(existing, backup)
+    {
+        staged.discard();
+        return Err(format!("could not back up {}: {error}", existing.display()));
+    }
+    if let (Some(backup), Some(existing)) = (&prepared.backup, &existing) {
+        restored = Some((backup.clone(), existing.clone()));
+    }
+
+    // 4 and 5: move the new tree into place and append the line that makes it active.
+    let dir = match cases::commit(state, &case, staged, &source) {
+        Ok(dir) => dir,
+        Err(error) => {
+            // 6: the new tree is gone, so the old one goes back exactly where it was and the old ledger
+            // line — never retired before the new line existed — still names it.
+            if let Some((backup, existing)) = &restored {
+                let _ = fs::rename(backup, existing);
+                // `backup_path` makes the stamp directory before it knows the move will happen, so an
+                // empty one is left behind unless it is removed here.
+                if let Some(parent) = backup.parent() {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    // 7: the old line is superseded rather than retired. The ledger is append-only and the last `case`
+    // line for an id wins, so appending `retired` here would retire the case that just landed; the old
+    // line stays as history and only its backup tree is reclaimed.
+    if let Some((backup, _)) = &restored {
+        let _ = fs::remove_dir_all(backup);
+        if let Some(parent) = backup.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
     let live_digest = digest_live(&dir)?;
     Ok(Installed {
         kind: Kind::Case,

@@ -20,6 +20,15 @@ pub const FORMAT: u32 = 1;
 pub const MAX_MANIFEST: u64 = 64 * 1024;
 pub const MAX_ENTRIES: usize = 4096;
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Compressed bytes on disk. Checked from metadata before the file is read at all, so an archive that is
+/// merely huge never becomes this process's memory.
+pub const MAX_ARCHIVE: u64 = 128 * 1024 * 1024;
+/// The `tar -t` listing, which is read before anything is extracted.
+pub const MAX_LISTING: usize = 4 * 1024 * 1024;
+/// Total bytes after decompression. A gzip header can claim any size, so this is counted from the stream.
+pub const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
+/// How long extraction may take before the child is killed and the tree removed.
+pub const MAX_EXTRACT_SECONDS: u64 = 20;
 
 const KNOWN_ROLES: [&str; 5] = ["survey", "patch", "sweep", "verify", "record"];
 const KNOWN_TOOLS: [&str; 13] = [
@@ -540,25 +549,45 @@ impl Drop for Pack {
 impl Pack {
     pub fn open(file: &Path) -> Result<Pack, String> {
         ensure_gnu_tar()?;
-        let archive = fs::read(file)
-            .map_err(|error| format!("could not read {}: {error}", file.display()))?;
-        let digest = mneme::sha256::hex(&archive);
-        let uncompressed = gzip_size(file)?;
-        if uncompressed > MAX_BYTES {
+        // The archive cap is a metadata check, so a 4 GB file is refused without being read.
+        let on_disk = fs::metadata(file)
+            .map_err(|error| format!("could not stat {}: {error}", file.display()))?
+            .len();
+        if on_disk > MAX_ARCHIVE {
             return Err(format!(
-                "{} expands to {uncompressed} bytes; the cap is {MAX_BYTES}",
+                "{} is {on_disk} bytes; the archive cap is {MAX_ARCHIVE}",
                 file.display()
             ));
         }
-        let names = capture("tar", &["-tzf", &file.to_string_lossy()])?;
-        let types = capture("tar", &["-tvzf", &file.to_string_lossy()])?;
+        let digest = file_digest(file)?;
+        let uncompressed = expanded_size(file)?;
+        if uncompressed > MAX_EXPANDED {
+            return Err(format!(
+                "{} expands past {uncompressed} bytes; the cap is {MAX_EXPANDED}",
+                file.display()
+            ));
+        }
+        let names = capture_bounded(
+            "tar",
+            &["-tzf", &file.to_string_lossy()],
+            MAX_LISTING,
+            "the tar listing",
+        )?;
+        let types = capture_bounded(
+            "tar",
+            &["-tvzf", &file.to_string_lossy()],
+            MAX_LISTING,
+            "the tar listing",
+        )?;
         validate_listing(&names, &types)?;
         let root = scratch::unique("pack-open");
         scratch::state_dir(&root)
             .map_err(|error| format!("could not make {}: {error}", root.display()))?;
         let cleanup = Cleanup(root.clone());
         let text = file.to_string_lossy().to_string();
-        let status = Command::new("tar")
+        // Extraction runs bounded in time as well as in bytes: a nested archive or a device node can make
+        // tar sit there, and a pack that never finishes is a pack that never gets refused.
+        let mut child = Command::new("tar")
             .args([
                 "-xzf",
                 &text,
@@ -567,8 +596,31 @@ impl Pack {
                 "--same-permissions",
                 "--no-same-owner",
             ])
-            .status()
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| format!("could not run tar: {error}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(MAX_EXTRACT_SECONDS);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                Err(error) => return Err(format!("could not wait for tar: {error}")),
+            }
+        };
+        let Some(status) = status else {
+            return Err(format!(
+                "{} did not extract within {MAX_EXTRACT_SECONDS}s; the tree was removed",
+                file.display()
+            ));
+        };
         if !status.success() {
             return Err(format!("tar could not extract {}", file.display()));
         }
@@ -784,20 +836,110 @@ fn validate_listing(names: &str, types: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn gzip_size(file: &Path) -> Result<u64, String> {
-    let out = capture("gzip", &["-l", &file.to_string_lossy()])?;
-    for line in out.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 2
-            && let Ok(size) = fields[1].parse::<u64>()
-        {
-            return Ok(size);
+/// The SHA-256 of a file, read in chunks. The archive cap bounds the size; this bounds the memory.
+fn file_digest(file: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut handle = fs::File::open(file)
+        .map_err(|error| format!("could not read {}: {error}", file.display()))?;
+    let mut digest = mneme::sha256::Digest::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = handle
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read {}: {error}", file.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finish())
+}
+
+/// How many bytes the archive expands to, counted from a decompression stream that stops one byte past the
+/// cap. `gzip -l` reports what the trailer claims, and a trailer is written by whoever built the archive.
+fn expanded_size(file: &Path) -> Result<u64, String> {
+    use std::io::Read;
+    let mut child = Command::new("gzip")
+        .arg("-dc")
+        .arg(file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("could not run gzip: {error}"))?;
+    let mut out = child.stdout.take().ok_or_else(|| "gzip gave no output".to_string())?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut total: u64 = 0;
+    loop {
+        let read = match out.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("gzip could not decompress {}: {error}", file.display()));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > MAX_EXPANDED {
+            // One byte past the cap is enough to refuse it; there is no reason to finish decompressing.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(total);
         }
     }
-    Err(format!(
-        "gzip could not report the size of {}",
-        file.display()
-    ))
+    let _ = child.wait();
+    Ok(total)
+}
+
+/// Run a program and keep at most `limit` bytes of its output. The listing of an archive is read before the
+/// archive is extracted, so this is where a pack with a million entries is refused cheaply.
+fn capture_bounded(
+    program: &str,
+    args: &[&str],
+    limit: usize,
+    label: &str,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+    let mut out = child.stdout.take().ok_or_else(|| format!("{program} gave no output"))?;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut overflow = false;
+    loop {
+        let read = out
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read {program} output: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if kept.len() + read > limit {
+            overflow = true;
+            break;
+        }
+        kept.extend_from_slice(&buffer[..read]);
+    }
+    if overflow {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{label} is over {limit} bytes; the pack is refused"));
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for {program}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(kept).map_err(|_| format!("{program} wrote non-UTF-8 output"))
 }
 
 fn verify_sums(root: &Path, files: &[(String, PathBuf, u64)]) -> Result<(), String> {
