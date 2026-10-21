@@ -83,6 +83,26 @@ fn prune(base: &std::path::Path) {
             let _ = std::fs::remove_dir_all(&path);
         }
     }
+    // Roots that are not named `process-<pid>` (older suites wrote `governance-accept-<pid>-N`) cannot be
+    // checked against `/proc`, so age decides. Two days is longer than any test run and short enough that a
+    // crashed suite's leftovers do not accumulate: this directory held 10,913 entries and 657 MB before the
+    // rule existed, from roots no naming convention could reclaim.
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 /// Make a state directory private, and keep an existing one private. One creator, because four modules

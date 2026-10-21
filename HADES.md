@@ -589,6 +589,15 @@ curved mouse path and per-character text entry for ref-based clicks and typing. 
 whole string; long input is sent in small chunks instead of being truncated. `observe` accepts `text_limit`
 and `item_limit`, and `eval` and `network_body` accept `full` for a 100,000-character return.
 
+Chromium's own stderr goes to `<state>/browser/chromium.log`, truncated on each launch, and a launch that
+dies before its first reply reports the last line Chromium wrote plus the child's exit status. Without that,
+every failure read as "the browser closed the pipe", which names the symptom and not the cause.
+
+The state directory also has to leave room for Chromium's socket: it binds
+`<TMPDIR>/.org.chromium.Chromium.XXXXXX/SingletonSocket`, and a Unix socket path is 107 bytes. A longer
+`TMPDIR` makes the bind fail inside Chromium, which aborts with `SIGTRAP` and no message, so `hades` checks
+the length before spawning and refuses with the number and the fix.
+
 There is one Chromium per state directory, held under the resolved path. Two state directories used to share
 one process, so a test and a daemon could drive each other's tabs, cookies and downloads. A failed call
 drops only the state that failed, and a session unused for fifteen minutes is closed on the next call

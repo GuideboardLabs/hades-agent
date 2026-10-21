@@ -940,6 +940,11 @@ These are current limits, not aspirations hidden in a roadmap:
 - The `preferences.md` prompt block and `taste adopt` are not shipped. A CLI answer can only teach a root when the session log supplies it; a TUI answer always knows its root.
 - Taste adapts a recommendation and can stop asking a choice. It does not infer a preference the person never chose.
 - The browser needs an external Chromium binary. Vision is optional and needs local GGUF model files.
+- Chromium binds a Unix socket under its `TMPDIR`, so the state directory has to leave room for it: past 61
+  characters of `TMPDIR`, the bind fails inside Chromium and it aborts. `hades` refuses such a state with
+  the numbers instead of launching. The browser's own stderr is kept at `<state>/browser/chromium.log`.
+- The live browser suite is `cargo test -p harness --lib browser:: -- --ignored` (add `DISPLAY=:0` for the
+  headed case). Twelve tests; all twelve pass on this machine.
 - `eval` can act outside the textual safety floor. It is an explicit escape hatch.
 - The floor reads text. `--policy strict` is a deny list over the same text, so an obfuscated command
   (`r''m -rf`, `$(printf rm)`) is not caught by either. The cage is the bound the kernel enforces.

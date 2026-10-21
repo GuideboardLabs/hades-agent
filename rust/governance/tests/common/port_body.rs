@@ -54,11 +54,48 @@ impl TestStore for SqliteStore {
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch(name: &str) -> PathBuf {
+    prune_once();
     let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = scratch_base().join(format!("governance-{name}-{}-{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
+}
+
+/// Remove directories this suite left behind.
+///
+/// Each run makes one directory per test and removes none, so the base grew by about five thousand entries a
+/// day: 10,913 directories and 657 MB before this existed. Every name carries the process that made it, so a
+/// directory whose process is gone is safe to remove, and a live process keeps its own.
+fn prune_once() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(scratch_base()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("governance-") else {
+                continue;
+            };
+            // The pid is the second-to-last segment: `governance-<name>-<pid>-<counter>`.
+            let mut parts: Vec<&str> = rest.split('-').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            parts.pop();
+            let pid = parts.pop().unwrap_or_default();
+            if pid.is_empty() || !pid.chars().all(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+            if pid == std::process::id().to_string() {
+                continue;
+            }
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
 }
 
 fn today() -> Date {
