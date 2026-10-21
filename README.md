@@ -943,6 +943,9 @@ These are current limits, not aspirations hidden in a roadmap:
 - Chromium binds a Unix socket under its `TMPDIR`, so the state directory has to leave room for it: past 61
   characters of `TMPDIR`, the bind fails inside Chromium and it aborts. `hades` refuses such a state with
   the numbers instead of launching. The browser's own stderr is kept at `<state>/browser/chromium.log`.
+- `scripts/cross-check.sh` checks the workspace for `aarch64-unknown-linux-gnu` without root: it stages the
+  cross gcc under a prefix and points `CC_<target>` at it. CI installs the package instead
+  (`.github/workflows/cross.yml`).
 - The live browser suite is `cargo test -p harness --lib browser:: -- --ignored` (add `DISPLAY=:0` for the
   headed case). Twelve tests; all twelve pass on this machine.
 - `eval` can act outside the textual safety floor. It is an explicit escape hatch.
