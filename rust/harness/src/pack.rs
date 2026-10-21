@@ -600,7 +600,8 @@ impl Pack {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("could not run tar: {error}"))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(MAX_EXTRACT_SECONDS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(MAX_EXTRACT_SECONDS);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
@@ -866,7 +867,10 @@ fn expanded_size(file: &Path) -> Result<u64, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("could not run gzip: {error}"))?;
-    let mut out = child.stdout.take().ok_or_else(|| "gzip gave no output".to_string())?;
+    let mut out = child
+        .stdout
+        .take()
+        .ok_or_else(|| "gzip gave no output".to_string())?;
     let mut buffer = vec![0u8; 1 << 20];
     let mut total: u64 = 0;
     loop {
@@ -875,7 +879,10 @@ fn expanded_size(file: &Path) -> Result<u64, String> {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("gzip could not decompress {}: {error}", file.display()));
+                return Err(format!(
+                    "gzip could not decompress {}: {error}",
+                    file.display()
+                ));
             }
         };
         if read == 0 {
@@ -908,7 +915,10 @@ fn capture_bounded(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("could not run {program}: {error}"))?;
-    let mut out = child.stdout.take().ok_or_else(|| format!("{program} gave no output"))?;
+    let mut out = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{program} gave no output"))?;
     let mut kept: Vec<u8> = Vec::new();
     let mut buffer = vec![0u8; 64 * 1024];
     let mut overflow = false;
@@ -928,7 +938,9 @@ fn capture_bounded(
     if overflow {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("{label} is over {limit} bytes; the pack is refused"));
+        return Err(format!(
+            "{label} is over {limit} bytes; the pack is refused"
+        ));
     }
     let output = child
         .wait_with_output()

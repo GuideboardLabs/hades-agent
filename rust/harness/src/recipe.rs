@@ -84,7 +84,10 @@ impl Recipe {
             }
             rules.push(Protect::parse(trimmed, root)?);
         }
-        Ok(Recipe { verify, protect: rules })
+        Ok(Recipe {
+            verify,
+            protect: rules,
+        })
     }
 
     /// Replace the profile's check and its protected set together.
@@ -138,7 +141,8 @@ mod tests {
     fn a_check_without_protection_is_refused() {
         let root = scratch("unprotected");
         let text = r#"{"version":1,"verify":"pytest -q"}"#;
-        let error = Recipe::parse(text, &root).expect_err("a changed verifier must name what it protects");
+        let error =
+            Recipe::parse(text, &root).expect_err("a changed verifier must name what it protects");
         assert!(error.contains("protect"), "{error}");
     }
 

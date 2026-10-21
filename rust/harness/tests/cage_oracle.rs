@@ -299,7 +299,12 @@ fn the_abi_probe_answers_rather_than_panicking() {
     // On a kernel with Landlock this is the version; on one without it is ENOSYS, which `available()`
     // turns into `false`. Neither may panic, and a cross-check has to compile the same code.
     let abi = harness::cage::abi();
-    assert!(abi < 0 || abi >= 1, "{abi}");
+    // Either a version (>= 1) or a negative errno. Zero is neither, and a zero would silently look like
+    // "no rights" rather than "no syscall".
+    assert!(
+        abi != 0,
+        "the probe returned neither an abi nor an error: {abi}"
+    );
     let _ = harness::cage::available();
 }
 
@@ -327,7 +332,9 @@ fn the_socket_right_is_handled_only_where_the_kernel_has_it() {
     );
     if harness::cage::abi() < 9 {
         assert!(
-            Cage::around("/work").socket_note().contains("not contained"),
+            Cage::around("/work")
+                .socket_note()
+                .contains("not contained"),
             "{}",
             Cage::around("/work").socket_note()
         );

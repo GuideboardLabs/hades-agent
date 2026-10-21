@@ -931,7 +931,10 @@ mod tests {
         // this reads text after stripping quoted spans, so it does not match. The assertion is that the
         // miss is recorded as a known miss rather than papered over.
         let joined = "sh -c 'r''m -rf /'";
-        assert!(strict(joined).is_none(), "strict claimed a catch it cannot make: {joined}");
+        assert!(
+            strict(joined).is_none(),
+            "strict claimed a catch it cannot make: {joined}"
+        );
         assert!(STRICT_DENY_LIST.contains("deny list"));
     }
 

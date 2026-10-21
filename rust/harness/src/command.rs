@@ -148,10 +148,7 @@ fn run_inner(
         std::fs::create_dir_all(tmp).map_err(|error| {
             Fault::harness(format!("could not make {}: {error}", tmp.display()))
         })?;
-        command
-            .env("TMPDIR", tmp)
-            .env("TMP", tmp)
-            .env("TEMP", tmp);
+        command.env("TMPDIR", tmp).env("TMP", tmp).env("TEMP", tmp);
     }
 
     if let Some(plan) = plan {
@@ -314,8 +311,9 @@ fn read_pipe<R: std::io::Read>(pipe: Option<R>, limit: usize) -> Captured {
     captured
 }
 
-/// Keep the head and the tail, and say what was left out. Both ends, because a failure usually announces
-/// itself at one end and explains itself at the other.
+/// Cut `text` to `limit` bytes, counting nothing as already dropped. Test-only: the running reader counts
+/// what it drops, and this is the shape a caller with the whole string would have.
+#[cfg(test)]
 fn truncate(text: &str, limit: usize) -> (String, bool) {
     cap_to(text.to_string(), limit, 0)
 }
@@ -327,10 +325,7 @@ fn cap_to(text: String, limit: usize, seen_omitted: usize) -> (String, bool) {
     }
     if text.len() <= limit {
         // Everything that survived fits; only the already-dropped bytes need saying.
-        return (
-            format!("{text}\n… {seen_omitted} bytes omitted …"),
-            true,
-        );
+        return (format!("{text}\n… {seen_omitted} bytes omitted …"), true);
     }
 
     let head = limit * 2 / 3;
@@ -430,7 +425,11 @@ mod tests {
         )
         .expect("a run");
         assert!(run.output.len() < 4000, "{}", run.output.len());
-        assert!(run.output.contains("omitted"), "{}", &run.output[..200.min(run.output.len())]);
+        assert!(
+            run.output.contains("omitted"),
+            "{}",
+            &run.output[..200.min(run.output.len())]
+        );
         assert!(run.truncated);
         let counted: usize = run
             .output
@@ -439,7 +438,10 @@ mod tests {
             .and_then(|part| part.split_whitespace().next())
             .and_then(|number| number.parse().ok())
             .unwrap_or(0);
-        assert!(counted > 1_900_000, "the marker undercounts the stream: {counted}");
+        assert!(
+            counted > 1_900_000,
+            "the marker undercounts the stream: {counted}"
+        );
     }
 
     #[test]

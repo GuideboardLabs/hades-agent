@@ -22,13 +22,13 @@ use mneme::NoteStore;
 
 use crate::Assembly;
 use crate::Engine;
-use crate::engine::CageMode;
 use crate::Harness;
 use crate::ScriptedModel;
 use crate::approval::{ApprovalBroker, OnDisk, PendingId, Scope};
 use crate::boundary;
 use crate::config;
 use crate::context::{self, Budgeted, Context, Learned, Section};
+use crate::engine::CageMode;
 use crate::fault::Fault;
 use crate::graph::{BaselineGate, Bounds, Ended, Remembering, Runner};
 use crate::memory::{Memory, MnemeMemory, OutcomeNote};
@@ -716,25 +716,20 @@ fn models() -> Result<(String, i32), String> {
     );
     // Named endpoints from the config, so a model that is not a shipped preset is still choosable by id.
     // Only the variable name is printed: the value lives in .env and is never read here.
-    if let Ok(home) = hades_home() {
-        if let Ok(Some(config)) = config::load(&config::path_in(&home)) {
-            if !config.endpoints.is_empty() {
-                text.push_str("\nnamed endpoints:\n");
-                for (name, endpoint) in &config.endpoints {
-                    text.push_str(&format!(
-                        "{:<20} {}\n{:<20} {} ({} tokens)\n",
-                        name,
-                        endpoint.model,
-                        "",
-                        endpoint.url,
-                        endpoint.context_tokens
-                    ));
-                    if let Some(key) = &endpoint.key_env {
-                        text.push_str(&format!("{:<20} key: ${key}\n", ""));
-                    }
-                    text.push('\n');
-                }
+    if let Ok(home) = hades_home()
+        && let Ok(Some(config)) = config::load(&config::path_in(&home))
+        && !config.endpoints.is_empty()
+    {
+        text.push_str("\nnamed endpoints:\n");
+        for (name, endpoint) in &config.endpoints {
+            text.push_str(&format!(
+                "{:<20} {}\n{:<20} {} ({} tokens)\n",
+                name, endpoint.model, "", endpoint.url, endpoint.context_tokens
+            ));
+            if let Some(key) = &endpoint.key_env {
+                text.push_str(&format!("{:<20} key: ${key}\n", ""));
             }
+            text.push('\n');
         }
     }
     Ok((text, 0))
@@ -1258,16 +1253,16 @@ fn answerer(
                 {
                     from_named_endpoint(endpoint)
                 } else {
-                let preset = model::preset(model_id).ok_or_else(|| {
-                    format!(
-                        "no model named `{model_id}`: try {}",
-                        model::presets()
-                            .iter()
-                            .map(|preset| preset.id)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })?;
+                    let preset = model::preset(model_id).ok_or_else(|| {
+                        format!(
+                            "no model named `{model_id}`: try {}",
+                            model::presets()
+                                .iter()
+                                .map(|preset| preset.id)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
                     model::from_preset(&preset)
                 }
             }
@@ -1367,8 +1362,8 @@ fn key_spec(spec: &str) -> Key {
 /// A named endpoint from the config, as an answerer. The key is resolved by name through the same seam a
 /// preset uses: the config records the variable and never the value.
 fn from_named_endpoint(endpoint: &crate::config::Endpoint) -> OpenAi {
-    let mut open =
-        OpenAi::new(endpoint.url.clone(), endpoint.model.clone()).with_context(endpoint.context_tokens);
+    let mut open = OpenAi::new(endpoint.url.clone(), endpoint.model.clone())
+        .with_context(endpoint.context_tokens);
     if let Some(key) = &endpoint.key_env {
         open = open.with_key(Key::Env(key.clone()));
     }
@@ -5786,6 +5781,24 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
         ),
     };
 
+    // The plan's size is one string before the receipt is built; formatting it inline made the receipt a
+    // `format!` inside a `format!`, which reads as an argument and is evaluated twice over.
+    let plan = match plan_chars {
+        Some(chars) => format!("{chars} chars"),
+        None => "none".to_string(),
+    };
+    // The floor line and the audit line are built here, not inside the receipt's own `format!`: a nested
+    // format is an argument that runs first and looks like it does not.
+    let floor = format!("floor:   {}\n", crate::floor::receipt());
+    let audit = if crate::activity::gaps() == 0 {
+        String::new()
+    } else {
+        format!(
+            "audit:   incomplete, {} write(s) lost ({})\n",
+            crate::activity::gaps(),
+            crate::activity::last_gap().unwrap_or_else(|| "unknown".to_string())
+        )
+    };
     let mut text = format!(
         "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\ncontext: {} tokens\ncage:    {}\n{}\n{}shadow:  {}\nmap:     {hits} hits, {misses} misses\n",
         session.id(),
@@ -5795,21 +5808,13 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
         engine.policy_name(),
         answerer.describe(),
         harness.line(),
-        match plan_chars {
-            Some(chars) => format!("{chars} chars"),
-            None => "none".to_string(),
-        },
+        plan,
         engine.profile().context_tokens,
         engine.cage(),
         // The floor is a text heuristic and the receipt says so; a run that printed "safety: on" would be
         // claiming the sandbox this build does not have.
-        format!("floor:   {}\\n", crate::floor::receipt()),
-        // A ledger that could not record something says so, rather than letting the run look complete.
-        if crate::activity::gaps() == 0 {
-            String::new()
-        } else {
-            format!("audit:   incomplete ({} gap(s) this process)\\n", crate::activity::gaps())
-        },
+        floor,
+        audit,
         engine.shadows(),
     );
     text.push_str(&format!("history: {}\n", history(&learned)));
@@ -6643,7 +6648,11 @@ fn acp(args: &[String], input: &mut dyn BufRead) -> Result<(String, i32), String
 /// The HTTP surface. A thin client of the daemon: it binds a listener and turns each request into an op on
 /// the socket, or a read of the same files the daemon answers from.
 fn http(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse_with(args, &["bind", "state", "token-file", "max-connections"], &["once"])?;
+    let flags = parse_with(
+        args,
+        &["bind", "state", "token-file", "max-connections"],
+        &["once"],
+    )?;
     let state = state_of(&flags)?;
     let bind = match flags.named.get("bind") {
         Some(text) => text.parse::<std::net::SocketAddr>().map_err(|_| {

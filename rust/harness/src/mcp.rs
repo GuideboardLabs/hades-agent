@@ -200,7 +200,10 @@ impl McpConfig {
                 },
             );
         }
-        Ok(McpConfig { servers: out, commands })
+        Ok(McpConfig {
+            servers: out,
+            commands,
+        })
     }
 
     /// The shape `save` writes back.

@@ -108,12 +108,10 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
         ]);
     }
     for index in 16..64 {
-        let s0 = w[index - 15].rotate_right(7)
-            ^ w[index - 15].rotate_right(18)
-            ^ (w[index - 15] >> 3);
-        let s1 = w[index - 2].rotate_right(17)
-            ^ w[index - 2].rotate_right(19)
-            ^ (w[index - 2] >> 10);
+        let s0 =
+            w[index - 15].rotate_right(7) ^ w[index - 15].rotate_right(18) ^ (w[index - 15] >> 3);
+        let s1 =
+            w[index - 2].rotate_right(17) ^ w[index - 2].rotate_right(19) ^ (w[index - 2] >> 10);
         w[index] = w[index - 16]
             .wrapping_add(s0)
             .wrapping_add(w[index - 7])

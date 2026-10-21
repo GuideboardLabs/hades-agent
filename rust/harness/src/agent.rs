@@ -2105,13 +2105,7 @@ fn shell(args: &Value, world: &World) -> String {
     }
     let program = format!("timeout {seconds} sh -c {}", quote(command));
     let cage = crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network());
-    match crate::command::run_clean_in(
-        &program,
-        &world.root,
-        6000,
-        Some(&cage),
-        Some(&scratch),
-    ) {
+    match crate::command::run_clean_in(&program, &world.root, 6000, Some(&cage), Some(&scratch)) {
         Ok(run) => {
             let mut text = run.output;
             if text.trim().is_empty() {
@@ -3633,11 +3627,14 @@ mod tests {
             for result in kept.iter().filter(|m| m["role"] == "tool") {
                 let id = result["tool_call_id"].as_str();
                 let paired = kept.iter().any(|message| {
-                    message["tool_calls"].as_array().is_some_and(|calls| {
-                        calls.iter().any(|call| call["id"].as_str() == id)
-                    })
+                    message["tool_calls"]
+                        .as_array()
+                        .is_some_and(|calls| calls.iter().any(|call| call["id"].as_str() == id))
                 });
-                assert!(paired, "keep={keep} orphaned a tool result at split {split}");
+                assert!(
+                    paired,
+                    "keep={keep} orphaned a tool result at split {split}"
+                );
             }
             // And the other direction: a kept call has its result.
             for message in kept.iter() {
@@ -3648,7 +3645,8 @@ mod tests {
                     let id = call["id"].as_str();
                     assert!(
                         kept.iter()
-                            .any(|other| other["role"] == "tool" && other["tool_call_id"].as_str() == id),
+                            .any(|other| other["role"] == "tool"
+                                && other["tool_call_id"].as_str() == id),
                         "keep={keep} kept a call without its result at split {split}"
                     );
                 }

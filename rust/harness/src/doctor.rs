@@ -249,7 +249,10 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
     // a limit nobody sees is a limit that gets assumed away.
     found.extend(security_findings(home));
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    found.push(Finding::ok("recipe", crate::recipe::Recipe::describe(&root)));
+    found.push(Finding::ok(
+        "recipe",
+        crate::recipe::Recipe::describe(&root),
+    ));
     // An audit trail with a silent hole is worse than one that says where the hole is. The counter is per
     // process, so this reports the gaps this process hit; the ledger's own history is the longer record.
     let gaps = crate::activity::gaps();

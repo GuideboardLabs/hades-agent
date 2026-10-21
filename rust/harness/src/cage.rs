@@ -199,7 +199,6 @@ pub fn scan_sockets(candidates: &[PathBuf]) -> Vec<(PathBuf, SocketState)> {
         .collect()
 }
 
-
 /// What a program the harness runs is allowed to touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cage {
@@ -663,5 +662,13 @@ pub fn available() -> bool {
 fn call(number: libc::c_long, a: usize, b: usize, c: usize, d: usize) -> isize {
     // SAFETY: a system call with the arguments its own contract requires. Nothing is dereferenced that the
     // caller did not build, and the numbers come from libc's table for this architecture.
-    unsafe { libc::syscall(number, a as libc::c_long, b as libc::c_long, c as libc::c_long, d as libc::c_long) as isize }
+    unsafe {
+        libc::syscall(
+            number,
+            a as libc::c_long,
+            b as libc::c_long,
+            c as libc::c_long,
+            d as libc::c_long,
+        ) as isize
+    }
 }

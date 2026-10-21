@@ -526,7 +526,10 @@ fn a_failed_case_replacement_restores_the_old_case() {
         fs::read_to_string(case_dir.join("installed-by-hand")).expect("the marker"),
         "v1\n"
     );
-    assert_eq!(cases::tree_digest(&case_dir.join("tree")).expect("digest"), first_digest);
+    assert_eq!(
+        cases::tree_digest(&case_dir.join("tree")).expect("digest"),
+        first_digest
+    );
 
     // The active ledger line is still v1: the append that failed is the only write attempted.
     let case = cases::find(&target, "research", "research-f3e86460f834")

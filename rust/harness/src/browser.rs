@@ -375,7 +375,11 @@ impl Session {
         // Chromium's process singleton creates a socket in its TMPDIR and aborts with "Failed to create
         // socket directory" when that directory does not exist, so the paths are made here and the
         // variable is set below. The paths are resolved and checked under `<state>/browser` first.
-        let StatePaths { profile, downloads, tmp } = state_paths(state)?;
+        let StatePaths {
+            profile,
+            downloads,
+            tmp,
+        } = state_paths(state)?;
 
         let (to_child, child_read) = UnixStream::pair()
             .map_err(|error| format!("could not make the command pipe: {error}"))?;
@@ -3015,7 +3019,10 @@ mod tests {
         let args = launch_args(false, true);
         assert!(args.iter().any(|arg| arg == "--no-sandbox"), "{args:?}");
         let headed = launch_args(true, false);
-        assert!(!headed.contains(&"--headless=new".to_string()), "{headed:?}");
+        assert!(
+            !headed.contains(&"--headless=new".to_string()),
+            "{headed:?}"
+        );
     }
 
     #[test]
@@ -3026,12 +3033,18 @@ mod tests {
         let paths = state_paths(&state).expect("state paths");
         let root = std::fs::canonicalize(state.join("browser")).expect("the browser root");
         for path in [&paths.profile, &paths.downloads, &paths.tmp] {
-            assert!(path.starts_with(&root), "{} escaped {}", path.display(), root.display());
+            assert!(
+                path.starts_with(&root),
+                "{} escaped {}",
+                path.display(),
+                root.display()
+            );
         }
         // A symlink where one of the directories should be is refused rather than followed.
         std::fs::remove_dir_all(root.join("downloads")).expect("remove");
         std::os::unix::fs::symlink("/tmp", root.join("downloads")).expect("symlink");
-        let said = state_paths(&state).expect_err("a link out of the root is not a download directory");
+        let said =
+            state_paths(&state).expect_err("a link out of the root is not a download directory");
         assert!(said.contains("outside"), "{said}");
     }
 
@@ -3069,11 +3082,11 @@ mod tests {
         let state = crate::scratch::root().join("shots-confined");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
-        let error = resolve_shot(&state, Some("../../outside.png"))
-            .expect_err("a traversal is refused");
-        assert!(error.contains("shots"), "{error}");
         let error =
-            resolve_shot(&state, Some("/tmp/outside.png")).expect_err("an absolute path is refused");
+            resolve_shot(&state, Some("../../outside.png")).expect_err("a traversal is refused");
+        assert!(error.contains("shots"), "{error}");
+        let error = resolve_shot(&state, Some("/tmp/outside.png"))
+            .expect_err("an absolute path is refused");
         assert!(error.contains("shots"), "{error}");
         let inside = resolve_shot(&state, Some("sub/page.png")).expect("an inside path");
         let shots = std::fs::canonicalize(state.join("shots")).expect("the shots directory");

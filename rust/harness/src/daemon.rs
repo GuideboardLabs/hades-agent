@@ -75,7 +75,13 @@ fn inflight_path(state: &Path, session: &str) -> PathBuf {
     // validate, so anything else is folded to `-` rather than being trusted as a path component.
     let safe: String = session
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
         .collect();
     inflight_dir(state).join(format!("{safe}.json"))
 }
@@ -315,8 +321,8 @@ impl Daemon {
         }
     }
 
-/// Every session under this state directory, as the logs have it. Read fresh every time, because the
-/// logs are the only place this exists.
+    /// Every session under this state directory, as the logs have it. Read fresh every time, because the
+    /// logs are the only place this exists.
     fn status(&self) -> Result<Value, Fault> {
         let waiting = self.questions_raw()?;
         let runs = self.runs.lock().map_err(|_| {

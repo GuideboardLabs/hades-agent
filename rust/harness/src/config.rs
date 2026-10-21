@@ -70,9 +70,9 @@ impl Endpoint {
     /// A URL has to say https or http, and a key is named, not pasted. Both refusals are here rather than
     /// at the call site because a bad endpoint is discovered at three in the morning otherwise.
     fn parse(name: &str, value: &Value, path: &Path) -> Result<Endpoint, String> {
-        let object = value.as_object().ok_or_else(|| {
-            format!("{}: `endpoints.{name}` is not an object", path.display())
-        })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{}: `endpoints.{name}` is not an object", path.display()))?;
         let url = object
             .get("url")
             .and_then(Value::as_str)
@@ -90,19 +90,19 @@ impl Endpoint {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|model| !model.is_empty())
-            .ok_or_else(|| {
-                format!("{}: `endpoints.{name}.model` is missing", path.display())
-            })?
+            .ok_or_else(|| format!("{}: `endpoints.{name}.model` is missing", path.display()))?
             .to_string();
         let key_env = match object.get("key_env") {
             None | Some(Value::Null) => None,
             Some(Value::String(text)) => {
                 let text = text.trim();
                 let valid = !text.is_empty()
-                    && text
-                        .chars()
-                        .enumerate()
-                        .all(|(at, ch)| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_lowercase() || (at > 0 && ch.is_ascii_digit()));
+                    && text.chars().enumerate().all(|(at, ch)| {
+                        ch == '_'
+                            || ch.is_ascii_uppercase()
+                            || ch.is_ascii_lowercase()
+                            || (at > 0 && ch.is_ascii_digit())
+                    });
                 if !valid {
                     return Err(format!(
                         "{}: `endpoints.{name}.key_env` is a variable name, not a key",
@@ -132,7 +132,13 @@ impl Endpoint {
             .get("thinking")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        Ok(Endpoint { url, model, key_env, context_tokens, thinking })
+        Ok(Endpoint {
+            url,
+            model,
+            key_env,
+            context_tokens,
+            thinking,
+        })
     }
 }
 
@@ -142,7 +148,10 @@ fn endpoints(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, Endp
         return Ok(BTreeMap::new());
     };
     let object = value.as_object().ok_or_else(|| {
-        format!("{}: `endpoints` is not an object of name to endpoint", path.display())
+        format!(
+            "{}: `endpoints` is not an object of name to endpoint",
+            path.display()
+        )
     })?;
     let mut out = BTreeMap::new();
     for (name, endpoint) in object {
@@ -159,10 +168,19 @@ fn endpoints(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, Endp
 
 /// A model id is a shipped preset or a named endpoint. Anything else is refused by name, here, because the
 /// alternative is a run that starts and then cannot reach anything.
-fn check_model(model: &str, endpoints: &BTreeMap<String, Endpoint>, path: &Path, field: &str) -> Result<(), String> {
+fn check_model(
+    model: &str,
+    endpoints: &BTreeMap<String, Endpoint>,
+    path: &Path,
+    field: &str,
+) -> Result<(), String> {
     if crate::model::preset(model).is_none() && !endpoints.contains_key(model) {
         let mut known = endpoints.keys().cloned().collect::<Vec<_>>();
-        known.extend(crate::model::presets().iter().map(|preset| preset.id.to_string()));
+        known.extend(
+            crate::model::presets()
+                .iter()
+                .map(|preset| preset.id.to_string()),
+        );
         return Err(format!(
             "{}: `{field}` names model `{model}`, which is neither a preset nor an endpoint; try {}",
             path.display(),

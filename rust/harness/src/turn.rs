@@ -331,7 +331,7 @@ impl<'a> Seams<'a> {
                 // The strict deny list runs before the ordinary floor and before any question: a
                 // destructive primitive is refused rather than offered to a person as a choice.
                 if self.policy.is_strict()
-                    && let Some(floor) = crate::floor::strict(&program)
+                    && let Some(floor) = crate::floor::strict(program)
                 {
                     let reason = format!("{}: {}", crate::floor::STRICT_DENY_LIST, floor.reason());
                     entries.push(session.append(
