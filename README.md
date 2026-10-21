@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.13-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-901%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.14-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-903%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.13 |
+| **Version** | 0.0.14 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,13 +61,19 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 901 passing, 13 ignored live tests |
+| **Tests** | 903 passing, 13 ignored live tests |
 
 ---
 
+## What 0.0.14 adds
+
+- **`config.json` can set a model per profile.** `profile_models` maps a shipped profile id to a preset; a profile with no entry inherits the config's `model`. An unknown id or preset is refused when the config is read, with the valid names in the message.
+- **`hades route` prints the effective model**, including a `profile_models` override, so the choice is visible without starting a run.
+
 ## What 0.0.13 adds
 
-- **Profiles can name a model, and inherit one when they do not.** `--model` still wins, then the profile's preset, then the config. No shipped profile pins a model, so `verify` no longer asks for a preset this build does not ship.
+- **Profiles can name a model, and inherit one when they do not.** `--model` still wins, then `profile_models.<id>` from `config.json`, then the profile's own setting, then the config's model. No shipped profile pins a model, so `verify` no longer asks for a preset this build does not ship.
+- **The per-profile setting is validated when the config is read.** An unknown profile id or an unknown preset is refused by name, not silently ignored.
 - **`hades profiles` and `hades route` say `inherit`** where a profile has no model of its own.
 
 ## What 0.0.12 adds
@@ -650,6 +656,24 @@ hades chat
 
 Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway additionally needs
 `HADES_TELEGRAM_TOKEN` and a non-empty `gateway.telegram.allowed_users` list.
+
+### Setting a model per profile
+
+Every profile runs the config's `model` unless it is given its own. Add a `profile_models` object to
+`config.json`:
+
+```json
+{
+  "model": "deepseek-v4.1-flash",
+  "profile_models": {
+    "verify": "nanbeige-3b"
+  }
+}
+```
+
+Each key must name a shipped profile (`hades profiles`) and each value a preset (`hades models`). A typo
+is refused when the config is read, not silently ignored. Precedence is `--model`, then
+`profile_models.<id>`, then the profile's own setting, then the config's `model`.
 
 ---
 

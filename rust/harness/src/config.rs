@@ -11,6 +11,7 @@
 //! window all come with the preset, and a bare name would leave a daemon holding an id it has nowhere to
 //! send. `hades models` lists what this build ships.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -34,8 +35,17 @@ pub struct Config {
     pub root: PathBuf,
     /// The Mneme vault, for the audit and for the memory seam that comes later.
     pub vault: PathBuf,
+    /// Per-profile model overrides, by shipped profile id. A profile with no entry inherits `model`.
+    pub profile_models: BTreeMap<String, String>,
     /// The MCP servers a chat may reach, and the tools a person has allowed on each.
     pub mcp: crate::mcp::McpConfig,
+}
+
+impl Config {
+    /// The model this config asks a named profile to run, if it asks for one.
+    pub fn profile_model(&self, profile: &str) -> Option<&str> {
+        self.profile_models.get(profile).map(String::as_str)
+    }
 }
 
 /// The config file under a Hades home.
@@ -96,6 +106,7 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         model: field(object, "model", path)?,
         root: PathBuf::from(field(object, "root", path)?),
         vault: PathBuf::from(field(object, "vault", path)?),
+        profile_models: profile_models(object.get("profile_models"), path)?,
         mcp: crate::mcp::McpConfig::from_value(object.get("mcp"), path)?,
     }))
 }
@@ -113,6 +124,7 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         "model": config.model,
         "root": config.root.to_string_lossy(),
         "vault": config.vault.to_string_lossy(),
+        "profile_models": config.profile_models,
         "mcp": config.mcp.to_value(),
     });
     let text = serde_json::to_string_pretty(&value)
@@ -146,6 +158,58 @@ fn field(object: &Map<String, Value>, key: &str, path: &Path) -> Result<String, 
         })
 }
 
+/// The optional `profile_models` map. Every key must name a shipped profile and every value a preset
+/// this build knows: a typo that is silently ignored is a setting the owner believes is on.
+fn profile_models(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "{}: `profile_models` is not an object of profile id to preset",
+            path.display()
+        )
+    })?;
+    let profiles = crate::profile::shipped()
+        .iter()
+        .map(|profile| profile.id.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let presets = crate::model::presets()
+        .iter()
+        .map(|preset| preset.id)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = BTreeMap::new();
+    for (profile, model) in object {
+        if crate::profile::named(profile).is_none() {
+            return Err(format!(
+                "{}: `profile_models.{profile}` names no shipped profile; try {profiles}",
+                path.display()
+            ));
+        }
+        let model = model
+            .as_str()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{}: `profile_models.{profile}` is not a preset id",
+                    path.display()
+                )
+            })?;
+        if crate::model::preset(model).is_none() {
+            return Err(format!(
+                "{}: `profile_models.{profile}` names model `{model}`, which this build has no \
+                 preset for; try {presets}",
+                path.display()
+            ));
+        }
+        out.insert(profile.clone(), model.to_string());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +235,7 @@ mod tests {
             model: "deepseek-v4.1-flash".to_string(),
             root: PathBuf::from("/work/tree"),
             vault: PathBuf::from("/work/tree/.hades/mneme"),
+            profile_models: BTreeMap::new(),
             mcp: crate::mcp::McpConfig::from_value(
                 Some(&json!({
                     "servers": {
@@ -226,6 +291,36 @@ mod tests {
         std::fs::write(&path, r#"{"version":99}"#).expect("write");
         let said = load(&path).expect_err("newer is not readable");
         assert!(said.contains("newer Hades"), "{said}");
+    }
+
+    #[test]
+    fn profile_models_round_trip_and_are_validated() {
+        let dir = scratch("profile-models");
+        let path = dir.join("config.json");
+        let mut config = sample();
+        config
+            .profile_models
+            .insert("fix".to_string(), "nanbeige-3b".to_string());
+        save(&path, &config).expect("save");
+        assert_eq!(load(&path).expect("load"), Some(config));
+
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v","profile_models":{"nope":"nanbeige-3b"}}"#,
+        )
+        .expect("write");
+        let said = load(&path).expect_err("an unknown profile is not ignored");
+        assert!(said.contains("names no shipped profile"), "{said}");
+        assert!(said.contains("fix"), "{said}");
+
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v","profile_models":{"fix":"not-a-preset"}}"#,
+        )
+        .expect("write");
+        let said = load(&path).expect_err("an unknown preset is not ignored");
+        assert!(said.contains("has no preset"), "{said}");
+        assert!(said.contains("not-a-preset"), "{said}");
     }
 
     #[test]

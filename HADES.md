@@ -36,7 +36,8 @@ the first machine to start, it has already moved over.
 
 - `~/.hades/config.json`: the provider, the model preset, the working root and the vault. A daemon or a
   bot is started with no arguments, so it reads this file; a CLI flag is an override on top of it. Secrets
-  never go in it: keys and bot tokens stay in `~/.hades/.env`.
+  never go in it: keys and bot tokens stay in `~/.hades/.env`. An optional `profile_models` object names a
+  preset per profile; a profile with no entry runs the config's `model`.
 - `~/.hades/mneme`: the six areas, `charter.md` from the interview (who the agent is, what the work is
   for, which topics matter), `TAXONOMY.md`, and a generated `INDEX.md`.
 - `--non-interactive` is the installer's path: flags and defaults, no prompts.

@@ -1099,6 +1099,17 @@ pub(crate) fn goal(flags: &Flags) -> Result<String, String> {
         .ok_or_else(|| "this command needs a goal".to_string())
 }
 
+/// The model a profile runs: the config's per-profile setting, then the profile's own, then none
+/// (which means the config's `model`). `--model` is handled before this and outranks both.
+fn effective_model<'a>(
+    config: Option<&'a config::Config>,
+    profile: &'a crate::profile::Profile,
+) -> Option<&'a str> {
+    config
+        .and_then(|config| config.profile_model(profile.id.as_str()))
+        .or(profile.model.as_deref())
+}
+
 /// Who answers this turn: a model when one is named, the person at the keyboard when a program is given.
 ///
 /// The preset path and the raw path differ only in where the endpoint and the key come from, so the
@@ -2641,6 +2652,13 @@ fn config_cmd(args: &[String]) -> Result<(String, i32), String> {
             text.push_str(&format!("model: {}\n", config.model));
             text.push_str(&format!("root: {}\n", config.root.display()));
             text.push_str(&format!("vault: {}\n", config.vault.display()));
+            if config.profile_models.is_empty() {
+                text.push_str("profile models: every profile inherits\n");
+            } else {
+                for (profile, model) in &config.profile_models {
+                    text.push_str(&format!("profile model: {profile} -> {model}\n"));
+                }
+            }
             text.push_str(&format!("mcp servers: {}\n", config.mcp.servers.len()));
             text.push_str("\nkeys and tokens live in .env, never in this file\n");
             Ok((text, 0))
@@ -3184,12 +3202,14 @@ fn route(args: &[String]) -> Result<(String, i32), String> {
     }
     let found = profile::named(id.as_str())
         .ok_or_else(|| format!("the rules picked {id}, which this build does not ship"))?;
+    let config = config_of(&flags)?;
+    let model = effective_model(config.as_ref(), &found).unwrap_or("inherit");
 
     Ok((
         format!(
             "profile: {}\nmodel:   {}\nreason:  {}\n",
             found.id,
-            found.model.as_deref().unwrap_or("inherit"),
+            model,
             reason.as_str()
         ),
         0,
@@ -3970,6 +3990,7 @@ fn init(
         model: preset.id.to_string(),
         root: root.clone(),
         vault: vault_path.clone(),
+        profile_models: std::collections::BTreeMap::new(),
         mcp: crate::mcp::McpConfig::default(),
     };
     config::save(&config_path, &config).map_err(|error| {
@@ -4147,7 +4168,7 @@ pub(crate) fn assemble(
         flags,
         config.as_ref(),
         Some(&harness),
-        profile.model.as_deref(),
+        effective_model(config.as_ref(), &profile),
     )?;
     // A strict request is checked while the check is free. An endpoint or a key that cannot work is
     // refused here, with the model and the provider named, rather than by the first call: a call that
@@ -5899,12 +5920,16 @@ mod gate_tests {
 mod profile_model_tests {
     use super::*;
 
-    fn config(model: &str) -> crate::config::Config {
+    fn config(model: &str, profile_models: &[(&str, &str)]) -> crate::config::Config {
         crate::config::Config {
             provider: "test".to_string(),
             model: model.to_string(),
             root: PathBuf::from("/tmp/hades-profile-model/root"),
             vault: PathBuf::from("/tmp/hades-profile-model/vault"),
+            profile_models: profile_models
+                .iter()
+                .map(|(profile, model)| (profile.to_string(), model.to_string()))
+                .collect(),
             mcp: Default::default(),
         }
     }
@@ -5925,7 +5950,7 @@ mod profile_model_tests {
     fn a_profile_model_outranks_the_config() {
         let answerer = answerer(
             &flags(None),
-            Some(&config("not-a-preset")),
+            Some(&config("not-a-preset", &[])),
             None,
             Some("nanbeige-3b"),
         )
@@ -5937,7 +5962,7 @@ mod profile_model_tests {
     fn the_flag_outranks_the_profile_model() {
         let answerer = answerer(
             &flags(Some("bonsai-27b")),
-            Some(&config("not-a-preset")),
+            Some(&config("not-a-preset", &[])),
             None,
             Some("nanbeige-3b"),
         )
@@ -5947,8 +5972,20 @@ mod profile_model_tests {
 
     #[test]
     fn with_no_profile_model_the_config_is_used() {
-        let answerer = answerer(&flags(None), Some(&config("nanbeige-3b")), None, None)
+        let answerer = answerer(&flags(None), Some(&config("nanbeige-3b", &[])), None, None)
             .expect("the config's preset resolves");
         assert!(answerer.describe().contains("nanbeige-3b"));
+    }
+
+    #[test]
+    fn the_config_profile_model_outranks_the_profiles_own() {
+        let first = config("not-a-preset", &[("fix", "nanbeige-3b")]);
+        let fix = crate::profile::named("fix").expect("fix");
+        assert_eq!(effective_model(Some(&first), &fix), Some("nanbeige-3b"));
+
+        let mut verify = crate::profile::named("verify").expect("verify");
+        verify.model = Some("bonsai-27b".to_string());
+        let second = config("not-a-preset", &[("verify", "nanbeige-3b")]);
+        assert_eq!(effective_model(Some(&second), &verify), Some("nanbeige-3b"));
     }
 }
