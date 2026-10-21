@@ -23,6 +23,19 @@ Two runs on the same machine, in the same session:
 | share of the current path | 81.5% | 80.4% |
 | curl peak RSS | 11 256 KiB | 11 148 KiB |
 
+## The same question on a real page
+
+The loopback fixture has no network, so it measures the process and nothing else. `scripts/bench-fetch-live.sh`
+runs both arms against `https://example.com/`, 10 fetches, on this machine:
+
+| | total | per fetch |
+|---|---|---|
+| curl per fetch | 720 ms | 72.0 ms |
+| one process, connections reused | 228 ms | 22.8 ms |
+
+68% of a real fetch is process start plus a fresh TLS handshake. The handshake is the larger half: a
+persistent client saves both, a faster process would save only the smaller one.
+
 ## Decision
 
 **Over the 20% threshold: open a separate task for a persistent client. Do not bundle it into 0.1.0.**
