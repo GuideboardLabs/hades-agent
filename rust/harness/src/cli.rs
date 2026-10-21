@@ -210,6 +210,28 @@ hades — the harness, one turn or a whole graph
       incompatible against the live catalog. Scores are 5-gram Jaccard; a redundant
       row prints the shared shingles so the heuristic can be rejected
 
+  hades pack apply <file> --plan <decisions.json> [--state <dir>] [--activate]
+      install the accepted rows. A missing decision is a skip. Skills land as
+      proposals unless --activate; harnesses become a numbered generation; cases
+      are copied with their pinned tree. Refuses an existing target, a duplicate,
+      or an install against a conflict. The apply is atomic per item, not per pack
+
+  hades pack uninstall <id> [--version <v>] [--state <dir>]
+      remove the catalog rows and the live paths a pack installed. A path another
+      pack row still names, a path a person edited, a promoted skill and a changed
+      harness are kept. Cases are retired through the ledger, never deleted behind it
+
+  hades pack list [--state <dir>] [--json]
+      print the installed catalog
+
+  hades pack adapt <file> --item <kind>:<identity> [--accept] [model flags]
+      rewrite one skill or harness for this home. Without --accept it only prints
+      a diff, changes and conflicts. Adaptation needs derivatives: allowed
+
+  hades pack merge <file> --item skill:<identity> --into <skill> [--name <n>] [--accept]
+      merge a pack skill into an installed skill as a new proposal. The target is
+      never edited. Unresolved conflicts are stamped and cannot be promoted
+
   hades note research <topic> <title...> [--slug <slug>] [--source-url <url>]
                      [--summary <text>] [--provenance <text>] [--vault <dir>]
                      [--db <file>] [--config <file>]
@@ -2402,7 +2424,15 @@ fn pack_cmd(args: &[String]) -> Result<(String, i32), String> {
         "export" => pack_export(rest),
         "inspect" => pack_inspect(rest),
         "plan" => pack_plan(rest),
-        other => Err(format!("`pack {other}`: say export, inspect or plan")),
+        "apply" => pack_apply(rest),
+        "uninstall" => pack_uninstall(rest),
+        "list" => pack_list(rest),
+        "adapt" => pack_adapt(rest),
+        "merge" => pack_merge(rest),
+        "help" | "--help" => Ok((pack_help(), 0)),
+        other => Err(format!(
+            "`pack {other}`: say export, inspect, plan, apply, uninstall, list, adapt, merge or help"
+        )),
     }
 }
 
@@ -2531,6 +2561,263 @@ fn pack_plan(args: &[String]) -> Result<(String, i32), String> {
     Ok((text, 0))
 }
 
+fn pack_help() -> String {
+    "pack export <id> --from <state> [selectors] [--out <file>]\n\
+     pack inspect <file> [--json]\n\
+     pack plan <file> [--state <dir>] [--json]\n\
+     pack apply <file> --plan <decisions.json> [--state <dir>] [--activate]\n\
+     pack uninstall <id> [--version <v>] [--state <dir>]\n\
+     pack list [--state <dir>] [--json]\n\
+     pack adapt <file> --item <kind>:<identity> [--accept] [model flags]\n\
+     pack merge <file> --item skill:<identity> --into <skill> [--name <n>] [--accept]\n"
+        .to_string()
+}
+
+fn pack_item(text: &str) -> Result<(crate::pack::Kind, String), String> {
+    let (kind, identity) = text
+        .split_once(':')
+        .ok_or_else(|| format!("`{text}` is not <kind>:<identity>"))?;
+    let kind = match kind {
+        "skill" => crate::pack::Kind::Skill,
+        "harness" => crate::pack::Kind::Harness,
+        "case" => crate::pack::Kind::Case,
+        other => {
+            return Err(format!(
+                "`{other}` is not a kind; say skill, harness or case"
+            ));
+        }
+    };
+    if identity.is_empty() {
+        return Err("the item identity is empty".to_string());
+    }
+    Ok((kind, identity.to_string()))
+}
+
+fn pack_model(flags: &Flags, config: Option<&config::Config>) -> Result<OpenAi, String> {
+    match answerer(flags, config, None, None)? {
+        Answerer::Model(open) => Ok(open),
+        Answerer::Scripted(_) => Err(
+            "pack adapt and merge need a model; pass --model <preset>, --endpoint and --model, or \
+             `hades init` to write a config that names one"
+                .to_string(),
+        ),
+    }
+}
+
+fn pack_apply(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state", "plan"], &["activate"])?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack apply` needs a pack file".to_string())?;
+    let plan = flags
+        .named
+        .get("plan")
+        .ok_or_else(|| "`pack apply` needs `--plan <decisions.json>`".to_string())?;
+    let text =
+        fs::read_to_string(plan).map_err(|error| format!("could not read {plan}: {error}"))?;
+    let decisions = crate::pack_fit::parse_decisions(&text)?;
+    let state = state_of(&flags)?;
+    let home = hades_home()?;
+    let pack = crate::pack::Pack::open(Path::new(file))?;
+    let receipt = crate::pack_fit::apply(
+        &pack,
+        &home,
+        &state,
+        &decisions,
+        switched(&flags, "activate"),
+    )?;
+    Ok((receipt.text(), 0))
+}
+
+fn pack_uninstall(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state", "version"], &[])?;
+    let id = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack uninstall` needs a pack id".to_string())?;
+    let state = state_of(&flags)?;
+    let home = hades_home()?;
+    let receipt = crate::pack_fit::uninstall(
+        &home,
+        &state,
+        id,
+        flags.named.get("version").map(String::as_str),
+    )?;
+    Ok((receipt.text(), 0))
+}
+
+fn pack_list(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state"], &["json"])?;
+    let state = state_of(&flags)?;
+    let rows = crate::pack_fit::read_catalog(&state)?;
+    if switched(&flags, "json") {
+        let value = Value::Array(
+            rows.iter()
+                .map(crate::pack_fit::Installed::to_value)
+                .collect(),
+        );
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|error| format!("could not encode the catalog: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+    if rows.is_empty() {
+        return Ok(("catalog: empty\n".to_string(), 0));
+    }
+    let mut text = format!("catalog: {} item(s)\n", rows.len());
+    for row in rows {
+        text.push_str(&format!(
+            "  {:<8} {:<32} {} {} -> {}\n",
+            row.kind.name(),
+            row.identity,
+            row.pack,
+            row.version,
+            row.live
+        ));
+    }
+    Ok((text, 0))
+}
+
+fn pack_adapt(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "state",
+            "item",
+            "config",
+            "model",
+            "endpoint",
+            "key",
+            "temperature",
+            "max-tokens",
+            "context",
+            "thinking",
+        ],
+        &["accept"],
+    )?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack adapt` needs a pack file".to_string())?;
+    let (kind, identity) = pack_item(
+        flags
+            .named
+            .get("item")
+            .ok_or_else(|| "`pack adapt` needs `--item <kind>:<identity>`".to_string())?,
+    )?;
+    if kind == crate::pack::Kind::Case {
+        return Err("a case is not adapted; adapt a skill or a harness".to_string());
+    }
+    let state = state_of(&flags)?;
+    let home = hades_home()?;
+    let pack = crate::pack::Pack::open(Path::new(file))?;
+    let old = crate::pack_fit::item_text(&pack, kind, &identity)?;
+    let prompt = crate::pack_fit::adapt_prompt(&pack, &home, &state, kind, &identity)?;
+    let open = pack_model(&flags, config_of(&flags)?.as_ref())?;
+    let messages = serde_json::json!([
+        {"role": "system", "content": "You adapt one procedure to a local Hades home. You answer with one JSON object."},
+        {"role": "user", "content": prompt},
+    ]);
+    let reply = open
+        .chat(messages.as_array().expect("an array"), None, &|_, _| {})
+        .map_err(|fault| {
+            format!(
+                "the adapter ended in a {} fault: {}",
+                fault.class(),
+                fault.detail()
+            )
+        })?;
+    let adapted = crate::pack_fit::parse_adapt(kind, &old, &reply.content)?;
+    let mut out = crate::pack_fit::adapted_report(&old, &adapted);
+    if switched(&flags, "accept") {
+        if !adapted.conflicts.is_empty() {
+            return Err(
+                "the adapter named unresolved conflicts; resolve them before --accept".to_string(),
+            );
+        }
+        let path =
+            crate::pack_fit::accept_adapted(&pack, &home, &state, kind, &identity, &adapted)?;
+        out.push_str(&format!("accepted: {path}\n"));
+    }
+    Ok((out, 0))
+}
+
+fn pack_merge(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "state",
+            "item",
+            "into",
+            "name",
+            "config",
+            "model",
+            "endpoint",
+            "key",
+            "temperature",
+            "max-tokens",
+            "context",
+            "thinking",
+        ],
+        &["accept"],
+    )?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack merge` needs a pack file".to_string())?;
+    let (kind, identity) = pack_item(
+        flags
+            .named
+            .get("item")
+            .ok_or_else(|| "`pack merge` needs `--item skill:<identity>`".to_string())?,
+    )?;
+    if kind != crate::pack::Kind::Skill {
+        return Err("0.0.20 merges skills only; harness merging is not defined".to_string());
+    }
+    let into = flags
+        .named
+        .get("into")
+        .ok_or_else(|| "`pack merge` needs `--into <installed-skill>`".to_string())?;
+    let name = flags
+        .named
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| format!("{identity}-merged"));
+    let state = state_of(&flags)?;
+    let home = hades_home()?;
+    let pack = crate::pack::Pack::open(Path::new(file))?;
+    let incoming = crate::pack_fit::item_text(&pack, kind, &identity)?;
+    let existing = crate::skills::installed(&state)
+        .into_iter()
+        .find(|skill| skill.name == *into)
+        .ok_or_else(|| format!("there is no installed skill called `{into}`"))?;
+    let base = fs::read_to_string(&existing.path)
+        .map_err(|error| format!("could not read {}: {error}", existing.path.display()))?;
+    let prompt = crate::pack_fit::merge_prompt(&pack, &home, &state, &identity, into)?;
+    let open = pack_model(&flags, config_of(&flags)?.as_ref())?;
+    let messages = serde_json::json!([
+        {"role": "system", "content": "You merge two skill texts. You answer with one JSON object."},
+        {"role": "user", "content": prompt},
+    ]);
+    let reply = open
+        .chat(messages.as_array().expect("an array"), None, &|_, _| {})
+        .map_err(|fault| {
+            format!(
+                "the merger ended in a {} fault: {}",
+                fault.class(),
+                fault.detail()
+            )
+        })?;
+    let adapted = crate::pack_fit::parse_merge(&incoming, &base, &reply.content)?;
+    let mut out = crate::pack_fit::adapted_report(&format!("{incoming}\n{base}"), &adapted);
+    if switched(&flags, "accept") {
+        let path =
+            crate::pack_fit::accept_merge(&pack, &home, &state, &identity, into, &name, &adapted)?;
+        out.push_str(&format!("accepted: {path}\n"));
+    }
+    Ok((out, 0))
+}
+
 /// Proposals from finished work, and the two decisions a person can take on one. A proposal is never loaded
 /// until it is promoted, because a skill is an instruction.
 fn skills_cmd(args: &[String]) -> Result<(String, i32), String> {
@@ -2635,7 +2922,7 @@ fn skills_verify(state: &Path, flags: &Flags) -> Result<(String, i32), String> {
         .positional
         .get(1)
         .ok_or_else(|| "verify needs a proposal name".to_string())?;
-    let path = crate::skills::proposed_dir(state).join(format!("{name}.md"));
+    let path = crate::skills::proposal_path(state, name)?;
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("there is no proposal called `{name}`"))?;
     let evidence = crate::skills::evidence(&text);
@@ -2670,9 +2957,10 @@ fn skills_verify(state: &Path, flags: &Flags) -> Result<(String, i32), String> {
     let active = thrown.join("skills").join(name);
     crate::scratch::state_dir(&active)
         .map_err(|error| format!("could not make {}: {error}", active.display()))?;
+    crate::skills::copy_proposal_support(state, name, &active)?;
     std::fs::write(
         active.join("SKILL.md"),
-        text.replace("status: proposed", "status: active"),
+        crate::skills::set_status(&text, "active"),
     )
     .map_err(|error| format!("could not write the throwaway skill: {error}"))?;
     let mut passthrough = Vec::new();

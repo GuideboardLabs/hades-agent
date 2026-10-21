@@ -1194,7 +1194,7 @@ fn make_every_directory_0755(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
     if let Some(parent) = to.parent() {
         make_dir(parent)?;
     }
@@ -1213,7 +1213,7 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     make_dir(to)?;
     let mut entries = Vec::new();
     for entry in
@@ -1244,7 +1244,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn walk_regular(root: &Path) -> Result<Vec<(String, PathBuf, u64)>, String> {
+pub(crate) fn walk_regular(root: &Path) -> Result<Vec<(String, PathBuf, u64)>, String> {
     let mut found = Vec::new();
     walk(root, root, &mut found)?;
     found.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1485,7 +1485,7 @@ fn catalog(state: &Path) -> Result<Vec<CatalogItem>, String> {
             let text = format!("{}\n{}", case.goal, case.check);
             items.push(CatalogItem {
                 kind: Kind::Case,
-                identity: cases::case_id(&case.profile, &case.goal, &case.check, &case.tree),
+                identity: case.id.clone(),
                 digest: digest_case(&value, &case.tree),
                 text,
             });
@@ -1527,6 +1527,22 @@ fn pack_items(pack: &Pack) -> Result<Vec<PackItem>, String> {
                 let case = Case::from_value(&value).ok_or_else(|| {
                     format!("case `{}` has no readable fields", provided.identity)
                 })?;
+                if provided.identity != case.id {
+                    return Err(format!(
+                        "case `{}` carries id `{}` in case.json; the manifest and the case must agree",
+                        provided.identity, case.id
+                    ));
+                }
+                if !cases::valid_id(&case.id) {
+                    return Err(format!("`{}` is not a case id", case.id));
+                }
+                let expected = cases::case_id(&case.profile, &case.goal, &case.check, &case.tree);
+                if case.id != expected {
+                    return Err(format!(
+                        "case `{}` is not the id of its profile, goal, check and tree (expected {expected})",
+                        case.id
+                    ));
+                }
                 let tree = path.join("tree");
                 let tree_digest = cases::tree_digest(&tree)?;
                 if tree_digest != case.tree {
@@ -1570,7 +1586,7 @@ fn digest_file(path: &Path) -> Result<String, String> {
     Ok(mneme::sha256::hex(&bytes))
 }
 
-fn digest_tree(root: &Path) -> Result<String, String> {
+pub(crate) fn digest_tree(root: &Path) -> Result<String, String> {
     let files = walk_regular(root)?;
     let mut text = String::new();
     for (relative, path, _) in files {

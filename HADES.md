@@ -199,7 +199,26 @@ is checked again at plan time. `--network`, `--writes vault|state`, `--requires-
 status, and warnings for network or vault writes. `hades pack plan` is also read-only: each item is
 `new`, `duplicate`, `conflict`, `redundant` or `incompatible` against the live catalog. Identity and
 content digest decide duplicate versus conflict; 5-gram Jaccard decides redundancy at 0.60 and prints the
-shared shingles. `plan` never installs; fitting a plan into a state is the next release.
+shared shingles.
+
+`hades pack apply <file> --plan <decisions.json>` is the write. Each decision names `kind`, `identity` and
+`install`, `replace` or `skip`; a row outside the plan is refused, and every target is checked before the
+first write. Skills go to `skills/proposed/<name>/` unless `--activate`; a conflict may be replaced, and the
+old live path moves to `packs/replaced/<pack>/<time>/`. Harnesses go to `<home>/harness/<profile>/` through
+the generation recorder. Cases copy their pinned tree after a digest check and append a ledger line with a
+`source`. The pack content is copied to `packs/<id>/<version>/`; `packs/catalog.jsonl` records the pack,
+version, pack digest, item digest, live digest, live path and content path. Nothing is a symlink.
+
+`hades pack list` reads that catalog. `hades pack uninstall <id> [--version <v>]` removes a live copy only
+when its digest still matches, keeps a promoted skill, retires a case in its ledger, removes content only
+when no remaining row references it, and appends an event. Atomicity is per item: a failure after earlier
+rows have landed leaves those rows and names the failure. `hades pack adapt` produces a local draft from
+one model call and writes it only with `--accept`; `hades pack merge` composes a skill draft and never
+overwrites the installed skill. Both require `derivatives: allowed`, and a merged draft with unresolved
+conflicts cannot be promoted even with `--force`.
+
+Trust is not in 0.0.20. A pack is unsigned, `signature` is reported as `unsigned` or `present, not
+verified`, and digest pinning is 0.1.0 work.
 
 ## Installing
 

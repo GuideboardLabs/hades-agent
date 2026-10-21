@@ -673,6 +673,41 @@ pub fn append_result(state: &Path, profile: &str, result: &ResultLine) -> Result
     )
 }
 
+/// Install a case that came from a pack. The tree is verified against the case's recorded digest before
+/// anything lands, and a ledger failure removes the copied tree so a case directory never exists without a
+/// line that names it.
+pub(crate) fn install_pack(
+    state: &Path,
+    case: &Case,
+    source_tree: &Path,
+    source: &str,
+) -> Result<PathBuf, String> {
+    if !valid_id(&case.id) {
+        return Err(format!("`{}` is not a case id", case.id));
+    }
+    let base = profile_dir(state, &case.profile);
+    let dir = base.join(&case.id);
+    if dir.exists() {
+        return Err(format!("a case called `{}` is already installed", case.id));
+    }
+    let digest = tree_digest(source_tree)?;
+    if digest != case.tree {
+        return Err(format!(
+            "case `{}` tree changed: recorded {}, found {digest}",
+            case.id, case.tree
+        ));
+    }
+    let target = dir.join("tree");
+    copy_dir(source_tree, &target)?;
+    let mut installed = case.clone();
+    installed.source = source.to_string();
+    if let Err(error) = append(state, &case.profile, &installed.to_value()) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    Ok(dir)
+}
+
 /// Retire a case: append a case line with `status: "retired"` and remove its tree. The evidence of the
 /// case line stays; the tree is what the person asked to reclaim.
 pub fn forget(state: &Path, profile: &str, id: &str) -> Result<Case, String> {

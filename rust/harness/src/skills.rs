@@ -131,7 +131,80 @@ pub fn list_in(dir: &Path) -> Vec<Skill> {
 }
 
 pub fn proposed(state: &Path) -> Vec<Skill> {
-    list_in(&proposed_dir(state))
+    let dir = proposed_dir(state);
+    let mut found = directories_with_skill(&dir);
+    found.extend(list_in(&dir));
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found.dedup_by(|a, b| a.name == b.name);
+    found
+}
+
+/// The file a proposal is read from. A flat proposal is `<name>.md`; a directory proposal is
+/// `<name>/SKILL.md`. Both existing at once is ambiguous and refused rather than silently picked.
+pub fn proposal_path(state: &Path, name: &str) -> Result<PathBuf, String> {
+    let flat = proposed_dir(state).join(format!("{name}.md"));
+    let tree = proposed_dir(state).join(name).join("SKILL.md");
+    match (flat.is_file(), tree.is_file()) {
+        (true, false) => Ok(flat),
+        (false, true) => Ok(tree),
+        (true, true) => Err(format!(
+            "there are two proposals called `{name}`: {} and {}",
+            flat.display(),
+            tree.display()
+        )),
+        (false, false) => Err(format!("there is no proposal called `{name}`")),
+    }
+}
+
+/// The directory a directory-shaped proposal owns, or `None` for a flat proposal.
+pub fn proposal_tree(state: &Path, name: &str) -> Option<PathBuf> {
+    let dir = proposed_dir(state).join(name);
+    (dir.join("SKILL.md").is_file()).then_some(dir)
+}
+
+pub fn proposal_text(state: &Path, name: &str) -> Result<String, String> {
+    let path = proposal_path(state, name)?;
+    std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))
+}
+
+/// Copy the support files of a proposal into an installed directory. `SKILL.md` is not copied; the caller
+/// writes the active text it already has. A flat proposal has no support files.
+pub fn copy_proposal_support(state: &Path, name: &str, to: &Path) -> Result<(), String> {
+    let Some(from) = proposal_tree(state, name) else {
+        return Ok(());
+    };
+    copy_support_tree(&from, to, Some("SKILL.md"))
+}
+
+fn copy_support_tree(from: &Path, to: &Path, skip: Option<&str>) -> Result<(), String> {
+    std::fs::create_dir_all(to)
+        .map_err(|error| format!("could not make {}: {error}", to.display()))?;
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(from)
+        .map_err(|error| format!("could not read {}: {error}", from.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if skip == Some(name.as_str()) {
+            continue;
+        }
+        let target = to.join(&name);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("could not stat {}: {error}", path.display()))?;
+        if meta.is_dir() {
+            copy_support_tree(&path, &target, None)?;
+        } else if meta.is_file() {
+            std::fs::copy(&path, &target)
+                .map_err(|error| format!("could not copy {}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn installed(state: &Path) -> Vec<Skill> {
@@ -208,6 +281,7 @@ pub struct Evidence {
     pub regression: Vec<String>,
     pub holdout: Vec<String>,
     pub version: Option<String>,
+    pub conflicts: Vec<String>,
 }
 
 pub fn evidence(text: &str) -> Evidence {
@@ -218,6 +292,7 @@ pub fn evidence(text: &str) -> Evidence {
             regression: Vec::new(),
             holdout: Vec::new(),
             version: None,
+            conflicts: Vec::new(),
         };
     };
     let contract = front.get("contract").cloned();
@@ -229,6 +304,7 @@ pub fn evidence(text: &str) -> Evidence {
         regression: list(front.get("regression")),
         holdout: list(front.get("holdout")),
         version,
+        conflicts: list(front.get("conflicts")),
     }
 }
 
@@ -266,6 +342,12 @@ pub fn promotable(
     evidence: &Evidence,
     verification: Option<&serde_json::Value>,
 ) -> Result<Vec<String>, String> {
+    if !evidence.conflicts.is_empty() {
+        return Err(format!(
+            "this proposal has unresolved conflicts: {}",
+            evidence.conflicts.join("; ")
+        ));
+    }
     if evidence.legacy {
         return Ok(vec![
             "this proposal predates the contract; it has no inputs, outputs, scope or failure modes"
@@ -329,6 +411,70 @@ pub fn proposal_profile(text: &str) -> Option<String> {
     frontmatter(text).and_then(|fields| fields.get("profile").cloned())
 }
 
+/// Rewrite one frontmatter field, preserving every other field and the body. A file with no frontmatter
+/// gets one; a field already present is replaced rather than duplicated.
+pub fn set_field(text: &str, key: &str, value: &str) -> String {
+    rewrite_frontmatter(text, &[(key.to_string(), value.to_string())])
+}
+
+/// Add evidence fields a pack or an edit left out. Existing values are kept: the tool never invents a
+/// contract or a case name over one a person wrote.
+pub fn ensure_defaults(text: &str) -> String {
+    let existing = frontmatter(text).unwrap_or_default();
+    let defaults = [
+        ("contract", "TODO".to_string()),
+        ("regression", "[]".to_string()),
+        ("holdout", "[]".to_string()),
+        ("version", "1".to_string()),
+    ];
+    let missing: Vec<(String, String)> = defaults
+        .into_iter()
+        .filter(|(key, _)| !existing.contains_key(*key))
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+    if missing.is_empty() {
+        text.to_string()
+    } else {
+        rewrite_frontmatter(text, &missing)
+    }
+}
+
+pub fn set_status(text: &str, status: &str) -> String {
+    set_field(text, "status", status)
+}
+
+fn rewrite_frontmatter(text: &str, updates: &[(String, String)]) -> String {
+    let (mut fields, body) = match text.strip_prefix("---\n").and_then(|rest| {
+        rest.find("\n---").map(|end| {
+            let front = &rest[..end];
+            let body = rest[end + 4..].trim_start_matches('\n').to_string();
+            let mut map = std::collections::BTreeMap::new();
+            for line in front.lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    map.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+            (map, body)
+        })
+    }) {
+        Some(parts) => parts,
+        None => (
+            std::collections::BTreeMap::new(),
+            text.trim_start_matches('\n').to_string(),
+        ),
+    };
+    for (key, value) in updates {
+        fields.insert(key.clone(), value.clone());
+    }
+    let mut out = String::from("---\n");
+    for (key, value) in fields {
+        out.push_str(&format!("{key}: {value}\n"));
+    }
+    out.push_str("---\n\n");
+    out.push_str(&body);
+    out
+}
+
 /// Move a proposal into the directory the agent reads, flipping `status: proposed` to `status: active`.
 pub fn promote(state: &Path, name: &str) -> Result<PathBuf, String> {
     promote_with(state, name, false)
@@ -337,10 +483,16 @@ pub fn promote(state: &Path, name: &str) -> Result<PathBuf, String> {
 /// The same, with the contract gate. `force` promotes and prints the warnings instead of refusing; it never
 /// erases the missing evidence, and the installed file keeps the `TODO` it was promoted with.
 pub fn promote_with(state: &Path, name: &str, force: bool) -> Result<PathBuf, String> {
-    let from = proposed_dir(state).join(format!("{name}.md"));
+    let from = proposal_path(state, name)?;
     let text = std::fs::read_to_string(&from)
         .map_err(|_| format!("there is no proposal called `{name}`"))?;
     let evidence = evidence(&text);
+    if !evidence.conflicts.is_empty() {
+        return Err(format!(
+            "`{name}` has unresolved conflicts and cannot be promoted: {}",
+            evidence.conflicts.join("; ")
+        ));
+    }
     let receipt = std::fs::read_to_string(verification_path(state, name))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
@@ -352,23 +504,36 @@ pub fn promote_with(state: &Path, name: &str, force: bool) -> Result<PathBuf, St
     for warning in &warnings {
         eprintln!("warning: {name}: {warning}");
     }
-    let text = text.replace("status: proposed", "status: active");
+    let text = set_status(&text, "active");
     let dir = installed_dir(state).join(name);
     crate::scratch::state_dir(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
+    if let Some(tree) = proposal_tree(state, name) {
+        copy_support_tree(&tree, &dir, Some("SKILL.md"))?;
+    }
     let to = dir.join("SKILL.md");
     std::fs::write(&to, text)
         .map_err(|error| format!("could not write {}: {error}", to.display()))?;
-    std::fs::remove_file(&from)
-        .map_err(|error| format!("could not remove {}: {error}", from.display()))?;
+    if let Some(tree) = proposal_tree(state, name) {
+        std::fs::remove_dir_all(&tree)
+            .map_err(|error| format!("could not remove {}: {error}", tree.display()))?;
+    } else {
+        std::fs::remove_file(&from)
+            .map_err(|error| format!("could not remove {}: {error}", from.display()))?;
+    }
     Ok(to)
 }
 
 /// Delete a proposal. A rejection is a decision and it is recorded by the file being gone, not by a status
 /// the next reader has to interpret.
 pub fn reject(state: &Path, name: &str) -> Result<(), String> {
-    let path = proposed_dir(state).join(format!("{name}.md"));
-    std::fs::remove_file(&path).map_err(|_| format!("there is no proposal called `{name}`"))
+    let path = proposal_path(state, name)?;
+    if let Some(tree) = proposal_tree(state, name) {
+        std::fs::remove_dir_all(&tree)
+            .map_err(|error| format!("could not remove {}: {error}", tree.display()))
+    } else {
+        std::fs::remove_file(&path).map_err(|_| format!("there is no proposal called `{name}`"))
+    }
 }
 
 #[cfg(test)]

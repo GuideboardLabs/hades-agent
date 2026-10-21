@@ -216,6 +216,37 @@ PLAN=$(HOME="$TEMP_HOME" "$B" pack plan "$PACK_A" --state "$TEMP_HOME/.hades")
 has "$PLAN" "duplicate" || fail "plan did not call the re-export a duplicate: $PLAN"
 ok "pack plan classifies a re-export as duplicate"
 
+# A pack exported from a home it is then installed into is a duplicate by construction. The fit check
+# therefore builds a second source home and applies that pack to the installed home.
+mkdir -p "$TEMP_HOME/.hades-source/skills/fit-skill" "$TEMP_HOME/.hades-source/harness/fit"
+printf '%s\n' '---' 'name: fit-skill' 'contract: acceptance' '---' '' 'Use the fit source.' \
+    > "$TEMP_HOME/.hades-source/skills/fit-skill/SKILL.md"
+printf '%s\n' 'You are a fit harness.' > "$TEMP_HOME/.hades-source/harness/fit/system.md"
+PACK_FIT="$BASE/fit.hadepack"
+OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/fit --from "$TEMP_HOME/.hades-source" \
+    --skill fit-skill --profile fit --title "Fit pack" --out "$PACK_FIT" 2>&1) \
+    || fail "the fit pack export failed: $OUT"
+printf '%s\n' '{"items":[{"kind":"skill","identity":"fit-skill","action":"install"},{"kind":"harness","identity":"fit","action":"install"}]}' \
+    > "$BASE/decisions.json"
+OUT=$(HOME="$TEMP_HOME" "$B" pack apply "$PACK_FIT" --plan "$BASE/decisions.json" \
+    --state "$TEMP_HOME/.hades" 2>&1) || fail "pack apply failed: $OUT"
+has "$OUT" "applied: 2 item(s)" || fail "apply did not report two items: $OUT"
+[ -f "$TEMP_HOME/.hades/skills/proposed/fit-skill/SKILL.md" ] || fail "apply did not install the skill as a proposal"
+[ -f "$TEMP_HOME/.hades/harness/fit/system.md" ] || fail "apply did not install the harness"
+ok "pack apply installs accepted rows and leaves the skill proposed"
+
+LIST=$(HOME="$TEMP_HOME" "$B" pack list --state "$TEMP_HOME/.hades")
+has "$LIST" "fit-skill" || fail "pack list lost the installed skill: $LIST"
+has "$LIST" "harness/fit" || fail "pack list lost the installed harness: $LIST"
+ok "pack list reads the catalog"
+
+OUT=$(HOME="$TEMP_HOME" "$B" pack uninstall seth/fit --state "$TEMP_HOME/.hades" 2>&1) \
+    || fail "pack uninstall failed: $OUT"
+has "$OUT" "removed: 2" || fail "uninstall did not report two removals: $OUT"
+[ ! -e "$TEMP_HOME/.hades/skills/proposed/fit-skill" ] || fail "uninstall left the skill"
+[ ! -e "$TEMP_HOME/.hades/harness/fit" ] || fail "uninstall left the harness"
+ok "pack uninstall removes the live copies"
+
 set +e
 OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/empty --from "$TEMP_HOME/.hades" --out "$BASE/empty.hadepack" 2>&1); CODE=$?
 set -e

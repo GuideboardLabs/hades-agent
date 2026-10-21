@@ -881,6 +881,124 @@ fn absolute(path: &Path) -> std::path::PathBuf {
     })
 }
 
+/// Put only the harness files a generation recorded back. Used by pack uninstall: a pack that replaced a
+/// harness must not also roll the skill tree back, because the pack's skills are removed separately and a
+/// person may have edited an unrelated skill since. The same whole-pass digest verification as `restore`
+/// applies before the first write.
+pub fn restore_harness(
+    home: &Path,
+    profile: &str,
+    harness: &Path,
+    id: u64,
+    guard: &str,
+) -> Result<Generation, String> {
+    let dir = generation_dir(home, profile, id);
+    let generation = read_generation(home, profile, id)?.ok_or_else(|| {
+        format!(
+            "there is no generation {id} for profile `{profile}` under {}",
+            generations_root(home, profile).display()
+        )
+    })?;
+    let recorded = std::fs::read_to_string(dir.join(GUARD)).unwrap_or_default();
+    if recorded.trim() != guard.trim() {
+        return Err(format!(
+            "generation {id} was captured under a different floor, policy or set of profile defaults; \
+             restoring it would cross a floor change, so it is refused"
+        ));
+    }
+    if let Some(recorded) = &generation.harness
+        && absolute(Path::new(recorded)) != absolute(harness)
+    {
+        return Err(format!(
+            "generation {id} was captured from {recorded}, and {} is a different harness; restoring \
+             it would put those bytes in a tree that never held them, so it is refused",
+            harness.display()
+        ));
+    }
+    let mut writes: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    for file in &generation.files {
+        let Some(rest) = file.path.strip_prefix("harness/") else {
+            continue;
+        };
+        if rest.is_empty()
+            || rest
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(format!(
+                "`{}` is outside the harness tree, so it is refused",
+                file.path
+            ));
+        }
+        let to = harness.join(rest);
+        let bytes = std::fs::read(dir.join(&file.path))
+            .map_err(|error| format!("generation {id} is missing {}: {error}", file.path))?;
+        if sha256(&bytes) != file.sha256 {
+            return Err(format!(
+                "{} in generation {id} does not match the hash in its manifest, so it is refused \
+                 rather than restored",
+                file.path
+            ));
+        }
+        writes.push((to, bytes));
+    }
+    for (to, bytes) in writes {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+        }
+        let temporary = to.with_file_name(format!(
+            ".{}.restore-{}.tmp",
+            to.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            std::process::id()
+        ));
+        std::fs::write(&temporary, bytes)
+            .map_err(|error| format!("could not restore {}: {error}", to.display()))?;
+        std::fs::rename(&temporary, &to).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("could not restore {}: {error}", to.display())
+        })?;
+    }
+    let recorded_guidance = generation
+        .files
+        .iter()
+        .any(|file| file.path == "harness/tool_guidance.md");
+    if !recorded_guidance {
+        let stale = harness.join("tool_guidance.md");
+        match std::fs::remove_file(&stale) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "the generation has no guidance but {} could not be removed: {error}",
+                    stale.display()
+                ));
+            }
+        }
+    }
+    let recorded_system = generation
+        .files
+        .iter()
+        .any(|file| file.path == "harness/system.md");
+    if !recorded_system {
+        let stale = harness.join("system.md");
+        match std::fs::remove_file(&stale) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "the generation has no system prompt but {} could not be removed: {error}",
+                    stale.display()
+                ));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(harness);
+    Ok(generation)
+}
+
 /// Put the files a generation recorded back where they belong. Only the files the manifest names are
 /// touched: a skill added after the generation is left alone, because a rollback of the harness is not a
 /// deletion of work done since.

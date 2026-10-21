@@ -2594,6 +2594,194 @@ fn counting_failure() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>
     (format!("http://127.0.0.1:{port}/v1/chat/completions"), seen)
 }
 
+/// An endpoint that answers one chat-completions call with a scripted JSON body, in the SSE shape the
+/// client reads. The test passes the JSON it wants the model to have said.
+fn scripted_chat(content: &str) -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    let content = content.to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut raw: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                raw.extend_from_slice(&chunk[..read]);
+                let Some(end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                let length = head
+                    .split("\r\n")
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let delta = serde_json::json!({"choices":[{"delta":{"content": content}}]});
+            let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1/chat/completions")
+}
+
+#[test]
+fn pack_adapt_writes_a_reviewable_proposal_from_a_model_reply() {
+    let dir = scratch("pack-adapt-cli");
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("skills/pack-skill")).expect("skill");
+    std::fs::create_dir_all(source.join("harness/research")).expect("harness");
+    std::fs::write(
+        source.join("skills/pack-skill/SKILL.md"),
+        "---\nname: pack-skill\ncontract: test\n---\n\nUse the old command.\n",
+    )
+    .expect("skill text");
+    std::fs::write(source.join("harness/research/system.md"), "A harness.").expect("harness text");
+    let archive = dir.join("adapt.hadepack");
+    let (code, text) = hades(&[
+        "pack",
+        "export",
+        "test/pack",
+        "--from",
+        source.to_str().expect("source"),
+        "--skill",
+        "pack-skill",
+        "--profile",
+        "research",
+        "--derivatives",
+        "allowed",
+        "--out",
+        archive.to_str().expect("archive"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).expect("target");
+    let endpoint = scripted_chat(
+        r#"{"text":"Use the new command.","changes":["new command"],"conflicts":[]}"#,
+    );
+    let (code, text) = hades(&[
+        "pack",
+        "adapt",
+        archive.to_str().expect("archive"),
+        "--item",
+        "skill:pack-skill",
+        "--state",
+        target.to_str().expect("target"),
+        "--endpoint",
+        &endpoint,
+        "--model",
+        "test",
+        "--accept",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let proposal = target.join("skills/proposed/pack-skill/SKILL.md");
+    assert!(proposal.is_file(), "{text}");
+    let body = std::fs::read_to_string(proposal).expect("proposal");
+    assert!(body.contains("Use the new command."), "{body}");
+    assert!(body.contains("status: proposed"), "{body}");
+    assert!(body.contains("contract: TODO"), "{body}");
+    assert!(!target.join("skills/pack-skill").exists(), "nothing active");
+}
+
+#[test]
+fn pack_merge_never_overwrites_the_existing_skill() {
+    let dir = scratch("pack-merge-cli");
+    let source = dir.join("source");
+    std::fs::create_dir_all(source.join("skills/pack-skill")).expect("skill");
+    std::fs::create_dir_all(source.join("harness/research")).expect("harness");
+    std::fs::write(
+        source.join("skills/pack-skill/SKILL.md"),
+        "---\nname: pack-skill\ncontract: test\n---\n\nIncoming procedure.\n",
+    )
+    .expect("skill text");
+    std::fs::write(source.join("harness/research/system.md"), "A harness.").expect("harness text");
+    let archive = dir.join("merge.hadepack");
+    let (code, text) = hades(&[
+        "pack",
+        "export",
+        "test/pack",
+        "--from",
+        source.to_str().expect("source"),
+        "--skill",
+        "pack-skill",
+        "--profile",
+        "research",
+        "--derivatives",
+        "allowed",
+        "--out",
+        archive.to_str().expect("archive"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(
+        target.join("decisions.json"),
+        r#"{"items":[{"kind":"skill","identity":"pack-skill","action":"install"}]}"#,
+    )
+    .expect("decisions");
+    let (code, text) = hades(&[
+        "pack",
+        "apply",
+        archive.to_str().expect("archive"),
+        "--plan",
+        target.join("decisions.json").to_str().expect("plan"),
+        "--state",
+        target.to_str().expect("target"),
+        "--activate",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let active = target.join("skills/pack-skill/SKILL.md");
+    let before = std::fs::read_to_string(&active).expect("active");
+
+    let endpoint = scripted_chat(
+        r#"{"text":"Merged procedure.","changes":["Merged procedure."],"conflicts":[]}"#,
+    );
+    let (code, text) = hades(&[
+        "pack",
+        "merge",
+        archive.to_str().expect("archive"),
+        "--item",
+        "skill:pack-skill",
+        "--into",
+        "pack-skill",
+        "--name",
+        "pack-skill-merged",
+        "--state",
+        target.to_str().expect("target"),
+        "--endpoint",
+        &endpoint,
+        "--model",
+        "test",
+        "--accept",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        target
+            .join("skills/proposed/pack-skill-merged/SKILL.md")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&active).expect("active"),
+        before,
+        "merge must not overwrite the installed skill"
+    );
+}
+
 #[test]
 fn a_strict_turn_refuses_a_missing_key_before_a_session_is_created() {
     let dir = scratch("strict-key");

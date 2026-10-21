@@ -69,6 +69,7 @@ pub mod memory;
 pub mod mode;
 pub mod model;
 pub mod pack;
+pub mod pack_fit;
 pub mod patch;
 pub mod path;
 pub mod policy;

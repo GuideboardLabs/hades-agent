@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.19-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-969%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.20-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-984%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.19 |
+| **Version** | 0.0.20 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,38 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 969 passing, 13 ignored live tests |
+| **Tests** | 984 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.20 adds
+
+This release makes a pack fit into a home, and keeps a record of what it changed.
+
+- **`hades pack apply` installs only the rows a person accepted.** The decision file names a kind,
+  identity and one of `install`, `replace` or `skip`; a row outside the plan is refused. Skills land
+  under `skills/proposed/` unless `--activate` names them active. A conflict may be replaced, and the
+  old live path is moved to `packs/replaced/<pack>/<time>/` first. A skill installed as a proposal is
+  not loaded as active work.
+- **Every installed item lands in a catalog.** `packs/catalog.jsonl` records the pack, version, pack
+  digest, item digest, the live digest at install time, the live path and the content path. The content
+  is a copy under `packs/<id>/<version>/`; nothing is symlinked. A second apply of the same version is
+  refused before it writes.
+- **`hades pack uninstall` removes what the pack owns.** It removes a live copy only when its digest
+  still matches, so a skill edited after install is kept and named in the receipt. A promoted skill is
+  kept as active. A case is retired in its ledger rather than left as a broken directory. Shared
+  content is removed only when no remaining row references it, and an uninstall event is appended.
+- **`hades pack adapt` makes a local draft.** One model call reads the pack text, the local catalog
+  brief and the license. It returns rewritten text, a change list and any unresolved conflicts; the
+  result is shown as a diff and written only with `--accept`. Derivatives must be allowed. The draft
+  carries `contract: TODO`, empty regression and holdout lists, so it cannot pass as evidence until a
+  person fills them in.
+- **`hades pack merge` composes a draft, never an overwrite.** The incoming skill and the installed one
+  are both read, both contracts and the conflicts are recorded with provenance, and the result is a
+  proposal. It is skill-only in this release; harness merge is refused by name.
+- **The limits are explicit.** Atomicity is per item, not per pack: a failure after earlier rows have
+  landed leaves those rows and names the failure. Trust (digest pinning and unsigned-pack refusal) is
+  0.1.0 work; a pack is still unsigned and the reader says so.
 
 ## What 0.0.19 adds
 
@@ -872,7 +901,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **969 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **984 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
