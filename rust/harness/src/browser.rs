@@ -2483,20 +2483,8 @@ impl Session {
     }
 
     fn screenshot(&mut self, args: &Value) -> Result<String, String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let stamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|since| since.as_millis())
-                    .unwrap_or(0);
-                // Under `shots`, not `browser`: the `image` tool reads state/shots by policy and
-                // nothing under state/browser, so the default is the loop that works - save here,
-                // look at it there, with the path the policy itself granted.
-                self.state.join("shots").join(format!("shot-{stamp}.png"))
-            });
+        let requested = args.get("path").and_then(Value::as_str);
+        let path = resolve_shot(&self.state, requested)?;
         let reply = self.page_call(
             "Page.captureScreenshot",
             json!({"format": "png", "captureBeyondViewport": false}),
@@ -2514,6 +2502,57 @@ impl Session {
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
         Ok(format!("saved to {}", path.display()))
     }
+}
+
+/// Where a screenshot may be written: under the state's `shots` directory, and nowhere else.
+///
+/// The path arrives from the model, so it is treated as hostile: an absolute path, a `..` component, or a
+/// prefix component is refused by name. The parent is created and then canonicalized, because a symlink
+/// under `shots` pointing elsewhere would otherwise pass a textual prefix test.
+fn resolve_shot(state: &Path, requested: Option<&str>) -> Result<PathBuf, String> {
+    const REFUSED: &str = "a screenshot path must stay inside the state's shots directory";
+    let shots = state.join("shots");
+    std::fs::create_dir_all(&shots)
+        .map_err(|error| format!("could not make {}: {error}", shots.display()))?;
+    let shots = std::fs::canonicalize(&shots)
+        .map_err(|error| format!("could not resolve {}: {error}", shots.display()))?;
+    let path = match requested {
+        Some(raw) => {
+            let relative = Path::new(raw);
+            if relative.is_absolute()
+                || relative.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(REFUSED.to_string());
+            }
+            shots.join(relative)
+        }
+        None => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or(0);
+            // Under `shots`, not `browser`: the `image` tool reads state/shots by policy and nothing
+            // under state/browser, so the default is the loop that works - save here, look at it
+            // there, with the path the policy itself granted.
+            shots.join(format!("shot-{stamp}.png"))
+        }
+    };
+    let parent = path.parent().ok_or(REFUSED)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("could not resolve {}: {error}", parent.display()))?;
+    if !parent.starts_with(&shots) {
+        return Err(REFUSED.to_string());
+    }
+    Ok(path)
 }
 
 const PAGE: &str = r#"(() => {
@@ -2831,6 +2870,22 @@ mod tests {
     }
 
     #[test]
+    fn a_screenshot_cannot_escape_the_shots_directory() {
+        let state = crate::scratch::root().join("shots-confined");
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).expect("a scratch state");
+        let error = resolve_shot(&state, Some("../../outside.png"))
+            .expect_err("a traversal is refused");
+        assert!(error.contains("shots"), "{error}");
+        let error =
+            resolve_shot(&state, Some("/tmp/outside.png")).expect_err("an absolute path is refused");
+        assert!(error.contains("shots"), "{error}");
+        let inside = resolve_shot(&state, Some("sub/page.png")).expect("an inside path");
+        let shots = std::fs::canonicalize(state.join("shots")).expect("the shots directory");
+        assert!(inside.starts_with(&shots), "{}", inside.display());
+    }
+
+    #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_is_observable() {
         let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -2898,11 +2953,8 @@ mod tests {
         );
         assert!(bad.contains("the script failed"), "{bad}");
         assert!(bad.contains("title: clicked"), "{bad}");
-        let shot = state.join("shot.png");
-        let saved = tool(
-            &json!({"action": "screenshot", "path": shot.display().to_string()}),
-            &state,
-        );
+        let shot = state.join("shots").join("shot.png");
+        let saved = tool(&json!({"action": "screenshot", "path": "shot.png"}), &state);
         assert!(saved.contains("saved to"), "{saved}");
         let bytes = std::fs::read(&shot).expect("a screenshot");
         assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']), "PNG magic");
