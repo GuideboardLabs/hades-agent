@@ -2840,14 +2840,44 @@ pub fn estimate_tokens(messages: &[Value]) -> usize {
     messages
         .iter()
         .map(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
+            // The whole message, not just `content`: an assistant turn that calls a tool carries its
+            // arguments in `tool_calls`, and a `write_file` with a 40 KB body costs what it costs. Counting
+            // only `content` read that turn as free, so the estimate under-reported exactly the turns that
+            // grow fastest.
+            serde_json::to_string(message)
                 .map(|text| text.len() / 4)
                 .unwrap_or(0)
                 + 8
         })
         .sum()
+}
+
+/// Where a compression may cut, and where it may not.
+///
+/// The cut has to land before a turn, never inside one: a `tool` message whose assistant call was summarized
+/// away is a request the provider rejects, and an assistant call whose result was dropped is the other half
+/// of the same mistake. A boundary is safe when the first kept message is not a tool result and the last
+/// summarized message is not an assistant that called one.
+fn split_point(messages: &[Value], keep: usize) -> Option<usize> {
+    let wanted = messages.len().saturating_sub(keep);
+    let calls = |message: &Value| {
+        message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+    };
+    for split in (2..=wanted).rev() {
+        let kept_is_result = messages
+            .get(split)
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("tool");
+        let summarized_ends_in_a_call = messages.get(split - 1).is_some_and(calls);
+        if !kept_is_result && !summarized_ends_in_a_call {
+            return Some(split);
+        }
+    }
+    None
 }
 
 /// Keep a conversation inside the window: the old turns become one summary at the top, the recent turns
@@ -2865,16 +2895,32 @@ pub fn compress(
         .first()
         .cloned()
         .unwrap_or_else(|| json!({"role": "system", "content": ""}));
-    let split = messages.len().saturating_sub(keep);
-    if split <= 1 {
+    let Some(split) = split_point(messages, keep) else {
         return Ok(false);
-    }
+    };
     let mut transcript = String::new();
     for message in &messages[1..split] {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        // A call without its name and arguments is not a summary of the turn, it is a note that something
+        // happened. The summary has to carry what was asked of the tool and what it answered.
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let name = call
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let arguments = call
+                    .get("function")
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                transcript.push_str(&format!("{role} called {name}({arguments})\n"));
+            }
+        }
         let content = message
             .get("content")
             .and_then(Value::as_str)
@@ -3553,6 +3599,61 @@ mod tests {
         let short = vec![json!({"role": "user", "content": "hi"})];
         let long = vec![json!({"role": "user", "content": "x".repeat(4000)})];
         assert!(estimate_tokens(&long) > estimate_tokens(&short) + 900);
+    }
+
+    #[test]
+    fn tool_arguments_count_toward_the_estimate() {
+        // A write_file body lives in `tool_calls[].function.arguments`, not in `content`. Counting only
+        // content read a 40 KB edit as free, which is the shape that grows fastest in a real session.
+        let small = json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}]});
+        let large = json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": format!("{{\"body\":\"{}\"}}", "x".repeat(40_000))}}]});
+        assert!(
+            estimate_tokens(&[large]) > estimate_tokens(&[small]) + 9_000,
+            "the estimate ignored the arguments"
+        );
+    }
+
+    #[test]
+    fn compression_keeps_a_tool_call_with_its_result() {
+        let messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "body"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        // The naive cut for keep=2 is index 3, which keeps the result and summarizes the call away. The
+        // real cut has to land at 2, keeping the pair together.
+        assert_eq!(split_point(&messages, 2), Some(2));
+        for keep in 1..=3 {
+            let Some(split) = split_point(&messages, keep) else {
+                continue;
+            };
+            let kept = &messages[split..];
+            for result in kept.iter().filter(|m| m["role"] == "tool") {
+                let id = result["tool_call_id"].as_str();
+                let paired = kept.iter().any(|message| {
+                    message["tool_calls"].as_array().is_some_and(|calls| {
+                        calls.iter().any(|call| call["id"].as_str() == id)
+                    })
+                });
+                assert!(paired, "keep={keep} orphaned a tool result at split {split}");
+            }
+            // And the other direction: a kept call has its result.
+            for message in kept.iter() {
+                let Some(calls) = message["tool_calls"].as_array() else {
+                    continue;
+                };
+                for call in calls {
+                    let id = call["id"].as_str();
+                    assert!(
+                        kept.iter()
+                            .any(|other| other["role"] == "tool" && other["tool_call_id"].as_str() == id),
+                        "keep={keep} kept a call without its result at split {split}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
