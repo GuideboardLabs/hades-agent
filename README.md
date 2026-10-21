@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.15-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-919%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.16-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-942%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.15 |
+| **Version** | 0.0.16 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,35 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 919 passing, 13 ignored live tests |
+| **Tests** | 942 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.16 adds
+
+### The offline library
+
+Hades can read a local shelf with no network.
+
+- **Every install starts empty.** `hades library list` on a fresh state prints that the shelf is empty. There is no seed corpus, no sample paper, no placeholder entry. A document exists only after you add it.
+- **`hades library add <file-or-directory>`** imports PDF, EPUB, LaTeX, Markdown, plain text and reStructuredText. Directories are walked. The original is kept on disk and the readable text is extracted into the shelf.
+- **PDF text comes from `pdftotext`** (poppler), not a browser or a model. EPUB is unpacked with a member cap and refuses path traversal. LaTeX is converted to Markdown by a small deterministic reader, so a paper stored as source remains readable without a TeX installation.
+- **The index is SQLite with FTS5.** `hades library search <words>` returns ranked passages; `hades library read <id>` prints the stored text; `hades library verify` re-reads every original and recomputes its hash.
+- **`hades research <question> --offline`** plans, searches the shelf, fetches a library document and runs the same byte-verified quote check. The report records `mode "offline library"`.
+- **The shelf is per state.** A process started with `--state X` cannot read `--state Y`'s books. The agent's `library` tool uses the same resolved shelf.
+- **`--strict` upgrades an off-question claim from a warning to a failed check.** The normal check still exits 0 so an honest report with a flagged claim remains inspectable.
+
+### Research depth
+
+- **A structural relevance gate.** Each extracted claim is compared with its subquestion on distinctive terms. A claim that only matches the source's general subject is marked `off-question`, kept in the report under its own heading, and counted. It is never silently promoted into findings.
+- **Fan-out is deduplicated and ranked.** Search hits are de-duplicated by normalized URL; primary documents are fetched before secondary pages, and social posts last.
+- **Contradictions are first-class evidence.** An extractor may return a `contradicts` quote. The quote goes through the same byte check and appears in a `## Disputed` section instead of being averaged away.
+- **A claim can be revised in place.** When a later source supports the same normalized claim with a new quote, the old text and support are kept in `history`; the report marks the claim as revised.
+- **One retry on a bad quote.** If every draft from a source fails the byte check, the extractor is called once more with the mismatch as a hint. A second failure is recorded, not repeated.
+- **`hades research bench <questions.json>`** runs a question set and reports published, claims, verified quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid, not a truth score.
+- **`hades research file <run-id> --topic <topic>`** files a published, strict-green report as a Mneme research note with provenance and a `hades://research/<id>` source link.
+
+The check proves provenance, not truth. The relevance gate catches a claim that is about the wrong subject, but it cannot prove that a correctly quoted sentence is representative, current or complete.
 
 ## What 0.0.15 adds
 

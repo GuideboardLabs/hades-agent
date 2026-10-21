@@ -35,6 +35,14 @@ pub enum QuestionKind {
     Decision,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Web,
+    Offline,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -146,6 +154,13 @@ impl Quote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimRevision {
+    pub text: String,
+    pub support: Vec<Quote>,
+    pub at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claim {
     pub id: String,
     pub text: String,
@@ -153,6 +168,10 @@ pub struct Claim {
     pub subquestion: String,
     pub support: Vec<Quote>,
     pub contradict: Vec<Quote>,
+    #[serde(default = "yes")]
+    pub on_question: bool,
+    #[serde(default)]
+    pub history: Vec<ClaimRevision>,
     pub decision: Option<DecisionCriteria>,
     pub alternatives: Vec<String>,
     pub revision_of: Option<String>,
@@ -178,13 +197,15 @@ pub struct Source {
 
 impl Source {
     pub fn admits(&self, body: &str) -> Result<(), String> {
-        if !(self.url.starts_with("http://") || self.url.starts_with("https://")) {
-            return Err("the source is not an http(s) URL".to_string());
+        let library = self.url.starts_with("library://");
+        if !(library || self.url.starts_with("http://") || self.url.starts_with("https://")) {
+            return Err("the source is not an http(s) or library URL".to_string());
         }
         if self.snippet_only {
             return Err("a search snippet is not a source".to_string());
         }
-        if body.chars().count() < MIN_BODY_CHARS {
+        let floor = if library { 80 } else { MIN_BODY_CHARS };
+        if body.chars().count() < floor {
             return Err(format!(
                 "the body is {} characters; a snippet or an empty page is not evidence",
                 body.chars().count()
@@ -241,6 +262,8 @@ pub struct ResearchRun {
     pub kind: QuestionKind,
     pub status: RunStatus,
     pub created_at_ms: u64,
+    #[serde(default)]
+    pub mode: RunMode,
     pub budget: ResearchBudget,
     pub subquestions: Vec<Subquestion>,
     pub assignments: Vec<Assignment>,
@@ -300,6 +323,7 @@ impl Store {
             kind,
             status: RunStatus::Planned,
             created_at_ms: now_ms(),
+            mode: RunMode::Web,
             budget,
             subquestions: Vec::new(),
             assignments: Vec::new(),
@@ -415,6 +439,9 @@ pub struct Fetched {
     pub status: Option<u16>,
     pub content_type: String,
     pub body: String,
+    /// What the extractor sees, when the full body is too large or only one part is relevant. The body
+    /// is still the canonical text the quote is verified against.
+    pub excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -436,6 +463,8 @@ pub struct ClaimDraft {
     pub decision: Option<DecisionCriteria>,
     #[serde(default)]
     pub alternatives: Vec<String>,
+    #[serde(default)]
+    pub contradicts: Vec<String>,
 }
 
 pub trait Web {
@@ -474,6 +503,20 @@ pub trait Extractor {
         budget: &ResearchBudget,
     ) -> Result<(Vec<ClaimDraft>, Option<Usage>), String> {
         Ok((self.extract(subquestion, source, body, budget)?, None))
+    }
+
+    /// One retry after a quote failed to verify. The hint names the failed quote; it is never the whole
+    /// source and it is never trusted as evidence. A default implementation keeps offline extractors
+    /// honest: no hint support means no second opinion.
+    fn extract_with_hint(
+        &self,
+        subquestion: &str,
+        source: &Source,
+        body: &str,
+        budget: &ResearchBudget,
+        _hint: Option<&str>,
+    ) -> Result<(Vec<ClaimDraft>, Option<Usage>), String> {
+        self.extract_with_usage(subquestion, source, body, budget)
     }
 }
 
@@ -524,6 +567,7 @@ impl Web for Searx {
             status: None,
             content_type: "text/html".to_string(),
             body,
+            excerpt: None,
         })
     }
 }
@@ -758,6 +802,9 @@ fn clip(text: &str, limit: usize) -> String {
 }
 
 fn kind_of(url: &str) -> SourceKind {
+    if url.starts_with("library://") {
+        return SourceKind::Primary;
+    }
     let host = host_of(url).to_ascii_lowercase();
     if host.contains("x.com") || host.contains("twitter.com") {
         SourceKind::Social
@@ -773,6 +820,15 @@ fn kind_of(url: &str) -> SourceKind {
         SourceKind::Unknown
     } else {
         SourceKind::Secondary
+    }
+}
+
+fn source_rank(kind: SourceKind) -> u8 {
+    match kind {
+        SourceKind::Primary => 0,
+        SourceKind::Secondary => 1,
+        SourceKind::Unknown => 2,
+        SourceKind::Social => 3,
     }
 }
 
@@ -853,9 +909,28 @@ impl Extractor for ModelExtractor<'_> {
         body: &str,
         budget: &ResearchBudget,
     ) -> Result<(Vec<ClaimDraft>, Option<Usage>), String> {
+        self.extract_with_hint(subquestion, source, body, budget, None)
+    }
+
+    fn extract_with_hint(
+        &self,
+        subquestion: &str,
+        source: &Source,
+        body: &str,
+        budget: &ResearchBudget,
+        hint: Option<&str>,
+    ) -> Result<(Vec<ClaimDraft>, Option<Usage>), String> {
         let text = clip(body, SENT_CHARS);
+        let hint = hint
+            .map(|hint| {
+                format!(
+                    "\n\nA previous quote did not appear in the source. The failed quote was:\n{}\nCopy a new quote exactly from the text above; do not repair it by guessing.",
+                    clip(hint, 600)
+                )
+            })
+            .unwrap_or_default();
         let user = format!(
-            "Subquestion: {subquestion}\n\nSource: {}\nURL: {}\nKind: {:?}\n\nTEXT:\n{text}\n\nReturn at most {} claims as a JSON array.",
+            "Subquestion: {subquestion}\n\nSource: {}\nURL: {}\nKind: {:?}\n\nTEXT:\n{text}\n\nReturn at most {} claims as a JSON array.{hint}",
             source.title, source.url, source.kind, budget.claims_per_source
         );
         let completion = self
@@ -868,7 +943,7 @@ impl Extractor for ModelExtractor<'_> {
 
 const PLANNER_SYSTEM: &str = "You are the planning step of an evidence-first research run. Return only a JSON array. Each item is {\"text\": \"...\", \"query\": \"...\", \"kind\": \"fact\"|\"decision\"}. Give 3 to 5 subquestions. Each query must be plain keywords a search engine can answer; do not use site: operators, URL fragments or file paths. Do not answer the question.";
 
-const EXTRACTOR_SYSTEM: &str = "You are one stateless extraction worker. You see one subquestion and one source. Return only a JSON array. Each item is {\"text\": \"...\", \"quote\": \"...\", \"kind\": \"sourced\"|\"observed\"|\"inferred\", \"decision\": {\"support\": \"...\", \"weaken\": \"...\", \"unclear\": \"...\"} | null, \"alternatives\": [\"...\"]}. The quote must be copied character for character from the source, must be a contiguous span, and must be at least 20 characters. Do not paraphrase. Do not use ellipses. The claim must keep every qualifier in the quote: platform, driver, version, model and condition. Do not turn a conditional observation into a general one. Only return claims that directly answer the subquestion; do not return general facts about the project. If the source does not support a claim, return [].";
+const EXTRACTOR_SYSTEM: &str = "You are one stateless extraction worker. You see one subquestion and one source. Return only a JSON array. Each item is {\"text\": \"...\", \"quote\": \"...\", \"kind\": \"sourced\"|\"observed\"|\"inferred\", \"decision\": {\"support\": \"...\", \"weaken\": \"...\", \"unclear\": \"...\"} | null, \"alternatives\": [\"...\"], \"contradicts\": [\"...\"]}. The quote must be copied character for character from the source, must be a contiguous span, and must be at least 20 characters. Do not paraphrase. Do not use ellipses. The claim must keep every qualifier in the quote: platform, driver, version, model and condition. Do not turn a conditional observation into a general one. Put a contradicting quote in `contradicts` only when this same source states a conflicting result. Only return claims that directly answer the subquestion; do not return general facts about the project. If the source does not support a claim, return [].";
 
 fn parse_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
     let extracted = crate::model::extract(text);
@@ -889,11 +964,248 @@ fn parse_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
 
 // ── engine ───────────────────────────────────────────────────────────────────
 
+fn absorb_drafts(
+    store: &Store,
+    run: &mut ResearchRun,
+    index: usize,
+    source: &Source,
+    body: &str,
+    drafts: Vec<ClaimDraft>,
+    budget: &ResearchBudget,
+) -> Result<(usize, usize, Option<String>), String> {
+    let mut added = 0usize;
+    let mut verified = 0usize;
+    let mut first_bad = None;
+    for draft in drafts.into_iter().take(budget.claims_per_source) {
+        let quote_text = draft.quote.trim().to_string();
+        if quote_text.chars().count() < MIN_QUOTE_CHARS {
+            run.failures.push(Failure {
+                stage: "verify".to_string(),
+                subject: source.id.clone(),
+                reason: "the quote is shorter than 20 characters".to_string(),
+            });
+            continue;
+        }
+        let Some(start) = body.find(&quote_text) else {
+            first_bad.get_or_insert_with(|| quote_text.clone());
+            run.failures.push(Failure {
+                stage: "verify".to_string(),
+                subject: source.id.clone(),
+                reason: format!(
+                    "the quote was not found in the source: {}",
+                    clip(&quote_text, 120)
+                ),
+            });
+            continue;
+        };
+        let end = start + quote_text.len();
+        let quote = Quote {
+            source: source.id.clone(),
+            start,
+            end,
+            text: quote_text,
+        };
+        if !quote.verifies(body) {
+            first_bad.get_or_insert_with(|| quote.text.clone());
+            run.failures.push(Failure {
+                stage: "verify".to_string(),
+                subject: source.id.clone(),
+                reason: "the quote did not verify at its byte range".to_string(),
+            });
+            continue;
+        }
+        verified += 1;
+
+        let mut contradict = Vec::new();
+        for text in &draft.contradicts {
+            let text = text.trim().to_string();
+            if text.chars().count() < MIN_QUOTE_CHARS {
+                run.failures.push(Failure {
+                    stage: "contradict".to_string(),
+                    subject: source.id.clone(),
+                    reason: "the contradiction quote is shorter than 20 characters".to_string(),
+                });
+                continue;
+            }
+            let Some(start) = body.find(&text) else {
+                run.failures.push(Failure {
+                    stage: "contradict".to_string(),
+                    subject: source.id.clone(),
+                    reason: format!(
+                        "the contradiction quote was not found: {}",
+                        clip(&text, 120)
+                    ),
+                });
+                continue;
+            };
+            let quote = Quote {
+                source: source.id.clone(),
+                start,
+                end: start + text.len(),
+                text,
+            };
+            if quote.verifies(body) {
+                contradict.push(quote);
+            }
+        }
+
+        let on_question =
+            claim_on_question(&run.subquestions[index].text, &draft.text, &quote.text);
+        let normalized = normalize_claim(&draft.text);
+        if let Some(existing) = run
+            .claims
+            .iter_mut()
+            .find(|claim| normalize_claim(&claim.text) == normalized)
+        {
+            if existing.text != draft.text.trim() {
+                existing.history.push(ClaimRevision {
+                    text: existing.text.clone(),
+                    support: existing.support.clone(),
+                    at_ms: now_ms(),
+                });
+                existing.text = draft.text.trim().to_string();
+                existing.decision = draft.decision;
+                existing.alternatives = draft.alternatives;
+            }
+            existing.on_question |= on_question;
+            if !existing
+                .support
+                .iter()
+                .any(|q| q.source == quote.source && q.start == quote.start)
+            {
+                existing.support.push(quote);
+            }
+            for quote in contradict {
+                if !existing
+                    .contradict
+                    .iter()
+                    .any(|q| q.source == quote.source && q.start == quote.start)
+                {
+                    existing.contradict.push(quote);
+                }
+            }
+        } else {
+            let id = format!("c{}", run.claims.len() + 1);
+            let claim = Claim {
+                id: id.clone(),
+                text: draft.text.trim().to_string(),
+                kind: draft.kind,
+                subquestion: run.subquestions[index].id.clone(),
+                support: vec![quote],
+                contradict,
+                on_question,
+                history: Vec::new(),
+                decision: draft.decision,
+                alternatives: draft.alternatives,
+                revision_of: None,
+            };
+            run.subquestions[index].claim_ids.push(id);
+            store.append_evidence(&run.id, &claim);
+            run.claims.push(claim);
+            run.usage.claims += 1;
+            added += 1;
+        }
+    }
+    Ok((added, verified, first_bad))
+}
+
+const CLAIM_STOP: &[&str] = &[
+    "what",
+    "which",
+    "documented",
+    "document",
+    "does",
+    "with",
+    "from",
+    "this",
+    "that",
+    "into",
+    "about",
+    "when",
+    "where",
+    "your",
+    "their",
+    "there",
+    "these",
+    "those",
+    "have",
+    "has",
+    "were",
+    "was",
+    "are",
+    "for",
+    "the",
+    "and",
+    "not",
+    "but",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "how",
+    "why",
+    "who",
+    "one",
+    "two",
+    "out",
+    "use",
+    "using",
+    "used",
+    "paper",
+    "study",
+    "result",
+    "results",
+    "findings",
+    "according",
+    "source",
+    "sources",
+];
+
+fn distinctive_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for word in text.split_whitespace() {
+        let word = word
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '.' && ch != '+' && ch != '#')
+            .to_ascii_lowercase();
+        if word.len() >= 4 && !CLAIM_STOP.contains(&word.as_str()) && !terms.contains(&word) {
+            terms.push(word);
+        }
+    }
+    terms
+}
+
+/// A conservative lexical signal, not a semantic judge. It is strict enough to catch a general fact
+/// published under a specific subquestion, and it never drops the claim: the report lists it and
+/// `check --strict` can turn it red.
+fn claim_on_question(subquestion: &str, claim: &str, quote: &str) -> bool {
+    let terms = distinctive_terms(subquestion);
+    if terms.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {}",
+        claim.to_ascii_lowercase(),
+        quote.to_ascii_lowercase()
+    );
+    let matched = terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count();
+    let needed = if terms.len() >= 4 { 2 } else { 1 };
+    matched >= needed
+}
+
+fn yes() -> bool {
+    true
+}
+
 pub struct Engine<'a> {
     pub store: &'a Store,
     pub web: &'a dyn Web,
     pub planner: &'a dyn Planner,
     pub extractor: &'a dyn Extractor,
+    pub mode: RunMode,
 }
 
 impl<'a> Engine<'a> {
@@ -912,6 +1224,8 @@ impl<'a> Engine<'a> {
         let mut run = self
             .store
             .create_named(id, question, kind, budget.clone())?;
+        run.mode = self.mode;
+        self.store.save(&run)?;
         let started = Instant::now();
         let deadline = started + Duration::from_secs(budget.minutes.max(1) * 60);
 
@@ -949,6 +1263,7 @@ impl<'a> Engine<'a> {
                     .append_failure(&run.id, run.failures.last().expect("just pushed"));
                 run.status = RunStatus::Failed;
                 self.store.save(&run)?;
+                let _ = record_failure(self.store, &run);
                 return Err(format!(
                     "{reason}\nrun: {}",
                     self.store.dir(&run.id).display()
@@ -971,6 +1286,7 @@ impl<'a> Engine<'a> {
             });
             run.status = RunStatus::Failed;
             self.store.save(&run)?;
+            let _ = record_failure(self.store, &run);
             return Err(format!(
                 "the planner returned no subquestions\nrun: {}",
                 self.store.dir(&run.id).display()
@@ -1031,7 +1347,7 @@ impl<'a> Engine<'a> {
             self.store.append_assignment(&run.id, &assignment);
 
             let query = run.subquestions[index].query.clone();
-            let hits = match self.web.search(&query, 5) {
+            let mut hits = match self.web.search(&query, 5) {
                 Ok(hits) => hits,
                 Err(reason) => {
                     run.usage.searches += 1;
@@ -1050,6 +1366,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             };
+            hits.sort_by_key(|hit| (source_rank(kind_of(&hit.url)), normalize_url(&hit.url)));
             run.usage.searches += 1;
 
             let mut new_claims = 0usize;
@@ -1095,10 +1412,11 @@ impl<'a> Engine<'a> {
                 run.usage.sources += 1;
                 self.store.save(&run)?;
 
+                let view = fetched.excerpt.as_deref().unwrap_or(&fetched.body);
                 let drafts = match self.extractor.extract_with_usage(
                     &run.subquestions[index].text,
                     &source,
-                    &fetched.body,
+                    view,
                     &budget,
                 ) {
                     Ok((drafts, usage)) => {
@@ -1118,76 +1436,49 @@ impl<'a> Engine<'a> {
                     }
                 };
 
-                for draft in drafts.into_iter().take(budget.claims_per_source) {
-                    let quote_text = draft.quote.trim().to_string();
-                    if quote_text.chars().count() < MIN_QUOTE_CHARS {
-                        run.failures.push(Failure {
-                            stage: "verify".to_string(),
-                            subject: source.id.clone(),
-                            reason: "the quote is shorter than 20 characters".to_string(),
-                        });
-                        continue;
-                    }
-                    let Some(start) = fetched.body.find(&quote_text) else {
-                        run.failures.push(Failure {
-                            stage: "verify".to_string(),
-                            subject: source.id.clone(),
-                            reason: format!(
-                                "the quote was not found in the source: {}",
-                                clip(&quote_text, 120)
-                            ),
-                        });
-                        continue;
-                    };
-                    let end = start + quote_text.len();
-                    let quote = Quote {
-                        source: source.id.clone(),
-                        start,
-                        end,
-                        text: quote_text,
-                    };
-                    if !quote.verifies(&fetched.body) {
-                        run.failures.push(Failure {
-                            stage: "verify".to_string(),
-                            subject: source.id.clone(),
-                            reason: "the quote did not verify at its byte range".to_string(),
-                        });
-                        continue;
-                    }
-
-                    let normalized = normalize_claim(&draft.text);
-                    if let Some(existing) = run
-                        .claims
-                        .iter_mut()
-                        .find(|claim| normalize_claim(&claim.text) == normalized)
-                    {
-                        if !existing
-                            .support
-                            .iter()
-                            .any(|q| q.source == quote.source && q.start == quote.start)
-                        {
-                            existing.support.push(quote);
+                let (mut added, verified, first_bad) = absorb_drafts(
+                    self.store,
+                    &mut run,
+                    index,
+                    &source,
+                    &fetched.body,
+                    drafts,
+                    &budget,
+                )?;
+                if verified == 0
+                    && let Some(bad) = first_bad
+                {
+                    match self.extractor.extract_with_hint(
+                        &run.subquestions[index].text,
+                        &source,
+                        view,
+                        &budget,
+                        Some(&bad),
+                    ) {
+                        Ok((retry, usage)) => {
+                            if let Some(usage) = usage {
+                                run.usage.extractor_prompt_tokens += usage.prompt_tokens;
+                                run.usage.extractor_generated_tokens += usage.generated_tokens;
+                            }
+                            let (more, _, _) = absorb_drafts(
+                                self.store,
+                                &mut run,
+                                index,
+                                &source,
+                                &fetched.body,
+                                retry,
+                                &budget,
+                            )?;
+                            added += more;
                         }
-                    } else {
-                        let id = format!("c{}", run.claims.len() + 1);
-                        let claim = Claim {
-                            id: id.clone(),
-                            text: draft.text.trim().to_string(),
-                            kind: draft.kind,
-                            subquestion: run.subquestions[index].id.clone(),
-                            support: vec![quote],
-                            contradict: Vec::new(),
-                            decision: draft.decision,
-                            alternatives: draft.alternatives,
-                            revision_of: None,
-                        };
-                        run.subquestions[index].claim_ids.push(id);
-                        self.store.append_evidence(&run.id, &claim);
-                        run.claims.push(claim);
-                        run.usage.claims += 1;
-                        new_claims += 1;
+                        Err(reason) => run.failures.push(Failure {
+                            stage: "extract".to_string(),
+                            subject: source.id.clone(),
+                            reason: format!("the retry after a failed quote failed: {reason}"),
+                        }),
                     }
                 }
+                new_claims += added;
                 self.store.save(&run)?;
             }
 
@@ -1242,6 +1533,7 @@ impl<'a> Engine<'a> {
             self.store.append_failure(&run.id, &failure);
             run.status = RunStatus::Failed;
             self.store.save(&run)?;
+            let _ = record_failure(self.store, &run);
             return Err(format!(
                 "the run produced no verified claim\nrun: {}",
                 self.store.dir(&run.id).display()
@@ -1274,10 +1566,166 @@ pub enum CheckCode {
     Unreadable,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BenchQuestion {
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub key_terms: Vec<String>,
+    #[serde(default = "one")]
+    pub min_claims: usize,
+}
+
+fn one() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchRow {
+    pub id: String,
+    pub question: String,
+    pub run_id: String,
+    pub published: bool,
+    pub claims: usize,
+    pub verified: usize,
+    pub off_question: usize,
+    pub sources: usize,
+    pub seconds_ms: u64,
+    pub prompt_tokens: u64,
+    pub generated_tokens: u64,
+    pub coverage: usize,
+    pub key_terms: usize,
+    pub missing: Vec<String>,
+}
+
+/// Run a question set through the real engine. Key-term coverage is a reading aid, not a truth score;
+/// the row carries the run id so a person can hand-grade the report.
+pub fn run_bench(
+    store: &Store,
+    web: &dyn Web,
+    planner: &dyn Planner,
+    extractor: &dyn Extractor,
+    mode: RunMode,
+    questions: &[BenchQuestion],
+    budget: ResearchBudget,
+) -> Result<Vec<BenchRow>, String> {
+    let mut rows = Vec::new();
+    for question in questions {
+        let started = Instant::now();
+        let engine = Engine {
+            store,
+            web,
+            planner,
+            extractor,
+            mode,
+        };
+        let run = engine.run(&question.question, budget.clone())?;
+        let check = check_with(store, &run.id, true)?;
+        let text = run
+            .claims
+            .iter()
+            .map(|claim| claim.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        let mut coverage = 0usize;
+        let mut missing = Vec::new();
+        for term in &question.key_terms {
+            if text.contains(&term.to_ascii_lowercase()) {
+                coverage += 1;
+            } else {
+                missing.push(term.clone());
+            }
+        }
+        rows.push(BenchRow {
+            id: question.id.clone(),
+            question: question.question.clone(),
+            run_id: run.id,
+            published: run.status == RunStatus::Published && check.code == CheckCode::Green,
+            claims: run.claims.len(),
+            verified: check.verified,
+            off_question: check.off_question,
+            sources: run.sources.len(),
+            seconds_ms: started.elapsed().as_millis() as u64,
+            prompt_tokens: run.usage.planner_prompt_tokens + run.usage.extractor_prompt_tokens,
+            generated_tokens: run.usage.planner_generated_tokens
+                + run.usage.extractor_generated_tokens,
+            coverage,
+            key_terms: question.key_terms.len(),
+            missing,
+        });
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureIndexEntry {
+    pub run_id: String,
+    pub question: String,
+    pub mode: RunMode,
+    pub failures: Vec<Failure>,
+    pub at_ms: u64,
+}
+
+/// Append a failed run to the research failure index. The case store is a repo-task corpus with a pinned
+/// tree and a replayable ruler; a research question has neither, so it gets its own ledger rather than a
+/// case that would pretend to be replayable.
+pub fn record_failure(store: &Store, run: &ResearchRun) -> Result<(), String> {
+    let entry = FailureIndexEntry {
+        run_id: run.id.clone(),
+        question: run.question.clone(),
+        mode: run.mode,
+        failures: run.failures.clone(),
+        at_ms: now_ms(),
+    };
+    let path = store.root().join("failure-index.jsonl");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    use std::io::Write;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&entry)
+            .map_err(|error| format!("could not encode the failure: {error}"))?
+    )
+    .map_err(|error| format!("could not append to {}: {error}", path.display()))
+}
+
+pub fn failure_index(store: &Store) -> Result<Vec<FailureIndexEntry>, String> {
+    let path = store.root().join("failure-index.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let mut entries = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(serde_json::from_str(line).map_err(|error| {
+            format!(
+                "{}:{}: the failure index is not valid JSON: {error}",
+                path.display(),
+                number + 1
+            )
+        })?);
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Clone)]
 pub struct CheckReport {
     pub code: CheckCode,
     pub verified: usize,
+    pub off_question: usize,
     pub failures: Vec<String>,
 }
 
@@ -1294,8 +1742,13 @@ impl CheckReport {
 fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
     let mut text = format!("# {}\n\n", run.question.trim());
     text.push_str(&format!(
-        "Run `{}`, status `{:?}`. This report verifies provenance, not truth.\n\n",
-        run.id, run.status
+        "Run `{}`, status `{:?}`, mode `{}`. This report verifies provenance, not truth.\n\n",
+        run.id,
+        run.status,
+        match run.mode {
+            RunMode::Web => "web",
+            RunMode::Offline => "offline library",
+        }
     ));
 
     text.push_str("## Findings\n\n");
@@ -1310,9 +1763,72 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
         }
         text.push_str(&format!("### {}\n\n", q.text.trim()));
         for claim in claims {
+            let mut marks = Vec::new();
+            if !claim.on_question {
+                marks.push("off-question".to_string());
+            }
+            if !claim.history.is_empty() {
+                marks.push(format!("revised {}x", claim.history.len()));
+            }
+            let marks = if marks.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", marks.join(", "))
+            };
+            text.push_str(&format!(
+                "- [{}] {}{}\n",
+                claim.id,
+                claim.text.trim(),
+                marks
+            ));
+        }
+        text.push('\n');
+    }
+
+    let off_question: Vec<&Claim> = run
+        .claims
+        .iter()
+        .filter(|claim| !claim.on_question)
+        .collect();
+    if !off_question.is_empty() {
+        text.push_str("## Off-question claims\n\n");
+        text.push_str(
+            "These quotes verify, but the claim may not answer the subquestion it is filed under. \
+             `research check --strict` turns this red.\n\n",
+        );
+        for claim in off_question {
             text.push_str(&format!("- [{}] {}\n", claim.id, claim.text.trim()));
         }
         text.push('\n');
+    }
+
+    let disputed: Vec<&Claim> = run
+        .claims
+        .iter()
+        .filter(|claim| !claim.contradict.is_empty())
+        .collect();
+    if !disputed.is_empty() {
+        text.push_str("## Disputed\n\n");
+        text.push_str(
+            "A source in this run states both the support and the contradicting quote. Both are \
+             byte-verified; the run does not decide which one is right.\n\n",
+        );
+        for claim in disputed {
+            text.push_str(&format!("### [{}] {}\n\n", claim.id, claim.text.trim()));
+            for quote in &claim.support {
+                text.push_str(&format!(
+                    "- support [{}] {}..{}: \"{}\"\n",
+                    quote.source, quote.start, quote.end, quote.text
+                ));
+            }
+            for quote in &claim.contradict {
+                text.push_str(&format!(
+                    "- contradicts [{}] {}..{}: \"{}\"\n",
+                    quote.source, quote.start, quote.end, quote.text
+                ));
+            }
+            text.push('\n');
+        }
     }
 
     let inferred: Vec<&Claim> = run
@@ -1359,12 +1875,16 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
         "run_id": run.id,
         "question": run.question,
         "status": format!("{:?}", run.status),
+        "mode": run.mode,
         "claims": run.claims.iter().map(|claim| serde_json::json!({
             "id": claim.id,
             "text": claim.text,
             "kind": claim.kind,
             "subquestion": claim.subquestion,
             "quotes": claim.support,
+            "contradict": claim.contradict,
+            "on_question": claim.on_question,
+            "history": claim.history,
             "decision": claim.decision,
             "alternatives": claim.alternatives,
         })).collect::<Vec<_>>(),
@@ -1389,9 +1909,14 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
 /// Deterministic provenance check. The report must cite every claim, and every quote must match the
 /// stored canonical text at its byte range.
 pub fn check(store: &Store, id: &str) -> Result<CheckReport, String> {
+    check_with(store, id, false)
+}
+
+pub fn check_with(store: &Store, id: &str, strict: bool) -> Result<CheckReport, String> {
     let run = store.load(id)?;
     let mut failures = Vec::new();
     let mut verified = 0usize;
+    let mut off_question = 0usize;
     let mut unreadable = false;
 
     let report_path = store.dir(id).join("report.md");
@@ -1404,10 +1929,13 @@ pub fn check(store: &Store, id: &str) -> Result<CheckReport, String> {
     };
 
     for claim in &run.claims {
+        if !claim.on_question {
+            off_question += 1;
+        }
         if claim.kind != ClaimKind::Inferred && claim.support.is_empty() {
             failures.push(format!("{} has no support quote", claim.id));
         }
-        for quote in &claim.support {
+        for quote in claim.support.iter().chain(claim.contradict.iter()) {
             let path = store.source_path(id, &quote.source);
             let body = match fs::read_to_string(&path) {
                 Ok(body) => body,
@@ -1435,6 +1963,11 @@ pub fn check(store: &Store, id: &str) -> Result<CheckReport, String> {
             failures.push(format!("{} is not cited in report.md", claim.id));
         }
     }
+    if strict && off_question > 0 {
+        failures.push(format!(
+            "{off_question} verified claim(s) are off-question; inspect the report before trusting it"
+        ));
+    }
 
     let code = if unreadable {
         CheckCode::Unreadable
@@ -1446,6 +1979,7 @@ pub fn check(store: &Store, id: &str) -> Result<CheckReport, String> {
     Ok(CheckReport {
         code,
         verified,
+        off_question,
         failures,
     })
 }
@@ -1695,6 +2229,8 @@ mod tests {
             subquestion: "q1".to_string(),
             support: vec![quote],
             contradict: Vec::new(),
+            on_question: true,
+            history: Vec::new(),
             decision: None,
             alternatives: Vec::new(),
             revision_of: None,
@@ -1737,6 +2273,8 @@ mod tests {
                 text: "text".to_string(),
             }],
             contradict: Vec::new(),
+            on_question: true,
+            history: Vec::new(),
             decision: None,
             alternatives: Vec::new(),
             revision_of: None,
@@ -1744,5 +2282,132 @@ mod tests {
         store.save(&run).expect("a run");
         write_report(&store, &run).expect("a report");
         assert!(check(&store, &run.id).expect("a check").code == CheckCode::Unreadable);
+    }
+
+    #[test]
+    fn a_second_quote_with_the_same_claim_text_revises_in_place() {
+        let store = Store::new(&crate::scratch::unique("research-revision"));
+        let mut run = store
+            .create_named(
+                "r-test",
+                "What limits Vulkan on RDNA1?",
+                QuestionKind::Fact,
+                ResearchBudget::default(),
+            )
+            .expect("a run");
+        run.subquestions.push(Subquestion {
+            id: "q1".to_string(),
+            text: "What limits Vulkan on RDNA1?".to_string(),
+            query: "Vulkan RDNA1".to_string(),
+            kind: QuestionKind::Fact,
+            status: SubquestionStatus::Pending,
+            claim_ids: Vec::new(),
+        });
+        let source = Source {
+            id: "s1".to_string(),
+            url: "https://example.com/paper".to_string(),
+            final_url: "https://example.com/paper".to_string(),
+            title: "Paper".to_string(),
+            fetched_at_ms: 1,
+            status: Some(200),
+            content_type: "text/html".to_string(),
+            sha256: "0".repeat(64),
+            canonical_sha256: "0".repeat(64),
+            bytes: 200,
+            parser: PARSER.to_string(),
+            kind: SourceKind::Primary,
+            artifact_url: None,
+            snippet_only: false,
+        };
+        let body = "The first measurement shows a limit. The second measurement shows the same limit again.";
+        let first = ClaimDraft {
+            text: "Vulkan on RDNA1 has a limit.".to_string(),
+            quote: "The first measurement shows a limit.".to_string(),
+            kind: ClaimKind::Sourced,
+            decision: None,
+            alternatives: Vec::new(),
+            contradicts: Vec::new(),
+        };
+        let second = ClaimDraft {
+            text: "Vulkan on RDNA1 has a limit".to_string(),
+            quote: "The second measurement shows the same limit again.".to_string(),
+            kind: ClaimKind::Sourced,
+            decision: None,
+            alternatives: Vec::new(),
+            contradicts: Vec::new(),
+        };
+        absorb_drafts(
+            &store,
+            &mut run,
+            0,
+            &source,
+            body,
+            vec![first],
+            &ResearchBudget::default(),
+        )
+        .expect("the first draft");
+        absorb_drafts(
+            &store,
+            &mut run,
+            0,
+            &source,
+            body,
+            vec![second],
+            &ResearchBudget::default(),
+        )
+        .expect("the second draft");
+        assert_eq!(run.claims.len(), 1);
+        assert_eq!(run.claims[0].support.len(), 2);
+        assert_eq!(run.claims[0].history.len(), 1);
+        assert!(run.claims[0].history[0].text.contains("has a limit."));
+    }
+
+    #[test]
+    fn a_failed_run_is_appended_to_the_research_failure_index() {
+        let store = Store::new(&crate::scratch::unique("research-failure-index"));
+        let mut run = store
+            .create_named(
+                "r-failed",
+                "What is true?",
+                QuestionKind::Fact,
+                ResearchBudget::default(),
+            )
+            .expect("a run");
+        run.status = RunStatus::Failed;
+        run.failures.push(Failure {
+            stage: "publish".to_string(),
+            subject: "What is true?".to_string(),
+            reason: "the run produced no verified claim".to_string(),
+        });
+        store.save(&run).expect("a run");
+        record_failure(&store, &run).expect("an index entry");
+        record_failure(&store, &run).expect("a second index entry");
+        let entries = failure_index(&store).expect("an index");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].run_id, "r-failed");
+        assert_eq!(entries[0].failures[0].stage, "publish");
+    }
+
+    #[test]
+    fn a_general_claim_is_off_question_for_a_specific_subquestion() {
+        let question =
+            "What are the documented limitations of llama.cpp Vulkan inference on AMD RDNA1 GPUs?";
+        assert!(!claim_on_question(
+            question,
+            "llama.cpp loads a GGUF file from disk.",
+            "The model loader reads the file and allocates a context."
+        ));
+        assert!(claim_on_question(
+            question,
+            "Vulkan inference on RDNA1 is limited by the driver.",
+            "On RDNA1 the Vulkan backend falls back for some shaders."
+        ));
+    }
+
+    #[test]
+    fn a_primary_source_outranks_a_social_post() {
+        assert!(source_rank(SourceKind::Primary) < source_rank(SourceKind::Secondary));
+        assert!(source_rank(SourceKind::Secondary) < source_rank(SourceKind::Unknown));
+        assert!(source_rank(SourceKind::Unknown) < source_rank(SourceKind::Social));
     }
 }

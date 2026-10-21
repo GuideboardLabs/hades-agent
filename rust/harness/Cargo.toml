@@ -1,6 +1,6 @@
 [package]
 name = "harness"
-version = "0.0.15"
+version = "0.0.16"
 edition = "2024"
 description = "The Hades harness: one turn of the loop, typed, with the model behind a seam."
 license = "MIT"
@@ -18,6 +18,7 @@ governance = { path = "../governance" }
 # Entry payloads are JSON, which is the format the session tree already writes.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
 unicode-width = "0.2"

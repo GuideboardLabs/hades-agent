@@ -334,6 +334,24 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
         {
             "type": "function",
             "function": {
+                "name": "library",
+                "description": "Search or read Hades' offline library: PDFs, EPUB books, LaTeX, Markdown and text imported with `hades library add`. Use it when the network is unavailable, when the person names a book or paper, or when a claim should come from a local document. Search returns entry ids and snippets; read returns the canonical text around an offset.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["search", "read", "list"]},
+                        "query": {"type": "string", "description": "For search: words to find."},
+                        "id": {"type": "string", "description": "For read: the entry id from search or list."},
+                        "offset": {"type": "integer", "description": "For read: character offset. Default 0."},
+                        "limit": {"type": "integer", "description": "For search: hits. Default 5, max 25."}
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "recall",
                 "description": "Search Hades' own memory vault for notes about a topic. Use it before answering questions about past work, decisions or the person's projects.",
                 "parameters": {
@@ -605,7 +623,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-const TOOLS: [&str; 23] = [
+const TOOLS: [&str; 24] = [
     "shell",
     "read_file",
     "write_file",
@@ -615,6 +633,7 @@ const TOOLS: [&str; 23] = [
     "image",
     "browser",
     "fetch",
+    "library",
     "recall",
     "remember",
     "session_search",
@@ -821,6 +840,11 @@ pub(crate) fn label(name: &str, arguments: &str) -> String {
         "search" => args.get("pattern").and_then(Value::as_str).unwrap_or(""),
         "fetch" => args.get("url").and_then(Value::as_str).unwrap_or(""),
         "web_search" => args.get("query").and_then(Value::as_str).unwrap_or(""),
+        "library" => args
+            .get("query")
+            .or_else(|| args.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("the shelf"),
         "recall" => args.get("query").and_then(Value::as_str).unwrap_or(""),
         "remember" => args
             .get("title")
@@ -1082,6 +1106,7 @@ fn execute_with_stop(
         "image" => image(&args, world),
         "fetch" => fetch(&args),
         "web_search" => web_search(&args),
+        "library" => library_tool(&args, world),
         "delegate" => delegate(&args, world, client, activity),
         "spawn" => spawn(&args, world, client, activity),
         "children" => list_children(world),
@@ -2293,6 +2318,115 @@ fn web_search(args: &Value) -> String {
     clip(&text, 6000)
 }
 
+/// Read the local shelf. The library path is the state's own shelf, so a process started with a different
+/// `--state` cannot reach another install's books.
+fn library_tool(args: &Value, world: &World) -> String {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("search");
+    let open = || crate::library::Library::open(world.state.join("library"));
+    match action {
+        "list" => {
+            let library = match open() {
+                Ok(library) => library,
+                Err(said) => return said,
+            };
+            match library.list() {
+                Ok(entries) if entries.is_empty() => {
+                    "the offline library is empty; add a file with `hades library add <path>`"
+                        .into()
+                }
+                Ok(entries) => {
+                    let mut text = String::new();
+                    for entry in entries.iter().take(100) {
+                        text.push_str(&format!(
+                            "{}  {}  {}{}\n",
+                            entry.id,
+                            entry.title,
+                            entry.format.label(),
+                            entry
+                                .pages
+                                .map(|pages| format!("  {pages} pages"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    clip(&text, 8_000)
+                }
+                Err(said) => said,
+            }
+        }
+        "read" => {
+            let Some(id) = args.get("id").and_then(Value::as_str) else {
+                return "library read needs an id from search or list".into();
+            };
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let library = match open() {
+                Ok(library) => library,
+                Err(said) => return said,
+            };
+            match library.text(id) {
+                Ok((entry, text)) => {
+                    let total = text.chars().count();
+                    if offset >= total {
+                        return format!(
+                            "{}: offset {offset} is past the end ({} characters)",
+                            entry.id, total
+                        );
+                    }
+                    let rest: String = text.chars().skip(offset).collect();
+                    let shown = clip(&rest, 12_000);
+                    if offset + shown.chars().count() < total {
+                        format!(
+                            "{}\n\n[showing characters {offset}..{} of {total}; call again with a larger offset]",
+                            shown,
+                            offset + shown.chars().count()
+                        )
+                    } else {
+                        shown
+                    }
+                }
+                Err(said) => said,
+            }
+        }
+        _ => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            if query.trim().is_empty() {
+                return "library search needs a query".into();
+            }
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .min(25) as usize;
+            let library = match open() {
+                Ok(library) => library,
+                Err(said) => return said,
+            };
+            match library.search(query, limit) {
+                Ok(hits) if hits.is_empty() => "no library hits".into(),
+                Ok(hits) => {
+                    let mut text = String::new();
+                    for hit in hits {
+                        text.push_str(&format!(
+                            "{}  {}{}  {}\n  {}\n",
+                            hit.entry.id,
+                            hit.entry.title,
+                            hit.page
+                                .map(|page| format!("  page {page}"))
+                                .unwrap_or_default(),
+                            hit.entry.format.label(),
+                            hit.snippet
+                        ));
+                    }
+                    clip(&text, 10_000)
+                }
+                Err(said) => said,
+            }
+        }
+    }
+}
+
 fn urlencode(text: &str) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
@@ -2934,6 +3068,7 @@ mod tests {
             "session_search",
             "skills",
             "web_search",
+            "library",
             "delegate",
             "image",
         ] {

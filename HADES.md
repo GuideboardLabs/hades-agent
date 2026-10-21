@@ -104,11 +104,38 @@ worker sees one subquestion and one source, never another worker's conversation.
 under `<state>/research/<run-id>/`: `run.json`, `assignments.jsonl`, `evidence.jsonl`, `failures.jsonl`,
 `sources/`, `report.md` and `report.json`.
 
-A source is admitted only when it has an HTTP URL, a body of at least 400 characters and a hash. Every
-sourced claim cites a byte range into the stored canonical text, and `hades research check <run-id>`
-re-reads that file and compares the bytes. The check exits 0 for green, 1 for a bad quote or a missing
-citation, and 2 when a source cannot be read. It proves provenance, not truth: a real quote can still be
-wrapped in a claim that overgeneralizes.
+A source is admitted only when it has an HTTP or `library://` URL, a body above the snippet floor and a
+hash. Every sourced claim cites a byte range into the stored canonical text, and `hades research check
+<run-id>` re-reads that file and compares the bytes. The check exits 0 for green, 1 for a bad quote or a
+missing citation, and 2 when a source cannot be read. It proves provenance, not truth: a real quote can
+still be wrapped in a claim that overgeneralizes.
+
+The relevance gate is structural. Each claim is compared with its subquestion on distinctive terms; a
+claim that matches only the source's general subject is kept, marked `off-question` and reported under
+its own heading. `--strict` turns any off-question claim into a failed check. A contradiction quote goes
+through the same byte check and is printed in `## Disputed`; a later support for the same normalized
+claim revises it in place and keeps the old text in `history`. One retry is allowed when every draft
+from a source fails the byte check, with the mismatch as the hint.
+
+`hades research bench <questions.json>` runs a question set and reports published, claims, verified
+quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid,
+not a truth score. `hades research file <run-id> --topic <topic>` files a published, strict-green report
+as a Mneme research note.
+
+## The offline library
+
+`hades library` is a local shelf. Every install starts empty: no seed corpus, no sample paper, no
+placeholder entry. A document exists only after `hades library add <file-or-directory>` imports it.
+
+PDF text comes from `pdftotext`; EPUB is unpacked with a member cap and a path-traversal check; LaTeX is
+converted to Markdown by a deterministic reader; Markdown, text and reStructuredText are stored as text.
+The original is kept and hashed, the readable text is chunked into SQLite with FTS5, and `hades library
+verify` re-reads every original and recomputes its hash.
+
+The shelf is per state. A process started with `--state X` cannot read `--state Y`'s books, and the
+agent's `library` tool uses the same resolved shelf. `hades research <question> --offline` plans,
+searches the shelf, fetches a library document and runs the same byte check; the report says `mode
+"offline library"`.
 
 The canonical text is stripped HTML, not the raw response; the parser version is stored with each source.
 Script, style, noscript, template, SVG and iframe bodies are removed before tags. If the local SearXNG
@@ -485,10 +512,11 @@ These are decisions, not omissions. Each has a reason and the seam it would chan
   through the same gate as any other fetch, and a search fallback is a network dependency the run
   records rather than a policy change.
 - **The provenance check is not a truth check.** A quote can verify while the claim around it adds a
-  condition the source never stated. The extractor prompt asks the claim to keep platform, driver,
-  version and condition qualifiers, but that is a prompt-level control, not a structural guarantee.
-- **A social URL is refused today.** The gate requires a linked artifact, and artifact-link extraction
-  is 0.0.16; until then an X post cannot be a source on its own.
+  condition the source never stated. The structural relevance gate catches a claim about the wrong
+  subject and the extractor prompt asks qualifiers to survive, but neither can prove a correctly quoted
+  sentence is representative, current or complete.
+- **A social URL is still refused on its own.** The gate requires a linked artifact, and artifact-link
+  extraction is not built; until then an X post cannot be a source by itself.
 - **Hades writes only its own vault.** WEFT is read by its owner, not by Hades; `mneme export` is the
   one-way path.
 - **`skills report` says which numbers are unmeasured.** It does not estimate them.

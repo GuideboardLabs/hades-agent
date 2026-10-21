@@ -150,12 +150,36 @@ hades — the harness, one turn or a whole graph
 
   hades research <question> [--queries 12] [--sources 12] [--fetches 24]
                  [--minutes 60] [--claims 3] [--state <dir>] [--json]
+                 [--offline] [--library <dir>]
       one evidence-first run: plan, search, fetch, extract, verify. Every published
       claim cites a byte-verified quote in a stored source. The check proves
-      provenance, not truth
+      provenance, not truth. --offline reads only the local library and makes no
+      network call
 
-  hades research check <run-id> | show <run-id> | list [--state <dir>]
-      re-read a run without asking a model; check exits 0 green, 1 red, 2 unreadable
+  hades research check <run-id> | show <run-id> | list [--state <dir>] [--strict]
+      re-read a run without asking a model; check exits 0 green, 1 red, 2 unreadable.
+      --strict also turns red when a claim is off-question
+
+  hades research file <run-id> --topic <topic> [--slug <slug>] [--summary <text>]
+                      [--state <dir>] [--vault <dir>] [--db <file>] [--config <file>]
+      file a published, strict-green report as a Mneme research note
+
+  hades research bench <questions.json> [--offline] [--library <dir>] [--json] [...]
+      run a question set through the real engine and report coverage, verified
+      quotes, off-question claims, sources, time and tokens
+
+  hades research failures [--state <dir>] [--json]
+      list failed research runs from the append-only failure index
+
+  hades library add <path>... [--title <t>] [--author <a>]... [--year <n>]
+                           [--tag <t>]... [--library <dir>] [--state <dir>] [--json]
+      import a PDF, EPUB, LaTeX, Markdown, text or HTML file, or walk a directory.
+      A fresh install has no library entries; there is no seed shelf
+
+  hades library list | search <terms> | show <id> [--text] | verify [<id>]
+                       | remove <id> [--purge] [--library <dir>] [--state <dir>]
+      list the shelf, search it with FTS5, print one document, verify hashes and
+      chunk bounds, or remove an entry to trash
 
   hades note research <topic> <title...> [--slug <slug>] [--source-url <url>]
                      [--summary <text>] [--provenance <text>] [--vault <dir>]
@@ -396,6 +420,7 @@ fn dispatch(
         "topic" => create_topic_cmd(rest),
         "note" => note_cmd(rest),
         "research" => research_cmd(rest),
+        "library" => library_cmd(rest),
         "project" => create_project_cmd(rest),
         "product" => create_product_cmd(rest),
         "service" => service(rest),
@@ -3487,6 +3512,245 @@ fn note_cmd(args: &[String]) -> Result<(String, i32), String> {
     }
 }
 
+/// `hades library`: the local shelf. A fresh state has no entries and no seed content.
+fn library_cmd(args: &[String]) -> Result<(String, i32), String> {
+    match args.first().map(String::as_str) {
+        Some("add") => library_add_cmd(&args[1..]),
+        Some("list") => library_list_cmd(&args[1..]),
+        Some("search") => library_search_cmd(&args[1..]),
+        Some("show") => library_show_cmd(&args[1..]),
+        Some("verify") => library_verify_cmd(&args[1..]),
+        Some("remove") => library_remove_cmd(&args[1..]),
+        Some(other) => Err(format!(
+            "there is no library command `{other}`: try add, list, search, show, verify or remove"
+        )),
+        None => {
+            Err("library needs a command: add, list, search, show, verify or remove".to_string())
+        }
+    }
+}
+
+fn library_add_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &["library", "state", "title", "author", "year", "tag"],
+        &["json"],
+    )?;
+    if flags.positional.is_empty() {
+        return Err("library add needs a file or directory".to_string());
+    }
+    if flags.named.contains_key("title")
+        && (flags.positional.len() > 1
+            || flags.positional.iter().any(|path| Path::new(path).is_dir()))
+    {
+        return Err("--title names one document; use it with a single file".to_string());
+    }
+    let year = match flags.named.get("year") {
+        Some(value) => Some(
+            value
+                .parse::<i32>()
+                .map_err(|_| format!("`--year {value}` is not a year"))?,
+        ),
+        None => None,
+    };
+    let options = crate::library::AddOptions {
+        title: flags.named.get("title").cloned(),
+        authors: flags.repeated.get("author").cloned().unwrap_or_default(),
+        year,
+        tags: flags.repeated.get("tag").cloned().unwrap_or_default(),
+    };
+    let library = crate::library::Library::open(library_path(&flags)?)?;
+    let mut merged = crate::library::ImportReport::default();
+    for path in &flags.positional {
+        let report = library.add_path(path, &options)?;
+        merged.added.extend(report.added);
+        merged.skipped.extend(report.skipped);
+    }
+
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&merged)
+            .map_err(|error| format!("could not encode the import: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+
+    let mut text = String::new();
+    let duplicates = merged.added.iter().filter(|item| item.duplicate).count();
+    for item in &merged.added {
+        let entry = &item.entry;
+        text.push_str(&format!(
+            "{} {}  {}  {}{}\n",
+            if item.duplicate { "duplicate" } else { "added" },
+            entry.id,
+            entry.title,
+            entry.format.label(),
+            entry
+                .pages
+                .map(|pages| format!("  {pages} pages"))
+                .unwrap_or_default()
+        ));
+    }
+    for skipped in &merged.skipped {
+        text.push_str(&format!("skipped {}: {}\n", skipped.path, skipped.reason));
+    }
+    text.push_str(&format!(
+        "summary: {} added, {duplicates} duplicate, {} skipped\n",
+        merged.added.len() - duplicates,
+        merged.skipped.len()
+    ));
+    Ok((text, 0))
+}
+
+fn library_list_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["library", "state"], &["json"])?;
+    let library = crate::library::Library::open(library_path(&flags)?)?;
+    let entries = library.list()?;
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&entries)
+            .map_err(|error| format!("could not encode the library: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+    if entries.is_empty() {
+        return Ok(("no library entries\n".to_string(), 0));
+    }
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&format!(
+            "{}  {}  {}{}  {} bytes\n",
+            entry.id,
+            entry.title,
+            entry.format.label(),
+            entry
+                .pages
+                .map(|pages| format!("  {pages} pages"))
+                .unwrap_or_default(),
+            entry.bytes
+        ));
+    }
+    Ok((text, 0))
+}
+
+fn library_search_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["library", "state", "limit"], &["json"])?;
+    let query = flags.positional.join(" ");
+    if query.trim().is_empty() {
+        return Err("library search needs a query".to_string());
+    }
+    let limit = number(&flags, "limit", 10)?.min(50);
+    let library = crate::library::Library::open(library_path(&flags)?)?;
+    let hits = library.search(&query, limit)?;
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&hits)
+            .map_err(|error| format!("could not encode the hits: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+    if hits.is_empty() {
+        return Ok(("no library hits\n".to_string(), 0));
+    }
+    let mut text = String::new();
+    for hit in hits {
+        text.push_str(&format!(
+            "{}  {}{}  {}\n  {}\n",
+            hit.entry.id,
+            hit.entry.title,
+            hit.page
+                .map(|page| format!("  page {page}"))
+                .unwrap_or_default(),
+            hit.entry.format.label(),
+            hit.snippet
+        ));
+    }
+    Ok((text, 0))
+}
+
+fn library_show_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["library", "state"], &["text"])?;
+    let id = flags
+        .positional
+        .first()
+        .ok_or_else(|| "library show needs an entry id".to_string())?;
+    let library = crate::library::Library::open(library_path(&flags)?)?;
+    let (entry, text) = library.text(id)?;
+    if switched(&flags, "text") {
+        return Ok((text, 0));
+    }
+    let mut out = format!(
+        "id: {}\ntitle: {}\nformat: {}\nadded: {} ms\nbytes: {}\npages: {}\nsource sha256: {}\ntext sha256: {}\noriginal: {}\ncanonical: {}\n",
+        entry.id,
+        entry.title,
+        entry.format.label(),
+        entry.added_at_ms,
+        entry.bytes,
+        entry
+            .pages
+            .map(|pages| pages.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        entry.source_sha256,
+        entry.text_sha256,
+        entry.original,
+        entry.canonical
+    );
+    if !entry.authors.is_empty() {
+        out.push_str(&format!("authors: {}\n", entry.authors.join(", ")));
+    }
+    if let Some(year) = entry.year {
+        out.push_str(&format!("year: {year}\n"));
+    }
+    if !entry.tags.is_empty() {
+        out.push_str(&format!("tags: {}\n", entry.tags.join(", ")));
+    }
+    Ok((out, 0))
+}
+
+fn library_verify_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse(args, &["library", "state"])?;
+    let library = crate::library::Library::open(library_path(&flags)?)?;
+    let id = flags.positional.first().map(String::as_str);
+    let report = library.verify(id)?;
+    if report.entries.is_empty() {
+        return Ok(("the library is empty\n".to_string(), 0));
+    }
+    let mut text = String::new();
+    for item in &report.entries {
+        if item.ok {
+            text.push_str(&format!("ok {}\n", item.id));
+        } else {
+            text.push_str(&format!("FAILED {}\n", item.id));
+            for problem in &item.problems {
+                text.push_str(&format!("  - {problem}\n"));
+            }
+        }
+    }
+    text.push_str(&format!(
+        "verify: {} ({} entries)\n",
+        if report.ok { "green" } else { "red" },
+        report.entries.len()
+    ));
+    Ok((text, if report.ok { 0 } else { 1 }))
+}
+
+fn library_remove_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["library", "state"], &["purge"])?;
+    let id = flags
+        .positional
+        .first()
+        .ok_or_else(|| "library remove needs an entry id".to_string())?;
+    let library = crate::library::Library::open(library_path(&flags)?)?;
+    let entry = library.remove(id, switched(&flags, "purge"))?;
+    let how = if switched(&flags, "purge") {
+        "deleted"
+    } else {
+        "moved to trash"
+    };
+    Ok((format!("{how}: {}  {}\n", entry.id, entry.title), 0))
+}
+
+fn library_path(flags: &Flags) -> Result<PathBuf, String> {
+    match flags.named.get("library") {
+        Some(path) => guarded(Path::new(path)),
+        None => Ok(state_of(flags)?.join("library")),
+    }
+}
+
 /// `hades research "<question>"`: one evidence-first run. The note-creation verb moved to
 /// `hades note research`; this name is the engine.
 fn research_cmd(args: &[String]) -> Result<(String, i32), String> {
@@ -3494,6 +3758,9 @@ fn research_cmd(args: &[String]) -> Result<(String, i32), String> {
         Some("check") => research_check_cmd(&args[1..]),
         Some("show") => research_show_cmd(&args[1..]),
         Some("list") => research_list_cmd(&args[1..]),
+        Some("file") => research_file_cmd(&args[1..]),
+        Some("bench") => research_bench_cmd(&args[1..]),
+        Some("failures") => research_failures_cmd(&args[1..]),
         _ => research_run_cmd(args),
     }
 }
@@ -3515,12 +3782,19 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
             "queries",
             "minutes",
             "claims",
+            "library",
         ],
-        &["json"],
+        &["json", "offline"],
     )?;
     let question = flags.positional.join(" ");
     if question.trim().is_empty() {
         return Err("research needs a question. Try `hades research \"<question>\"`".to_string());
+    }
+    let offline = switched(&flags, "offline");
+    if !offline && flags.named.contains_key("library") {
+        return Err(
+            "--library is used with --offline; a web run does not read the shelf".to_string(),
+        );
     }
     let state = state_of(&flags)?;
     let config = config_of(&flags)?;
@@ -3538,12 +3812,29 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
     let extractor = crate::research::ModelExtractor {
         harness: answerer.harness(),
     };
-    let web = crate::research::Searx::from_env();
+    let library_root = library_path(&flags)?;
+    let web: Box<dyn crate::research::Web> = if offline {
+        let library = crate::library::Library::open(&library_root)?;
+        if library.is_empty()? {
+            return Err(format!(
+                "the offline library is empty; add a file with `hades library add <path> --library {}`",
+                library_root.display()
+            ));
+        }
+        Box::new(crate::library::LibraryWeb::new(library_root))
+    } else {
+        Box::new(crate::research::Searx::from_env())
+    };
     let engine = crate::research::Engine {
         store: &store,
-        web: &web,
+        web: web.as_ref(),
         planner: &planner,
         extractor: &extractor,
+        mode: if offline {
+            crate::research::RunMode::Offline
+        } else {
+            crate::research::RunMode::Web
+        },
     };
     let run = engine.run(&question, budget)?;
     let check = crate::research::check(&store, &run.id)?;
@@ -3562,7 +3853,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
     }
 
     let mut text = format!(
-        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nsources: {}\nclaims: {}\nverified quotes: {}\nmodel tokens: planner {}+{}, extractor {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
+        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\nmodel tokens: planner {}+{}, extractor {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
         run.id,
         run.status,
         run.question,
@@ -3572,6 +3863,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         run.usage.sources,
         run.usage.claims,
         check.verified,
+        check.off_question,
         run.usage.planner_prompt_tokens,
         run.usage.planner_generated_tokens,
         run.usage.extractor_prompt_tokens,
@@ -3590,14 +3882,17 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
 }
 
 fn research_check_cmd(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(args, &["state"])?;
+    let flags = parse_with(args, &["state"], &["strict"])?;
     let id = flags
         .positional
         .first()
         .ok_or_else(|| "research check needs a run id".to_string())?;
     let store = crate::research::Store::new(&state_of(&flags)?);
-    let check = crate::research::check(&store, id)?;
-    let mut text = format!("{}: {} verified quote(s)\n", id, check.verified);
+    let check = crate::research::check_with(&store, id, switched(&flags, "strict"))?;
+    let mut text = format!(
+        "{}: {} verified quote(s), {} off-question claim(s)\n",
+        id, check.verified, check.off_question
+    );
     for failure in &check.failures {
         text.push_str(&format!("- {failure}\n"));
     }
@@ -3609,6 +3904,241 @@ fn research_check_cmd(args: &[String]) -> Result<(String, i32), String> {
         text.push_str("check: unreadable\n");
     }
     Ok((text, check.exit()))
+}
+
+fn research_file_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &["state", "vault", "db", "config", "topic", "slug", "summary"],
+        &[],
+    )?;
+    let id = flags
+        .positional
+        .first()
+        .ok_or_else(|| "research file needs a run id".to_string())?;
+    let topic = flags
+        .named
+        .get("topic")
+        .ok_or_else(|| "research file needs `--topic <topic>`".to_string())?;
+    let store = crate::research::Store::new(&state_of(&flags)?);
+    let run = store.load(id)?;
+    if run.status != crate::research::RunStatus::Published {
+        return Err(format!(
+            "run `{id}` is {:?}; only a published run can be filed",
+            run.status
+        ));
+    }
+    let check = crate::research::check_with(&store, id, true)?;
+    if check.code != crate::research::CheckCode::Green {
+        return Err(format!(
+            "run `{id}` does not pass `research check --strict`: {}",
+            check.failures.join("; ")
+        ));
+    }
+    let root = creation_root(&flags)?;
+    let vault = record(&root, &db_path(&flags)?)?;
+    let summary = flags
+        .named
+        .get("summary")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{} claims, {} verified quotes, {} sources",
+                run.claims.len(),
+                check.verified,
+                run.sources.len()
+            )
+        });
+    let provenance = format!(
+        "hades research {id}; {}; {} verified quotes; mode {}",
+        if check.off_question == 0 {
+            "strict check green".to_string()
+        } else {
+            format!("{} off-question claim(s)", check.off_question)
+        },
+        check.verified,
+        match run.mode {
+            crate::research::RunMode::Web => "web",
+            crate::research::RunMode::Offline => "offline library",
+        }
+    );
+    let path = vault
+        .create_research(
+            topic,
+            &run.question,
+            flags.named.get("slug").map(String::as_str),
+            &summary,
+            &provenance,
+            Some(&format!("hades://research/{id}")),
+        )
+        .map_err(|fault| fault.to_string())?;
+    let note = vault.read_note(&path).map_err(|fault| fault.to_string())?;
+    let report = fs::read_to_string(store.dir(id).join("report.md"))
+        .map_err(|error| format!("could not read the report: {error}"))?;
+    vault
+        .write_note(&path, &note.frontmatter, &report)
+        .map_err(|fault| fault.to_string())?;
+    // `create_research` wrote a frontmatter-only stub; `write_note` updates the record. Export refuses a
+    // path whose bytes differ from the record (the hand-edit guard), so write the body here, at the path
+    // this command just created.
+    fs::write(
+        &path,
+        format!("{}\n{}\n", note.frontmatter.render(), report.trim()),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    Ok((created_text(&vault, &path), 0))
+}
+
+fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "config",
+            "state",
+            "model",
+            "endpoint",
+            "key",
+            "temperature",
+            "max-tokens",
+            "thinking",
+            "sources",
+            "fetches",
+            "queries",
+            "minutes",
+            "claims",
+            "library",
+        ],
+        &["json", "offline"],
+    )?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "research bench needs a JSON question file".to_string())?;
+    let text = fs::read_to_string(file).map_err(|error| format!("{file}: {error}"))?;
+    let questions: Vec<crate::research::BenchQuestion> = serde_json::from_str(&text)
+        .map_err(|error| format!("{file}: the bench file is not a JSON array: {error}"))?;
+    if questions.is_empty() {
+        return Err("the bench file has no questions".to_string());
+    }
+    let offline = switched(&flags, "offline");
+    if !offline && flags.named.contains_key("library") {
+        return Err(
+            "--library is used with --offline; a web run does not read the shelf".to_string(),
+        );
+    }
+    let state = state_of(&flags)?;
+    let config = config_of(&flags)?;
+    let answerer = answerer(&flags, config.as_ref(), None, None)?;
+    let budget = crate::research::ResearchBudget {
+        queries: number(&flags, "queries", 12)?,
+        fetches: number(&flags, "sources", number(&flags, "fetches", 24)?)?,
+        minutes: number(&flags, "minutes", 60)? as u64,
+        claims_per_source: number(&flags, "claims", 3)?,
+    };
+    let store = crate::research::Store::new(&state);
+    let planner = crate::research::ModelPlanner {
+        harness: answerer.harness(),
+    };
+    let extractor = crate::research::ModelExtractor {
+        harness: answerer.harness(),
+    };
+    let library_root = library_path(&flags)?;
+    let web: Box<dyn crate::research::Web> = if offline {
+        let library = crate::library::Library::open(&library_root)?;
+        if library.is_empty()? {
+            return Err(format!(
+                "the offline library is empty; add a file with `hades library add <path> --library {}`",
+                library_root.display()
+            ));
+        }
+        Box::new(crate::library::LibraryWeb::new(library_root))
+    } else {
+        Box::new(crate::research::Searx::from_env())
+    };
+    let mode = if offline {
+        crate::research::RunMode::Offline
+    } else {
+        crate::research::RunMode::Web
+    };
+    let rows = crate::research::run_bench(
+        &store,
+        web.as_ref(),
+        &planner,
+        &extractor,
+        mode,
+        &questions,
+        budget,
+    )?;
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&rows)
+            .map_err(|error| format!("could not encode the bench: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+    let mut out = format!("bench: {} question(s) in {mode:?} mode\n\n", rows.len());
+    out.push_str("| id | published | claims | verified | off-question | sources | ms | tokens | coverage |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    for row in &rows {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {}+{} | {}/{} |\n",
+            row.id,
+            if row.published { "yes" } else { "no" },
+            row.claims,
+            row.verified,
+            row.off_question,
+            row.sources,
+            row.seconds_ms,
+            row.prompt_tokens,
+            row.generated_tokens,
+            row.coverage,
+            row.key_terms
+        ));
+        if !row.missing.is_empty() {
+            out.push_str(&format!(
+                "\n`{}` missing key terms: {}\n",
+                row.id,
+                row.missing.join(", ")
+            ));
+        }
+        out.push_str(&format!("\n`{}` run: `{}`\n", row.id, row.run_id));
+    }
+    out.push_str(
+        "\nCoverage is a reading aid, not a truth score; open the run report to hand-grade it.\n",
+    );
+    Ok((out, 0))
+}
+
+fn research_failures_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state"], &["json"])?;
+    let store = crate::research::Store::new(&state_of(&flags)?);
+    let entries = crate::research::failure_index(&store)?;
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&entries)
+            .map_err(|error| format!("could not encode the failures: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+    if entries.is_empty() {
+        return Ok(("no failed research runs\n".to_string(), 0));
+    }
+    let mut out = format!("{} failed research run(s)\n", entries.len());
+    for entry in &entries {
+        out.push_str(&format!(
+            "{}  {:?}  {} failure(s)  {}\n",
+            entry.run_id,
+            entry.mode,
+            entry.failures.len(),
+            entry.question
+        ));
+        for failure in &entry.failures {
+            out.push_str(&format!(
+                "  {} {}: {}\n",
+                failure.stage, failure.subject, failure.reason
+            ));
+        }
+    }
+    Ok((out, 0))
 }
 
 fn research_show_cmd(args: &[String]) -> Result<(String, i32), String> {

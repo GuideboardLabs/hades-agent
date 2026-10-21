@@ -63,6 +63,7 @@ pub mod harness_files;
 pub mod http;
 pub mod httpd;
 pub mod judge;
+pub mod library;
 pub mod mcp;
 pub mod memory;
 pub mod mode;

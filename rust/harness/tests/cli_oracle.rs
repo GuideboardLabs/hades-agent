@@ -3175,3 +3175,61 @@ fn baseline_has_to_be_red_or_off() {
     assert_eq!(code, 2);
     assert!(text.contains("say red or off"), "{text}");
 }
+
+#[test]
+fn research_file_writes_the_report_body_and_the_run_link() {
+    let dir = scratch("research-file");
+    let state = dir.join("state");
+    let vault = dir.join("vault");
+    let db = dir.join("mneme.db");
+    let store = harness::research::Store::new(&state);
+    let mut run = store
+        .create_named(
+            "r-file",
+            "What did the shelf say?",
+            harness::research::QuestionKind::Fact,
+            harness::research::ResearchBudget::default(),
+        )
+        .expect("a run");
+    run.status = harness::research::RunStatus::Published;
+    store.save(&run).expect("a saved run");
+    std::fs::write(
+        store.dir("r-file").join("report.md"),
+        "# What did the shelf say?\n\nA body that must reach the note.\n",
+    )
+    .expect("a report");
+
+    let (code, text) = hades(&[
+        "topic",
+        "technical",
+        "GPU inference",
+        "--summary",
+        "Measured limits.",
+        "--vault",
+        vault.to_str().expect("utf8"),
+        "--db",
+        db.to_str().expect("utf8"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let (code, text) = hades(&[
+        "research",
+        "file",
+        "r-file",
+        "--topic",
+        "technical/gpu-inference",
+        "--state",
+        state.to_str().expect("utf8"),
+        "--vault",
+        vault.to_str().expect("utf8"),
+        "--db",
+        db.to_str().expect("utf8"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let note = vault.join("20 Research/technical/gpu-inference/what-did-the-shelf-say.md");
+    let body = std::fs::read_to_string(&note).expect("a filed note");
+    assert!(body.contains("A body that must reach the note."), "{body}");
+    assert!(
+        body.contains("source_url: hades://research/r-file"),
+        "{body}"
+    );
+}
