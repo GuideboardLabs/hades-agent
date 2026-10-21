@@ -404,6 +404,14 @@ It reads the tool name and its arguments as text: the command line of `shell`, t
 and the control named to `browser`. It cannot see a page whose button says "Continue", a command built at
 run time out of pieces, or a delete done by a binary nobody listed. It is a floor, not a sandbox.
 
+Three things bound a run, and none of them is a general sandbox. The **cage** is Landlock: it decides
+which paths may be read and written, and it is the only one of the three that the kernel enforces. The
+**floor** is a command-text heuristic over a fixed list; a receipt prints `floor: command-text heuristic
+(not a sandbox)`, and that is the whole claim. `--policy strict` adds a coarse **strict deny list** over
+the same text after quoted spans are stripped, which catches `rm -rf` typed out and does not catch
+`sh -c 'r''m -rf /'`; the receipt says `strict deny list` for the same reason. Anything that needs a real
+boundary needs the cage, or a container around it.
+
 ## Work that runs itself
 
 A job is a standing goal file under `<state>/jobs`, one file per job, and the file is the record. The body

@@ -306,7 +306,7 @@ hades — the harness, one turn or a whole graph
       the whole thread to that point, not a copy of one message
 
   hades acp [--root <dir>] [--state <dir>] [--config <file>] [--profile <id>]
-            [--policy guarded|open] [--verify <cmd>] [--program <cmd>]...
+            [--policy guarded|strict|open] [--verify <cmd>] [--program <cmd>]...
       the Agent Client Protocol over stdio, one JSON-RPC object per line. An editor
       drives the same governed run: tool calls stream as session/update, and a floor
       or policy question becomes session/request_permission. --program is the offline
@@ -387,7 +387,7 @@ hades — the harness, one turn or a whole graph
       structure, and every inline test module.
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
-      [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
+      [--policy open|guarded|strict] [--verify <command>] [--state <dir>] [--session <id>]
       [--cage on|off|strict] [--temperature t] [--max-tokens n] [--context n] [--thinking on|off]
       [--strict-model]
       run one turn, with a model answering
@@ -5787,7 +5787,7 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
     };
 
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\ncontext: {} tokens\ncage:    {}\nshadow:  {}\nmap:     {hits} hits, {misses} misses\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\ncontext: {} tokens\ncage:    {}\n{}shadow:  {}\nmap:     {hits} hits, {misses} misses\n",
         session.id(),
         session.len(),
         session.len() - before,
@@ -5801,6 +5801,9 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
         },
         engine.profile().context_tokens,
         engine.cage(),
+        // The floor is a text heuristic and the receipt says so; a run that printed "safety: on" would be
+        // claiming the sandbox this build does not have.
+        format!("floor:   {}\\n", crate::floor::receipt()),
         engine.shadows(),
     );
     text.push_str(&format!("history: {}\n", history(&learned)));

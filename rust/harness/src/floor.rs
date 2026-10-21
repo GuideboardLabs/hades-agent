@@ -85,6 +85,65 @@ impl Category {
     }
 }
 
+/// How the floor describes itself in a receipt.
+///
+/// The floor reads the tool name and its arguments as text. Calling that "safety: on" would claim a
+/// sandbox this code does not have, so the receipt names the mechanism and the cage is what bounds reads
+/// and writes.
+pub const HEURISTIC: &str = "command-text heuristic";
+
+/// How a strict policy describes itself. It refuses a short list of destructive primitives it can see in
+/// the command text, and it does not claim to catch an encoding it cannot read.
+pub const STRICT_DENY_LIST: &str = "strict deny list";
+
+/// The receipt line for a run. One string, so a caller cannot print half of it.
+pub fn receipt() -> &'static str {
+    "floor: command-text heuristic (not a sandbox)"
+}
+
+/// The words a strict policy refuses. This is a deny list over literal text: `rm -rf` typed out is caught,
+/// `r''m -rf` and `$(printf rm)` are not, and the receipt says `strict deny list` rather than "sandbox".
+const DESTRUCTIVE: [&str; 9] = [
+    "rm -rf",
+    "rm -fr",
+    "rm --recursive --force",
+    "mkfs",
+    "shred ",
+    "of=/dev/sd",
+    "of=/dev/nvme",
+    "of=/dev/vd",
+    "of=/dev/hd",
+];
+
+/// A strict check over the command text, after the contents of quoted strings are removed.
+///
+/// Stripping the quoted spans is what keeps `echo "rm -rf /"` from being refused; it is also what makes
+/// `sh -c 'rm -rf /'` invisible, which is the limitation this function has and states.
+pub fn strict(command: &str) -> Option<Floor> {
+    let visible = unquoted(command).to_lowercase();
+    for word in DESTRUCTIVE {
+        if visible.contains(word) {
+            return Some(Floor::new(Category::Delete, word));
+        }
+    }
+    None
+}
+
+/// The command with the contents of single- and double-quoted spans removed.
+fn unquoted(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => {}
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None => out.push(ch),
+        }
+    }
+    out
+}
+
 /// What tripped the floor, and why. The evidence is the matched word or endpoint, never the whole
 /// command: a command can carry a token in a URL, and a refusal is copied into a chat or a log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -849,6 +908,37 @@ fn mentions(text: &str, word: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_receipt_names_the_floor_as_a_heuristic() {
+        let line = receipt();
+        assert!(line.contains(HEURISTIC), "{line}");
+        assert!(line.contains("not a sandbox"), "{line}");
+    }
+
+    #[test]
+    fn strict_refuses_a_destructive_primitive() {
+        let floor = strict("rm -rf build && cargo build").expect("a refusal");
+        assert_eq!(floor.category(), Category::Delete);
+        assert!(floor.reason().contains("rm -rf"), "{}", floor.reason());
+        // Quoted text is not a command: printing the words must not trip the list.
+        assert!(strict("echo \"rm -rf / is refused\"").is_none());
+    }
+
+    #[test]
+    fn strict_records_what_it_cannot_see() {
+        // The plan's own example. Two adjacent quoted spans join to `rm -rf /` when a shell runs it, but
+        // this reads text after stripping quoted spans, so it does not match. The assertion is that the
+        // miss is recorded as a known miss rather than papered over.
+        let joined = "sh -c 'r''m -rf /'";
+        assert!(strict(joined).is_none(), "strict claimed a catch it cannot make: {joined}");
+        assert!(STRICT_DENY_LIST.contains("deny list"));
+    }
+
+    #[test]
+    fn unquoted_drops_both_kinds_of_quote() {
+        assert_eq!(unquoted("a 'b c' d \"e\""), "a  d ");
+    }
 
     fn command(text: &str) -> Option<Floor> {
         check("shell", &json!({ "command": text }), Path::new("/work"))

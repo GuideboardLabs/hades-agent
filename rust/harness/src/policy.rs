@@ -123,11 +123,27 @@ impl Rule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     rules: Vec<Rule>,
+    /// Guarded plus the deny list in [`crate::floor::strict`]. A field rather than a rule because a rule
+    /// matches an action name and this reads the command text.
+    strict: bool,
 }
 
 impl Policy {
     pub fn new(rules: Vec<Rule>) -> Self {
-        Policy { rules }
+        Policy {
+            rules,
+            strict: false,
+        }
+    }
+
+    /// The same rules, with the strict deny list on.
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.strict
     }
 
     /// The rules this policy holds, in order.
@@ -174,6 +190,11 @@ pub const OPEN: &str = "open";
 /// has already decided that the model gets the machine.
 pub const GUARDED: &str = "guarded";
 
+/// Guarded, plus a coarse deny list over command text. It refuses the destructive primitives in
+/// [`crate::floor::STRICT_DENY_LIST`] before the shell runs; it is a deny list, not a sandbox, and a
+/// receipt that says otherwise would be claiming a guarantee this build does not make.
+pub const STRICT: &str = "strict";
+
 /// The policies this build ships, by name.
 ///
 /// The difference between the two is the whole reason the broker exists: one lets the shell run, the other
@@ -191,13 +212,20 @@ pub fn named(name: &str) -> Option<Policy> {
             Decision::Ask,
             "this policy asks a person before the shell runs",
         )]),
+        STRICT => Policy::new(vec![Rule::new(
+            crate::SHELL,
+            Decision::Ask,
+            "this policy asks a person before the shell runs, and refuses a destructive primitive in the \
+             command text",
+        )])
+        .strict(),
         _ => return None,
     })
 }
 
 /// The names, for a usage message that cannot drift from the table.
-pub fn shipped() -> [&'static str; 2] {
-    [OPEN, GUARDED]
+pub fn shipped() -> [&'static str; 3] {
+    [OPEN, GUARDED, STRICT]
 }
 
 /// The actions a guard samples: what matters is the decision and the reason a person would read for it,

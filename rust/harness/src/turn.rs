@@ -328,6 +328,27 @@ impl<'a> Seams<'a> {
         }
         match answer.draft() {
             Draft::Program(program) => {
+                // The strict deny list runs before the ordinary floor and before any question: a
+                // destructive primitive is refused rather than offered to a person as a choice.
+                if self.policy.is_strict()
+                    && let Some(floor) = crate::floor::strict(&program)
+                {
+                    let reason = format!("{}: {}", crate::floor::STRICT_DENY_LIST, floor.reason());
+                    entries.push(session.append(
+                        Kind::ApprovalDecision,
+                        json!({
+                            "action": floor.action(),
+                            "decision": "deny",
+                            "by": "policy",
+                            "reason": reason,
+                        }),
+                    )?);
+                    return Ok(Turn {
+                        entries,
+                        outcome: Outcome::Refused { reason },
+                        usage: None,
+                    });
+                }
                 if let Some(floor) =
                     crate::floor::check(SHELL, &json!({ "command": program }), self.task.root())
                     && let Some(turn) =
