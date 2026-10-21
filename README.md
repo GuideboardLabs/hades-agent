@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
   <img alt="Version" src="https://img.shields.io/badge/version-0.0.9-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-855%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-864%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 855 passing, 13 ignored live tests |
+| **Tests** | 864 passing, 13 ignored live tests |
 
 ---
 
@@ -624,7 +624,9 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 | `hades explain <session>` | A compact turn map: action, state, tokens, decision |
 | `hades distill <session>` | Draft a runbook from a verified run; `--run` proves it |
 | `hades replay <runbook>` | Execute a runbook in a fresh root against `--check <cmd>` |
-| `hades tune <goal>` | Probe candidate harnesses; `--holdout` guards adoption, each adoption is a numbered generation |
+| `hades tune <goal>` | Probe candidate harnesses; `--holdout` guards adoption, the corpus gate refuses a regression, each adoption is a numbered generation |
+| `hades cases` / `hades case <id>` | List the failure corpus, print one case, `forget <id>` retires its tree |
+| `hades eval [--against <dir>]` | Replay the corpus: stale, holds, fixed, regression, still failing; `--dry-run` prices it |
 | `hades refine --rollback <n>` | Restore the files named in harness generation n |
 | `hades job <spec>` | Write a scheduled job |
 | `hades jobs` | List scheduled jobs |
@@ -636,8 +638,8 @@ Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway add
 | `hades taste [forget <n\|all>]` | What the answers taught, and how to forget it |
 | `hades route <goal>` | Show which profile the rules pick, and why |
 | `hades scoreboard` | What finished runs say per profile |
-| `hades skills list\|seed\|promote\|reject` | Manage built-in and proposed skills |
-| `hades session list\|show <id>` | Inspect the session tree |
+| `hades skills list\|seed\|promote\|reject\|verify\|report` | Manage built-in and proposed skills; `verify` runs a proposal's own cases |
+| `hades session list\|show <id>\|handover [id]` | Inspect the session tree, or read the harness-written handover |
 | `hades fork <session>` | Copy a chain to an entry, leaving the source alone |
 | `hades acp` | Serve ACP on stdio for an editor |
 | `hades doctor [--services on]` | Describe this install; writes nothing |
@@ -695,7 +697,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **855 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **864 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
