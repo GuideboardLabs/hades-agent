@@ -44,10 +44,27 @@ const RESULT_LIMIT: usize = 30_000;
 /// How many pages of `tools/list` are followed before the listing stops.
 const PAGE_LIMIT: usize = 10;
 
+/// The programs an MCP server may be started with unless the config names others. A server is a process
+/// that talks to the model, so the program is the one thing that must not be free-form: `sh -c` with an
+/// argument is a shell the model reached, and the allowlist is where that stops.
+pub const COMMANDS: &[&str] = &["npx", "bunx", "uvx", "python3", "node", "deno"];
+
 /// The `mcp` section of the config. A missing section is an empty registry, not an error.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
     pub servers: BTreeMap<String, McpServer>,
+    /// The programs a server may name. Defaults to [`COMMANDS`]; `mcp.commands` replaces the list rather
+    /// than adding to it, so an owner who writes it can state exactly what may run.
+    pub commands: Vec<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig {
+            servers: BTreeMap::new(),
+            commands: COMMANDS.iter().map(|command| command.to_string()).collect(),
+        }
+    }
 }
 
 /// One server. `allow` names the tools a person has decided may run; empty means none and `*` means all.
@@ -79,9 +96,30 @@ impl McpConfig {
         let object = value
             .as_object()
             .ok_or_else(|| format!("{}: `mcp` is not an object", path.display()))?;
-        refuse_unknown(object, &["servers"], "mcp", path)?;
+        refuse_unknown(object, &["servers", "commands"], "mcp", path)?;
+        let commands = match object.get("commands") {
+            None => COMMANDS
+                .iter()
+                .map(|command| command.to_string())
+                .collect::<Vec<String>>(),
+            Some(value) => string_list(Some(value), "mcp.commands", path)?
+                .into_iter()
+                .map(|command| command.trim().to_string())
+                .filter(|command| !command.is_empty())
+                .collect(),
+        };
+        if commands.is_empty() {
+            return Err(format!(
+                "{}: `mcp.commands` is empty, so no server could ever start; remove the key for the \
+                 default list",
+                path.display()
+            ));
+        }
         let Some(servers) = object.get("servers") else {
-            return Ok(McpConfig::default());
+            return Ok(McpConfig {
+                servers: BTreeMap::new(),
+                commands,
+            });
         };
         let servers = servers
             .as_object()
@@ -120,6 +158,18 @@ impl McpConfig {
                     )
                 })?
                 .to_string();
+            let program = std::path::Path::new(&command)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| command.clone());
+            if !commands.iter().any(|allowed| allowed == &program) {
+                return Err(format!(
+                    "{}: `{where_}.command` is `{command}`, which is not on `mcp.commands`; add it there \
+                     if it should be allowed, or use one of: {}",
+                    path.display(),
+                    commands.join(", ")
+                ));
+            }
             let args = string_list(server.get("args"), &format!("{where_}.args"), path)?;
             let env = string_map(server.get("env"), &format!("{where_}.env"), path)?;
             let allow = string_list(server.get("allow"), &format!("{where_}.allow"), path)?;
@@ -150,7 +200,7 @@ impl McpConfig {
                 },
             );
         }
-        Ok(McpConfig { servers: out })
+        Ok(McpConfig { servers: out, commands })
     }
 
     /// The shape `save` writes back.
@@ -168,7 +218,7 @@ impl McpConfig {
                 }),
             );
         }
-        json!({ "servers": servers })
+        json!({ "servers": servers, "commands": self.commands })
     }
 }
 

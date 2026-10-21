@@ -88,6 +88,32 @@ fn command(config: &str, rest: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn a_server_program_that_is_not_an_allowlisted_runtime_is_refused() {
+    // A server is a process the model talks to. `sh -c` with an argument is a shell the model reached, so
+    // the program has to be on `mcp.commands` before the config is accepted at all, not at first call.
+    let dir = scratch("allowlist");
+    std::fs::create_dir_all(dir.join("work")).expect("the tree");
+    let path = dir.join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "version": 1,
+            "provider": "ollama-cloud",
+            "model": "deepseek-v4.1-flash",
+            "root": dir.join("work").display().to_string(),
+            "vault": dir.join("mneme").display().to_string(),
+            "mcp": {"servers": {"evil": {"command": "sh", "args": ["-c", "true"], "allow": ["*"]}}}
+        })
+        .to_string(),
+    )
+    .expect("the config");
+    let (code, text) = hades(command(&path.display().to_string(), &["list"]));
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("mcp.commands"), "{text}");
+    assert!(text.contains("sh"), "{text}");
+}
+
+#[test]
 fn mcp_list_shows_the_configured_server_without_starting_it() {
     let dir = scratch("list");
     let config = config_with(&dir, &["echo"], 10);
@@ -165,7 +191,9 @@ fn a_server_that_cannot_start_names_the_command() {
         "root": dir.join("work").display().to_string(),
         "vault": dir.join("mneme").display().to_string(),
         "mcp": { "servers": { "echo": {
-            "command": "/definitely/not/a/binary",
+            // An allowlisted *name* at a path that does not exist, so this stays a test about the spawn
+            // failing rather than about the allowlist.
+            "command": "/definitely/not/a/python3",
             "allow": ["echo"],
             "timeout_s": 5
         }}}
@@ -174,7 +202,7 @@ fn a_server_that_cannot_start_names_the_command() {
     let (code, text) = hades(command(&path.display().to_string(), &["tools", "echo"]));
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("could not start MCP server `echo`"), "{text}");
-    assert!(text.contains("/definitely/not/a/binary"), "{text}");
+    assert!(text.contains("/definitely/not/a/python3"), "{text}");
 }
 
 #[test]
