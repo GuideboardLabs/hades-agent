@@ -57,7 +57,9 @@ pub struct Assembly {
     /// The name the policy was asked for by, so a log says which one was chosen rather than only what it does.
     pub policy_name: String,
     pub reason: RoutingReason,
-    pub caged: bool,
+    /// Whether the program is confined, and how tightly. `Off` is a caller's explicit choice; `On` is the
+    /// default and grants `/run`; `Strict` drops `/run` so a host control socket is not reachable.
+    pub cage: CageMode,
     /// Where the shadow snapshots go. `None` means nothing is snapshotted, which the run says out loud.
     pub shadow: Option<PathBuf>,
     /// What prompt the model was given: one size and one digest, recorded in the session at creation so a
@@ -68,6 +70,33 @@ pub struct Assembly {
     pub check_minutes: Option<u64>,
     /// The second oracle for a security run. `None` is an ordinary check.
     pub attack: Option<String>,
+}
+
+pub enum CageMode {
+    Off,
+    On,
+    Strict,
+}
+
+impl CageMode {
+    /// The flag's spelling, for an error that says what was accepted.
+    pub fn parse(text: &str) -> Option<CageMode> {
+        match text {
+            "off" => Some(CageMode::Off),
+            "on" => Some(CageMode::On),
+            "strict" => Some(CageMode::Strict),
+            _ => None,
+        }
+    }
+
+    /// The cage this mode builds, or `None` when the caller asked for none.
+    pub fn build(self, root: &std::path::Path) -> Option<Cage> {
+        match self {
+            CageMode::Off => None,
+            CageMode::On => Some(Cage::around(root)),
+            CageMode::Strict => Some(Cage::strict(root)),
+        }
+    }
 }
 
 /// Everything one run needs except the model and the program.
@@ -101,16 +130,14 @@ impl Engine {
         // the one you get by not thinking about it. The scratch directory is inside the cage because a
         // program that wants somewhere for a temporary file finds `/tmp` closed and has to be pointed at a
         // place it may write, which is better than being handed the whole of `/tmp`.
-        let shell = if spec.caged {
+        let shell = if let Some(base) = spec.cage.build(&spec.root) {
             let scratch = spec.state.join("tmp");
             std::fs::create_dir_all(&scratch)
                 .map_err(|error| format!("could not make {}: {error}", scratch.display()))?;
             // `with_runtimes()` asks each interpreter where its own standard library lives, because a
             // Python whose prefix is outside the granted paths dies before it runs a line. Leaving it off
             // is the bug this module was extracted to stop repeating.
-            let cage = Cage::around(spec.root.clone())
-                .also_writable(scratch)
-                .with_runtimes();
+            let cage = base.also_writable(scratch).with_runtimes();
             Shell::new(spec.root.clone(), LIMIT).caged(cage)
         } else {
             Shell::new(spec.root.clone(), LIMIT)
@@ -377,7 +404,7 @@ mod tests {
             policy: crate::policy::named(crate::policy::OPEN).expect("a shipped policy"),
             policy_name: crate::policy::OPEN.to_string(),
             reason: RoutingReason::chosen("test"),
-            caged: false,
+            cage: CageMode::Off,
             shadow: None,
             prompt,
             check_minutes: None,

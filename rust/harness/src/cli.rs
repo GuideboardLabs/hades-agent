@@ -22,6 +22,7 @@ use mneme::NoteStore;
 
 use crate::Assembly;
 use crate::Engine;
+use crate::engine::CageMode;
 use crate::Harness;
 use crate::ScriptedModel;
 use crate::approval::{ApprovalBroker, OnDisk, PendingId, Scope};
@@ -386,7 +387,7 @@ hades — the harness, one turn or a whole graph
 
   hades turn <goal> --model <preset> [--root <dir>] [--profile <id>]
       [--policy open|guarded] [--verify <command>] [--state <dir>] [--session <id>]
-      [--cage on|off] [--temperature t] [--max-tokens n] [--context n] [--thinking on|off]
+      [--cage on|off|strict] [--temperature t] [--max-tokens n] [--context n] [--thinking on|off]
       [--strict-model]
       run one turn, with a model answering
 
@@ -409,6 +410,9 @@ session is opened, so a request that cannot work fails while it is free, and a f
 names that model. Nothing is substituted for it.
 The cage is on by default: the program may read the system and write in the task's root and in the state
 directory's tmp, and it may not read your home directory or reach the network. --cage off turns it off.
+--cage strict also drops the broad /run grant, so a host control socket (Docker, Podman, containerd) is not
+reachable; the resolver paths it needs are granted by name. No Landlock on this kernel can refuse a
+pathname Unix socket before ABI 9, and abstract sockets are never covered: `hades doctor` says which.
 A shadow snapshot of the tree is taken before each program runs, so a change can be undone: --shadow off
 turns that off, and `hades undo <session>` puts the latest one back.
 Exit codes: 0 done, 1 the turn ran and the check failed, 2 the harness could not do it
@@ -5509,10 +5513,10 @@ pub(crate) fn assemble(
         .cloned()
         .unwrap_or_else(|| default_session.to_string());
 
-    let caged = match flags.named.get("cage").map(String::as_str) {
-        None | Some("on") => true,
-        Some("off") => false,
-        Some(other) => return Err(format!("`--cage {other}`: say on or off")),
+    let cage = match flags.named.get("cage").map(String::as_str) {
+        None => CageMode::On,
+        Some(text) => CageMode::parse(text)
+            .ok_or_else(|| format!("`--cage {text}`: say on, off or strict"))?,
     };
     // On by default: the design asks for a shadow snapshot of every tool effect, and a safety net that has
     // to be remembered is one that will be forgotten. `--shadow off` is there because a snapshot costs a
@@ -5553,7 +5557,7 @@ pub(crate) fn assemble(
         policy,
         policy_name: policy_name.to_string(),
         reason,
-        caged,
+        cage,
         shadow,
         prompt: Some(harness.prompt().fact()),
         check_minutes,

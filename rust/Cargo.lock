@@ -183,6 +183,7 @@ version = "0.0.20"
 dependencies = [
  "crossterm",
  "governance",
+ "libc",
  "mneme",
  "ratatui",
  "rusqlite",

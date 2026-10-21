@@ -272,6 +272,50 @@ fn the_tool_says_what_it_confines() {
     );
 }
 
+#[test]
+fn the_report_names_the_socket_limit() {
+    // A Docker socket is a way to become root on the host, and Landlock's filesystem rules do not close a
+    // pathname Unix socket before ABI 9, and never close an abstract one. A cage that implied otherwise
+    // would be lying about what it contains; the report says the gap in words.
+    let (_base, root, _outside) = scratch("report");
+    let report = Cage::around(&root).report();
+    assert!(report.contains("unix sockets"), "{report}");
+    assert!(report.contains("landlock abi"), "{report}");
+    assert!(report.contains("tcp:"), "{report}");
+}
+
+#[test]
+fn the_landlock_syscalls_are_the_ones_the_kernel_table_names() {
+    // The crate used to hard-code x86-64's numbers behind a `cfg`, which is why an ARM64 build did not
+    // compile. They now come from libc, and this asserts the value on this architecture rather than
+    // trusting that a table exists: 444, 445 and 446 on both the x86-64 and the generic tables.
+    assert_eq!(libc::SYS_landlock_create_ruleset, 444);
+    assert_eq!(libc::SYS_landlock_add_rule, 445);
+    assert_eq!(libc::SYS_landlock_restrict_self, 446);
+}
+
+#[test]
+fn the_abi_probe_answers_rather_than_panicking() {
+    // On a kernel with Landlock this is the version; on one without it is ENOSYS, which `available()`
+    // turns into `false`. Neither may panic, and a cross-check has to compile the same code.
+    let abi = harness::cage::abi();
+    assert!(abi < 0 || abi >= 1, "{abi}");
+    let _ = harness::cage::available();
+}
+
+#[test]
+fn strict_mode_does_not_grant_run() {
+    let cage = Cage::strict("/work");
+    assert!(
+        !cage.grants_read(Path::new("/run")),
+        "strict mode removes the broad /run grant"
+    );
+    assert!(
+        cage.grants_read(Path::new("/usr")),
+        "the system a program needs to start is still readable"
+    );
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:

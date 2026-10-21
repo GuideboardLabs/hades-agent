@@ -22,3 +22,9 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled", 
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
 unicode-width = "0.2"
+# The Landlock syscalls, with the per-architecture numbers libc already knows. The cage used raw x86-64
+# assembly, which is why the crate did not compile on ARM64 at all.
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"

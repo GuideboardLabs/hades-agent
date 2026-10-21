@@ -29,15 +29,14 @@ use std::sync::OnceLock;
 
 use crate::fault::Fault;
 
-/// The syscall numbers, on the architecture that has them.
-#[cfg(target_arch = "x86_64")]
-mod number {
-    pub const CREATE_RULESET: usize = 444;
-    pub const ADD_RULE: usize = 445;
-    pub const RESTRICT_SELF: usize = 446;
-    pub const PRCTL: usize = 157;
-    pub const SET_NO_NEW_PRIVS: usize = 38;
-}
+/// The syscall numbers the Landlock API uses.
+///
+/// Named from `libc` where the pinned crate has them, because the number is per-architecture and writing
+/// x86-64's down by hand is how the crate came to not compile on ARM64 at all. Landlock was added to the
+/// generic and x86-64 tables as 444, 445 and 446; the assertion below keeps the fallback honest.
+const SYS_CREATE_RULESET: libc::c_long = libc::SYS_landlock_create_ruleset as libc::c_long;
+const SYS_ADD_RULE: libc::c_long = libc::SYS_landlock_add_rule as libc::c_long;
+const SYS_RESTRICT_SELF: libc::c_long = libc::SYS_landlock_restrict_self as libc::c_long;
 
 /// Ask for the ABI version rather than a rule set.
 const WANT_VERSION: usize = 1;
@@ -133,6 +132,57 @@ pub const SYSTEM: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/proc", "/sys", "/run",
 ];
 
+/// The same list with the broad `/run` grant removed.
+///
+/// `/run` is where the host's own control sockets live: Docker, Podman, containerd, and the system bus. A
+/// cage that grants it hands a program a way to ask a privileged daemon to do the work instead, and on
+/// kernels before Landlock ABI 9 no filesystem rule can refuse the connect. Strict mode is for a caller who
+/// would rather name the resolver than take that path.
+pub const SYSTEM_STRICT: &[&str] = &[
+    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/proc", "/sys",
+];
+
+/// The only `/run` paths strict mode keeps, and it keeps them by name.
+///
+/// A name lookup is the one thing a program cannot do without: `systemd-resolved` publishes its stub
+/// resolver under `/run`, and without it every clone, install and fetch fails with a DNS error that looks
+/// like a broken network rather than a cage. Both are sockets, not the directory, and neither can start a
+/// container.
+const STRICT_RESOLVE: &[&str] = &["/run/systemd/resolve", "/run/nscd"];
+
+/// The control sockets a host may expose to a program that can reach `/run` or `/var/run`.
+pub const SOCKETS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+];
+
+/// A socket the harness found on the host, and whether it is there at all.
+///
+/// Presence is the fact this can establish without opening anything: whether the caller may connect also
+/// depends on its group membership, and a doctor that guessed that would be wrong on half the machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketState {
+    Absent,
+    Present,
+}
+
+/// Scan the named sockets. Only presence is reported; nothing is opened.
+pub fn scan_sockets(candidates: &[PathBuf]) -> Vec<(PathBuf, SocketState)> {
+    candidates
+        .iter()
+        .map(|path| {
+            let state = match std::fs::metadata(path) {
+                Ok(_) => SocketState::Present,
+                Err(_) => SocketState::Absent,
+            };
+            (path.clone(), state)
+        })
+        .collect()
+}
+
+
 /// What a program the harness runs is allowed to touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cage {
@@ -213,6 +263,92 @@ impl Cage {
         self
     }
 
+    /// A cage with no broad `/run`: the system, the named resolver paths, and nothing that can ask a
+    /// privileged daemon to act. Opt-in, because removing `/run` breaks a legitimate runtime that keeps
+    /// something else there, and the doctor names the path when one is hit.
+    pub fn strict(root: impl Into<PathBuf>) -> Cage {
+        let mut cage = Cage::around(root);
+        cage.readable = SYSTEM_STRICT
+            .iter()
+            .chain(STRICT_RESOLVE.iter())
+            .map(PathBuf::from)
+            .filter(|path| {
+                !matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            })
+            .collect();
+        cage
+    }
+
+    /// Whether this cage would let the caller read `path`, by the rules it holds rather than by trying.
+    ///
+    /// A writable directory is readable too, because the writable rule carries the whole mask. The check is
+    /// textual over absolute grants, which is the same approximation the kernel makes: it is a report for
+    /// `doctor` and a test seam, not a second security mechanism.
+    pub fn grants_read(&self, path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
+        let under = |grant: &PathBuf| path == grant || path.starts_with(grant);
+        self.readable.iter().any(under)
+            || self.writable.iter().any(under)
+            || self
+                .files
+                .iter()
+                .any(|(grant, rights)| grant == path && rights & READ_FILE != 0)
+    }
+
+    /// How the cage's Unix-socket coverage reads on this kernel.
+    ///
+    /// Landlock ABI 9 (Linux 7.1) added `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`: a connect to a pathname socket
+    /// created outside the domain is denied unless the path grants the right. Before ABI 9 there is no such
+    /// rule, and abstract-namespace sockets are never covered by it. This says which of those is true here
+    /// rather than letting "landlock" imply more than it does.
+    pub fn socket_note(&self) -> String {
+        let abi = abi();
+        if abi >= 9 {
+            "closed to pathname sockets outside the granted paths (landlock ABI 9 resolve_unix); abstract \
+             sockets are not contained"
+                .to_string()
+        } else {
+            format!(
+                "not contained by this kernel (landlock abi {abi} has no pathname socket rule; abstract \
+                 sockets were never covered)"
+            )
+        }
+    }
+
+    /// The cage's whole claim in readable form: what the kernel supports, what it closes, and what it does
+    /// not. `describe()` is the one-line version for a log; this is the one a person reads in `doctor`.
+    pub fn report(&self) -> String {
+        let abi = abi();
+        let tcp = if self.network {
+            "open (the caller asked for the network)"
+        } else if abi >= 4 {
+            "closed"
+        } else {
+            "open (this kernel cannot close TCP)"
+        };
+        let mut text = format!(
+            "landlock abi {abi}; tcp: {tcp}; unix sockets: {}; readable: {}; writable: {}",
+            self.socket_note(),
+            self.readable
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            self.writable
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        if abi < 5 {
+            text.push_str("; this kernel cannot restrict device ioctls");
+        }
+        if abi < 3 {
+            text.push_str("; this kernel cannot restrict truncation");
+        }
+        text
+    }
+
     /// What the cage allows, for a log or a surface that has to state it rather than imply it.
     pub fn describe(&self) -> String {
         let mut text = format!(
@@ -244,6 +380,7 @@ impl Cage {
         if version < 3 {
             text.push_str(" (this kernel cannot restrict truncation)");
         }
+        text.push_str(&format!("; unix sockets: {}", self.socket_note()));
         text
     }
 
@@ -455,7 +592,7 @@ impl Plan {
     /// program cannot lift its own cage, and neither can anything it runs.
     pub fn confine(&self) -> std::io::Result<()> {
         let ruleset = call(
-            number::CREATE_RULESET,
+            SYS_CREATE_RULESET,
             self.attr.as_ptr() as usize,
             self.attr.len(),
             0,
@@ -466,7 +603,7 @@ impl Plan {
         }
         for (rule, _fd) in &self.rules {
             let added = call(
-                number::ADD_RULE,
+                SYS_ADD_RULE,
                 ruleset as usize,
                 PATH_BENEATH,
                 rule.as_ptr() as usize,
@@ -478,11 +615,11 @@ impl Plan {
         }
         // The kernel refuses to confine a process that could still gain privileges from a set-user-id
         // binary, so this comes first. It is also true for its own sake.
-        let set = call5(number::PRCTL, number::SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        let set = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } as isize;
         if set < 0 {
             return Err(std::io::Error::from_raw_os_error(-set as i32));
         }
-        let confined = call(number::RESTRICT_SELF, ruleset as usize, 0, 0, 0);
+        let confined = call(SYS_RESTRICT_SELF, ruleset as usize, 0, 0, 0);
         if confined < 0 {
             return Err(std::io::Error::from_raw_os_error(-confined as i32));
         }
@@ -492,7 +629,7 @@ impl Plan {
 
 /// The kernel's Landlock ABI version, or a negative number when there is none.
 pub fn abi() -> isize {
-    call(number::CREATE_RULESET, 0, 0, WANT_VERSION, 0)
+    call(SYS_CREATE_RULESET, 0, 0, WANT_VERSION, 0)
 }
 
 /// Whether a program can be caged at all here.
@@ -502,62 +639,12 @@ pub fn available() -> bool {
 
 /// One Linux system call.
 ///
-/// The standard library does not expose these, and the alternative to a dozen lines of convention is a
-/// dependency whose whole job would be to write them down. The convention is part of the kernel's ABI: the
-/// number in `rax`, the arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, the result in `rax`, and a failure
-/// signalled by a result in `-1..-4095`. Raw assembly does not set libc's errno;
-/// callers must convert the negated return value with `from_raw_os_error`.
-#[cfg(target_arch = "x86_64")]
-fn call(number: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
-    let result: isize;
+/// The standard library does not expose these. `libc::syscall` does, with the per-architecture number in
+/// its own table, so the same code compiles on x86-64 and on ARM64 and the number is never this file's
+/// guess. Raw assembly would not set libc's errno; callers convert the negated return value with
+/// `from_raw_os_error`.
+fn call(number: libc::c_long, a: usize, b: usize, c: usize, d: usize) -> isize {
     // SAFETY: a system call with the arguments its own contract requires. Nothing is dereferenced that the
-    // caller did not build, the register set is the calling convention, and the flags are not assumed.
-    unsafe {
-        std::arch::asm!(
-            "syscall",
-            inlateout("rax") number as isize => result,
-            in("rdi") a,
-            in("rsi") b,
-            in("rdx") c,
-            in("r10") d,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
-    }
-    result
-}
-
-/// There is no fourth argument to pass on an architecture this does not know, and guessing would be worse
-/// than saying so: [`available`] is false here, so no caller gets as far as a rule.
-#[cfg(not(target_arch = "x86_64"))]
-fn call(_number: usize, _a: usize, _b: usize, _c: usize, _d: usize) -> isize {
-    -1
-}
-
-/// The five-argument form, for `prctl`. Kept separate so the common case stays four arguments wide.
-#[cfg(target_arch = "x86_64")]
-fn call5(number: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
-    let result: isize;
-    // SAFETY: as [`call`], with the fifth argument in the register the convention puts it in.
-    unsafe {
-        std::arch::asm!(
-            "syscall",
-            inlateout("rax") number as isize => result,
-            in("rdi") a,
-            in("rsi") b,
-            in("rdx") c,
-            in("r10") d,
-            in("r8") e,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
-    }
-    result
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn call5(_number: usize, _a: usize, _b: usize, _c: usize, _d: usize, _e: usize) -> isize {
-    -1
+    // caller did not build, and the numbers come from libc's table for this architecture.
+    unsafe { libc::syscall(number, a as libc::c_long, b as libc::c_long, c as libc::c_long, d as libc::c_long) as isize }
 }

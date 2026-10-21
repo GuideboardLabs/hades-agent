@@ -1,0 +1,26 @@
+name: cross
+
+# The cage used raw x86-64 assembly, so the crate did not compile on ARM64 at all. A cross-check is the
+# only thing that keeps that from happening again: this machine has one architecture, and the next one
+# may not. The C dependency (bundled SQLite) needs a cross C compiler, which is why the runner installs it.
+on:
+  push:
+  pull_request:
+
+jobs:
+  aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install an aarch64 C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Add the target
+        run: rustup target add aarch64-unknown-linux-gnu
+      - name: Check the harness for aarch64
+        working-directory: rust
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo check -p harness --target aarch64-unknown-linux-gnu

@@ -44,6 +44,40 @@ impl Finding {
     }
 }
 
+/// What the cage can and cannot contain on this kernel, the safety floor's own claim, and any host socket
+/// the cage cannot close. Read-only: nothing here opens a socket or changes a rule.
+pub fn security_findings(root: &Path) -> Vec<Finding> {
+    let mut found = Vec::new();
+    let cage = crate::cage::Cage::around(root);
+    found.push(Finding::ok("cage", cage.report()));
+    found.push(Finding::ok(
+        "safety floor",
+        "command-text heuristic; not a sandbox (the cage is the boundary)",
+    ));
+    let candidates: Vec<PathBuf> = crate::cage::SOCKETS.iter().map(PathBuf::from).collect();
+    found.extend(socket_findings(&candidates));
+    found
+}
+
+/// One warning per Unix socket a caged program could reach. A socket that is not there is not a finding.
+pub fn socket_findings(candidates: &[PathBuf]) -> Vec<Finding> {
+    let abi = crate::cage::abi();
+    crate::cage::scan_sockets(candidates)
+        .into_iter()
+        .filter(|(_, state)| *state == crate::cage::SocketState::Present)
+        .map(|(path, _)| {
+            Finding::warn(
+                "socket",
+                format!(
+                    "unix socket at {}: a caged program can reach it and landlock abi {abi} does not \
+                     refuse the connect (use `--cage strict` to drop /run)",
+                    path.display()
+                ),
+            )
+        })
+        .collect()
+}
+
 /// The checks, in the order a person would debug them. `home` is the Hades home, `config` the path the CLI
 /// would read, and `binary` the executable that is running.
 pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<Finding> {
@@ -209,6 +243,10 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
         }
     }
 
+    // The security section is read-only and cheap, so it runs on every `doctor` rather than behind a flag:
+    // a limit nobody sees is a limit that gets assumed away.
+    found.extend(security_findings(home));
+
     found
 }
 
@@ -281,5 +319,28 @@ mod tests {
         let (text, _) = render(&found);
         assert!(text.contains("1 value(s)"), "{text}");
         assert!(!text.contains("secret-value"), "{text}");
+    }
+
+    #[test]
+    fn a_reachable_docker_socket_is_a_warning_and_an_absent_one_is_not() {
+        let home = scratch("socket");
+        let sock = home.join("docker.sock");
+        std::fs::write(&sock, b"").expect("a socket file");
+        let found = socket_findings(&[sock.clone(), home.join("absent.sock")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].level, Level::Warn);
+        assert!(found[0].detail.contains("docker.sock"), "{:?}", found[0]);
+        // The report names the limit rather than implying the cage closes it.
+        let (text, _) = render(&found);
+        assert!(text.contains("unix socket"), "{text}");
+    }
+
+    #[test]
+    fn the_security_section_names_the_abi_and_the_floor() {
+        let found = security_findings(Path::new("/work"));
+        let (text, _) = render(&found);
+        assert!(text.contains("landlock"), "{text}");
+        assert!(text.contains("unix sockets"), "{text}");
+        assert!(text.contains("command-text heuristic"), "{text}");
     }
 }
