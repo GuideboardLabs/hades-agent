@@ -119,7 +119,7 @@ from a source fails the byte check, with the mismatch as the hint.
 
 `hades research bench <questions.json>` runs a question set and reports published, claims, verified
 quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid,
-not a truth score. `hades research file <run-id> --topic <topic>` files a published, strict-green report
+not a truth score. `hades research file <run-id> --topic <category/topic>` files a published, strict-green report
 as a Mneme research note.
 
 ## The offline library

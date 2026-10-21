@@ -87,7 +87,7 @@ Hades can read a local shelf with no network.
 - **A claim can be revised in place.** When a later source supports the same normalized claim with a new quote, the old text and support are kept in `history`; the report marks the claim as revised.
 - **One retry on a bad quote.** If every draft from a source fails the byte check, the extractor is called once more with the mismatch as a hint. A second failure is recorded, not repeated.
 - **`hades research bench <questions.json>`** runs a question set and reports published, claims, verified quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid, not a truth score.
-- **`hades research file <run-id> --topic <topic>`** files a published, strict-green report as a Mneme research note with provenance and a `hades://research/<id>` source link.
+- **`hades research file <run-id> --topic <category/topic>`** files a published, strict-green report as a Mneme research note with provenance and a `hades://research/<id>` source link.
 
 The check proves provenance, not truth. The relevance gate catches a claim that is about the wrong subject, but it cannot prove that a correctly quoted sentence is representative, current or complete.
 

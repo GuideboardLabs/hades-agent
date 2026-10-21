@@ -160,7 +160,7 @@ hades — the harness, one turn or a whole graph
       re-read a run without asking a model; check exits 0 green, 1 red, 2 unreadable.
       --strict also turns red when a claim is off-question
 
-  hades research file <run-id> --topic <topic> [--slug <slug>] [--summary <text>]
+  hades research file <run-id> --topic <category/topic> [--slug <slug>] [--summary <text>]
                       [--state <dir>] [--vault <dir>] [--db <file>] [--config <file>]
       file a published, strict-green report as a Mneme research note
 
