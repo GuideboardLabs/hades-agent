@@ -226,7 +226,17 @@ version, pack digest, item digest, live digest, live path and content path. Noth
 `hades pack list` reads that catalog. `hades pack uninstall <id> [--version <v>]` removes a live copy only
 when its digest still matches, keeps a promoted skill, retires a case in its ledger, removes content only
 when no remaining row references it, and appends an event. Atomicity is per item: a failure after earlier
-rows have landed leaves those rows and names the failure. `hades pack adapt` produces a local draft from
+rows have landed leaves those rows and names the failure. A case replacement is transactional within its
+row: the verified copy is staged beside the target, the old tree is renamed aside, and the new active line
+is appended only after the tree lands. A failure renames the old tree back, so the old line stays
+authoritative and the live path is exactly what the ledger says it is.
+
+The reader's caps bind before the work. The archive's size is checked from the tarball header before a byte
+of the body is read, the listing is captured with a bound, the expanded size is counted from the gzip
+stream and stops one byte past 512 MiB, and extraction has a deadline. A cap that runs after extraction is
+not a cap, so none of these are post-hoc.
+
+`hades pack adapt` produces a local draft from
 one model call and writes it only with `--accept`; `hades pack merge` composes a skill draft and never
 overwrites the installed skill. Both require `derivatives: allowed`, and a merged draft with unresolved
 conflicts cannot be promoted even with `--force`.
@@ -277,6 +287,16 @@ Hades has its own vault and state, and pointing it here is the one thing the sep
 Exit code 2, and no fallback. Paths are compared by parts after `.` and `..` are resolved, so
 `ObsidianVault-notes` is somebody else's directory and is not refused; a symlink or a relative path does not
 walk around the rule.
+
+The model does not name a program for an MCP server. `mcp.json` lists servers and, optionally, an allowlist
+of runtimes (`npx`, `bunx`, `uvx`, `python3`, `node`, `deno` by default). A server's program is matched by
+basename against that list at load, and a config naming `sh -c` is refused with the key named. A server is a
+process that talks to the model, so the program is the one field that must not be free-form.
+
+Named endpoints live in the config with the *name* of the key's environment variable, never the value:
+`{"endpoints": {"local": {"url": "http://127.0.0.1:8101/v1", "model": "qwen3.8", "key_env": "LOCAL_KEY"}}}`.
+`hades config` and `hades models` print `key: $LOCAL_KEY`. A model id that is neither a shipped preset nor a
+named endpoint is refused at load rather than silently substituted at the turn.
 
 The vault here also carries fences of its own. A fenced path is reported by the audit and does **not** fail it:
 the directory is the vault, the notes outside the fences are the corpus, and the corpus is something you walk.
@@ -515,7 +535,11 @@ Every tool call a chat or a scheduled job decides writes one line to `<state>/ac
 [--limit n]` prints the last twenty, oldest first, with the local clock.
 
 A stop writes a line of its own with the decision `stop`, because "who stopped what" is the same question
-as "who allowed what" and should be answered from the same file. The daemon records the stops it carries
+as "who allowed what" and should be answered from the same file. A line that could not be written is not
+swallowed: the count of failed appends is held for the life of the process, `hades doctor` prints
+`activity gaps: N` with the last error, and a turn that lost a line says `audit: incomplete` in its
+receipt. Actions still proceed, because a full disk is not a reason to stop working, but a ledger with a
+silent hole would be worse than one that names it. The daemon records the stops it carries
 out (a run, every run, or a shutdown) with the caller's own name; cancelling a job records its file as the
 artifact. A stop that found nothing in flight is still recorded, and says so.
 
@@ -564,6 +588,13 @@ passes the patched binary's WebRTC IP flag; `HADES_HEADED=1` drops headless mode
 curved mouse path and per-character text entry for ref-based clicks and typing. Humanized typing streams the
 whole string; long input is sent in small chunks instead of being truncated. `observe` accepts `text_limit`
 and `item_limit`, and `eval` and `network_body` accept `full` for a 100,000-character return.
+
+There is one Chromium per state directory, held under the resolved path. Two state directories used to share
+one process, so a test and a daemon could drive each other's tabs, cookies and downloads. A failed call
+drops only the state that failed, and a session unused for fifteen minutes is closed on the next call
+rather than holding a profile lock for the lifetime of the process. A screenshot path is model input and is
+treated as hostile: an absolute path, a `..` component, or a symlinked parent is refused, and the shot
+lands under `<state>/shots/`.
 
 ## Seeing
 

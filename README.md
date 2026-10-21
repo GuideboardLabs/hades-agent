@@ -435,10 +435,24 @@ a safety-floor category.
 ## The cage, the floor, and the ledger
 
 - **Landlock** denies reads outside the workspace and the state scratch. The process cannot browse the
-  rest of the filesystem just because it has a shell.
+  rest of the filesystem just because it has a shell. `--cage on` is the default and keeps `/run` readable;
+  `--cage strict` drops it, which is the only way to close a Docker socket on a kernel whose Landlock
+  cannot refuse a Unix-socket connect (ABI 8 and below). `hades doctor` names the ABI, every socket it can
+  reach, and the one flag that would close it.
 - **The floor** refuses permanent deletes, money movement, credential changes, new security access and
-  outbound messages before a tool runs.
-- **The ledger** records every allow and every refusal, including refusals that never reached a model.
+  outbound messages before a tool runs. It reads the tool name and its arguments as text, and the receipt
+  says so: `floor: command-text heuristic (not a sandbox)`. It cannot see a button, a command assembled at
+  run time, or a delete performed by a binary nobody listed.
+- **`--policy strict`** adds a deny list of primitives (`rm -rf`, `rm -fr`, `mkfs`, `shred`,
+  `of=/dev/sd|nvme|vd|hd`) ahead of the ordinary floor and ahead of any permission question. It is a named
+  list, not a proof: `sh -c 'r''m -rf /'` still gets through, and the test that covers it asserts exactly
+  that.
+- **The ledger** records every allow and every refusal, including refusals that never reached a model. A
+  write that fails is counted and named: `hades doctor` prints `activity gaps: N`, and a turn whose ledger
+  lost a line prints `audit: incomplete`.
+- **A run that died leaves a marker.** `<state>/inflight/<session>.json` is written when a run starts and
+  removed when it ends, so `hades status` and `hades doctor` can report `interrupted: N` with the session,
+  the run, the start time and the goal. Nothing is replayed automatically.
 - **The boundary** refuses `~/.hermes` and the live knowledge vault by default, so a coding run cannot
   wander into the second brain.
 
@@ -927,6 +941,14 @@ These are current limits, not aspirations hidden in a roadmap:
 - Taste adapts a recommendation and can stop asking a choice. It does not infer a preference the person never chose.
 - The browser needs an external Chromium binary. Vision is optional and needs local GGUF model files.
 - `eval` can act outside the textual safety floor. It is an explicit escape hatch.
+- The floor reads text. `--policy strict` is a deny list over the same text, so an obfuscated command
+  (`r''m -rf`, `$(printf rm)`) is not caught by either. The cage is the bound the kernel enforces.
+- Crash recovery reports an interrupted run and does not replay it. The marker is in `<state>/inflight/`.
+- Every fetch is a `curl` process. Measured at 8.9 ms/fetch against 1.7 ms over one keep-alive
+  connection on a loopback fixture, so about 81% of fetch wall time is process startup. A persistent
+  client is deferred, with the guarantees it must keep, in [`docs/fetch-benchmark.md`](docs/fetch-benchmark.md).
+- Unix-socket connects are only refused by Landlock on ABI 9 (Linux 7.1). On ABI 8 the answer is
+  `--cage strict`, which is a path grant change, not a socket rule.
 
 ---
 
