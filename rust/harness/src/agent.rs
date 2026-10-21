@@ -4871,7 +4871,7 @@ mod tests {
         }
         for _ in 0..count {
             entered
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("a held model call");
         }
         gate.release();

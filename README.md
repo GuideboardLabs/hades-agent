@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.16-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-942%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.17-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-950%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.16 |
+| **Version** | 0.0.17 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,43 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 942 passing, 13 ignored live tests |
+| **Tests** | 950 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.17 adds
+
+This release closes the limits named at 0.0.16. The library reads more kinds of documents, and research
+records a disagreement between sources instead of averaging it away.
+
+### The library reads structure, not just bytes
+
+- **A scanned PDF falls back to OCR.** Hades still tries `pdftotext` first. When the text layer is empty it
+  rasterizes each page with `pdftoppm` at 300 dpi and runs `tesseract`; the page marker records `ocr=1`, and
+  the entry carries the tag `ocr` in `library list`, `library show` and `library list --json`. Page and byte
+  caps stop a runaway scan. `--ocr-lang` selects the language pack, and the scratch directory is removed on
+  every exit path.
+- **An EPUB is read in spine order.** The extractor follows `META-INF/container.xml` to the OPF package,
+  then the manifest and spine, instead of trusting the zip listing. EPUB3 `nav` and EPUB2 `ncx` supply the
+  table of contents; footnote asides stay as footnote text; image `alt` text is folded into the body.
+- **LaTeX math becomes readable Markdown math.** `\[...\]`, `\(...\)`, `equation`, `align` and `gather`
+  convert to display and inline math, and escaped dollars survive. This is still a reading view, not
+  rendered math.
+
+### Research can record a dispute
+
+- **`--judge on|off`** (default on) compares claims from different sources on the same subquestion, in
+  capped pairs. A contradictory pair is written to `## Cross-source disputes` in the report and to
+  `disputes` in `run.json` and `report.json`. Both quotes are still byte-verified; the section records a
+  conflict, not a verdict.
+- **`--judge off`** keeps the old behavior. Judge token counts are recorded separately on the usage ledger,
+  and older runs still load because every new field is serde-defaulted.
+- **`hades research bench <questions.json> --grades <grades.json>`** compares key-term coverage with a human
+  verdict. The bench prints `grades: N pass, N partial, N fail` and
+  `coverage predicted N/M grades; this is a calibration, not truth`. A grade that names a question the
+  bench does not have is a named error, not a silent skip.
+- **The parent-log race test waits 30 seconds**, not 10, so a loaded full-suite run cannot turn endpoint
+  latency into a false log-collision failure.
 
 ## What 0.0.16 adds
 
@@ -802,7 +836,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **864 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **950 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

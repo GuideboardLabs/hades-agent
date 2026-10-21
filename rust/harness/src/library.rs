@@ -8,7 +8,7 @@
 //! its own database, its own delete path and its own boundary. A report may cite a library entry, but the
 //! library is not imported into the vault by existing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -135,6 +135,7 @@ pub struct AddOptions {
     pub authors: Vec<String>,
     pub year: Option<i32>,
     pub tags: Vec<String>,
+    pub ocr_lang: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,7 +371,7 @@ impl Library {
             .title
             .clone()
             .unwrap_or_else(|| title_from_path(path));
-        let extracted = extract(&title, path, format, &bytes)?;
+        let extracted = extract(&title, path, format, &bytes, options)?;
         if extracted.text.trim().is_empty() {
             return Err("the extracted text is empty".to_string());
         }
@@ -385,6 +386,15 @@ impl Library {
             format.label(),
             source_sha256
         );
+        let header = if extracted.tags.iter().any(|tag| tag == "ocr") {
+            format!(
+                "<!-- hades-library format={} original-sha256={} ocr=1 -->\n\n",
+                format.label(),
+                source_sha256
+            )
+        } else {
+            header
+        };
         let canonical_text = format!("{header}{}", extracted.text.trim_end());
         let canonical_text = format!("{canonical_text}\n");
         let text_sha256 = mneme::sha256::hex(canonical_text.as_bytes());
@@ -426,7 +436,7 @@ impl Library {
             text_sha256,
             original,
             canonical,
-            tags: sorted_unique(&options.tags),
+            tags: sorted_unique(&options.tags, &extracted.tags),
         };
         if let Err(reason) = self.insert(&entry, &chunk_text(&canonical_text, CHUNK_CHARS)) {
             let _ = fs::remove_file(&original_path);
@@ -836,11 +846,18 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 struct Extracted {
     text: String,
     pages: Option<usize>,
+    tags: Vec<String>,
 }
 
-fn extract(title: &str, path: &Path, format: Format, bytes: &[u8]) -> Result<Extracted, String> {
+fn extract(
+    title: &str,
+    path: &Path,
+    format: Format,
+    bytes: &[u8],
+    options: &AddOptions,
+) -> Result<Extracted, String> {
     match format {
-        Format::Pdf => extract_pdf(path),
+        Format::Pdf => extract_pdf(path, options.ocr_lang.as_deref().unwrap_or("eng")),
         Format::Epub => extract_epub(path),
         Format::Latex => {
             let text = String::from_utf8(bytes.to_vec())
@@ -848,6 +865,7 @@ fn extract(title: &str, path: &Path, format: Format, bytes: &[u8]) -> Result<Ext
             Ok(Extracted {
                 text: latex_to_markdown(&text),
                 pages: None,
+                tags: Vec::new(),
             })
         }
         Format::Markdown => {
@@ -856,6 +874,7 @@ fn extract(title: &str, path: &Path, format: Format, bytes: &[u8]) -> Result<Ext
             Ok(Extracted {
                 text: normalize(&text),
                 pages: None,
+                tags: Vec::new(),
             })
         }
         Format::Text => {
@@ -864,6 +883,7 @@ fn extract(title: &str, path: &Path, format: Format, bytes: &[u8]) -> Result<Ext
             Ok(Extracted {
                 text: format!("# {}\n\n{}", title.trim(), normalize(&text)),
                 pages: None,
+                tags: Vec::new(),
             })
         }
         Format::Html => {
@@ -872,12 +892,13 @@ fn extract(title: &str, path: &Path, format: Format, bytes: &[u8]) -> Result<Ext
             Ok(Extracted {
                 text: strip_html(&text),
                 pages: None,
+                tags: Vec::new(),
             })
         }
     }
 }
 
-fn extract_pdf(path: &Path) -> Result<Extracted, String> {
+fn extract_pdf(path: &Path, ocr_lang: &str) -> Result<Extracted, String> {
     let output = Command::new("pdftotext")
         .args(["-layout", "-enc", "UTF-8"])
         .arg(path)
@@ -893,7 +914,7 @@ fn extract_pdf(path: &Path) -> Result<Extracted, String> {
     }
     let raw = String::from_utf8_lossy(&output.stdout);
     if raw.trim().is_empty() {
-        return Err("the PDF has no text layer; OCR is not part of this release".to_string());
+        return ocr_pdf(path, ocr_lang);
     }
     let pages = raw.split('\u{c}').count();
     let mut text = String::new();
@@ -904,63 +925,510 @@ fn extract_pdf(path: &Path) -> Result<Extracted, String> {
     Ok(Extracted {
         text,
         pages: Some(pages),
+        tags: Vec::new(),
     })
 }
 
-fn extract_epub(path: &Path) -> Result<Extracted, String> {
-    let listing = Command::new("unzip")
-        .args(["-Z1"])
-        .arg(path)
-        .output()
-        .map_err(|error| format!("EPUB import needs unzip: {error}"))?;
-    if !listing.status.success() {
+const OCR_DPI: u32 = 300;
+const MAX_OCR_PAGES: usize = 400;
+const MAX_OCR_BYTES: usize = 64 * 1024 * 1024;
+
+fn ocr_pdf(path: &Path, lang: &str) -> Result<Extracted, String> {
+    let pages = pdf_pages(path)?;
+    if pages == 0 {
+        return Err("the PDF has no pages to OCR".to_string());
+    }
+    if pages > MAX_OCR_PAGES {
         return Err(format!(
-            "unzip could not list the EPUB: {}",
-            clip(String::from_utf8_lossy(&listing.stderr).trim(), 300)
+            "the PDF has {pages} pages; OCR is capped at {MAX_OCR_PAGES}"
         ));
     }
-    let mut members: Vec<String> = String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .filter(|name| safe_member(name))
-        .filter(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower.ends_with(".xhtml") || lower.ends_with(".html") || lower.ends_with(".htm")
-        })
-        .map(str::to_string)
-        .collect();
-    members.sort();
-    members.truncate(MAX_EPUB_MEMBERS);
-    if members.is_empty() {
-        return Err("the EPUB has no XHTML or HTML members".to_string());
-    }
-    let mut text = String::new();
-    for member in members {
-        let output = Command::new("unzip")
-            .args(["-p"])
-            .arg(path)
-            .arg(&member)
-            .output()
-            .map_err(|error| format!("unzip could not read `{member}`: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "unzip could not read `{member}`: {}",
-                clip(String::from_utf8_lossy(&output.stderr).trim(), 300)
-            ));
+    let scratch =
+        std::env::temp_dir().join(format!("hades-ocr-{}-{}", std::process::id(), now_ms()));
+    fs::create_dir_all(&scratch).map_err(|error| {
+        format!(
+            "could not create OCR scratch {}: {error}",
+            scratch.display()
+        )
+    })?;
+    let result = (|| {
+        let mut text = String::new();
+        for page in 1..=pages {
+            let page_arg = page.to_string();
+            let dpi = OCR_DPI.to_string();
+            let output = Command::new("pdftoppm")
+                .args([
+                    "-r",
+                    &dpi,
+                    "-gray",
+                    "-png",
+                    "-singlefile",
+                    "-f",
+                    &page_arg,
+                    "-l",
+                    &page_arg,
+                ])
+                .arg(path)
+                .arg(scratch.join("page"))
+                .output()
+                .map_err(|error| format!("PDF OCR needs pdftoppm from poppler-utils: {error}"))?;
+            if !output_ok(&output) {
+                return Err(format!(
+                    "pdftoppm failed on page {page}: {}",
+                    clip(String::from_utf8_lossy(&output.stderr).trim(), 300)
+                ));
+            }
+            let image = scratch.join("page.png");
+            let output = Command::new("tesseract")
+                .arg(&image)
+                .args(["stdout", "-l", lang, "--psm", "3"])
+                .output()
+                .map_err(|error| format!("PDF OCR needs tesseract: {error}"))?;
+            if !output_ok(&output) {
+                return Err(format!(
+                    "tesseract failed on page {page}: {}",
+                    clip(String::from_utf8_lossy(&output.stderr).trim(), 300)
+                ));
+            }
+            let page_text = String::from_utf8_lossy(&output.stdout);
+            let page_text = page_text.trim();
+            if !page_text.is_empty() {
+                text.push_str(&format!("\n\n<!-- page {page} ocr=1 -->\n\n{page_text}"));
+            }
+            if text.len() > MAX_OCR_BYTES {
+                return Err(format!(
+                    "OCR produced more than {MAX_OCR_BYTES} bytes; split the PDF"
+                ));
+            }
         }
-        let page = String::from_utf8_lossy(&output.stdout);
-        let cleaned = strip_html(&page);
-        if cleaned.trim().is_empty() {
+        if text.trim().is_empty() {
+            return Err(
+                "OCR produced no text; the scan may be blank or the language is wrong".to_string(),
+            );
+        }
+        Ok(Extracted {
+            text,
+            pages: Some(pages),
+            tags: vec!["ocr".to_string()],
+        })
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn pdf_pages(path: &Path) -> Result<usize, String> {
+    let output = Command::new("pdfinfo")
+        .arg(path)
+        .output()
+        .map_err(|error| format!("PDF OCR needs pdfinfo from poppler-utils: {error}"))?;
+    if !output_ok(&output) {
+        return Err(format!(
+            "pdfinfo failed: {}",
+            clip(String::from_utf8_lossy(&output.stderr).trim(), 300)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pages = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Pages:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .ok_or_else(|| "pdfinfo did not report a page count".to_string())?;
+    Ok(pages)
+}
+
+fn output_ok(output: &std::process::Output) -> bool {
+    output.status.success()
+}
+
+fn extract_epub(path: &Path) -> Result<Extracted, String> {
+    let package = read_epub_package(path)?;
+    let toc = epub_toc(path, &package)?;
+    let mut text = String::new();
+    if !toc.is_empty() {
+        text.push_str("## Contents\n\n");
+        for (index, (title, _)) in toc.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", index + 1, title));
+        }
+        text.push('\n');
+    }
+    let mut chapters = 0usize;
+    for idref in &package.spine {
+        let Some(item) = package.manifest.get(idref) else {
+            return Err(format!(
+                "the EPUB spine names `{idref}` but the manifest does not"
+            ));
+        };
+        let lower = item.media_type.to_ascii_lowercase();
+        if !(lower.contains("xhtml") || lower.contains("html")) {
             continue;
         }
-        text.push_str(&format!("\n\n<!-- file: {member} -->\n\n"));
-        text.push_str(cleaned.trim());
+        let page = epub_text(path, &item.file)?;
+        let (body, notes) = epub_html(&page);
+        if body.trim().is_empty() {
+            continue;
+        }
+        chapters += 1;
+        let title = toc
+            .iter()
+            .find(|(_, href)| href == &item.file)
+            .map(|(title, _)| title.as_str())
+            .unwrap_or(&item.id);
+        text.push_str(&format!(
+            "\n\n<!-- chapter {chapters}: {title} ({}) -->\n\n",
+            item.file
+        ));
+        text.push_str(body.trim());
+        if !notes.is_empty() {
+            text.push_str("\n\n## Notes\n\n");
+            for (label, note) in notes {
+                text.push_str(&format!("[^{label}]: {note}\n"));
+            }
+        }
     }
     if text.trim().is_empty() {
-        return Err("the EPUB members have no readable text".to_string());
+        return Err("the EPUB spine has no readable chapters".to_string());
     }
-    Ok(Extracted { text, pages: None })
+    Ok(Extracted {
+        text,
+        pages: None,
+        tags: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct EpubItem {
+    id: String,
+    file: String,
+    media_type: String,
+    properties: String,
+}
+
+#[derive(Debug, Clone)]
+struct EpubPackage {
+    manifest: BTreeMap<String, EpubItem>,
+    spine: Vec<String>,
+    toc: Option<String>,
+}
+
+fn epub_member(path: &Path, member: &str) -> Result<Vec<u8>, String> {
+    let output = Command::new("unzip")
+        .args(["-p"])
+        .arg(path)
+        .arg(member)
+        .output()
+        .map_err(|error| format!("EPUB import needs unzip: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "unzip could not read `{member}`: {}",
+            clip(String::from_utf8_lossy(&output.stderr).trim(), 300)
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn epub_text(path: &Path, member: &str) -> Result<String, String> {
+    let bytes = epub_member(path, member)?;
+    String::from_utf8(bytes).map_err(|_| format!("the EPUB member `{member}` is not UTF-8"))
+}
+
+fn read_epub_package(path: &Path) -> Result<EpubPackage, String> {
+    let container = epub_text(path, "META-INF/container.xml")
+        .map_err(|_| "the EPUB has no META-INF/container.xml".to_string())?;
+    let opf = attr_value(&container, "full-path")
+        .ok_or_else(|| "the EPUB container does not name an OPF package".to_string())?;
+    if !safe_member(&opf) {
+        return Err(format!("the EPUB package path `{opf}` is unsafe"));
+    }
+    let opf_dir = opf.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let xml = epub_text(path, &opf)?;
+    let mut manifest = BTreeMap::new();
+    for tag in tags(&xml, "item") {
+        let Some(id) = attr_value(tag, "id") else {
+            continue;
+        };
+        let Some(href) = attr_value(tag, "href") else {
+            continue;
+        };
+        let Some(file) = join_member(opf_dir, &href) else {
+            return Err(format!(
+                "the EPUB manifest href `{href}` escapes the package"
+            ));
+        };
+        manifest.insert(
+            id.clone(),
+            EpubItem {
+                id,
+                file,
+                media_type: attr_value(tag, "media-type").unwrap_or_default(),
+                properties: attr_value(tag, "properties").unwrap_or_default(),
+            },
+        );
+        if manifest.len() > MAX_EPUB_MEMBERS {
+            return Err(format!(
+                "the EPUB manifest has more than {MAX_EPUB_MEMBERS} items"
+            ));
+        }
+    }
+    let spine_tag = tags(&xml, "spine").into_iter().next();
+    let toc = spine_tag.and_then(|tag| attr_value(tag, "toc"));
+    let mut spine = Vec::new();
+    for tag in tags(&xml, "itemref") {
+        if let Some(idref) = attr_value(tag, "idref") {
+            spine.push(idref);
+            if spine.len() > MAX_EPUB_MEMBERS {
+                return Err(format!(
+                    "the EPUB spine has more than {MAX_EPUB_MEMBERS} items"
+                ));
+            }
+        }
+    }
+    if spine.is_empty() {
+        return Err("the EPUB package has no spine".to_string());
+    }
+    Ok(EpubPackage {
+        manifest,
+        spine,
+        toc,
+    })
+}
+
+fn epub_toc(path: &Path, package: &EpubPackage) -> Result<Vec<(String, String)>, String> {
+    if let Some(item) = package.manifest.values().find(|item| {
+        item.properties
+            .split_whitespace()
+            .any(|value| value == "nav")
+    }) {
+        let xml = epub_text(path, &item.file)?;
+        let mut toc = Vec::new();
+        for tag in tags(&xml, "a") {
+            let Some(href) = attr_value(tag, "href") else {
+                continue;
+            };
+            let Some(end) = xml[tag_end(&xml, tag)..].to_ascii_lowercase().find("</a>") else {
+                continue;
+            };
+            let start = tag_end(&xml, tag);
+            let title = strip_html(&xml[start..start + end]);
+            if !title.trim().is_empty() {
+                toc.push((
+                    title.trim().to_string(),
+                    join_member(member_dir(&item.file), &href).unwrap_or(href),
+                ));
+            }
+        }
+        if !toc.is_empty() {
+            return Ok(toc);
+        }
+    }
+    let Some(toc_id) = package.toc.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let Some(item) = package.manifest.get(toc_id) else {
+        return Ok(Vec::new());
+    };
+    let xml = epub_text(path, &item.file)?;
+    let mut toc = Vec::new();
+    let mut title: Option<String> = None;
+    for tag in tags_any(&xml, &["text", "content"]) {
+        if tag.starts_with("<text") {
+            title = Some(strip_html(tag_inner(&xml, tag)).trim().to_string());
+        } else if let (Some(title), Some(src)) = (title.take(), attr_value(tag, "src"))
+            && !title.is_empty()
+        {
+            toc.push((
+                title,
+                join_member(member_dir(&item.file), &src).unwrap_or(src),
+            ));
+        }
+    }
+    Ok(toc)
+}
+
+fn join_member(dir: &str, href: &str) -> Option<String> {
+    if href.starts_with('/') || href.contains('\\') {
+        return None;
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
+    for part in href.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            value => parts.push(value),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn member_dir(file: &str) -> &str {
+    file.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+}
+
+fn tags<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    tags_any(xml, &[name])
+        .into_iter()
+        .filter(|tag| tag_name(tag) == name)
+        .collect()
+}
+
+fn tags_any<'a>(xml: &'a str, names: &[&str]) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    let mut from = 0usize;
+    while let Some(at) = xml[from..].find('<') {
+        let start = from + at;
+        let rest = &xml[start + 1..];
+        let end = rest.find('>').map(|end| start + 1 + end + 1);
+        let Some(end) = end else { break };
+        let tag = &xml[start..end];
+        let name = tag_name(tag);
+        if names.contains(&name) {
+            found.push(tag);
+        }
+        from = end;
+    }
+    found
+}
+
+fn tag_name(tag: &str) -> &str {
+    let rest = tag.trim_start_matches('<').trim_start_matches('/');
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn tag_end(xml: &str, tag: &str) -> usize {
+    let start = tag.as_ptr() as usize - xml.as_ptr() as usize;
+    start + tag.len()
+}
+
+fn tag_inner<'a>(xml: &'a str, tag: &'a str) -> &'a str {
+    let start = tag_end(xml, tag);
+    let name = tag_name(tag);
+    let close = format!("</{name}>");
+    xml[start..]
+        .find(&close)
+        .map(|end| &xml[start..start + end])
+        .unwrap_or("")
+}
+
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(at) = tag[from..].find(name) {
+        let start = from + at;
+        let before = tag[..start].chars().next_back();
+        let after = &tag[start + name.len()..];
+        if before.is_some_and(char::is_whitespace) {
+            let rest = after.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim_start();
+                let quote = rest.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let value = &rest[1..];
+                    let end = value.find(quote)?;
+                    return Some(value[..end].to_string());
+                }
+            }
+        }
+        from = start + name.len();
+    }
+    None
+}
+
+fn epub_html(html: &str) -> (String, Vec<(String, String)>) {
+    let (html, notes) = extract_footnotes(html);
+    let html = mark_noterefs(&html);
+    let html = replace_images(&html);
+    (strip_html(&html), notes)
+}
+
+fn extract_footnotes(html: &str) -> (String, Vec<(String, String)>) {
+    let mut out = String::new();
+    let mut notes = Vec::new();
+    let mut from = 0usize;
+    while let Some(at) = html[from..].find("<aside") {
+        let start = from + at;
+        let Some(end) = html[start..].find('>').map(|at| start + at + 1) else {
+            break;
+        };
+        let tag = &html[start..end];
+        if tag_name(tag) != "aside" || attr_value(tag, "epub:type").as_deref() != Some("footnote") {
+            out.push_str(&html[from..end]);
+            from = end;
+            continue;
+        }
+        let Some(close) = html[end..].find("</aside>").map(|at| end + at) else {
+            out.push_str(&html[from..end]);
+            from = end;
+            continue;
+        };
+        let label = attr_value(tag, "id").unwrap_or_else(|| format!("{}", notes.len() + 1));
+        let text = strip_html(&html[end..close]);
+        notes.push((label, text.trim().to_string()));
+        out.push_str(&html[from..start]);
+        from = close + "</aside>".len();
+    }
+    out.push_str(&html[from..]);
+    (out, notes)
+}
+
+fn mark_noterefs(html: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0usize;
+    while let Some(at) = html[from..].find("<a") {
+        let start = from + at;
+        let Some(end) = html[start..].find('>').map(|at| start + at + 1) else {
+            break;
+        };
+        let tag = &html[start..end];
+        let Some(href) = attr_value(tag, "href") else {
+            out.push_str(&html[from..end]);
+            from = end;
+            continue;
+        };
+        if tag_name(tag) != "a" {
+            out.push_str(&html[from..end]);
+            from = end;
+            continue;
+        }
+        if attr_value(tag, "epub:type").as_deref() != Some("noteref") || !href.starts_with('#') {
+            out.push_str(&html[from..end]);
+            from = end;
+            continue;
+        }
+        let label = href.trim_start_matches('#');
+        let Some(close) = html[end..].find("</a>").map(|at| end + at + 4) else {
+            out.push_str(&html[from..end]);
+            from = end;
+            continue;
+        };
+        out.push_str(&html[from..start]);
+        out.push_str(&format!("[^{label}]"));
+        from = close;
+    }
+    out.push_str(&html[from..]);
+    out
+}
+
+fn replace_images(html: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0usize;
+    while let Some(at) = html[from..].find("<img") {
+        let start = from + at;
+        let Some(end) = html[start..].find('>').map(|at| start + at + 1) else {
+            break;
+        };
+        let tag = &html[start..end];
+        let alt = attr_value(tag, "alt").unwrap_or_default();
+        out.push_str(&html[from..start]);
+        if alt.trim().is_empty() {
+            out.push_str("![image]");
+        } else {
+            out.push_str(&format!("![{}]", alt.trim()));
+        }
+        from = end;
+    }
+    out.push_str(&html[from..]);
+    out
 }
 
 fn safe_member(name: &str) -> bool {
@@ -975,6 +1443,106 @@ fn normalize(text: &str) -> String {
     format!("{}\n", text.trim_end())
 }
 
+/// Expand simple `\newcommand{\name}{value}` definitions before the reading conversion.
+/// This is deliberately narrow: no arguments, no conditionals, no TeX execution.
+fn expand_latex_macros(input: &str) -> String {
+    let mut definitions: Vec<(String, String)> = Vec::new();
+    let mut kept = String::new();
+    let mut index = 0;
+    while index < input.len() {
+        let rest = &input[index..];
+        let command = ["\\newcommand", "\\renewcommand", "\\providecommand"]
+            .into_iter()
+            .find(|command| rest.starts_with(command));
+        if let Some(command) = command {
+            let mut at = index + command.len();
+            while at < input.len() && input.as_bytes()[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            if let Some((name, after_name)) = brace_group(input, at) {
+                let mut after = after_name;
+                while after < input.len() && input.as_bytes()[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if input[after..].starts_with('[') {
+                    after = input[after..]
+                        .find(']')
+                        .map(|end| after + end + 1)
+                        .unwrap_or(after);
+                    while after < input.len() && input.as_bytes()[after].is_ascii_whitespace() {
+                        after += 1;
+                    }
+                }
+                if let Some((value, end)) = brace_group(input, after) {
+                    definitions.push((name.trim().trim_start_matches('\\').to_string(), value));
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        kept.push(ch);
+        index += ch.len_utf8();
+    }
+    let mut text = kept;
+    for _ in 0..4 {
+        let mut changed = false;
+        for (name, value) in &definitions {
+            let with_braces = format!("\\{name}{{}}");
+            if text.contains(&with_braces) {
+                text = text.replace(&with_braces, value);
+                changed = true;
+            }
+            let bare = format!("\\{name}");
+            let mut rebuilt = String::new();
+            let mut from = 0;
+            while let Some(at) = text[from..].find(&bare) {
+                let start = from + at;
+                let end = start + bare.len();
+                let next = text[end..].chars().next();
+                let is_longer = next.is_some_and(|ch| ch.is_ascii_alphabetic());
+                rebuilt.push_str(&text[from..start]);
+                if is_longer {
+                    rebuilt.push_str(&bare);
+                } else {
+                    rebuilt.push_str(value);
+                    changed = true;
+                }
+                from = end;
+            }
+            rebuilt.push_str(&text[from..]);
+            text = rebuilt;
+        }
+        if !changed {
+            break;
+        }
+    }
+    text
+}
+
+fn brace_group(text: &str, start: usize) -> Option<(String, usize)> {
+    if !text[start..].starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut index = start;
+    let bytes = text.as_bytes();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' if !is_escaped(text, index) => depth += 1,
+            b'}' if !is_escaped(text, index) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((text[start + 1..index].to_string(), index + 1));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
 pub fn latex_to_markdown(input: &str) -> String {
     let input = input.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let body = match input.find("\\begin{document}") {
@@ -982,6 +1550,8 @@ pub fn latex_to_markdown(input: &str) -> String {
         None => input.as_str(),
     };
     let body = body.split("\\end{document}").next().unwrap_or(body);
+    let expanded = expand_latex_macros(body);
+    let body = expanded.as_str();
     let mut out = String::new();
     let mut index = 0;
     while index < body.len() {
@@ -1026,6 +1596,11 @@ pub fn latex_to_markdown(input: &str) -> String {
         if rest.starts_with("\\item") {
             out.push_str("\n- ");
             index += 5;
+            continue;
+        }
+        if let Some((rendered, next)) = math_span(body, index) {
+            out.push_str(&rendered);
+            index = next;
             continue;
         }
         if let Some((name, prefix)) = simple_command(rest) {
@@ -1075,6 +1650,52 @@ pub fn latex_to_markdown(input: &str) -> String {
         index += 1;
     }
     collapse_blank_lines(&out)
+}
+
+fn math_span(text: &str, index: usize) -> Option<(String, usize)> {
+    let rest = text.get(index..)?;
+    let (open, close, display) = if rest.starts_with("\\[") {
+        ("\\[", "\\]", true)
+    } else if rest.starts_with("\\(") {
+        ("\\(", "\\)", false)
+    } else {
+        let after = rest.strip_prefix("\\begin{")?;
+        let end = after.find('}')?;
+        let name = &after[..end];
+        let display = match name {
+            "equation" | "equation*" | "displaymath" => true,
+            "math" => false,
+            "align" | "align*" | "gather" | "gather*" | "multline" | "multline*" | "eqnarray"
+            | "eqnarray*" => true,
+            _ => return None,
+        };
+        let end_tag = format!("\\end{{{name}}}");
+        let start = index + "\\begin{".len() + end + 1;
+        let close_at = text.get(start..)?.find(&end_tag)?;
+        let content = text.get(start..start + close_at)?.trim();
+        let rendered = if display {
+            let body = if name.starts_with("align") || name.starts_with("eqnarray") {
+                format!("\\begin{{aligned}}\n{content}\n\\end{{aligned}}")
+            } else if name.starts_with("gather") {
+                format!("\\begin{{gathered}}\n{content}\n\\end{{gathered}}")
+            } else {
+                content.to_string()
+            };
+            format!("\n$${body}$$\n")
+        } else {
+            format!("${content}$")
+        };
+        return Some((rendered, start + close_at + end_tag.len()));
+    };
+    let start = index + open.len();
+    let close_at = text.get(start..)?.find(close)?;
+    let content = text.get(start..start + close_at)?.trim();
+    let rendered = if display {
+        format!("\n$${content}$$\n")
+    } else {
+        format!("${content}$")
+    };
+    Some((rendered, start + close_at + close.len()))
 }
 
 fn heading_command(rest: &str) -> Option<(usize, usize)> {
@@ -1271,9 +1892,10 @@ pub fn clip(text: &str, cap: usize) -> String {
     format!("{}...", text[..cut].trim_end())
 }
 
-fn sorted_unique(values: &[String]) -> Vec<String> {
+fn sorted_unique(values: &[String], extra: &[String]) -> Vec<String> {
     let mut values: Vec<String> = values
         .iter()
+        .chain(extra.iter())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect();
@@ -1418,6 +2040,65 @@ mod tests {
     }
 
     #[test]
+    fn a_scanned_pdf_is_ocrd_and_tagged() {
+        let tools = ["pdftoppm", "convert", "tesseract"];
+        if tools.iter().any(|tool| {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_err()
+        }) {
+            eprintln!("skipping OCR test: {} is not installed", tools.join(", "));
+            return;
+        }
+        let root = temp("library-ocr");
+        let source = root.join("text.pdf");
+        fs::write(&source, tiny_pdf("OCR sentinel")).expect("a pdf");
+        let image = root.join("page.png");
+        let status = std::process::Command::new("pdftoppm")
+            .args(["-r", "200", "-png", "-singlefile"])
+            .arg(&source)
+            .arg(root.join("page"))
+            .status()
+            .expect("pdftoppm");
+        assert!(status.success());
+        let scanned = root.join("scan.pdf");
+        let status = std::process::Command::new("convert")
+            .arg(&image)
+            .args(["-compress", "jpeg"])
+            .arg(&scanned)
+            .status()
+            .expect("convert");
+        assert!(status.success());
+        assert!(
+            String::from_utf8_lossy(
+                &std::process::Command::new("pdftotext")
+                    .arg(&scanned)
+                    .arg("-")
+                    .output()
+                    .expect("pdftotext")
+                    .stdout
+            )
+            .trim()
+            .is_empty()
+        );
+        let library = Library::open(root.join("library")).expect("a library");
+        let report = library
+            .add_path(&scanned, &AddOptions::default())
+            .expect("an OCR import");
+        let entry = &report.added[0].entry;
+        assert_eq!(entry.format, Format::Pdf);
+        assert!(
+            entry.tags.iter().any(|tag| tag == "ocr"),
+            "{:?}",
+            entry.tags
+        );
+        let (_, text) = library.text(&entry.id).expect("text");
+        assert!(text.to_ascii_lowercase().contains("ocr sentinel"), "{text}");
+        assert!(text.contains("ocr=1"), "{text}");
+    }
+
+    #[test]
     fn an_epub_is_unpacked_and_read() {
         let root = temp("library-epub");
         let book = root.join("book");
@@ -1426,14 +2107,33 @@ mod tests {
         fs::write(book.join("mimetype"), "application/epub+zip").expect("mimetype");
         fs::write(
             book.join("META-INF/container.xml"),
-            "<?xml version=\"1.0\"?><container><rootfiles><rootfile full-path=\"OEBPS/chapter.xhtml\" media-type=\"application/xhtml+xml\"/></rootfiles></container>",
+            "<?xml version=\"1.0\"?><container><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>",
         )
         .expect("container");
         fs::write(
-            book.join("OEBPS/chapter.xhtml"),
-            "<html><body><h1>Chapter</h1><p>The EPUB says RDNA1 has a limit.</p></body></html>",
+            book.join("OEBPS/content.opf"),
+            "<?xml version=\"1.0\"?><package version=\"3.0\"><manifest>\
+             <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\
+             <item id=\"ch2\" href=\"ch2.xhtml\" media-type=\"application/xhtml+xml\"/>\
+             <item id=\"ch1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/>\
+             </manifest><spine><itemref idref=\"ch2\"/><itemref idref=\"ch1\"/></spine></package>",
         )
-        .expect("chapter");
+        .expect("opf");
+        fs::write(
+            book.join("OEBPS/nav.xhtml"),
+            "<html><body><nav epub:type=\"toc\"><ol><li><a href=\"ch2.xhtml\">Second</a></li><li><a href=\"ch1.xhtml\">First</a></li></ol></nav></body></html>",
+        )
+        .expect("nav");
+        fs::write(
+            book.join("OEBPS/ch2.xhtml"),
+            "<html><body><h1>Second chapter</h1><p>The EPUB says RDNA1 has a limit.<a epub:type=\"noteref\" href=\"#fn1\">1</a></p><img src=\"chart.png\" alt=\"A measured chart\"/><aside epub:type=\"footnote\" id=\"fn1\"><p>The sample was 12 cards.</p></aside></body></html>",
+        )
+        .expect("second");
+        fs::write(
+            book.join("OEBPS/ch1.xhtml"),
+            "<html><body><h1>First chapter</h1><p>The opening chapter.</p></body></html>",
+        )
+        .expect("first");
         let source = root.join("book.epub");
         let status = std::process::Command::new("zip")
             .args(["-q", "-X", "-r"])
@@ -1449,7 +2149,13 @@ mod tests {
             .expect("an import");
         assert_eq!(report.added[0].entry.format, Format::Epub);
         let (_, text) = library.text(&report.added[0].entry.id).expect("text");
-        assert!(text.contains("The EPUB says RDNA1 has a limit."), "{text}");
+        assert!(text.contains("## Contents"), "{text}");
+        let second = text.find("Second chapter").expect("second");
+        let first = text.find("First chapter").expect("first");
+        assert!(second < first, "spine order was lost:\n{text}");
+        assert!(text.contains("![A measured chart]"), "{text}");
+        assert!(text.contains("[^fn1]"), "{text}");
+        assert!(text.contains("The sample was 12 cards."), "{text}");
     }
 
     #[test]
@@ -1507,6 +2213,47 @@ mod tests {
         let markdown = latex_to_markdown(text);
         assert!(markdown.contains("50% result."));
         assert!(!markdown.contains("this comment"));
+    }
+
+    #[test]
+    fn latex_display_and_inline_math_become_markdown_math() {
+        let text = "\\[\\frac{410}{240} = 1.708\\]\nand \\(a+b\\).";
+        let markdown = latex_to_markdown(text);
+        assert!(
+            markdown.contains("$$\\frac{410}{240} = 1.708$$"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("$a+b$"), "{markdown}");
+    }
+
+    #[test]
+    fn latex_equation_and_align_become_display_math() {
+        let equation = "\\begin{equation}E = mc^2\\end{equation}";
+        let markdown = latex_to_markdown(equation);
+        assert!(markdown.contains("$$E = mc^2$$"), "{markdown}");
+        let align = "\\begin{align}a &= b \\\\ c &= d\\end{align}";
+        let markdown = latex_to_markdown(align);
+        assert!(markdown.contains("\\begin{aligned}"), "{markdown}");
+        assert!(markdown.contains("a &= b"), "{markdown}");
+        assert!(!markdown.contains("\\begin{align}"), "{markdown}");
+    }
+
+    #[test]
+    fn a_latex_macro_definition_is_expanded_and_removed() {
+        let text = "\\newcommand{\\driver}{RDNA1}\nOn \\driver{} the result holds.";
+        let markdown = latex_to_markdown(text);
+        assert!(
+            markdown.contains("On RDNA1 the result holds."),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("\\newcommand"), "{markdown}");
+        assert!(!markdown.contains("{RDNA1}"), "{markdown}");
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_not_math() {
+        let markdown = latex_to_markdown("Cost is \\$5.");
+        assert!(markdown.contains("Cost is $5."), "{markdown}");
     }
 
     #[test]

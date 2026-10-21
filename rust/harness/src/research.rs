@@ -96,6 +96,16 @@ pub enum ClaimKind {
     Inferred,
 }
 
+impl ClaimKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ClaimKind::Observed => "observed",
+            ClaimKind::Sourced => "sourced",
+            ClaimKind::Inferred => "inferred",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchBudget {
     pub queries: usize,
@@ -116,6 +126,7 @@ impl Default for ResearchBudget {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UsageLedger {
     pub searches: usize,
     pub fetches: usize,
@@ -125,6 +136,8 @@ pub struct UsageLedger {
     pub planner_generated_tokens: u64,
     pub extractor_prompt_tokens: u64,
     pub extractor_generated_tokens: u64,
+    pub judge_prompt_tokens: u64,
+    pub judge_generated_tokens: u64,
     pub elapsed_ms: u64,
 }
 
@@ -256,6 +269,14 @@ pub struct Failure {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dispute {
+    pub id: String,
+    pub left: String,
+    pub right: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchRun {
     pub id: String,
     pub question: String,
@@ -269,6 +290,8 @@ pub struct ResearchRun {
     pub assignments: Vec<Assignment>,
     pub sources: Vec<Source>,
     pub claims: Vec<Claim>,
+    #[serde(default)]
+    pub disputes: Vec<Dispute>,
     pub failures: Vec<Failure>,
     pub usage: UsageLedger,
     pub report: Option<String>,
@@ -329,6 +352,7 @@ impl Store {
             assignments: Vec::new(),
             sources: Vec::new(),
             claims: Vec::new(),
+            disputes: Vec::new(),
             failures: Vec::new(),
             usage: UsageLedger::default(),
             report: None,
@@ -517,6 +541,19 @@ pub trait Extractor {
         _hint: Option<&str>,
     ) -> Result<(Vec<ClaimDraft>, Option<Usage>), String> {
         self.extract_with_usage(subquestion, source, body, budget)
+    }
+}
+
+pub trait DisputeJudge {
+    fn judge(&self, left: &Claim, right: &Claim) -> Result<Option<String>, String>;
+
+    /// The same comparison with the endpoint's token cost, when it reports one.
+    fn judge_with_usage(
+        &self,
+        left: &Claim,
+        right: &Claim,
+    ) -> Result<(Option<String>, Option<Usage>), String> {
+        Ok((self.judge(left, right)?, None))
     }
 }
 
@@ -941,8 +978,70 @@ impl Extractor for ModelExtractor<'_> {
     }
 }
 
-const PLANNER_SYSTEM: &str = "You are the planning step of an evidence-first research run. Return only a JSON array. Each item is {\"text\": \"...\", \"query\": \"...\", \"kind\": \"fact\"|\"decision\"}. Give 3 to 5 subquestions. Each query must be plain keywords a search engine can answer; do not use site: operators, URL fragments or file paths. Do not answer the question.";
+pub struct ModelDisputeJudge<'a> {
+    pub harness: &'a dyn Harness,
+}
 
+impl DisputeJudge for ModelDisputeJudge<'_> {
+    fn judge(&self, left: &Claim, right: &Claim) -> Result<Option<String>, String> {
+        self.judge_with_usage(left, right).map(|(reason, _)| reason)
+    }
+
+    fn judge_with_usage(
+        &self,
+        left: &Claim,
+        right: &Claim,
+    ) -> Result<(Option<String>, Option<Usage>), String> {
+        let left_quote = left
+            .support
+            .first()
+            .map(|quote| quote.text.as_str())
+            .unwrap_or("");
+        let right_quote = right
+            .support
+            .first()
+            .map(|quote| quote.text.as_str())
+            .unwrap_or("");
+        let user = format!(
+            "Subquestion: {}\n\nLeft claim [{}] ({}): {}\nLeft quote: {}\n\nRight claim [{}] ({}): {}\nRight quote: {}\n\nReturn only the JSON object.",
+            left.subquestion,
+            left.id,
+            left.kind.label(),
+            left.text,
+            left_quote,
+            right.id,
+            right.kind.label(),
+            right.text,
+            right_quote
+        );
+        let completion = self
+            .harness
+            .complete(DISPUTE_SYSTEM, &user, &Budget::new(8_000))
+            .map_err(|fault| format!("the dispute judge call failed: {}", fault.detail()))?;
+        let verdict: DisputeVerdict = parse_object(&completion.text)?;
+        let reason = if verdict.relation.eq_ignore_ascii_case("contradicts") {
+            Some(if verdict.reason.trim().is_empty() {
+                "the two sources assert incompatible results".to_string()
+            } else {
+                verdict.reason.trim().to_string()
+            })
+        } else {
+            None
+        };
+        Ok((reason, completion.usage))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DisputeVerdict {
+    relation: String,
+    #[serde(default)]
+    reason: String,
+}
+
+const DISPUTE_SYSTEM: &str = "You compare two claims from different sources. Return only one JSON object: {\"relation\":\"contradicts\"|\"compatible\"|\"unrelated\",\"reason\":\"...\"}. Use contradicts only when the same quantity, condition, population or time is asserted with incompatible values or opposite conclusions. Different models, drivers, versions, hardware or conditions are not a contradiction; call them unrelated. Do not use outside knowledge.";
+
+const PLANNER_SYSTEM: &str = "You are the planning step of an evidence-first research run. Return only a JSON array. Each item is {\"text\": \"...\", \"query\": \"...\", \"kind\": \"fact\"|\"decision\"}. Give 3 to 5 subquestions. Each query must be plain keywords a search engine can answer; do not use site: operators, URL fragments or file paths. Do not answer the question.";
 const EXTRACTOR_SYSTEM: &str = "You are one stateless extraction worker. You see one subquestion and one source. Return only a JSON array. Each item is {\"text\": \"...\", \"quote\": \"...\", \"kind\": \"sourced\"|\"observed\"|\"inferred\", \"decision\": {\"support\": \"...\", \"weaken\": \"...\", \"unclear\": \"...\"} | null, \"alternatives\": [\"...\"], \"contradicts\": [\"...\"]}. The quote must be copied character for character from the source, must be a contiguous span, and must be at least 20 characters. Do not paraphrase. Do not use ellipses. The claim must keep every qualifier in the quote: platform, driver, version, model and condition. Do not turn a conditional observation into a general one. Put a contradicting quote in `contradicts` only when this same source states a conflicting result. Only return claims that directly answer the subquestion; do not return general facts about the project. If the source does not support a claim, return [].";
 
 fn parse_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
@@ -958,6 +1057,23 @@ fn parse_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
     }
     Err(format!(
         "the model did not return the requested JSON: {}",
+        clip(text, 300)
+    ))
+}
+
+fn parse_object<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
+    let extracted = crate::model::extract(text);
+    if let Ok(value) = serde_json::from_str::<T>(&extracted) {
+        return Ok(value);
+    }
+    if let (Some(start), Some(end)) = (extracted.find('{'), extracted.rfind('}'))
+        && end > start
+        && let Ok(value) = serde_json::from_str::<T>(&extracted[start..=end])
+    {
+        return Ok(value);
+    }
+    Err(format!(
+        "the model did not return the requested JSON object: {}",
         clip(text, 300)
     ))
 }
@@ -1200,11 +1316,72 @@ fn yes() -> bool {
     true
 }
 
+const MAX_DISPUTE_PAIRS: usize = 16;
+
+fn judge_disputes(store: &Store, run: &mut ResearchRun, judge: &dyn DisputeJudge) {
+    let mut pairs = Vec::new();
+    'outer: for left in 0..run.claims.len() {
+        for right in left + 1..run.claims.len() {
+            if pairs.len() >= MAX_DISPUTE_PAIRS {
+                break 'outer;
+            }
+            let a = &run.claims[left];
+            let b = &run.claims[right];
+            if a.subquestion != b.subquestion || !a.on_question || !b.on_question {
+                continue;
+            }
+            if a.text.trim().eq_ignore_ascii_case(b.text.trim()) {
+                continue;
+            }
+            let a_source = a.support.first().map(|quote| quote.source.as_str());
+            let b_source = b.support.first().map(|quote| quote.source.as_str());
+            if a_source.is_none() || a_source == b_source {
+                continue;
+            }
+            pairs.push((left, right));
+        }
+    }
+    for (left, right) in pairs {
+        let (left_claim, right_claim) = (run.claims[left].clone(), run.claims[right].clone());
+        match judge.judge_with_usage(&left_claim, &right_claim) {
+            Ok((Some(reason), usage)) => {
+                if let Some(usage) = usage {
+                    run.usage.judge_prompt_tokens += usage.prompt_tokens;
+                    run.usage.judge_generated_tokens += usage.generated_tokens;
+                }
+                let id = format!("d{}", run.disputes.len() + 1);
+                run.disputes.push(Dispute {
+                    id,
+                    left: left_claim.id,
+                    right: right_claim.id,
+                    reason,
+                });
+            }
+            Ok((None, usage)) => {
+                if let Some(usage) = usage {
+                    run.usage.judge_prompt_tokens += usage.prompt_tokens;
+                    run.usage.judge_generated_tokens += usage.generated_tokens;
+                }
+            }
+            Err(reason) => {
+                let failure = Failure {
+                    stage: "dispute".to_string(),
+                    subject: format!("{} vs {}", left_claim.id, right_claim.id),
+                    reason,
+                };
+                run.failures.push(failure.clone());
+                store.append_failure(&run.id, &failure);
+            }
+        }
+    }
+}
+
 pub struct Engine<'a> {
     pub store: &'a Store,
     pub web: &'a dyn Web,
     pub planner: &'a dyn Planner,
     pub extractor: &'a dyn Extractor,
+    pub judge: Option<&'a dyn DisputeJudge>,
     pub mode: RunMode,
 }
 
@@ -1539,6 +1716,9 @@ impl<'a> Engine<'a> {
                 self.store.dir(&run.id).display()
             ));
         }
+        if let Some(judge) = self.judge {
+            judge_disputes(self.store, &mut run, judge);
+        }
         run.status = RunStatus::Checking;
         self.store.save(&run)?;
         let report = write_report(self.store, &run)?;
@@ -1580,6 +1760,32 @@ fn one() -> usize {
     1
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BenchVerdict {
+    Pass,
+    Partial,
+    Fail,
+}
+
+impl BenchVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            BenchVerdict::Pass => "pass",
+            BenchVerdict::Partial => "partial",
+            BenchVerdict::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchGrade {
+    pub id: String,
+    pub verdict: BenchVerdict,
+    #[serde(default)]
+    pub notes: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchRow {
     pub id: String,
@@ -1596,6 +1802,10 @@ pub struct BenchRow {
     pub coverage: usize,
     pub key_terms: usize,
     pub missing: Vec<String>,
+    #[serde(default)]
+    pub grade: Option<String>,
+    #[serde(default)]
+    pub agreement: Option<bool>,
 }
 
 /// Run a question set through the real engine. Key-term coverage is a reading aid, not a truth score;
@@ -1609,6 +1819,46 @@ pub fn run_bench(
     questions: &[BenchQuestion],
     budget: ResearchBudget,
 ) -> Result<Vec<BenchRow>, String> {
+    run_bench_with_grades(
+        store, web, planner, extractor, mode, questions, budget, None,
+    )
+}
+
+fn predicted_verdict(coverage: usize, key_terms: usize) -> BenchVerdict {
+    if key_terms > 0 && coverage == key_terms {
+        BenchVerdict::Pass
+    } else if coverage > 0 {
+        BenchVerdict::Partial
+    } else {
+        BenchVerdict::Fail
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors run_bench and adds only the optional grade file
+pub fn run_bench_with_grades(
+    store: &Store,
+    web: &dyn Web,
+    planner: &dyn Planner,
+    extractor: &dyn Extractor,
+    mode: RunMode,
+    questions: &[BenchQuestion],
+    budget: ResearchBudget,
+    grades: Option<&[BenchGrade]>,
+) -> Result<Vec<BenchRow>, String> {
+    if let Some(grades) = grades {
+        let mut seen = std::collections::BTreeSet::new();
+        for grade in grades {
+            if !questions.iter().any(|question| question.id == grade.id) {
+                return Err(format!(
+                    "the grade file names {} but the bench has no such question",
+                    grade.id
+                ));
+            }
+            if !seen.insert(grade.id.as_str()) {
+                return Err(format!("the grade file names {} twice", grade.id));
+            }
+        }
+    }
     let mut rows = Vec::new();
     for question in questions {
         let started = Instant::now();
@@ -1617,6 +1867,7 @@ pub fn run_bench(
             web,
             planner,
             extractor,
+            judge: None,
             mode,
         };
         let run = engine.run(&question.question, budget.clone())?;
@@ -1637,6 +1888,8 @@ pub fn run_bench(
                 missing.push(term.clone());
             }
         }
+        let grade = grades.and_then(|grades| grades.iter().find(|grade| grade.id == question.id));
+        let predicted = predicted_verdict(coverage, question.key_terms.len());
         rows.push(BenchRow {
             id: question.id.clone(),
             question: question.question.clone(),
@@ -1653,6 +1906,8 @@ pub fn run_bench(
             coverage,
             key_terms: question.key_terms.len(),
             missing,
+            grade: grade.map(|grade| grade.verdict.label().to_string()),
+            agreement: grade.map(|grade| grade.verdict == predicted),
         });
     }
     Ok(rows)
@@ -1831,6 +2086,41 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
         }
     }
 
+    if !run.disputes.is_empty() {
+        text.push_str("## Cross-source disputes\n\n");
+        text.push_str(
+            "The judge compared claims from different sources on the same subquestion. Both quotes \
+             are byte-verified; this section records a conflict, not a verdict.\n\n",
+        );
+        for dispute in &run.disputes {
+            let left = run.claims.iter().find(|claim| claim.id == dispute.left);
+            let right = run.claims.iter().find(|claim| claim.id == dispute.right);
+            text.push_str(&format!(
+                "- [{}] [{}] vs [{}]: {}\n",
+                dispute.id, dispute.left, dispute.right, dispute.reason
+            ));
+            if let Some(claim) = left {
+                text.push_str(&format!("  - [{}] {}\n", claim.id, claim.text.trim()));
+                for quote in &claim.support {
+                    text.push_str(&format!(
+                        "    - [{}] {}..{}: \"{}\"\n",
+                        quote.source, quote.start, quote.end, quote.text
+                    ));
+                }
+            }
+            if let Some(claim) = right {
+                text.push_str(&format!("  - [{}] {}\n", claim.id, claim.text.trim()));
+                for quote in &claim.support {
+                    text.push_str(&format!(
+                        "    - [{}] {}..{}: \"{}\"\n",
+                        quote.source, quote.start, quote.end, quote.text
+                    ));
+                }
+            }
+            text.push('\n');
+        }
+    }
+
     let inferred: Vec<&Claim> = run
         .claims
         .iter()
@@ -1895,6 +2185,7 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
             "sha256": source.sha256,
             "kind": source.kind,
         })).collect::<Vec<_>>(),
+        "disputes": run.disputes,
     });
     fs::write(
         store.dir(&run.id).join("report.json"),

@@ -117,18 +117,34 @@ through the same byte check and is printed in `## Disputed`; a later support for
 claim revises it in place and keeps the old text in `history`. One retry is allowed when every draft
 from a source fails the byte check, with the mismatch as the hint.
 
+A second, opt-in-by-default pass compares claims from different sources on the same subquestion, in
+capped pairs. `--judge on|off` controls it. A pair the judge calls contradictory is written to
+`## Cross-source disputes` and to `disputes` in `run.json` and `report.json`; both quoted ranges are
+still byte-checked. The section records a conflict, not a verdict, and judge token counts are kept
+separate on the usage ledger.
+
 `hades research bench <questions.json>` runs a question set and reports published, claims, verified
 quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid,
-not a truth score. `hades research file <run-id> --topic <category/topic>` files a published, strict-green report
-as a Mneme research note.
+not a truth score. `--grades <grades.json>` compares that coverage band with a human `pass`, `partial`
+or `fail` verdict and prints `coverage predicted N/M grades; this is a calibration, not truth`. A grade
+that names no question in the bench is a named error. `hades research file <run-id> --topic
+<category/topic>` files a published, strict-green report as a Mneme research note.
 
 ## The offline library
 
 `hades library` is a local shelf. Every install starts empty: no seed corpus, no sample paper, no
 placeholder entry. A document exists only after `hades library add <file-or-directory>` imports it.
 
-PDF text comes from `pdftotext`; EPUB is unpacked with a member cap and a path-traversal check; LaTeX is
-converted to Markdown by a deterministic reader; Markdown, text and reStructuredText are stored as text.
+PDF text comes from `pdftotext`. When a PDF has no usable text layer, each page is rasterized with
+`pdftoppm` at 300 dpi and read with `tesseract`; the entry carries the tag `ocr`, page markers record
+`ocr=1`, and `--ocr-lang` selects the language pack. Page and byte caps bound the fallback, and the
+scratch directory is removed on every exit path. EPUB is read through `META-INF/container.xml` to the
+OPF package and then in spine order, with EPUB3 `nav` or EPUB2 `ncx` contents, footnote asides and image
+alt text; a member cap and a path-traversal check still apply. LaTeX is converted to Markdown by a
+deterministic reader: `\[...\]` and `\(...\)`, `equation`, `align` and `gather` become readable math,
+and escaped dollars survive. That is a reading view, not rendered math. Markdown, text and
+reStructuredText are stored as text.
+
 The original is kept and hashed, the readable text is chunked into SQLite with FTS5, and `hades library
 verify` re-reads every original and recomputes its hash.
 
@@ -515,6 +531,14 @@ These are decisions, not omissions. Each has a reason and the seam it would chan
   condition the source never stated. The structural relevance gate catches a claim about the wrong
   subject and the extractor prompt asks qualifiers to survive, but neither can prove a correctly quoted
   sentence is representative, current or complete.
+- **OCR is a fallback, not reconstruction.** It needs `pdftoppm` and `tesseract` on the host and returns
+  text without columns, tables or reading order. A page that OCRs badly is still stored and tagged, not
+  silently dropped.
+- **LaTeX math is a reading view.** It converts to Markdown math for reading; it does not render symbols
+  or check that an expression is correct.
+- **The dispute judge is an opinion, capped.** It compares only cross-source pairs on one subquestion,
+  stops at sixteen pairs, and can call an unrelated pair contradictory or miss one. Every quote in the
+  section is byte-checked; the label is not a verdict.
 - **A social URL is still refused on its own.** The gate requires a linked artifact, and artifact-link
   extraction is not built; until then an X post cannot be a source by itself.
 - **Hades writes only its own vault.** WEFT is read by its owner, not by Hades; `mneme export` is the

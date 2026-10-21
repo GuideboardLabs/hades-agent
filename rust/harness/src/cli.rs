@@ -149,12 +149,13 @@ hades — the harness, one turn or a whole graph
       the version of this build (`--version` and `-V` are the same)
 
   hades research <question> [--queries 12] [--sources 12] [--fetches 24]
-                 [--minutes 60] [--claims 3] [--state <dir>] [--json]
+                 [--minutes 60] [--claims 3] [--judge on|off] [--state <dir>] [--json]
                  [--offline] [--library <dir>]
       one evidence-first run: plan, search, fetch, extract, verify. Every published
       claim cites a byte-verified quote in a stored source. The check proves
       provenance, not truth. --offline reads only the local library and makes no
-      network call
+      network call. --judge compares claims from different sources on one
+      subquestion; --judge off skips that pass
 
   hades research check <run-id> | show <run-id> | list [--state <dir>] [--strict]
       re-read a run without asking a model; check exits 0 green, 1 red, 2 unreadable.
@@ -164,17 +165,23 @@ hades — the harness, one turn or a whole graph
                       [--state <dir>] [--vault <dir>] [--db <file>] [--config <file>]
       file a published, strict-green report as a Mneme research note
 
-  hades research bench <questions.json> [--offline] [--library <dir>] [--json] [...]
+  hades research bench <questions.json> [--grades <grades.json>] [--offline]
+                       [--library <dir>] [--json] [...]
       run a question set through the real engine and report coverage, verified
-      quotes, off-question claims, sources, time and tokens
+      quotes, off-question claims, sources, time and tokens. --grades compares
+      key-term coverage with a human verdict; the agreement is a calibration,
+      not truth
 
   hades research failures [--state <dir>] [--json]
       list failed research runs from the append-only failure index
 
   hades library add <path>... [--title <t>] [--author <a>]... [--year <n>]
-                           [--tag <t>]... [--library <dir>] [--state <dir>] [--json]
+                           [--tag <t>]... [--ocr-lang <lang>] [--library <dir>]
+                           [--state <dir>] [--json]
       import a PDF, EPUB, LaTeX, Markdown, text or HTML file, or walk a directory.
-      A fresh install has no library entries; there is no seed shelf
+      A fresh install has no library entries; there is no seed shelf. A scanned
+      PDF falls back to pdftoppm and tesseract; --ocr-lang selects the language
+      pack
 
   hades library list | search <terms> | show <id> [--text] | verify [<id>]
                        | remove <id> [--purge] [--library <dir>] [--state <dir>]
@@ -3533,7 +3540,9 @@ fn library_cmd(args: &[String]) -> Result<(String, i32), String> {
 fn library_add_cmd(args: &[String]) -> Result<(String, i32), String> {
     let flags = parse_with(
         args,
-        &["library", "state", "title", "author", "year", "tag"],
+        &[
+            "library", "state", "title", "author", "year", "tag", "ocr-lang",
+        ],
         &["json"],
     )?;
     if flags.positional.is_empty() {
@@ -3558,6 +3567,7 @@ fn library_add_cmd(args: &[String]) -> Result<(String, i32), String> {
         authors: flags.repeated.get("author").cloned().unwrap_or_default(),
         year,
         tags: flags.repeated.get("tag").cloned().unwrap_or_default(),
+        ocr_lang: flags.named.get("ocr-lang").cloned(),
     };
     let library = crate::library::Library::open(library_path(&flags)?)?;
     let mut merged = crate::library::ImportReport::default();
@@ -3615,10 +3625,15 @@ fn library_list_cmd(args: &[String]) -> Result<(String, i32), String> {
     let mut text = String::new();
     for entry in entries {
         text.push_str(&format!(
-            "{}  {}  {}{}  {} bytes\n",
+            "{}  {}  {}{}{}  {} bytes\n",
             entry.id,
             entry.title,
             entry.format.label(),
+            if entry.tags.iter().any(|tag| tag == "ocr") {
+                "  [ocr]"
+            } else {
+                ""
+            },
             entry
                 .pages
                 .map(|pages| format!("  {pages} pages"))
@@ -3783,6 +3798,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
             "minutes",
             "claims",
             "library",
+            "judge",
         ],
         &["json", "offline"],
     )?;
@@ -3812,6 +3828,14 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
     let extractor = crate::research::ModelExtractor {
         harness: answerer.harness(),
     };
+    let judge = crate::research::ModelDisputeJudge {
+        harness: answerer.harness(),
+    };
+    let judge_on = flags
+        .named
+        .get("judge")
+        .map(|value| value != "off")
+        .unwrap_or(true);
     let library_root = library_path(&flags)?;
     let web: Box<dyn crate::research::Web> = if offline {
         let library = crate::library::Library::open(&library_root)?;
@@ -3830,6 +3854,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         web: web.as_ref(),
         planner: &planner,
         extractor: &extractor,
+        judge: if judge_on { Some(&judge) } else { None },
         mode: if offline {
             crate::research::RunMode::Offline
         } else {
@@ -3853,7 +3878,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
     }
 
     let mut text = format!(
-        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\nmodel tokens: planner {}+{}, extractor {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
+        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\ncross-source disputes: {}\nmodel tokens: planner {}+{}, extractor {}+{}, judge {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
         run.id,
         run.status,
         run.question,
@@ -3864,10 +3889,13 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         run.usage.claims,
         check.verified,
         check.off_question,
+        run.disputes.len(),
         run.usage.planner_prompt_tokens,
         run.usage.planner_generated_tokens,
         run.usage.extractor_prompt_tokens,
         run.usage.extractor_generated_tokens,
+        run.usage.judge_prompt_tokens,
+        run.usage.judge_generated_tokens,
         run.usage.elapsed_ms,
         store.dir(&run.id).display(),
         store.dir(&run.id).join("report.md").display(),
@@ -4010,6 +4038,7 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
             "minutes",
             "claims",
             "library",
+            "grades",
         ],
         &["json", "offline"],
     )?;
@@ -4023,6 +4052,16 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
     if questions.is_empty() {
         return Err("the bench file has no questions".to_string());
     }
+    let grades: Option<Vec<crate::research::BenchGrade>> =
+        match flags.named.get("grades") {
+            Some(path) => {
+                let text = fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+                Some(serde_json::from_str(&text).map_err(|error| {
+                    format!("{path}: the grade file is not a JSON array: {error}")
+                })?)
+            }
+            None => None,
+        };
     let offline = switched(&flags, "offline");
     if !offline && flags.named.contains_key("library") {
         return Err(
@@ -4063,7 +4102,7 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
     } else {
         crate::research::RunMode::Web
     };
-    let rows = crate::research::run_bench(
+    let rows = crate::research::run_bench_with_grades(
         &store,
         web.as_ref(),
         &planner,
@@ -4071,6 +4110,7 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
         mode,
         &questions,
         budget,
+        grades.as_deref(),
     )?;
     if switched(&flags, "json") {
         let text = serde_json::to_string_pretty(&rows)
@@ -4078,11 +4118,11 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
         return Ok((format!("{text}\n"), 0));
     }
     let mut out = format!("bench: {} question(s) in {mode:?} mode\n\n", rows.len());
-    out.push_str("| id | published | claims | verified | off-question | sources | ms | tokens | coverage |\n");
-    out.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    out.push_str("| id | published | claims | verified | off-question | sources | ms | tokens | coverage | grade | agreement |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
     for row in &rows {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {}+{} | {}/{} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {}+{} | {}/{} | {} | {} |\n",
             row.id,
             if row.published { "yes" } else { "no" },
             row.claims,
@@ -4093,8 +4133,14 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
             row.prompt_tokens,
             row.generated_tokens,
             row.coverage,
-            row.key_terms
+            row.key_terms,
+            row.grade.as_deref().unwrap_or("-"),
+            row.agreement
+                .map(|agreement| if agreement { "yes" } else { "no" })
+                .unwrap_or("-")
         ));
+    }
+    for row in &rows {
         if !row.missing.is_empty() {
             out.push_str(&format!(
                 "\n`{}` missing key terms: {}\n",
@@ -4103,6 +4149,30 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
             ));
         }
         out.push_str(&format!("\n`{}` run: `{}`\n", row.id, row.run_id));
+    }
+    let graded: Vec<_> = rows.iter().filter(|row| row.grade.is_some()).collect();
+    if !graded.is_empty() {
+        let count = |verdict: &str| {
+            graded
+                .iter()
+                .filter(|row| row.grade.as_deref() == Some(verdict))
+                .count()
+        };
+        let agree = graded
+            .iter()
+            .filter(|row| row.agreement == Some(true))
+            .count();
+        out.push_str(&format!(
+            "\ngrades: {} pass, {} partial, {} fail\n",
+            count("pass"),
+            count("partial"),
+            count("fail")
+        ));
+        out.push_str(&format!(
+            "coverage predicted {}/{} grades; this is a calibration, not truth\n",
+            agree,
+            graded.len()
+        ));
     }
     out.push_str(
         "\nCoverage is a reading aid, not a truth score; open the run report to hand-grade it.\n",

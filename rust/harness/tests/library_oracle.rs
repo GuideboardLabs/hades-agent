@@ -69,6 +69,7 @@ fn offline_research_reads_the_library_and_checks_green() {
         web: &web,
         planner: &planner,
         extractor: &extractor,
+        judge: None,
         mode: RunMode::Offline,
     };
     let run = engine
