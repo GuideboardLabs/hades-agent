@@ -39,6 +39,8 @@ pub struct Config {
     pub profile_models: BTreeMap<String, String>,
     /// The MCP servers a chat may reach, and the tools a person has allowed on each.
     pub mcp: crate::mcp::McpConfig,
+    /// Endpoints this owner named, so a model that is not a shipped preset is still choosable by id.
+    pub endpoints: BTreeMap<String, Endpoint>,
 }
 
 impl Config {
@@ -46,6 +48,128 @@ impl Config {
     pub fn profile_model(&self, profile: &str) -> Option<&str> {
         self.profile_models.get(profile).map(String::as_str)
     }
+}
+
+/// A named endpoint the owner added, so a non-shipped model can be chosen by name.
+///
+/// The key is named by its *variable*, never by its value: a config file is copied into a backup and a
+/// secret in it is a secret in the backup. `context_tokens` is required because the window decides when a
+/// conversation is compressed, and a guessed window is a run that fails at the provider instead of here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub url: String,
+    pub model: String,
+    /// The environment variable or `.env` name holding the key, if the endpoint needs one.
+    pub key_env: Option<String>,
+    pub context_tokens: usize,
+    /// Whether the endpoint accepts a `reasoning` field. Recorded rather than assumed.
+    pub thinking: bool,
+}
+
+impl Endpoint {
+    /// A URL has to say https or http, and a key is named, not pasted. Both refusals are here rather than
+    /// at the call site because a bad endpoint is discovered at three in the morning otherwise.
+    fn parse(name: &str, value: &Value, path: &Path) -> Result<Endpoint, String> {
+        let object = value.as_object().ok_or_else(|| {
+            format!("{}: `endpoints.{name}` is not an object", path.display())
+        })?;
+        let url = object
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .ok_or_else(|| {
+                format!(
+                    "{}: `endpoints.{name}.url` must start with http:// or https://",
+                    path.display()
+                )
+            })?
+            .to_string();
+        let model = object
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                format!("{}: `endpoints.{name}.model` is missing", path.display())
+            })?
+            .to_string();
+        let key_env = match object.get("key_env") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => {
+                let text = text.trim();
+                let valid = !text.is_empty()
+                    && text
+                        .chars()
+                        .enumerate()
+                        .all(|(at, ch)| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_lowercase() || (at > 0 && ch.is_ascii_digit()));
+                if !valid {
+                    return Err(format!(
+                        "{}: `endpoints.{name}.key_env` is a variable name, not a key",
+                        path.display()
+                    ));
+                }
+                Some(text.to_string())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{}: `endpoints.{name}.key_env` is not a string",
+                    path.display()
+                ));
+            }
+        };
+        let context_tokens = object
+            .get("context_tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0)
+            .ok_or_else(|| {
+                format!(
+                    "{}: `endpoints.{name}.context_tokens` must be a positive number",
+                    path.display()
+                )
+            })? as usize;
+        let thinking = object
+            .get("thinking")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(Endpoint { url, model, key_env, context_tokens, thinking })
+    }
+}
+
+/// The optional `endpoints` map: named endpoints that are not shipped presets.
+fn endpoints(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, Endpoint>, String> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value.as_object().ok_or_else(|| {
+        format!("{}: `endpoints` is not an object of name to endpoint", path.display())
+    })?;
+    let mut out = BTreeMap::new();
+    for (name, endpoint) in object {
+        if crate::model::preset(name).is_some() {
+            return Err(format!(
+                "{}: `endpoints.{name}` shadows a shipped preset; pick another name",
+                path.display()
+            ));
+        }
+        out.insert(name.clone(), Endpoint::parse(name, endpoint, path)?);
+    }
+    Ok(out)
+}
+
+/// A model id is a shipped preset or a named endpoint. Anything else is refused by name, here, because the
+/// alternative is a run that starts and then cannot reach anything.
+fn check_model(model: &str, endpoints: &BTreeMap<String, Endpoint>, path: &Path, field: &str) -> Result<(), String> {
+    if crate::model::preset(model).is_none() && !endpoints.contains_key(model) {
+        let mut known = endpoints.keys().cloned().collect::<Vec<_>>();
+        known.extend(crate::model::presets().iter().map(|preset| preset.id.to_string()));
+        return Err(format!(
+            "{}: `{field}` names model `{model}`, which is neither a preset nor an endpoint; try {}",
+            path.display(),
+            known.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// The config file under a Hades home.
@@ -101,13 +225,18 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         ));
     }
 
+    let endpoints = endpoints(object.get("endpoints"), path)?;
+    let model = field(object, "model", path)?;
+    check_model(&model, &endpoints, path, "model")?;
+
     Ok(Some(Config {
         provider: field(object, "provider", path)?,
-        model: field(object, "model", path)?,
+        model,
         root: PathBuf::from(field(object, "root", path)?),
         vault: PathBuf::from(field(object, "vault", path)?),
-        profile_models: profile_models(object.get("profile_models"), path)?,
+        profile_models: profile_models(object.get("profile_models"), &endpoints, path)?,
         mcp: crate::mcp::McpConfig::from_value(object.get("mcp"), path)?,
+        endpoints,
     }))
 }
 
@@ -126,6 +255,18 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         "vault": config.vault.to_string_lossy(),
         "profile_models": config.profile_models,
         "mcp": config.mcp.to_value(),
+        "endpoints": config.endpoints.iter().map(|(name, endpoint)| {
+            let mut value = json!({
+                "url": endpoint.url,
+                "model": endpoint.model,
+                "context_tokens": endpoint.context_tokens,
+                "thinking": endpoint.thinking,
+            });
+            if let Some(key) = &endpoint.key_env {
+                value["key_env"] = json!(key);
+            }
+            (name.clone(), value)
+        }).collect::<Map<String, Value>>(),
     });
     let text = serde_json::to_string_pretty(&value)
         .map_err(|error| format!("the config could not be rendered: {error}"))?;
@@ -160,7 +301,11 @@ fn field(object: &Map<String, Value>, key: &str, path: &Path) -> Result<String, 
 
 /// The optional `profile_models` map. Every key must name a shipped profile and every value a preset
 /// this build knows: a typo that is silently ignored is a setting the owner believes is on.
-fn profile_models(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, String>, String> {
+fn profile_models(
+    value: Option<&Value>,
+    endpoints: &BTreeMap<String, Endpoint>,
+    path: &Path,
+) -> Result<BTreeMap<String, String>, String> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -198,10 +343,10 @@ fn profile_models(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String,
                     path.display()
                 )
             })?;
-        if crate::model::preset(model).is_none() {
+        if crate::model::preset(model).is_none() && !endpoints.contains_key(model) {
             return Err(format!(
-                "{}: `profile_models.{profile}` names model `{model}`, which this build has no \
-                 preset for; try {presets}",
+                "{}: `profile_models.{profile}` names model `{model}`, which is neither a preset nor an \
+                 endpoint; try {presets}",
                 path.display()
             ));
         }
@@ -250,6 +395,7 @@ mod tests {
                 Path::new("sample"),
             )
             .expect("the sample mcp section"),
+            endpoints: BTreeMap::new(),
         }
     }
 
@@ -276,7 +422,7 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"provider":"ollama-cloud","model":"x","root":"/r"}"#,
+            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r"}"#,
         )
         .expect("write");
         let said = load(&path).expect_err("a vault is required");
@@ -319,7 +465,7 @@ mod tests {
         )
         .expect("write");
         let said = load(&path).expect_err("an unknown preset is not ignored");
-        assert!(said.contains("has no preset"), "{said}");
+        assert!(said.contains("neither a preset nor an endpoint"), "{said}");
         assert!(said.contains("not-a-preset"), "{said}");
     }
 
@@ -329,7 +475,7 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"provider":"ollama-cloud","model":"x","root":"/r","vault":"/v",
+            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v",
                 "mcp":{"servers":{"echo":{"command":"true","alow":["echo"]}}}}"#,
         )
         .expect("write");
@@ -344,11 +490,72 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"provider":"ollama-cloud","model":"x","root":"/r","vault":"/v"}"#,
+            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v"}"#,
         )
         .expect("write");
         let config = load(&path).expect("load").expect("a config");
         assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn an_endpoint_is_a_valid_model_id() {
+        let dir = scratch("endpoint");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"openai-compatible","model":"friend-vllm","root":"/r","vault":"/v",
+                "endpoints":{"friend-vllm":{"url":"http://100.64.0.2:8000/v1","model":"Qwen3.8-27B-FP8","key_env":"FRIEND_KEY","context_tokens":32000}}}"#,
+        )
+        .expect("write");
+        let config = load(&path).expect("load").expect("a config");
+        let endpoint = &config.endpoints["friend-vllm"];
+        assert_eq!(endpoint.url, "http://100.64.0.2:8000/v1");
+        assert_eq!(endpoint.model, "Qwen3.8-27B-FP8");
+        assert_eq!(endpoint.key_env.as_deref(), Some("FRIEND_KEY"));
+        assert_eq!(endpoint.context_tokens, 32000);
+    }
+
+    #[test]
+    fn an_unknown_endpoint_is_refused_by_name() {
+        let dir = scratch("endpoint-missing");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"openai-compatible","model":"ghost","root":"/r","vault":"/v"}"#,
+        )
+        .expect("write");
+        let said = load(&path).expect_err("an endpoint that does not exist is not a model");
+        assert!(said.contains("ghost"), "{said}");
+        assert!(said.contains("endpoint"), "{said}");
+    }
+
+    #[test]
+    fn a_pasted_key_is_refused_and_only_a_variable_name_is_kept() {
+        let dir = scratch("endpoint-key");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"openai-compatible","model":"e","root":"/r","vault":"/v",
+                "endpoints":{"e":{"url":"https://x.example/v1","model":"m","key_env":"sk-live-abc123","context_tokens":8000}}}"#,
+        )
+        .expect("write");
+        let said = load(&path).expect_err("a secret in the config is a secret in the backup");
+        assert!(said.contains("variable name"), "{said}");
+        assert!(!said.contains("sk-live"), "the key was echoed back: {said}");
+    }
+
+    #[test]
+    fn an_endpoint_without_a_window_is_refused() {
+        let dir = scratch("endpoint-window");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"openai-compatible","model":"e","root":"/r","vault":"/v",
+                "endpoints":{"e":{"url":"https://x.example/v1","model":"m"}}}"#,
+        )
+        .expect("write");
+        let said = load(&path).expect_err("a guessed window is a wrong window");
+        assert!(said.contains("context_tokens"), "{said}");
     }
 
     #[test]

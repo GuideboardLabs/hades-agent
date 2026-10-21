@@ -714,6 +714,29 @@ fn models() -> Result<(String, i32), String> {
         "Anything else: turn --model <name> --endpoint <url> [--key env:VAR|<VAR>] [--temperature t] \
          [--max-tokens n]\n",
     );
+    // Named endpoints from the config, so a model that is not a shipped preset is still choosable by id.
+    // Only the variable name is printed: the value lives in .env and is never read here.
+    if let Ok(home) = hades_home() {
+        if let Ok(Some(config)) = config::load(&config::path_in(&home)) {
+            if !config.endpoints.is_empty() {
+                text.push_str("\nnamed endpoints:\n");
+                for (name, endpoint) in &config.endpoints {
+                    text.push_str(&format!(
+                        "{:<20} {}\n{:<20} {} ({} tokens)\n",
+                        name,
+                        endpoint.model,
+                        "",
+                        endpoint.url,
+                        endpoint.context_tokens
+                    ));
+                    if let Some(key) = &endpoint.key_env {
+                        text.push_str(&format!("{:<20} key: ${key}\n", ""));
+                    }
+                    text.push('\n');
+                }
+            }
+        }
+    }
     Ok((text, 0))
 }
 
@@ -1229,6 +1252,12 @@ fn answerer(
                 open
             }
             None => {
+                if let Some(endpoint) = config
+                    .as_ref()
+                    .and_then(|config| config.endpoints.get(model_id.as_str()))
+                {
+                    from_named_endpoint(endpoint)
+                } else {
                 let preset = model::preset(model_id).ok_or_else(|| {
                     format!(
                         "no model named `{model_id}`: try {}",
@@ -1239,7 +1268,8 @@ fn answerer(
                             .join(", ")
                     )
                 })?;
-                model::from_preset(&preset)
+                    model::from_preset(&preset)
+                }
             }
         },
         None => {
@@ -1263,6 +1293,9 @@ fn answerer(
             match config {
                 Some(config) => {
                     let chosen = profile_model.unwrap_or(&config.model);
+                    if let Some(endpoint) = config.endpoints.get(chosen) {
+                        return Ok(Answerer::Model(from_named_endpoint(endpoint)));
+                    }
                     let preset = model::preset(chosen).ok_or_else(|| {
                         format!(
                             "the model `{chosen}` has no preset in this build. Run `hades init --model \
@@ -1329,6 +1362,20 @@ fn key_spec(spec: &str) -> Key {
         Some(var) => Key::Env(var.to_string()),
         None => Key::Home(spec.to_string()),
     }
+}
+
+/// A named endpoint from the config, as an answerer. The key is resolved by name through the same seam a
+/// preset uses: the config records the variable and never the value.
+fn from_named_endpoint(endpoint: &crate::config::Endpoint) -> OpenAi {
+    let mut open =
+        OpenAi::new(endpoint.url.clone(), endpoint.model.clone()).with_context(endpoint.context_tokens);
+    if let Some(key) = &endpoint.key_env {
+        open = open.with_key(Key::Env(key.clone()));
+    }
+    if endpoint.thinking {
+        open = open.with_thinking(true);
+    }
+    open
 }
 
 /// Who answers. An enum rather than a boxed trait object, because there are two and the CLI prints which.
@@ -3172,6 +3219,19 @@ fn config_cmd(args: &[String]) -> Result<(String, i32), String> {
                 for (profile, model) in &config.profile_models {
                     text.push_str(&format!("profile model: {profile} -> {model}\n"));
                 }
+            }
+            for (name, endpoint) in &config.endpoints {
+                text.push_str(&format!(
+                    "endpoint: {name} -> {} ({}), {} tokens{}\n",
+                    endpoint.model,
+                    endpoint.url,
+                    endpoint.context_tokens,
+                    endpoint
+                        .key_env
+                        .as_ref()
+                        .map(|key| format!(", key ${key}"))
+                        .unwrap_or_default()
+                ));
             }
             text.push_str(&format!("mcp servers: {}\n", config.mcp.servers.len()));
             text.push_str("\nkeys and tokens live in .env, never in this file\n");
@@ -5288,6 +5348,7 @@ fn init(
         vault: vault_path.clone(),
         profile_models: std::collections::BTreeMap::new(),
         mcp: crate::mcp::McpConfig::default(),
+        endpoints: std::collections::BTreeMap::new(),
     };
     config::save(&config_path, &config).map_err(|error| {
         format!(
@@ -7257,6 +7318,7 @@ mod profile_model_tests {
                 .map(|(profile, model)| (profile.to_string(), model.to_string()))
                 .collect(),
             mcp: Default::default(),
+            endpoints: Default::default(),
         }
     }
 
