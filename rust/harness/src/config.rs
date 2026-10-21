@@ -44,6 +44,16 @@ pub struct Config {
     /// Toolchains under the home directory, named explicitly. Discovery never walks the home, so a rustup,
     /// nvm, pyenv or uv install there is unreadable inside the cage unless it is listed here.
     pub runtime_paths: Vec<PathBuf>,
+    /// How research may reach outside the machine.
+    pub research: Research,
+}
+
+/// The research seam. `external_fallback` is off unless a person turns it on, because the fallback sends the
+/// query to a third party: a local SearXNG that answers badly is a bad answer, not permission to tell Jina
+/// and DuckDuckGo what was asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Research {
+    pub external_fallback: bool,
 }
 
 impl Config {
@@ -259,6 +269,7 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         mcp: crate::mcp::McpConfig::from_value(object.get("mcp"), path)?,
         endpoints,
         runtime_paths: runtime_paths(object.get("runtime_paths"), path)?,
+        research: research(object.get("research"), path)?,
     }))
 }
 
@@ -277,6 +288,9 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         "vault": config.vault.to_string_lossy(),
         "profile_models": config.profile_models,
         "mcp": config.mcp.to_value(),
+        "research": {
+            "external_fallback": config.research.external_fallback,
+        },
         "runtime_paths": config
             .runtime_paths
             .iter()
@@ -326,6 +340,36 @@ fn field(object: &Map<String, Value>, key: &str, path: &Path) -> Result<String, 
         })
 }
 
+/// The optional `research` section. Unknown keys are refused: a misspelled switch that is silently ignored
+/// is a setting the owner believes is on.
+fn research(value: Option<&Value>, path: &Path) -> Result<Research, String> {
+    let Some(value) = value else {
+        return Ok(Research::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{}: `research` is not an object", path.display()))?;
+    for key in object.keys() {
+        if key != "external_fallback" {
+            return Err(format!(
+                "{}: `research.{key}` is not a setting this build knows",
+                path.display()
+            ));
+        }
+    }
+    let external_fallback = match object.get("external_fallback") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return Err(format!(
+                "{}: `research.external_fallback` is not true or false",
+                path.display()
+            ));
+        }
+    };
+    Ok(Research { external_fallback })
+}
+
 /// The optional `runtime_paths` list: toolchains under the home directory that the cage may read.
 ///
 /// Each entry is a path to a directory. A relative path is refused because it would resolve against
@@ -346,7 +390,12 @@ fn runtime_paths(value: Option<&Value>, path: &Path) -> Result<Vec<PathBuf>, Str
             .as_str()
             .map(str::trim)
             .filter(|text| !text.is_empty())
-            .ok_or_else(|| format!("{}: `runtime_paths` holds something that is not a path", path.display()))?;
+            .ok_or_else(|| {
+                format!(
+                    "{}: `runtime_paths` holds something that is not a path",
+                    path.display()
+                )
+            })?;
         let candidate = PathBuf::from(text);
         if !candidate.is_absolute() {
             return Err(format!(
@@ -467,6 +516,7 @@ mod tests {
             )
             .expect("the sample mcp section"),
             runtime_paths: Vec::new(),
+            research: Research::default(),
             endpoints: BTreeMap::new(),
         }
     }
@@ -584,6 +634,7 @@ mod tests {
             mcp: crate::mcp::McpConfig::default(),
             endpoints: Default::default(),
             runtime_paths: vec![toolchain.clone()],
+            research: Research::default(),
         };
         save(&path, &config).expect("a save");
         let read = load(&path).expect("a read").expect("a config");
@@ -595,22 +646,54 @@ mod tests {
     }
 
     #[test]
+    fn research_fallback_is_off_by_default_and_a_misspelling_is_refused() {
+        let dir = scratch("research-section");
+        let path = dir.join("config.json");
+        let mut config = sample();
+        config.root = dir.clone();
+        config.vault = dir.join("vault");
+        save(&path, &config).expect("a save");
+        let read = load(&path).expect("a read").expect("a config");
+        assert!(!read.research.external_fallback);
+
+        // A turned-on switch survives, and a key this build does not know is an error rather than a setting
+        // the owner believes is on.
+        config.research.external_fallback = true;
+        save(&path, &config).expect("a save");
+        assert!(
+            load(&path)
+                .expect("a read")
+                .expect("a config")
+                .research
+                .external_fallback
+        );
+
+        let text = std::fs::read_to_string(&path).expect("the file");
+        std::fs::write(&path, text.replace("external_fallback", "external_fallbak"))
+            .expect("a write");
+        let error = load(&path).expect_err("an unknown key is refused");
+        assert!(
+            error.contains("is not a setting this build knows"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_relative_or_home_toolchain_is_refused_by_name() {
         let dir = scratch("toolchain-refused");
         let text = std::fs::read_to_string(dir.join("config.json")).unwrap_or_default();
         let _ = text;
         let path = dir.join("config.json");
-        let base = || {
-            Config {
-                provider: "local".into(),
-                model: crate::model::presets()[0].id.to_string(),
-                root: dir.clone(),
-                vault: dir.join("vault"),
-                profile_models: Default::default(),
-                mcp: crate::mcp::McpConfig::default(),
-                endpoints: Default::default(),
-                runtime_paths: Vec::new(),
-            }
+        let base = || Config {
+            provider: "local".into(),
+            model: crate::model::presets()[0].id.to_string(),
+            root: dir.clone(),
+            vault: dir.join("vault"),
+            profile_models: Default::default(),
+            mcp: crate::mcp::McpConfig::default(),
+            endpoints: Default::default(),
+            runtime_paths: Vec::new(),
+            research: Research::default(),
         };
         let mut config = base();
         config.runtime_paths = vec![PathBuf::from("relative/toolchain")];

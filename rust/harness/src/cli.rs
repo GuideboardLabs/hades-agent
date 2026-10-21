@@ -153,12 +153,15 @@ hades — the harness, one turn or a whole graph
 
   hades research <question> [--queries 12] [--sources 12] [--fetches 24]
                  [--minutes 60] [--claims 3] [--judge on|off] [--workers 4]
-                 [--entailment] [--state <dir>] [--json]
+                 [--entailment] [--state <dir>] [--json] [--external-search]
                  [--offline] [--library <dir>]
       one evidence-first run: plan, search, fetch, extract, verify. Every published
       claim cites a byte-verified quote in a stored source. The check proves
       provenance, not truth. --offline reads only the local library and makes no
-      network call. --judge compares claims from different sources on one
+      network call. A weak local search is returned as-is unless
+      `research.external_fallback` is on in the config or --external-search is
+      given: the fallback sends the question to Jina and DuckDuckGo, so it is not
+      a default. --judge compares claims from different sources on one
       subquestion; --judge off skips that pass. --workers fetches a batch of
       candidates in parallel (1..8); --workers 1 reproduces the serial order.
       --entailment asks the model whether each verified quote actually supports
@@ -4323,7 +4326,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
             "judge",
             "workers",
         ],
-        &["json", "offline", "entailment"],
+        &["json", "offline", "entailment", "external-search"],
     )?;
     let question = flags.positional.join(" ");
     if question.trim().is_empty() {
@@ -4375,7 +4378,15 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         }
         Box::new(crate::library::LibraryWeb::new(library_root))
     } else {
-        Box::new(crate::research::Searx::from_env())
+        Box::new(
+            crate::research::Searx::from_env().with_external(
+                config
+                    .as_ref()
+                    .map(|config| config.research.external_fallback)
+                    .unwrap_or(false)
+                    || switched(&flags, "external-search"),
+            ),
+        )
     };
     let engine = crate::research::Engine {
         store: &store,
@@ -4411,8 +4422,24 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         ));
     }
 
+    // Which search the run actually had, said out loud: "local" is the default, and a run that could reach
+    // Jina says so, because the question left the machine.
+    let search = if offline {
+        "library (no network)".to_string()
+    } else {
+        crate::research::Searx::from_env()
+            .with_external(
+                config
+                    .as_ref()
+                    .map(|config| config.research.external_fallback)
+                    .unwrap_or(false)
+                    || switched(&flags, "external-search"),
+            )
+            .backend()
+            .to_string()
+    };
     let mut text = format!(
-        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nworkers: {workers} (fetches)\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\ncross-source disputes: {}\nmodel tokens: planner {}+{}, extractor {}+{}, judge {}+{}, entailment {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
+        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearch: {search}\nsearches: {}\nfetches: {}\nworkers: {workers} (fetches)\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\ncross-source disputes: {}\nmodel tokens: planner {}+{}, extractor {}+{}, judge {}+{}, entailment {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
         run.id,
         run.status,
         run.question,
@@ -4645,7 +4672,15 @@ fn research_bench_cmd(args: &[String]) -> Result<(String, i32), String> {
         }
         Box::new(crate::library::LibraryWeb::new(library_root))
     } else {
-        Box::new(crate::research::Searx::from_env())
+        Box::new(
+            crate::research::Searx::from_env().with_external(
+                config
+                    .as_ref()
+                    .map(|config| config.research.external_fallback)
+                    .unwrap_or(false)
+                    || switched(&flags, "external-search"),
+            ),
+        )
     };
     let mode = if offline {
         crate::research::RunMode::Offline
@@ -5345,6 +5380,7 @@ fn init(
         mcp: crate::mcp::McpConfig::default(),
         endpoints: std::collections::BTreeMap::new(),
         runtime_paths: Vec::new(),
+        research: Default::default(),
     };
     config::save(&config_path, &config).map_err(|error| {
         format!(
@@ -7368,6 +7404,7 @@ mod profile_model_tests {
             mcp: Default::default(),
             endpoints: Default::default(),
             runtime_paths: Vec::new(),
+            research: Default::default(),
         }
     }
 

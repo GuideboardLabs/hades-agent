@@ -528,9 +528,7 @@ static DECLARED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Replace the declared toolchain list. Called once, when the config is loaded.
 pub fn declare_toolchains(paths: impl IntoIterator<Item = PathBuf>) {
-    let mut held = DECLARED
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let mut held = DECLARED.lock().unwrap_or_else(|poison| poison.into_inner());
     held.clear();
     held.extend(paths);
 }

@@ -576,6 +576,9 @@ pub trait EntailmentAuditor {
 
 pub struct Searx {
     base: String,
+    /// Whether a weak local result set may be sent to a third party. Off by default: the fallback is a
+    /// network dependency and a disclosure of the question.
+    external: bool,
 }
 
 impl Searx {
@@ -584,14 +587,45 @@ impl Searx {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-        Searx { base }
+        Searx {
+            base,
+            external: external_from(std::env::var("HADES_EXTERNAL_SEARCH").ok().as_deref()),
+        }
     }
+
+    /// Set the fallback for this instance, from the config or a one-run flag.
+    pub fn with_external(mut self, external: bool) -> Searx {
+        self.external = external;
+        self
+    }
+
+    /// What the receipt should say the search was.
+    pub fn backend(&self) -> &'static str {
+        if self.external {
+            "local+jina (external permitted)"
+        } else {
+            "local (external fallback off)"
+        }
+    }
+}
+
+/// `HADES_EXTERNAL_SEARCH=1` is the environment form of the switch; anything else, including an unset
+/// variable, is off. An explicit "0" has to mean off rather than "present, so on".
+fn external_from(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1") | Some("true") | Some("yes"))
+}
+
+/// Whether a search may call the external fallback: only when it was permitted, and only when the local
+/// instance did not answer the question. A permitted fallback never replaces a result that already sees two
+/// query terms.
+fn may_fall_back(external: bool, hits: &[SearchHit], query: &str) -> bool {
+    external && !relevant(hits, query)
 }
 
 impl Web for Searx {
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
         let hits = self.search_searx(query, limit)?;
-        if relevant(&hits, query) {
+        if !may_fall_back(self.external, &hits, query) {
             return Ok(hits);
         }
         // The local SearXNG instance can be healthy and still answer with a single-token match
@@ -2719,6 +2753,51 @@ fn completion_text(completion: &Completion) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hit(title: &str, url: &str) -> SearchHit {
+        SearchHit {
+            title: title.to_string(),
+            url: url.to_string(),
+            snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_external_fallback_is_off_by_default_and_only_one_spelling_turns_it_on() {
+        assert!(!external_from(None));
+        assert!(!external_from(Some("")));
+        assert!(!external_from(Some("0")));
+        assert!(!external_from(Some("no")));
+        assert!(external_from(Some("1")));
+        assert!(external_from(Some(" true ")));
+        let searx = Searx {
+            base: "http://127.0.0.1:8080".into(),
+            external: false,
+        };
+        assert!(searx.backend().starts_with("local ("));
+        assert!(
+            searx
+                .with_external(true)
+                .backend()
+                .starts_with("local+jina")
+        );
+    }
+
+    #[test]
+    fn a_weak_local_result_does_not_reach_out_unless_it_was_permitted() {
+        // The property the finding was about: a local instance that answers badly must not become a
+        // third-party request on its own.
+        assert!(!may_fall_back(false, &[], "llama.cpp vulkan rdna1"));
+        assert!(may_fall_back(true, &[], "llama.cpp vulkan rdna1"));
+    }
+
+    #[test]
+    fn a_result_that_sees_two_query_terms_is_never_replaced() {
+        // Even with the fallback permitted, a set that answers the question is the answer. The fallback is
+        // for a failed search, not for a search a person might like better.
+        let hits = vec![hit("llama.cpp Vulkan RDNA1", "https://example.test/a")];
+        assert!(!may_fall_back(true, &hits, "llama.cpp vulkan rdna1"));
+    }
 
     fn source() -> Source {
         Source {

@@ -159,7 +159,11 @@ fn a_toolchain_path_that_is_the_home_or_above_it_is_refused() {
             .grants_read(Path::new("/"))
     );
     let missing = base.join("home/does-not-exist");
-    assert!(!cage.with_runtime_paths([missing.clone()]).grants_read(&missing));
+    assert!(
+        !cage
+            .with_runtime_paths([missing.clone()])
+            .grants_read(&missing)
+    );
 }
 
 #[test]
