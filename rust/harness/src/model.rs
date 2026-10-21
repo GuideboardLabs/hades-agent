@@ -58,10 +58,28 @@ pub trait Harness {
         feed: Option<FeedFn<'_>>,
     ) -> Result<ModelAnswer, Fault>;
 
-    /// A plan, before any program. Separate from `run` because it is prose, not an answer, and because a
-    /// plan-first turn has to record it before the call that can change the tree. A harness that cannot
+    /// A plan, before any program. Separate from `run` because it is prose, not an answer, and because
+    /// a plan-first turn has to record it before the call that can change the tree. A harness that cannot
     /// plan returns an empty string, which the turn treats as nothing written.
     fn plan(&self, task: &TaskSpec, bundle: &Bundle, budget: &Budget) -> Result<String, Fault>;
+
+    /// A plain completion with the caller's own system prompt. Research uses this because its planner and
+    /// extractor are not code turns: no program, no check, just one question and one answer. The default
+    /// refuses, so a new harness cannot silently pretend it can answer one.
+    fn complete(&self, _system: &str, _user: &str, _budget: &Budget) -> Result<Completion, Fault> {
+        Err(Fault::model(
+            "this harness cannot answer a plain completion".to_string(),
+        ))
+    }
+}
+
+/// One completion and what it cost, when the endpoint reports cost. Separate from `ModelAnswer` because a
+/// research planner is prose, not a program, and pretending it is a draft would put it through the edit
+/// parser.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    pub text: String,
+    pub usage: Option<Usage>,
 }
 
 /// Answers from a queue, in order.
@@ -136,6 +154,21 @@ impl Harness for Scripted {
             .expect("the script lock")
             .pop_front()
             .ok_or_else(|| Fault::model("the script had no answer left, so no program was written"))
+    }
+
+    fn complete(&self, _system: &str, _user: &str, _budget: &Budget) -> Result<Completion, Fault> {
+        let answer = self
+            .answers
+            .lock()
+            .expect("the script lock")
+            .pop_front()
+            .ok_or_else(|| {
+                Fault::model("the script had no answer left, so no completion was made")
+            })?;
+        Ok(Completion {
+            text: answer.program().to_string(),
+            usage: answer.usage(),
+        })
     }
 }
 
@@ -471,6 +504,30 @@ impl Harness for OpenAi {
     /// the harness text must not make the model write a program here.
     fn plan(&self, task: &TaskSpec, bundle: &Bundle, _budget: &Budget) -> Result<String, Fault> {
         self.named(self.write_plan(task, bundle))
+    }
+
+    fn complete(&self, system: &str, user: &str, _budget: &Budget) -> Result<Completion, Fault> {
+        let messages = serde_json::json!([
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ]);
+        // A plain completion still has a cost. A local clone with a usage log makes the request ask
+        // for `stream_options.include_usage`; without the log the endpoint is allowed to omit `usage`,
+        // and the research ledger would read zero for a call that was not free.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = self.clone().with_usage_log(log.clone());
+        let reply = client.chat(
+            messages.as_array().expect("an array of messages"),
+            None,
+            &|_, _| {},
+        )?;
+        let usage = reply
+            .usage
+            .or_else(|| log.lock().ok().and_then(|entries| entries.last().copied()));
+        Ok(Completion {
+            text: reply.content.trim().to_string(),
+            usage,
+        })
     }
 
     /// Stream when the endpoint streams, and fall back to one POST when it does not.

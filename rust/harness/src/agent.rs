@@ -2308,20 +2308,83 @@ fn urlencode(text: &str) -> String {
 
 /// Coarse: a person reading a page does not need the tag soup, and the model needs the words.
 pub fn strip_html(text: &str) -> String {
+    // A page's visible text is not its byte stream. Script and style bodies are code, not prose, and
+    // an inline JSON island is data, not a sentence. Drop those blocks before removing tags; a
+    // naive tag stripper turns a JavaScript-heavy page into a wall of code that looks like evidence.
+    let bytes = text.as_bytes();
     let mut out = String::new();
-    let mut in_tag = false;
-    for ch in text.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'<' {
+            if starts_with_ci(bytes, index, b"<!--") {
+                index = find_ci(bytes, index + 4, b"-->").map_or(bytes.len(), |at| at + 3);
+                continue;
+            }
+            let mut skip_to = None;
+            for (open, close) in [
+                (b"<script".as_slice(), b"</script".as_slice()),
+                (b"<style".as_slice(), b"</style".as_slice()),
+                (b"<noscript".as_slice(), b"</noscript".as_slice()),
+                (b"<template".as_slice(), b"</template".as_slice()),
+                (b"<svg".as_slice(), b"</svg".as_slice()),
+                (b"<iframe".as_slice(), b"</iframe".as_slice()),
+            ] {
+                if starts_with_ci(bytes, index, open) {
+                    let after_open = index + open.len();
+                    skip_to = Some(match find_ci(bytes, after_open, close) {
+                        Some(at) => find_byte(bytes, at + close.len(), b'>')
+                            .map_or(bytes.len(), |end| end + 1),
+                        // A self-closing block (`<svg ... />`) has no closing tag. Drop the tag,
+                        // not the rest of the page.
+                        None => {
+                            find_byte(bytes, after_open, b'>').map_or(bytes.len(), |end| end + 1)
+                        }
+                    });
+                    break;
+                }
+            }
+            if let Some(next) = skip_to {
+                index = next;
+                continue;
+            }
+
+            let name = tag_name(bytes, index);
+            if matches!(
+                name.as_str(),
+                "p" | "div"
+                    | "br"
+                    | "li"
+                    | "tr"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "section"
+                    | "article"
+                    | "header"
+                    | "footer"
+                    | "pre"
+                    | "blockquote"
+            ) {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            index = find_byte(bytes, index + 1, b'>').map_or(bytes.len(), |end| end + 1);
+            continue;
         }
+        let ch = text[index..].chars().next().expect("a char boundary");
+        out.push(ch);
+        index += ch.len_utf8();
     }
+
+    let decoded = decode_entities(&out);
     let mut cleaned = String::new();
     let mut blank = 0;
-    for line in out.lines() {
-        let line = line.trim();
+    for line in decoded.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.is_empty() {
             blank += 1;
             if blank > 1 {
@@ -2330,10 +2393,61 @@ pub fn strip_html(text: &str) -> String {
         } else {
             blank = 0;
         }
-        cleaned.push_str(line);
+        cleaned.push_str(&line);
         cleaned.push('\n');
     }
-    cleaned
+    cleaned.trim_start_matches('\n').to_string()
+}
+
+fn starts_with_ci(bytes: &[u8], at: usize, needle: &[u8]) -> bool {
+    bytes.len() >= at + needle.len()
+        && bytes[at..at + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn find_ci(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || from >= bytes.len() {
+        return None;
+    }
+    (from..=bytes.len().saturating_sub(needle.len())).find(|at| starts_with_ci(bytes, *at, needle))
+}
+
+fn find_byte(bytes: &[u8], from: usize, byte: u8) -> Option<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, found)| **found == byte)
+        .map(|(at, _)| at)
+}
+
+fn tag_name(bytes: &[u8], open: usize) -> String {
+    let mut at = open + 1;
+    if bytes.get(at) == Some(&b'/') {
+        at += 1;
+    }
+    let mut name = String::new();
+    while let Some(byte) = bytes.get(at) {
+        if byte.is_ascii_alphanumeric() {
+            name.push(byte.to_ascii_lowercase() as char);
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    name
+}
+
+fn decode_entities(text: &str) -> String {
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
 }
 
 /// Look at a picture with the local vision pair. The path answers to the same `World::policy` the other

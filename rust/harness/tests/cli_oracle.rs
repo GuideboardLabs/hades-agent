@@ -113,6 +113,7 @@ fn the_vault_can_be_built_from_the_cli() {
     );
 
     let (code, text) = hades(&[
+        "note",
         "research",
         "technical/ai-inference",
         "KV cache at 32K",

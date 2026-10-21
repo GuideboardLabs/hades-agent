@@ -73,6 +73,7 @@ pub mod policy;
 pub mod profile;
 pub mod question;
 pub mod repomap;
+pub mod research;
 pub mod retry;
 pub mod route;
 pub mod ruler;

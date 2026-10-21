@@ -148,13 +148,27 @@ hades — the harness, one turn or a whole graph
   hades version
       the version of this build (`--version` and `-V` are the same)
 
+  hades research <question> [--queries 12] [--sources 12] [--fetches 24]
+                 [--minutes 60] [--claims 3] [--state <dir>] [--json]
+      one evidence-first run: plan, search, fetch, extract, verify. Every published
+      claim cites a byte-verified quote in a stored source. The check proves
+      provenance, not truth
+
+  hades research check <run-id> | show <run-id> | list [--state <dir>]
+      re-read a run without asking a model; check exits 0 green, 1 red, 2 unreadable
+
+  hades note research <topic> <title...> [--slug <slug>] [--source-url <url>]
+                     [--summary <text>] [--provenance <text>] [--vault <dir>]
+                     [--db <file>] [--config <file>]
+      write one durable finding under an existing topic
+
+  hades note topic|project|product ...   the creation verbs; `hades topic`,
+                                          `hades project` and `hades product`
+                                          remain as aliases
+
   hades topic <category> <name...> [--parent <topic>] [--summary <text>]
               [--provenance <text>] [--vault <dir>] [--db <file>] [--config <file>]
       create a general topic under one of the 26 categories, or a subtopic with --parent
-
-  hades research <topic> <title...> [--slug <slug>] [--source-url <url>] [--summary <text>]
-                 [--provenance <text>] [--vault <dir>] [--db <file>] [--config <file>]
-      write one durable finding under an existing topic
 
   hades project <name...> --topic <topic> --research <ref> [--research <ref>]...
                 [--summary <text>] [--provenance <text>] [--vault <dir>] [--db <file>]
@@ -380,7 +394,8 @@ fn dispatch(
         "audit" => audit(rest),
         "init" => init(rest, out, input),
         "topic" => create_topic_cmd(rest),
-        "research" => create_research_cmd(rest),
+        "note" => note_cmd(rest),
+        "research" => research_cmd(rest),
         "project" => create_project_cmd(rest),
         "product" => create_product_cmd(rest),
         "service" => service(rest),
@@ -3456,6 +3471,192 @@ fn create_topic_cmd(args: &[String]) -> Result<(String, i32), String> {
         )
         .map_err(|fault| fault.to_string())?;
     Ok((created_text(&vault, &path), 0))
+}
+
+/// `hades note <kind> ...`: the creation verbs live under one noun.
+fn note_cmd(args: &[String]) -> Result<(String, i32), String> {
+    match args.first().map(String::as_str) {
+        Some("topic") => create_topic_cmd(&args[1..]),
+        Some("research") => create_research_cmd(&args[1..]),
+        Some("project") => create_project_cmd(&args[1..]),
+        Some("product") => create_product_cmd(&args[1..]),
+        Some(other) => Err(format!(
+            "there is no note kind `{other}`: try topic, research, project or product"
+        )),
+        None => Err("note needs a kind: topic, research, project or product".to_string()),
+    }
+}
+
+/// `hades research "<question>"`: one evidence-first run. The note-creation verb moved to
+/// `hades note research`; this name is the engine.
+fn research_cmd(args: &[String]) -> Result<(String, i32), String> {
+    match args.first().map(String::as_str) {
+        Some("check") => research_check_cmd(&args[1..]),
+        Some("show") => research_show_cmd(&args[1..]),
+        Some("list") => research_list_cmd(&args[1..]),
+        _ => research_run_cmd(args),
+    }
+}
+
+fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "config",
+            "state",
+            "model",
+            "endpoint",
+            "key",
+            "temperature",
+            "max-tokens",
+            "thinking",
+            "sources",
+            "fetches",
+            "queries",
+            "minutes",
+            "claims",
+        ],
+        &["json"],
+    )?;
+    let question = flags.positional.join(" ");
+    if question.trim().is_empty() {
+        return Err("research needs a question. Try `hades research \"<question>\"`".to_string());
+    }
+    let state = state_of(&flags)?;
+    let config = config_of(&flags)?;
+    let answerer = answerer(&flags, config.as_ref(), None, None)?;
+    let budget = crate::research::ResearchBudget {
+        queries: number(&flags, "queries", 12)?,
+        fetches: number(&flags, "sources", number(&flags, "fetches", 24)?)?,
+        minutes: number(&flags, "minutes", 60)? as u64,
+        claims_per_source: number(&flags, "claims", 3)?,
+    };
+    let store = crate::research::Store::new(&state);
+    let planner = crate::research::ModelPlanner {
+        harness: answerer.harness(),
+    };
+    let extractor = crate::research::ModelExtractor {
+        harness: answerer.harness(),
+    };
+    let web = crate::research::Searx::from_env();
+    let engine = crate::research::Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+    };
+    let run = engine.run(&question, budget)?;
+    let check = crate::research::check(&store, &run.id)?;
+
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&run)
+            .map_err(|error| format!("could not encode the run: {error}"))?;
+        return Ok((
+            format!("{text}\n"),
+            if run.status == crate::research::RunStatus::Published {
+                0
+            } else {
+                1
+            },
+        ));
+    }
+
+    let mut text = format!(
+        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nsources: {}\nclaims: {}\nverified quotes: {}\nmodel tokens: planner {}+{}, extractor {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
+        run.id,
+        run.status,
+        run.question,
+        answerer.describe(),
+        run.usage.searches,
+        run.usage.fetches,
+        run.usage.sources,
+        run.usage.claims,
+        check.verified,
+        run.usage.planner_prompt_tokens,
+        run.usage.planner_generated_tokens,
+        run.usage.extractor_prompt_tokens,
+        run.usage.extractor_generated_tokens,
+        run.usage.elapsed_ms,
+        store.dir(&run.id).display(),
+        store.dir(&run.id).join("report.md").display(),
+    );
+    if !check.failures.is_empty() {
+        text.push_str("\ncheck failures:\n");
+        for failure in &check.failures {
+            text.push_str(&format!("  - {failure}\n"));
+        }
+    }
+    Ok((text, check.exit()))
+}
+
+fn research_check_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse(args, &["state"])?;
+    let id = flags
+        .positional
+        .first()
+        .ok_or_else(|| "research check needs a run id".to_string())?;
+    let store = crate::research::Store::new(&state_of(&flags)?);
+    let check = crate::research::check(&store, id)?;
+    let mut text = format!("{}: {} verified quote(s)\n", id, check.verified);
+    for failure in &check.failures {
+        text.push_str(&format!("- {failure}\n"));
+    }
+    if check.code == crate::research::CheckCode::Green {
+        text.push_str("check: green\n");
+    } else if check.code == crate::research::CheckCode::Red {
+        text.push_str("check: red\n");
+    } else {
+        text.push_str("check: unreadable\n");
+    }
+    Ok((text, check.exit()))
+}
+
+fn research_show_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse(args, &["state"])?;
+    let id = flags
+        .positional
+        .first()
+        .ok_or_else(|| "research show needs a run id".to_string())?;
+    let store = crate::research::Store::new(&state_of(&flags)?);
+    let run = store.load(id)?;
+    let report = run
+        .report
+        .clone()
+        .or_else(|| std::fs::read_to_string(store.dir(id).join("report.md")).ok())
+        .unwrap_or_else(|| "(no report)".to_string());
+    Ok((report, 0))
+}
+
+fn research_list_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse(args, &["state"])?;
+    let store = crate::research::Store::new(&state_of(&flags)?);
+    let ids = store.list();
+    if ids.is_empty() {
+        return Ok(("no research runs\n".to_string(), 0));
+    }
+    let mut text = String::new();
+    for id in ids {
+        match store.load(&id) {
+            Ok(run) => text.push_str(&format!(
+                "{id}  {:?}  {}  ({} claims, {} sources)\n",
+                run.status,
+                run.question,
+                run.claims.len(),
+                run.sources.len()
+            )),
+            Err(error) => text.push_str(&format!("{id}  unreadable: {error}\n")),
+        }
+    }
+    Ok((text, 0))
+}
+
+fn number(flags: &Flags, name: &str, default: usize) -> Result<usize, String> {
+    match flags.named.get(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("`--{name} {value}` is not a number")),
+    }
 }
 
 /// `hades research <topic> <title>`: a durable finding under an existing topic.

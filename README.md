@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.14-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-903%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.15-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-919%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.14 |
+| **Version** | 0.0.15 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,23 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 903 passing, 13 ignored live tests |
+| **Tests** | 919 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.15 adds
+
+Research is an evidence-first run, not a chat that summarizes links.
+
+- **`hades research <question>`** plans subquestions, searches, fetches, extracts and checks. Each worker gets one subquestion and one source; the run owns the state, so nothing depends on a growing conversation.
+- **Every published claim carries a byte-verified quote.** `report.md` and `report.json` cite claims, and `hades research check <run-id>` re-reads the stored canonical text and compares the byte range. Exit 0 is green, 1 is a bad quote or missing citation, 2 is an unreadable source.
+- **A run is a directory, not a transcript.** `run.json`, `assignments.jsonl`, `evidence.jsonl`, `failures.jsonl`, `sources/`, `report.md` and `report.json` live under `<state>/research/<run-id>/`. `hades research list` and `show` read it without asking a model.
+- **The source gate refuses snippets and empty pages.** A source needs an HTTP URL, a body of at least 400 characters and a hash; a search snippet is never evidence.
+- **`hades note research`** is now the vault-note verb. `hades note topic|project|product` are the same creation verbs, and the old top-level `topic`, `project` and `product` names remain aliases.
+- **The HTML parser drops code before prose.** Script, style, noscript, template, SVG and iframe bodies are removed before tags, so a JavaScript-heavy page is not mistaken for a wall of evidence.
+- **Search falls back when the local result set is blind.** If SearXNG cannot match two query terms, Hades reads DuckDuckGo's HTML results through Jina Reader rather than treating a single-token match as a source.
+
+The check proves provenance, not truth. A quote can be real while the claim around it overgeneralizes; the report says so, and the extractor prompt now requires platform, driver, version and condition qualifiers to survive into the claim.
 
 ## What 0.0.14 adds
 
@@ -89,7 +103,7 @@ The limits left by 0.0.11 are closed, or written down where they are decisions.
 
 The vault can be built from the command line, and its links are resolved rather than declared.
 
-- **Four creation verbs.** `hades topic <category> <name...> [--parent <topic>]`, `hades research <topic> <title>`, `hades project <name> [--topic <topic>] [--research <ref>...]`, and `hades product <name> --from <project>` write through `Vault`, so the CLI cannot author a note the store would refuse. Each refreshes `INDEX.md`.
+- **Four creation verbs.** `hades topic <category> <name...> [--parent <topic>]`, `hades research <topic> <title>` (now `hades note research`; the top-level name is the engine), `hades project <name> [--topic <topic>] [--research <ref>...]`, and `hades product <name> --from <project>` write through `Vault`, so the CLI cannot author a note the store would refuse. Each refreshes `INDEX.md`.
 - **A reference resolves to one note.** `research: [...]` and `from_project:` accept the full record path (`technical/ai-inference/kv-cache/kv-cache-at-32k`), the slug below its area (`kv-cache-at-32k`), or a bare trailing name (`kv-cache-at-32k`). A bare name two notes share is refused as ambiguous instead of guessing.
 - **A dangling link is a finding, not a crash.** `hades audit` reports `dangling_research` and `dangling_project` with the missing name and the note that named it. `hades audit --vault` imports leniently for exactly this reason; `hades mneme import` stays strict.
 - **An import reads the whole tree before it writes a row.** A tree that would leave an unresolvable reference is refused with zero rows written, including when the research note sorts after the project that names it.

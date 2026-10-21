@@ -83,8 +83,10 @@ v1 rebuild dropped, files a legacy flat topic under `general`, and each research
 its first topic tag as its primary topic. Run `hades mneme upgrade --retire-old` to write the new tree
 (`40 Products` and `50 Topics`) and move the stale `40 Topics` folder to `mneme-archive/`.
 
-The vault is built with `hades topic`, `hades research`, `hades project` and `hades product`; each goes
-through `Vault`, so the command cannot author a note the store would refuse. A `research:` reference may
+The vault is built with `hades note topic`, `hades note research`, `hades note project` and
+`hades note product`; each goes through `Vault`, so the command cannot author a note the store would
+refuse. The top-level `hades topic`, `hades project` and `hades product` names remain aliases;
+`hades research` is the research engine, not the note verb. A `research:` reference may
 be the full record path, the slug below `20 Research`, or a bare trailing name, and a bare name two notes
 share is refused. The audit reports a reference that resolves to nothing as `dangling_research` or
 `dangling_project` rather than aborting.
@@ -94,6 +96,24 @@ share is refused. The audit reports a reference that resolves to nothing as `dan
 `hades audit --vault <dir>` imports a markdown tree into a throwaway record and audits that, which is how
 a hand-edited tree is checked without touching the record. A fresh home audits clean: six empty areas, a
 charter and an index.
+
+## Research
+
+`hades research <question>` is one evidence-first run. The planner returns bounded subquestions; each
+worker sees one subquestion and one source, never another worker's conversation. The run owns the state
+under `<state>/research/<run-id>/`: `run.json`, `assignments.jsonl`, `evidence.jsonl`, `failures.jsonl`,
+`sources/`, `report.md` and `report.json`.
+
+A source is admitted only when it has an HTTP URL, a body of at least 400 characters and a hash. Every
+sourced claim cites a byte range into the stored canonical text, and `hades research check <run-id>`
+re-reads that file and compares the bytes. The check exits 0 for green, 1 for a bad quote or a missing
+citation, and 2 when a source cannot be read. It proves provenance, not truth: a real quote can still be
+wrapped in a claim that overgeneralizes.
+
+The canonical text is stripped HTML, not the raw response; the parser version is stored with each source.
+Script, style, noscript, template, SVG and iframe bodies are removed before tags. If the local SearXNG
+result set does not match two query terms, search falls back to DuckDuckGo's HTML endpoint through Jina
+Reader. Both the parser and the fallback are dependencies the run records, not silent assumptions.
 
 ## Installing
 
@@ -461,8 +481,14 @@ These are decisions, not omissions. Each has a reason and the seam it would chan
   terminal instead.
 - **Telegram is the only transport.** Discord is deferred; `gateway/` is transport-shaped, so it can land
   without moving the core.
-- **The network is open or closed per role.** There is no per-domain egress proxy. Research must say this
-  before it widens a fetch tool.
+- **The network is open or closed per role.** There is no per-domain egress proxy. Research fetches
+  through the same gate as any other fetch, and a search fallback is a network dependency the run
+  records rather than a policy change.
+- **The provenance check is not a truth check.** A quote can verify while the claim around it adds a
+  condition the source never stated. The extractor prompt asks the claim to keep platform, driver,
+  version and condition qualifiers, but that is a prompt-level control, not a structural guarantee.
+- **A social URL is refused today.** The gate requires a linked artifact, and artifact-link extraction
+  is 0.0.16; until then an X post cannot be a source on its own.
 - **Hades writes only its own vault.** WEFT is read by its owner, not by Hades; `mneme export` is the
   one-way path.
 - **`skills report` says which numbers are unmeasured.** It does not estimate them.
