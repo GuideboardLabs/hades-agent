@@ -376,10 +376,12 @@ impl Session {
         // socket directory" when that directory does not exist, so the paths are made here and the
         // variable is set below. The paths are resolved and checked under `<state>/browser` first.
         let StatePaths {
-            profile,
+            profile: state_profile,
             downloads,
-            tmp,
+            tmp: state_tmp,
         } = state_paths(state)?;
+        let (profile, tmp) = (state_profile, state_tmp);
+        chromium_path_check(&tmp)?;
 
         let (to_child, child_read) = UnixStream::pair()
             .map_err(|error| format!("could not make the command pipe: {error}"))?;
@@ -445,21 +447,52 @@ impl Session {
                 command.arg(format!("--fingerprint-webrtc-ip={ip}"));
             }
         }
+        // Chromium's own words are the only account of a launch that fails before the first CDP reply, and
+        // discarding them turned a named error into "the browser closed the pipe". The log is always kept,
+        // truncated on each launch, because the launch that fails is the one whose words matter.
+        let log = state.join("browser").join("chromium.log");
+        let stderr = match std::fs::File::create(&log) {
+            Ok(file) => Stdio::from(file),
+            Err(_) => Stdio::null(),
+        };
+        // Operator diagnostics only: extra Chromium flags for a host whose launch fails and whose log is not
+        // enough. Never set by the model, and never persisted.
+        if let Ok(extra) = std::env::var("HADES_CHROME_EXTRA") {
+            for flag in extra.split_whitespace() {
+                command.arg(flag);
+            }
+        }
         command
             .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         unsafe {
             command.pre_exec(move || {
+                // `dup2` onto the same descriptor is a no-op, and the pair was created close-on-exec: a pipe
+                // whose end already sat on 3 or 4 would stay close-on-exec and be gone by the time Chromium
+                // looked for it. Clearing the flag is what makes "the descriptor is on 3" true after exec.
                 if dup2(child_read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if fcntl(3, F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if dup2(child_write_fd, 4) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                if fcntl(4, F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
+        }
+        if std::env::var("HADES_BROWSER_DEBUG").as_deref() == Ok("1") {
+            eprintln!(
+                "browser: {} {:?} (fds {child_read_fd}->3, {child_write_fd}->4)",
+                binary.display(),
+                launch
+            );
         }
         let child = command
             .spawn()
@@ -503,7 +536,26 @@ impl Session {
             policy,
         };
 
-        let version = session.call("Browser.getVersion", json!({}), None)?;
+        let version = match session.call("Browser.getVersion", json!({}), None) {
+            Ok(version) => version,
+            Err(said) => {
+                // A launch that died before the first reply has a reason, and it is in the log. "The browser
+                // closed the pipe" is the symptom; the sandbox, a missing library or a locked profile is the
+                // cause, and an operator cannot act on the symptom.
+                let complaint = chromium_complaint(state);
+                let status = match session.child.try_wait() {
+                    Ok(Some(status)) => Some(format!("exit {status}")),
+                    _ => None,
+                };
+                session.close();
+                return Err(match (complaint, status) {
+                    (Some(complaint), Some(status)) => format!("{said} ({status}): {complaint}"),
+                    (Some(complaint), None) => format!("{said}: {complaint}"),
+                    (None, Some(status)) => format!("{said} ({status})"),
+                    (None, None) => said,
+                });
+            }
+        };
         let product = version
             .get("product")
             .and_then(Value::as_str)
@@ -2588,6 +2640,26 @@ impl Session {
 /// Extracted so the sandbox question is a test rather than a line buried in a constructor. Chromium's
 /// sandbox is the boundary between a page and the account running the browser; a product that disables it
 /// by default has traded that boundary for convenience on one machine.
+/// The last thing Chromium said before it died, minus the crashpad noise it emits on every host.
+///
+/// The launch log is written to `<state>/browser/chromium.log` on every start. This reads it back only when
+/// the first CDP call fails, so a healthy launch pays nothing.
+fn chromium_complaint(state: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(state.join("browser").join("chromium.log")).ok()?;
+    text.lines()
+        .rev()
+        .find(|line| {
+            !line.contains("crashpad") && (line.contains(":FATAL:") || line.contains(":ERROR:"))
+        })
+        .map(|line| {
+            // Drop the timestamp and pid prefix: `[pid:tid:date:time:SEVERITY:file] message`.
+            match line.find("] ") {
+                Some(index) => line[index + 2..].trim().to_string(),
+                None => line.trim().to_string(),
+            }
+        })
+}
+
 fn launch_args(headed: bool, no_sandbox: bool) -> Vec<String> {
     let mut args = Vec::new();
     if !headed {
@@ -2597,19 +2669,8 @@ fn launch_args(headed: bool, no_sandbox: bool) -> Vec<String> {
     if no_sandbox {
         args.push("--no-sandbox".to_string());
     }
-    args.extend(
-        [
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-            "--disable-component-update",
-            "--disable-sync",
-            "--window-size=1440,900",
-        ]
-        .iter()
-        .map(|argument| argument.to_string()),
-    );
+    let optional: [&str; 0] = [];
+    args.extend(optional.iter().map(|argument| argument.to_string()));
     args
 }
 
@@ -2621,6 +2682,34 @@ fn no_sandbox_requested() -> bool {
     std::env::var("HADES_BROWSER_NO_SANDBOX")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// The longest Unix socket path the kernel accepts: `sun_path` is 108 bytes including the terminator.
+const SUN_PATH_MAX: usize = 107;
+
+/// What Chromium appends to `TMPDIR` for its process-singleton socket.
+///
+/// It is a fixed string plus a six-character suffix, so the room left for `TMPDIR` is what decides whether a
+/// state directory can host a browser at all.
+const CHROMIUM_SOCKET: &str = "/.org.chromium.Chromium.XXXXXX/SingletonSocket";
+
+/// Check that `TMPDIR` leaves room for Chromium's socket before a launch is attempted.
+///
+/// Chromium binds a Unix socket under `TMPDIR`; when the path is longer than the kernel allows, `bind` fails
+/// inside Chromium and it aborts with `SIGTRAP` and no message, which reads as "the browser closed the pipe"
+/// from here. Measured on this machine: a state directory of 88 characters died this way, 61 or fewer worked.
+/// Refusing here names the number instead of letting a trap explain it.
+fn chromium_path_check(tmp: &Path) -> Result<(), String> {
+    let length = tmp.to_string_lossy().len() + CHROMIUM_SOCKET.len();
+    if length > SUN_PATH_MAX {
+        return Err(format!(
+            "the browser cannot start: {} is {} characters, and Chromium's socket needs {} more, past the              kernel's {SUN_PATH_MAX}-byte limit for a Unix socket. Use a shorter state directory (--state),              or point HADES_HOME at one.",
+            tmp.display(),
+            tmp.to_string_lossy().len(),
+            CHROMIUM_SOCKET.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Where a screenshot may be written: under the state's `shots` directory, and nowhere else.
@@ -2958,7 +3047,12 @@ fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
 
 unsafe extern "C" {
     fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
 }
+
+/// `F_SETFD`, from `fcntl.h`. The number is the same on every architecture Linux supports, but it is named
+/// so a reader does not have to look it up.
+const F_SETFD: i32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -2997,6 +3091,48 @@ mod tests {
     /// Unprivileged user namespaces are refused here (`kernel.apparmor_restrict_unprivileged_userns` is 1),
     /// so the fixture opts out explicitly and the product default stays sandboxed. Taking both in one place
     /// is what keeps a live test from failing for a reason that belongs to the host.
+    /// A state directory short enough for Chromium's socket.
+    ///
+    /// The cargo target directory is deep (`…/hades-target/scratch/process-N/…`), and Chromium aborts with a
+    /// bare `SIGTRAP` when its socket path passes 107 bytes. The test state lives in `/tmp` so the suite
+    /// tests the browser rather than the length of the build directory; `chromium_path_check` is what refuses
+    /// a long state in production, and it has its own test.
+    fn live_state(name: &str) -> PathBuf {
+        let state =
+            PathBuf::from("/tmp").join(format!("hades-browser-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).expect("a live state");
+        state
+    }
+
+    /// Set an environment variable for the length of a test and put it back on the way out, including when
+    /// the test panics. A leaked `HADES_HEADED` made every later live test launch headed Chromium with no
+    /// display, and the failures read as browser bugs rather than as one test's leftovers.
+    struct EnvVar(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvVar {
+        fn set(name: &'static str, value: &str) -> EnvVar {
+            let previous = std::env::var_os(name);
+            // SAFETY: every live test holds LIVE, so no other test reads or writes the environment here.
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            EnvVar(name, previous)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            // SAFETY: same lock as above.
+            unsafe {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+
     fn live() -> std::sync::MutexGuard<'static, ()> {
         // SAFETY: every test that starts a browser holds this lock, and nothing reads the variable while
         // another test runs.
@@ -3072,6 +3208,28 @@ mod tests {
     }
 
     #[test]
+    fn a_state_too_deep_for_chromiums_socket_is_refused_with_the_numbers() {
+        // Chromium binds `<TMPDIR>/.org.chromium.Chromium.XXXXXX/SingletonSocket`; past 107 bytes the bind
+        // fails inside Chromium and it aborts without a message. The check has to happen here, where the
+        // reason can be printed.
+        let short = Path::new("/tmp/hades/tmp");
+        assert!(chromium_path_check(short).is_ok());
+        let long = Path::new(
+            "/tmp/aaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccc/dddddddddddddddddddd/tmp",
+        );
+        let error = chromium_path_check(long).expect_err("a socket path past the limit");
+        assert!(error.contains("107"), "{error}");
+        assert!(error.contains("shorter state"), "{error}");
+        // The boundary: exactly at the limit passes, one byte more fails.
+        let room = SUN_PATH_MAX - CHROMIUM_SOCKET.len();
+        let exact = format!("/tmp/{}", "x".repeat(room - 5));
+        assert_eq!(exact.len() + CHROMIUM_SOCKET.len(), SUN_PATH_MAX);
+        assert!(chromium_path_check(Path::new(&exact)).is_ok());
+        let over = format!("/tmp/{}", "x".repeat(room - 4));
+        assert!(chromium_path_check(Path::new(&over)).is_err());
+    }
+
+    #[test]
     fn a_screenshot_decodes() {
         let bytes = base64_decode("aGVsbG8=").expect("base64");
         assert_eq!(bytes, b"hello");
@@ -3097,9 +3255,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_is_observable() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live");
         let opened = tool(
             &json!({"action": "open", "url": "https://example.com"}),
             &state,
@@ -3115,9 +3271,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_can_be_clicked_and_typed() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-actions");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-actions");
         allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
@@ -3174,9 +3328,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_popup_becomes_a_tab_the_model_can_switch_to() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-tabs");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-tabs");
         allow_local(&state);
         let second = state.join("second.html");
         std::fs::write(&second, "<title>second</title><p>second page</p>").expect("a page");
@@ -3211,9 +3363,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_dialog_is_handled_and_an_upload_lands() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-dialog");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-dialog");
         allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
@@ -3265,9 +3415,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_download_lands_in_the_state_directory() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-download");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-download");
         allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
@@ -3296,30 +3444,21 @@ mod tests {
     #[ignore = "starts a headed Chromium under a display; run with xvfb-run"]
     fn a_headed_browser_opens_a_page() {
         let _guard = live();
-        unsafe {
-            std::env::set_var("HADES_HEADED", "1");
-        }
-        let state = crate::scratch::root().join("browser-live-headed");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let _headed = EnvVar::set("HADES_HEADED", "1");
+        let state = live_state("live-headed");
         let opened = tool(
             &json!({"action": "open", "url": "https://example.com"}),
             &state,
         );
         assert!(opened.contains("title: Example Domain"), "{opened}");
         let _ = tool(&json!({"action": "close"}), &state);
-        unsafe {
-            std::env::remove_var("HADES_HEADED");
-        }
     }
 
     #[test]
     #[ignore = "starts a real Chromium and a cross-origin server; run with --ignored"]
     fn a_cross_origin_frame_can_be_observed_and_clicked() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-oopif");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-oopif");
         let site = state.join("site");
         std::fs::create_dir_all(&site).expect("a site");
         std::fs::write(
@@ -3425,9 +3564,7 @@ mod tests {
         unsafe {
             std::env::set_var("HADES_PROXY", format!("http://user:pass@127.0.0.1:{port}"));
         }
-        let state = crate::scratch::root().join("browser-live-proxy");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-proxy");
         let opened = tool(
             &json!({"action": "open", "url": "http://proxy.test/"}),
             &state,
@@ -3445,9 +3582,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_browser_context_isolates_its_tab() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-context");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-context");
         allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(&page, "<title>default</title><p>default</p>").expect("a page");
@@ -3456,8 +3591,12 @@ mod tests {
             &state,
         );
         assert!(opened.contains("title: default"), "{opened}");
+        // `data:` is refused by the scheme policy; an isolated context is tested with a page on disk, which is
+        // the same surface a real second context would open.
+        let other = state.join("other.html");
+        std::fs::write(&other, "<title>context</title><p>context</p>").expect("a page");
         let context = tool(
-            &json!({"action": "new_context", "url": "data:text/html,<title>context</title><p>context</p>"}),
+            &json!({"action": "new_context", "url": format!("file://{}", other.display())}),
             &state,
         );
         assert!(context.contains("title: context"), "{context}");
@@ -3498,9 +3637,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_same_origin_frame_can_be_observed_and_clicked() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-iframe");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-iframe");
         allow_local(&state);
         std::fs::write(
             state.join("inner.html"),
@@ -3538,9 +3675,7 @@ mod tests {
         unsafe {
             std::env::set_var("HADES_HUMANIZE", "1");
         }
-        let state = crate::scratch::root().join("browser-live-human");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-human");
         allow_local(&state);
         let page = state.join("page.html");
         std::fs::write(
@@ -3577,9 +3712,7 @@ mod tests {
     #[ignore = "starts a real Chromium and a local HTTP server; run with --ignored"]
     fn network_storage_and_cookies_are_visible() {
         let _guard = live();
-        let state = crate::scratch::root().join("browser-live-network");
-        let _ = std::fs::remove_dir_all(&state);
-        std::fs::create_dir_all(&state).expect("a scratch state");
+        let state = live_state("live-network");
         let site = state.join("site");
         std::fs::create_dir_all(&site).expect("a site");
         std::fs::write(
