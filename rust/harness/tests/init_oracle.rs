@@ -69,7 +69,8 @@ fn init_writes_a_config_a_vault_and_an_auditable_home() {
         "10 Outbox",
         "20 Research",
         "30 Projects",
-        "40 Topics",
+        "40 Products",
+        "50 Topics",
     ] {
         assert!(vault.join(area).is_dir(), "{area} is missing");
     }
@@ -86,8 +87,9 @@ fn init_writes_a_config_a_vault_and_an_auditable_home() {
     );
 
     let index = std::fs::read_to_string(vault.join("INDEX.md")).expect("an index");
-    assert!(index.starts_with("# Mneme index"), "{index}");
+    assert!(index.starts_with("# WEFT: index"), "{index}");
     assert!(index.contains("No topics yet"), "{index}");
+    assert!(vault.join("TAXONOMY.md").is_file(), "the taxonomy ships");
 
     let config = harness::config::load(&dir.join("config.json"))
         .expect("the config reads")

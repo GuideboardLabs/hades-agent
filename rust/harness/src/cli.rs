@@ -135,7 +135,7 @@ hades — the harness, one turn or a whole graph
   hades init [--non-interactive] [--config <file>] [--vault <dir>] [--root <dir>]
              [--model <preset>] [--provider <name>] [--name <name>] [--goal <text>]
              [--topics <a,b>] [--db <file>]
-      write the config, the record and the Mneme vault: five areas, the charter, a generated index
+      write the config, the record and the Mneme vault: six areas, the charter, a generated index
 
   hades service install [--prefix <dir>] [--home <dir>] [--out <dir>] [--force]
       write the two systemd user units for this install, rendered from the prefix and
@@ -3448,6 +3448,12 @@ fn mneme(args: &[String]) -> Result<(String, i32), String> {
                 .store()
                 .import_tree(&source, &[])
                 .map_err(|fault| fault.to_string())?;
+            // The index is a view of the record. An import that did not refresh it would leave a
+            // vault that audits correctly and reads as empty, which is the drift the map exists to
+            // prevent.
+            vault
+                .write_index(None, &[])
+                .map_err(|fault| fault.to_string())?;
             let mut text = format!("imported: {} from {}\n", report.imported, source.display());
             text.push_str(&format!("fenced: {}\n", report.fenced.len()));
             for path in &report.fenced {
@@ -3700,7 +3706,7 @@ fn init(
 /// An existing vault is refused; an empty directory is written into.
 ///
 /// The check is on content rather than existence because `mkdir -p` in an installer is not a vault, and
-/// refusing it would turn a harmless step into a failed install. A second `hades init` finds five areas
+/// refusing it would turn a harmless step into a failed install. A second `hades init` finds six areas
 /// and a charter in the directory, which is a vault by any reading.
 fn refuse_existing(vault: &Path) -> Result<(), String> {
     if !vault.exists() {

@@ -122,7 +122,12 @@ fn import_export_and_a_hand_edit_that_is_refused() {
         .expect("the inbox exists")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .map(|text| text.contains("The body."))
+                .unwrap_or(false)
+        })
         .expect("the note was exported");
     let canonical = std::fs::read_to_string(&exported).expect("read");
     assert!(canonical.contains("The body."), "{canonical}");

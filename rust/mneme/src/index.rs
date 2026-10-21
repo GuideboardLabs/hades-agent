@@ -1,4 +1,8 @@
 //! The index: a view of the frontmatter, so it can never drift from it.
+//!
+//! It reads like a WEFT map: the spine first (topics by category), then the work that hangs off it
+//! (research by topic), then what a project became (products), then the two queues. Markers are
+//! signage and are left out, so a fresh clone reads as empty rather than as six fake notes.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,43 +26,70 @@ pub fn render(
     inbox: &[Note],
     stale: &[Note],
 ) -> String {
-    let mut by_topic: BTreeMap<&str, Vec<&Note>> = BTreeMap::new();
-    let mut by_project: BTreeMap<&str, Vec<&Note>> = BTreeMap::new();
+    let area_of = |note: &Note| -> Option<Area> {
+        let relative = note.path.strip_prefix(root).ok()?;
+        let first = relative.components().next()?.as_os_str().to_string_lossy();
+        Area::ALL
+            .into_iter()
+            .find(|area| area.folder() == first.as_ref())
+    };
+
+    let mut topics: BTreeMap<&str, Vec<&Note>> = BTreeMap::new();
+    let mut research: BTreeMap<&str, Vec<&Note>> = BTreeMap::new();
+    let mut projects: Vec<&Note> = Vec::new();
+    let mut products: Vec<&Note> = Vec::new();
+    let mut outbox: Vec<&Note> = Vec::new();
+
     for note in notes {
-        let Ok(relative) = note.path.strip_prefix(root) else {
-            continue;
-        };
-        let Some(first) = relative.components().next() else {
-            continue;
-        };
-        let folder = first.as_os_str().to_string_lossy();
-        if folder.eq_ignore_ascii_case(Area::Inbox.folder()) {
+        if note.is_marker() {
             continue;
         }
-        for topic in note.topics() {
-            by_topic.entry(topic.as_str()).or_default().push(note);
-        }
-        for project in note.projects() {
-            by_project.entry(project.as_str()).or_default().push(note);
+        match area_of(note) {
+            Some(Area::Topics) => topics.entry(note.category()).or_default().push(note),
+            Some(Area::Research) => research.entry(note.topic()).or_default().push(note),
+            Some(Area::Projects) => projects.push(note),
+            Some(Area::Products) => products.push(note),
+            Some(Area::Outbox) => outbox.push(note),
+            _ => {}
         }
     }
 
     let mut lines: Vec<String> = vec![
-        "# Mneme index".to_string(),
+        "# WEFT: index".to_string(),
         String::new(),
         format!("Generated {generated} from note frontmatter. Do not edit."),
+        String::new(),
+        "The 26 categories are in [`TAXONOMY.md`](TAXONOMY.md). Every research note, project and \
+         product names a topic; every project names its research."
+            .to_string(),
         String::new(),
         "## Topics".to_string(),
         String::new(),
     ];
-    if by_topic.is_empty() {
+    if topics.is_empty() {
         lines.push(
-            "No topics yet. A topic is a note in `40 Topics`; everything else links to it."
+            "No topics yet. A topic is `50 Topics/<category>/<topic>/index.md`; everything else \
+             hangs off one."
                 .to_string(),
         );
         lines.push(String::new());
     } else {
-        for (topic, found) in &by_topic {
+        for (category, found) in &topics {
+            lines.push(format!("### {category} ({})", found.len()));
+            for note in found {
+                lines.push(entry_line(note, root, true));
+            }
+            lines.push(String::new());
+        }
+    }
+
+    lines.push("## Research".to_string());
+    lines.push(String::new());
+    if research.is_empty() {
+        lines.push("No research yet.".to_string());
+        lines.push(String::new());
+    } else {
+        for (topic, found) in &research {
             lines.push(format!("### {topic} ({})", found.len()));
             for note in found {
                 lines.push(entry_line(note, root, true));
@@ -69,25 +100,62 @@ pub fn render(
 
     lines.push("## Projects".to_string());
     lines.push(String::new());
-    if by_project.is_empty() {
+    if projects.is_empty() {
         lines.push("No projects yet.".to_string());
         lines.push(String::new());
     } else {
-        for (project, found) in &by_project {
-            lines.push(format!("### {project} ({})", found.len()));
-            for note in found {
-                lines.push(entry_line(note, root, false));
-            }
-            lines.push(String::new());
+        for note in &projects {
+            let research = note.research().len();
+            lines.push(format!(
+                "{} ({} research note(s))",
+                entry_line(note, root, true),
+                research
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    lines.push("## Products".to_string());
+    lines.push(String::new());
+    if products.is_empty() {
+        lines.push("No products yet. A product is a project that stopped moving.".to_string());
+        lines.push(String::new());
+    } else {
+        for note in &products {
+            lines.push(format!(
+                "{} (from `{}`{})",
+                entry_line(note, root, true),
+                note.from_project(),
+                if note.status().is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", note.status())
+                }
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    lines.push("## Outbox".to_string());
+    lines.push(String::new());
+    if outbox.is_empty() {
+        lines.push(
+            "Empty. Messages for other agents are left here, and nothing reads them yet."
+                .to_string(),
+        );
+    } else {
+        for note in outbox {
+            lines.push(entry_line(note, root, false));
         }
     }
+    lines.push(String::new());
 
     lines.push("## Inbox".to_string());
     lines.push(String::new());
     lines.push(format!(
         "{} candidate(s), {} stale after {INBOX_EXPIRY_DAYS} days.",
-        inbox.len(),
-        stale.len()
+        inbox.iter().filter(|note| !note.is_marker()).count(),
+        stale.iter().filter(|note| !note.is_marker()).count()
     ));
     lines.push(String::new());
     lines.join("\n")

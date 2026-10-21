@@ -92,6 +92,8 @@ fn curation(topics: &[&str], projects: &[&str], summary: &str, provenance: &str)
     Curation {
         topics: topics.iter().map(|topic| topic.to_string()).collect(),
         projects: projects.iter().map(|project| project.to_string()).collect(),
+        research: Vec::new(),
+        from_project: None,
         summary: summary.to_string(),
         provenance: provenance.to_string(),
     }
@@ -295,14 +297,14 @@ fn a_fenced_area_is_skipped_by_readers() {
             .expect("walk")
             .is_empty()
     );
-    assert_eq!(
-        curator
-            .vault()
-            .iter_notes(Some(Area::Research), &[])
-            .expect("walk")
-            .len(),
-        1
-    );
+    let real = curator
+        .vault()
+        .iter_notes(Some(Area::Research), &[])
+        .expect("walk")
+        .into_iter()
+        .filter(|note| !note.is_marker())
+        .count();
+    assert_eq!(real, 1);
 }
 
 // ---------------- audit ----------------
@@ -353,6 +355,7 @@ fn audit_flags_a_hand_written_note_with_no_provenance() {
             &Frontmatter {
                 title: Some("Smuggled".to_string()),
                 summary: Some("s".to_string()),
+                topic: Some("t".to_string()),
                 topics: vec!["t".to_string()],
                 ..Frontmatter::default()
             },
@@ -369,35 +372,25 @@ fn audit_flags_a_hand_written_note_with_no_provenance() {
 }
 
 #[test]
-fn audit_flags_a_durable_note_missing_a_summary_and_a_topic() {
+fn a_durable_note_without_a_summary_or_a_topic_is_refused_at_the_store() {
     let (curator, root) = fresh("thin");
-    curator
+    let error = curator
         .vault()
         .write_note(
             &root.join("20 Research").join("thin.md"),
             &Frontmatter {
                 title: Some("Thin".to_string()),
+                status: Some("durable".to_string()),
                 source_url: Some("https://e.com".to_string()),
                 ..Frontmatter::default()
             },
             "body",
         )
-        .expect("write");
-    let report = curator.audit().expect("audit");
-    let details: Vec<String> = report
-        .problems
-        .iter()
-        .map(|problem| format!("{} {}", problem.kind, problem.detail))
-        .collect();
+        .expect_err("a durable research note needs a topic");
     assert!(
-        details.contains(&"missing_summary no summary".to_string()),
-        "{details:?}"
+        matches!(error, mneme::Fault::InvalidNote { .. }),
+        "{error:?}"
     );
-    assert!(
-        details.contains(&"missing_topic no topic".to_string()),
-        "{details:?}"
-    );
-    assert!(!report.ok());
 }
 
 #[test]

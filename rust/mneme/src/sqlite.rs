@@ -25,33 +25,46 @@ use crate::frontmatter::{Field, Frontmatter};
 use crate::note::relative_posix;
 use crate::seams::NoteStore;
 use crate::sha256;
+use crate::topic::Category;
 
 /// The schema this build knows. A newer `user_version` is a refusal, never a migration guess.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 adds Products, nested slugs (a topic tree), and the fields that make the graph enforceable:
+/// `category`, `topic`, `parent`, `research`, `from_project`.
+pub const SCHEMA_VERSION: i64 = 2;
 
-/// The v1 schema, verbatim from `STORAGE.md` (`rev2`: ordered tags, nullable summary). The pragmas in
-/// that block are per connection and are applied in [`SqliteStore::open`], not here: `journal_mode` is
-/// stored in the file, `foreign_keys` and `busy_timeout` are not, and a batch that forgets them leaves
-/// orphan tags without an error.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS note (
     id           INTEGER PRIMARY KEY,
-    area         TEXT NOT NULL CHECK (area IN ('inbox','outbox','research','projects','topics')),
+    area         TEXT NOT NULL CHECK (area IN ('inbox','outbox','research','projects','products','topics')),
     slug         TEXT NOT NULL,
     title        TEXT,
     summary      TEXT,
     status       TEXT,
+    category     TEXT,
+    topic        TEXT,
+    parent       TEXT,
     source_url   TEXT,
     provenance   TEXT,
     captured     TEXT,
     body         TEXT NOT NULL,
     extra        TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(extra)),
+    research     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(research)),
+    from_project TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     exported_hash TEXT,
     UNIQUE (area, slug),
     CHECK (status IS NULL OR status <> 'durable' OR (ifnull(summary,'') <> '' AND
-           (ifnull(source_url,'') <> '' OR ifnull(provenance,'') <> '')))
+           (ifnull(source_url,'') <> '' OR ifnull(provenance,'') <> ''))),
+    CHECK (status IS NULL OR status <> 'durable' OR area NOT IN ('research','projects','products')
+           OR ifnull(topic,'') <> ''),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'topics'
+           OR category IN ('sports','technical','medical','finance','history','general','science','math','politics','current_events','underground','business','law','education','travel','animal_care','food','gaming','books','real_estate','automotive','parenting','tv_shows','movies','music','art')),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'projects'
+           OR ifnull(research,'[]') NOT IN ('','[]')),
+    CHECK (status IS NULL OR status <> 'durable' OR area <> 'products'
+           OR (ifnull(from_project,'') <> '' AND ifnull(topic,'') <> ''))
 );
 
 CREATE TABLE IF NOT EXISTS tag (
@@ -85,6 +98,82 @@ CREATE TRIGGER IF NOT EXISTS note_au AFTER UPDATE ON note BEGIN
 END;
 "#;
 
+/// v1 to v2. The area CHECK cannot be altered in place, so the note table is rebuilt with its tags.
+/// A vault from 0.0.9 keeps every row, every tag and every hash; the new columns start empty and are
+/// filled the first time a note is rewritten or filed.
+const MIGRATION_V1: &str = r#"
+PRAGMA foreign_keys = OFF;
+BEGIN;
+DROP TRIGGER IF EXISTS note_ai;
+DROP TRIGGER IF EXISTS note_ad;
+DROP TRIGGER IF EXISTS note_au;
+DROP TABLE IF EXISTS note_fts;
+ALTER TABLE note RENAME TO note_v1;
+CREATE TABLE note (
+    id           INTEGER PRIMARY KEY,
+    area         TEXT NOT NULL CHECK (area IN ('inbox','outbox','research','projects','products','topics')),
+    slug         TEXT NOT NULL,
+    title        TEXT,
+    summary      TEXT,
+    status       TEXT,
+    category     TEXT,
+    topic        TEXT,
+    parent       TEXT,
+    source_url   TEXT,
+    provenance   TEXT,
+    captured     TEXT,
+    body         TEXT NOT NULL,
+    extra        TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(extra)),
+    research     TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(research)),
+    from_project TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    exported_hash TEXT,
+    UNIQUE (area, slug)
+);
+INSERT INTO note (id, area, slug, title, summary, status, source_url, provenance, captured, body, extra, created_at, updated_at, exported_hash)
+SELECT id, area, slug, title, summary, status, source_url, provenance, captured, body, extra, created_at, updated_at, exported_hash FROM note_v1;
+ALTER TABLE tag RENAME TO tag_v1;
+CREATE TABLE tag (
+    note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL CHECK (kind IN ('topic','project')),
+    ordinal INTEGER NOT NULL,
+    value   TEXT NOT NULL CHECK (value <> ''),
+    PRIMARY KEY (note_id, kind, ordinal)
+) WITHOUT ROWID;
+INSERT INTO tag (note_id, kind, ordinal, value) SELECT note_id, kind, ordinal, value FROM tag_v1;
+DROP TABLE tag_v1;
+DROP TABLE note_v1;
+-- A 0.0.9 research or project note already named its topics as ordered tags. The first tag becomes
+-- the primary topic, so an upgraded vault does not audit as if every note had lost its home.
+UPDATE note SET topic = (
+    SELECT tag.value FROM tag
+    WHERE tag.note_id = note.id AND tag.kind = 'topic'
+    ORDER BY tag.ordinal LIMIT 1
+) WHERE area IN ('research','projects','products') AND topic IS NULL;
+CREATE VIRTUAL TABLE note_fts USING fts5(
+    title, summary, body,
+    content = 'note', content_rowid = 'id', tokenize = 'unicode61'
+);
+INSERT INTO note_fts(rowid, title, summary, body) SELECT id, title, summary, body FROM note;
+CREATE TRIGGER note_ai AFTER INSERT ON note BEGIN
+    INSERT INTO note_fts(rowid, title, summary, body)
+    VALUES (new.id, new.title, new.summary, new.body);
+END;
+CREATE TRIGGER note_ad AFTER DELETE ON note BEGIN
+    INSERT INTO note_fts(note_fts, rowid, title, summary, body)
+    VALUES ('delete', old.id, old.title, old.summary, old.body);
+END;
+CREATE TRIGGER note_au AFTER UPDATE ON note BEGIN
+    INSERT INTO note_fts(note_fts, rowid, title, summary, body)
+    VALUES ('delete', old.id, old.title, old.summary, old.body);
+    INSERT INTO note_fts(rowid, title, summary, body)
+    VALUES (new.id, new.title, new.summary, new.body);
+END;
+COMMIT;
+PRAGMA foreign_keys = ON;
+"#;
+
 /// One note a search found, with enough to cite it in a prompt and no more.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
@@ -102,7 +191,7 @@ pub struct SearchHit {
     pub score: f64,
 }
 
-/// The SQLite store: one connection, one root, and the five areas.
+/// The SQLite store: one connection, one root, and the six areas.
 pub struct SqliteStore {
     root: PathBuf,
     conn: Connection,
@@ -113,11 +202,16 @@ struct Stored {
     title: Option<String>,
     summary: Option<String>,
     status: Option<String>,
+    category: Option<String>,
+    topic: Option<String>,
+    parent: Option<String>,
     source_url: Option<String>,
     provenance: Option<String>,
     captured: Option<String>,
     body: String,
     extra: String,
+    research: String,
+    from_project: Option<String>,
 }
 
 impl SqliteStore {
@@ -144,21 +238,26 @@ impl SqliteStore {
         let _mode: String = conn
             .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
             .map_err(|error| io(db, error))?;
-        conn.execute_batch(SCHEMA).map_err(|error| io(db, error))?;
-
         let found: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| io(db, error))?;
-        if found == 0 {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-                .map_err(|error| io(db, error))?;
-        } else if found > SCHEMA_VERSION {
+        if found > SCHEMA_VERSION {
             return Err(Fault::Io {
                 path: db.display().to_string(),
                 detail: format!(
                     "schema version {found} is newer than this build's {SCHEMA_VERSION}; refusing to guess"
                 ),
             });
+        }
+        if found == 0 {
+            conn.execute_batch(SCHEMA).map_err(|error| io(db, error))?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|error| io(db, error))?;
+        } else if found == 1 {
+            conn.execute_batch(MIGRATION_V1)
+                .map_err(|error| io(db, error))?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|error| io(db, error))?;
         }
 
         Ok(SqliteStore { root, conn })
@@ -177,16 +276,20 @@ impl SqliteStore {
         self.root.join(area.folder()).join(format!("{slug}.md"))
     }
 
+    /// The area a path belongs to: the area folder itself or anything under it. A nested topic is
+    /// still in `topics`, which is what makes a tree possible without a second path rule.
     fn area_folder(&self, folder: &Path) -> Option<Area> {
-        Area::ALL
-            .into_iter()
-            .find(|area| folder == self.root.join(area.folder()))
+        Area::ALL.into_iter().find(|area| {
+            let root = self.root.join(area.folder());
+            folder == root || folder.starts_with(&root)
+        })
     }
 
     fn load(&self, area: Area, slug: &str) -> Result<Option<Stored>, Fault> {
         self.conn
             .query_row(
-                "SELECT title, summary, status, source_url, provenance, captured, body, extra \
+                "SELECT title, summary, status, category, topic, parent, source_url, provenance, \
+                        captured, body, extra, research, from_project \
                  FROM note WHERE area = ?1 AND slug = ?2",
                 params![area.key(), slug],
                 |row| {
@@ -194,11 +297,16 @@ impl SqliteStore {
                         title: row.get(0)?,
                         summary: row.get(1)?,
                         status: row.get(2)?,
-                        source_url: row.get(3)?,
-                        provenance: row.get(4)?,
-                        captured: row.get(5)?,
-                        body: row.get(6)?,
-                        extra: row.get(7)?,
+                        category: row.get(3)?,
+                        topic: row.get(4)?,
+                        parent: row.get(5)?,
+                        source_url: row.get(6)?,
+                        provenance: row.get(7)?,
+                        captured: row.get(8)?,
+                        body: row.get(9)?,
+                        extra: row.get(10)?,
+                        research: row.get(11)?,
+                        from_project: row.get(12)?,
                     })
                 },
             )
@@ -232,6 +340,14 @@ impl SqliteStore {
             title: stored.title.clone(),
             summary: stored.summary.clone(),
             status: stored.status.clone(),
+            category: stored.category.clone(),
+            topic: stored.topic.clone(),
+            parent: stored.parent.clone(),
+            research: decode_list(&stored.research).map_err(|detail| Fault::Io {
+                path: self.path_of(area, slug).display().to_string(),
+                detail,
+            })?,
+            from_project: stored.from_project.clone(),
             source_url: stored.source_url.clone(),
             provenance: stored.provenance.clone(),
             captured: stored.captured.clone(),
@@ -263,19 +379,24 @@ impl SqliteStore {
     fn store_note(&self, area: Area, slug: &str, text: &str) -> Result<(), Fault> {
         let path = self.path_of(area, slug);
         let (frontmatter, body) = Frontmatter::parse(text);
+        let frontmatter = normalize(&path, area, slug, frontmatter)?;
         let extra = encode_extra(&frontmatter.extra);
+        let research = encode_list(&frontmatter.research);
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|error| io(&path, error))?;
         transaction
             .execute(
-                "INSERT INTO note (area, slug, title, summary, status, source_url, provenance, \
-                                   captured, body, extra, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                "INSERT INTO note (area, slug, title, summary, status, category, topic, parent, \
+                                   source_url, provenance, captured, body, extra, research, \
+                                   from_project, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                          strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
                  ON CONFLICT(area, slug) DO UPDATE SET \
                     title = excluded.title, summary = excluded.summary, status = excluded.status, \
+                    category = excluded.category, topic = excluded.topic, parent = excluded.parent, \
                     source_url = excluded.source_url, provenance = excluded.provenance, \
                     captured = excluded.captured, body = excluded.body, extra = excluded.extra, \
+                    research = excluded.research, from_project = excluded.from_project, \
                     updated_at = excluded.updated_at",
                 params![
                     area.key(),
@@ -283,11 +404,16 @@ impl SqliteStore {
                     frontmatter.title,
                     frontmatter.summary,
                     frontmatter.status,
+                    frontmatter.category,
+                    frontmatter.topic,
+                    frontmatter.parent,
                     frontmatter.source_url,
                     frontmatter.provenance,
                     frontmatter.captured,
                     body.trim(),
-                    extra
+                    extra,
+                    research,
+                    frontmatter.from_project
                 ],
             )
             .map_err(|error| io(&path, error))?;
@@ -425,7 +551,7 @@ impl SqliteStore {
                     "SELECT n.id, n.area, n.slug, n.title, n.summary, n.provenance, n.extra,
                             bm25(note_fts, 5.0, 2.0, 1.0) AS score
                      FROM note_fts JOIN note n ON n.id = note_fts.rowid
-                     WHERE note_fts MATCH ?1
+                     WHERE note_fts MATCH ?1 AND ifnull(n.status,'') <> 'marker'
                      ORDER BY score, n.slug",
                 )
                 .map_err(|error| io(&self.root, error))?;
@@ -468,6 +594,7 @@ impl SqliteStore {
                 "SELECT n.id, n.area, n.slug, n.title, n.summary, n.provenance, n.extra
                  FROM note n JOIN tag t ON t.note_id = n.id
                  WHERE t.kind = 'topic' AND lower(t.value) IN ({placeholders})
+                   AND ifnull(n.status,'') <> 'marker'
                  GROUP BY n.id
                  ORDER BY n.slug"
             );
@@ -572,6 +699,11 @@ impl SqliteStore {
                 continue;
             };
             let text = fs::read_to_string(&path).map_err(|error| io(&path, error))?;
+            // A marker is seeded signage, not knowledge. Importing a whole vault must not clone the
+            // other vault's "start here" notes into this one, so they are skipped by status.
+            if Frontmatter::parse(&text).0.status.as_deref() == Some("marker") {
+                continue;
+            }
             self.store_note(area, &slug, &text)?;
             self.set_exported_hash(area, &slug, &sha256::hex(text.as_bytes()))?;
             report.imported += 1;
@@ -586,7 +718,7 @@ impl SqliteStore {
     /// silent overwrite is the one data loss this design can commit.
     pub fn export_tree(&self, target: &Path, force: bool) -> Result<ExportReport, Fault> {
         let mut report = ExportReport::default();
-        // The five areas exist even when empty: a person opening the vault expects its doors.
+        // The six areas exist even when empty: a person opening the vault expects its doors.
         for area in Area::ALL {
             let folder = target.join(area.folder());
             fs::create_dir_all(&folder).map_err(|error| io(&folder, error))?;
@@ -694,19 +826,25 @@ pub struct ExportReport {
     pub refused: Vec<PathBuf>,
 }
 
-/// A path is a note only inside one of the five area folders. The rule is here so the store and its
-/// callers cannot disagree about it. The slug is the file name without `.md`, which is the export
-/// identity in `STORAGE.md`.
+/// A path is a note only inside one of the six area folders, at any depth. The rule is here so the
+/// store and its callers cannot disagree about it. The slug is the path below the area without `.md`,
+/// so `50 Topics/technical/ai-inference/index.md` is `(topics, "technical/ai-inference/index")` and a
+/// topic tree needs no second path rule.
 pub fn note_path(root: &Path, path: &Path) -> Option<(Area, String)> {
     if path.extension() != Some(std::ffi::OsStr::new("md")) {
         return None;
     }
-    let slug = path.file_name()?.to_str()?.strip_suffix(".md")?.to_string();
-    let parent = path.parent()?;
     let area = Area::ALL
         .into_iter()
-        .find(|area| parent == root.join(area.folder()))?;
-    Some((area, slug))
+        .find(|area| path.starts_with(root.join(area.folder())))?;
+    let relative = path.strip_prefix(root.join(area.folder())).ok()?;
+    let slug = relative.with_extension("");
+    let slug = slug
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    (!slug.is_empty()).then_some((area, slug))
 }
 
 impl NoteStore for SqliteStore {
@@ -750,8 +888,10 @@ impl NoteStore for SqliteStore {
     }
 
     fn make_dirs(&self, path: &Path) -> Result<(), Fault> {
-        if self.area_folder(path).is_some() {
-            // Areas are logical rows plus a folder that `export` creates; there is nothing to make.
+        if let Some(area) = self.area_folder(path)
+            && path == self.root.join(area.folder())
+        {
+            // The area itself is a logical row plus a folder that `export` creates.
             return Ok(());
         }
         fs::create_dir_all(path).map_err(|error| io(path, error))
@@ -823,6 +963,99 @@ fn io(path: &Path, detail: impl std::fmt::Display) -> Fault {
         path: path.display().to_string(),
         detail: detail.to_string(),
     }
+}
+
+/// Fill the fields the path already knows, then refuse a note that still breaks its area's rule.
+///
+/// The path is part of the record: `50 Topics/technical/ai-inference/index.md` is a topic called
+/// `technical/ai-inference` in `technical`, and `20 Research/technical/ai-inference/x.md` is research
+/// under that topic. A writer may state the same thing in frontmatter; the path is the fallback, not
+/// a second source of truth.
+pub(crate) fn normalize(
+    path: &Path,
+    area: Area,
+    slug: &str,
+    mut frontmatter: Frontmatter,
+) -> Result<Frontmatter, Fault> {
+    let marker = frontmatter.status.as_deref() == Some("marker");
+    let identity = slug.strip_suffix("/index").unwrap_or(slug);
+    let refuse = |detail: String| Fault::InvalidNote {
+        path: path.display().to_string(),
+        detail,
+    };
+
+    if area == Area::Topics && !marker {
+        let category = frontmatter
+            .category
+            .clone()
+            .or_else(|| identity.split('/').next().map(str::to_string))
+            .and_then(|key| Category::parse(&key));
+        let Some(category) = category else {
+            return Err(refuse(format!(
+                "a topic names one of the 26 categories, and `{}` is not one",
+                identity.split('/').next().unwrap_or(identity)
+            )));
+        };
+        frontmatter.category = Some(category.key().to_string());
+        frontmatter.topic = Some(identity.to_string());
+        frontmatter.parent = identity
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string());
+    }
+
+    if area == Area::Research && frontmatter.topic.is_none() {
+        frontmatter.topic = identity
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .or_else(|| frontmatter.topics.first().cloned());
+    }
+
+    if area.needs_topic() && frontmatter.topic.is_none() && !marker {
+        return Err(refuse(
+            "this note needs a topic: file it under a topic folder or set `topic:`".to_string(),
+        ));
+    }
+
+    if let Some(topic) = frontmatter.topic.clone()
+        && !frontmatter.topics.contains(&topic)
+    {
+        frontmatter.topics.push(topic);
+    }
+
+    if area == Area::Projects
+        && frontmatter.status.as_deref() == Some("durable")
+        && frontmatter.research.is_empty()
+    {
+        return Err(refuse(
+            "a durable project names at least one research note in `research:`".to_string(),
+        ));
+    }
+
+    if area == Area::Products {
+        if frontmatter.from_project.as_deref().unwrap_or("").is_empty() && !marker {
+            return Err(refuse(
+                "a product names the project it came from in `from_project:`".to_string(),
+            ));
+        }
+        if let Some(status) = frontmatter.status.as_deref()
+            && !marker
+            && !matches!(status, "active" | "closed" | "inactive" | "frozen")
+        {
+            return Err(refuse(format!(
+                "a product's status is active, closed, inactive or frozen, not `{status}`"
+            )));
+        }
+    }
+
+    Ok(frontmatter)
+}
+
+fn encode_list(values: &[String]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn decode_list(raw: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str::<Vec<String>>(raw).map_err(|error| format!("research list: {error}"))
 }
 
 /// The note that retired this one, read from the extra frontmatter. An extra that will not decode is no
@@ -928,6 +1161,7 @@ mod tests {
             summary: Some("s".to_string()),
             status: Some("durable".to_string()),
             topics: topics.iter().map(|topic| topic.to_string()).collect(),
+            topic: topics.first().map(|topic| topic.to_string()),
             projects: vec!["hades".to_string()],
             source_url: Some("https://example.test/x".to_string()),
             provenance: Some("run 1".to_string()),
@@ -936,6 +1170,7 @@ mod tests {
                 .iter()
                 .map(|(key, field)| (key.to_string(), field.clone()))
                 .collect(),
+            ..Frontmatter::default()
         };
         format!("{}\n{}\n", frontmatter.render(), text.trim())
     }
@@ -1097,7 +1332,12 @@ mod tests {
             .write(&root.join(Area::Inbox.folder()).join("a.md"), "body\n")
             .expect("inbox");
         store
-            .write(&root.join(Area::Research.folder()).join("b.md"), "body\n")
+            .write(
+                &root
+                    .join(Area::Research.folder())
+                    .join("technical/ai-inference/b.md"),
+                "body\n",
+            )
             .expect("research");
         store
             .write(&root.join("INDEX.md"), "# index\n")
@@ -1113,7 +1353,9 @@ mod tests {
     fn a_move_leaves_one_row() {
         let (store, root) = fresh("move");
         let inbox = root.join(Area::Inbox.folder()).join("x.md");
-        let research = root.join(Area::Research.folder()).join("x.md");
+        let research = root
+            .join(Area::Research.folder())
+            .join("technical/ai-inference/x.md");
         store.write(&inbox, "body\n").expect("inbox");
         store.write(&research, "body\n").expect("research");
         store.remove(&inbox).expect("remove");
@@ -1272,7 +1514,9 @@ mod tests {
     #[test]
     fn search_quotes_the_terms_instead_of_reading_them_as_syntax() {
         let (store, root) = fresh("search-syntax");
-        let note_path = root.join(Area::Research.folder()).join("gate.md");
+        let note_path = root
+            .join(Area::Research.folder())
+            .join("technical/ai-inference/gate.md");
         store
             .write(&note_path, &note("The AND gate is open.", &[], &[]))
             .unwrap();
@@ -1291,7 +1535,9 @@ mod tests {
         let (store, root) = fresh("search-empty");
         assert!(store.search(&[], &[]).unwrap().is_empty());
 
-        let path = root.join(Area::Research.folder()).join("gone.md");
+        let path = root
+            .join(Area::Research.folder())
+            .join("technical/ai-inference/gone.md");
         store.write(&path, &note("A lantern.", &[], &[])).unwrap();
         assert_eq!(
             store.search(&["lantern".to_string()], &[]).unwrap().len(),
@@ -1373,5 +1619,123 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(30));
         conn.execute_batch("COMMIT;").expect("commit");
         panic!("the parent did not kill the child");
+    }
+
+    #[test]
+    fn a_v1_vault_migrates_and_keeps_its_rows_and_topics() {
+        use rusqlite::Connection;
+        let dir = scratch("migrate-v1");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let root = dir.join("vault");
+        fs::create_dir_all(&root).expect("root");
+        let db = dir.join("mneme.db");
+        let conn = Connection::open(&db).expect("v1 db");
+        conn.execute_batch(
+            "PRAGMA user_version = 1;
+             CREATE TABLE note (
+                id INTEGER PRIMARY KEY, area TEXT NOT NULL, slug TEXT NOT NULL, title TEXT,
+                summary TEXT, status TEXT, source_url TEXT, provenance TEXT, captured TEXT,
+                body TEXT NOT NULL, extra TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, exported_hash TEXT, UNIQUE (area, slug)
+             );
+             CREATE TABLE tag (
+                note_id INTEGER NOT NULL REFERENCES note(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL, ordinal INTEGER NOT NULL, value TEXT NOT NULL,
+                PRIMARY KEY (note_id, kind, ordinal)
+             ) WITHOUT ROWID;
+             INSERT INTO note (id, area, slug, title, summary, status, source_url, body, created_at, updated_at)
+             VALUES (1, 'research', 'legacy', 'Legacy', 's', 'durable', 'https://e.test', 'body',
+                     '2026-10-17T00:00:00Z', '2026-10-17T00:00:00Z');
+             INSERT INTO tag (note_id, kind, ordinal, value) VALUES (1, 'topic', 0, 'agent-memory');",
+        )
+        .expect("v1 schema");
+        drop(conn);
+
+        let store = SqliteStore::open(&db, &root).expect("migrate");
+        let version: i64 = store
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let stored = store.load(Area::Research, "legacy").unwrap().unwrap();
+        assert_eq!(stored.summary.as_deref(), Some("s"));
+        assert_eq!(stored.topic.as_deref(), Some("agent-memory"));
+    }
+
+    #[test]
+    fn a_topic_takes_its_category_and_topic_from_the_path() {
+        let (store, root) = fresh("topic-tree");
+        let path = root
+            .join(Area::Topics.folder())
+            .join("technical/ai-inference/kv-cache/index.md");
+        store
+            .write(
+                &path,
+                "---\ntitle: KV Cache\nsummary: A narrower topic.\nstatus: durable\nprovenance: seeded\n---\n\nbody\n",
+            )
+            .expect("topic");
+        let (area, slug) = note_path(&root, &path).expect("path");
+        assert_eq!(area, Area::Topics);
+        assert_eq!(slug, "technical/ai-inference/kv-cache/index");
+        let stored = store.load(area, &slug).expect("load").expect("row");
+        assert_eq!(stored.category.as_deref(), Some("technical"));
+        assert_eq!(
+            stored.topic.as_deref(),
+            Some("technical/ai-inference/kv-cache")
+        );
+        assert_eq!(stored.parent.as_deref(), Some("technical/ai-inference"));
+    }
+
+    #[test]
+    fn a_topic_outside_the_taxonomy_is_refused() {
+        let (store, root) = fresh("topic-unknown");
+        let error = store
+            .write(
+                &root
+                    .join(Area::Topics.folder())
+                    .join("astrology/rising-signs/index.md"),
+                "---\ntitle: Rising\nsummary: s\nstatus: durable\nprovenance: p\n---\n\nbody\n",
+            )
+            .expect_err("astrology is not one of the 26");
+        assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_durable_project_needs_research() {
+        let (store, root) = fresh("project-research");
+        let path = root.join(Area::Projects.folder()).join("loom/index.md");
+        let error = store
+            .write(
+                &path,
+                "---\ntitle: Loom\nsummary: s\nstatus: durable\ntopic: technical/ai-inference\nprovenance: p\n---\n\nbody\n",
+            )
+            .expect_err("a durable project needs research");
+        assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+        store
+            .write(
+                &path,
+                "---\ntitle: Loom\nsummary: s\nstatus: durable\ntopic: technical/ai-inference\nresearch: [2026-10-20-loom]\nprovenance: p\n---\n\nbody\n",
+            )
+            .expect("a project with research");
+    }
+
+    #[test]
+    fn a_product_names_the_project_it_came_from() {
+        let (store, root) = fresh("product-origin");
+        let path = root.join(Area::Products.folder()).join("loom-1/index.md");
+        let error = store
+            .write(
+                &path,
+                "---\ntitle: Loom 1\nsummary: s\ntopic: technical/ai-inference\nprovenance: p\n---\n\nbody\n",
+            )
+            .expect_err("a product needs its project");
+        assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
+        store
+            .write(
+                &path,
+                "---\ntitle: Loom 1\nsummary: s\ntopic: technical/ai-inference\nfrom_project: loom\nprovenance: p\n---\n\nbody\n",
+            )
+            .expect("a product with an origin");
     }
 }

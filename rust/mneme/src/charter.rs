@@ -33,7 +33,7 @@ pub fn render(agent_name: &str, agent_goal: &str, topics: &[String]) -> String {
         .filter(|topic| !topic.is_empty())
         .collect();
     let listed = if topics.is_empty() {
-        "None named yet. Name one here by hand, with `hades init`, or by writing a note in `40 Topics`."
+        "None named yet. Name one here by hand, with `hades init`, or by writing a note in `50 Topics`."
             .to_string()
     } else {
         topics

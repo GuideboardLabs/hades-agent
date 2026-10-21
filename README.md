@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.9-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-864%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.10-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-871%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.9 |
+| **Version** | 0.0.10 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,20 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 864 passing, 13 ignored live tests |
+| **Tests** | 871 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.10 adds
+
+The vault is a clone of WEFT, generic and empty, with marking posts a fresh agent can navigate.
+
+- **Six areas.** `00 Inbox`, `10 Outbox` (for work that leaves the machine and, later, messages for other agents), `20 Research`, `30 Projects`, `40 Products`, `50 Topics`.
+- **Topics are a tree.** The 26 categories are fixed from Foxforge's topic types, written to `TAXONOMY.md`; a topic is general (`technical/ai-inference`) and narrower things nest beneath it (`.../kv-cache`) instead of becoming a second topic for the same ethos.
+- **The rules are structural.** Every research note, project and product names a topic; a durable project names its research; a product names the project it came from and is `active`, `closed`, `inactive` or `frozen`. Both the SQLite store and the file vault refuse a note that breaks a rule.
+- **A fresh install reads as empty.** `hades init` seeds one `status: marker` note per area, and markers are excluded from the index, the audit counts and recall.
+- **The index is a view.** `INDEX.md` groups topics by category, research by topic, and shows each project's research count and each product's origin; `mneme import` refreshes it so a vault cannot audit correctly and read as empty.
+- **The record migrates.** Schema v2 rebuilds the note table for Products and nested slugs, keeps every row, tag and hash, and backfills each note's primary topic from its first tag.
 
 ## What 0.0.9 adds
 
@@ -287,6 +298,9 @@ visible to later turns.
 
 Mneme is a SQLite record with a markdown export:
 
+- Six areas: Inbox, Outbox, Research, Projects, Products, Topics.
+- Topics are a tree under 26 fixed categories; subtopics nest without inventing a new category.
+- Every research note, project and product names a topic; a durable project names its research; a product names the project it came from.
 - FTS5 search plus exact-topic recall under a token budget.
 - `supersedes` retirement in both directions, so a stale note can be retired without deleting history.
 - Curator-only writes through a `WritePermit`. The permit is a type, not a convention.

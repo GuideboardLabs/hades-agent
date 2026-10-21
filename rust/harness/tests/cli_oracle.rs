@@ -530,9 +530,12 @@ fn the_audit_runs_over_a_vault_and_reports_what_it_found() {
     let (code, text) = hades(&["audit", "--vault", &root.display().to_string()]);
     assert_ne!(
         code, 0,
-        "a note with no summary and no topic is a problem: {text}"
+        "a research note with no topic is refused, not silently imported: {text}"
     );
-    assert!(text.contains("missing_summary"), "{text}");
+    assert!(
+        text.contains("needs a topic"),
+        "the refusal names the rule: {text}"
+    );
 }
 
 /// Hades is a second system. It refuses the live install's paths by name rather than trusting whoever typed

@@ -72,6 +72,7 @@ fn filing(topics: &[&str], projects: &[&str]) -> Filing {
     Filing {
         topics: topics.iter().map(|topic| topic.to_string()).collect(),
         projects: projects.iter().map(|project| project.to_string()).collect(),
+        from_project: None,
         summary: Some("Short.".to_string()),
         source_url: Some("u".to_string()),
         provenance: None,
@@ -89,7 +90,7 @@ fn titles(notes: &[Note]) -> Vec<String> {
 // ---------------- the five areas, and the charter ----------------
 
 #[test]
-fn init_creates_the_five_areas() {
+fn init_creates_the_six_areas() {
     let root = scratch("init");
     let vault = Vault::new(root.clone(), FileVault::new(), FixedClock(today()));
     assert_eq!(vault.init(None).expect("init"), root);
@@ -98,11 +99,19 @@ fn init_creates_the_five_areas() {
         "10 Outbox",
         "20 Research",
         "30 Projects",
-        "40 Topics",
+        "40 Products",
+        "50 Topics",
     ] {
         assert!(root.join(name).is_dir(), "{name}");
+        assert!(
+            root.join(name).join("START HERE.md").is_file(),
+            "{name} marker"
+        );
     }
     assert!(root.join("INDEX.md").is_file());
+    assert!(root.join("TAXONOMY.md").is_file());
+    let taxonomy = std::fs::read_to_string(root.join("TAXONOMY.md")).expect("taxonomy");
+    assert!(taxonomy.contains("## Technical (`technical`)"));
 }
 
 #[test]
@@ -213,6 +222,7 @@ fn file_moves_and_records_topics_and_projects() {
             &Filing {
                 topics: vec!["agent-memory".to_string()],
                 projects: vec!["hades-agent".to_string()],
+                from_project: None,
                 summary: Some("A one line summary.".to_string()),
                 source_url: Some("https://example.com/a".to_string()),
                 provenance: None,
@@ -369,7 +379,7 @@ fn index_lists_notes_under_their_topics() {
         .expect("build index");
     assert!(text.contains("### agent-memory (1)"), "{text}");
     assert!(text.contains("Finding") && text.contains("Short."));
-    assert!(text.contains("### hades-agent (1)"));
+    assert!(text.contains("## Projects"));
     assert!(text.contains("0 candidate(s)"));
     assert!(text.contains("20 Research/"));
     assert!(
@@ -588,12 +598,15 @@ fn a_fenced_note_is_never_walked_or_indexed() {
         .store()
         .write(
             &hidden,
-            "---\ntitle: Hidden\nsummary: secret\ntopics: [vaults]\nsource_url: u\n---\n\nbody\n",
+            "---\ntitle: Hidden\nsummary: secret\ntopic: vaults\ntopics: [vaults]\nsource_url: u\n---\n\nbody\n",
         )
         .expect("write");
 
     let fences = vec!["20 Research/2026-01-01-hidden.md".to_string()];
-    let walked = titles(&vault.iter_notes(None, &fences).expect("walk"));
+    let walked: Vec<String> = titles(&vault.iter_notes(None, &fences).expect("walk"))
+        .into_iter()
+        .filter(|title| !title.ends_with("start here"))
+        .collect();
     assert_eq!(walked, ["Public"]);
     assert!(
         vault.store().exists(&public) && vault.store().exists(&hidden),

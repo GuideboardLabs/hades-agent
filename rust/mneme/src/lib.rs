@@ -6,17 +6,19 @@
 //! A port of the Python spec at `hades/vault.py`. The tests in `tests/port_oracle.rs` mirror the
 //! Python suite, and the port counts as done when those behaviours hold here unchanged.
 //!
-//! Five areas, topics as notes, frontmatter as the graph:
+//! Six areas, topics as notes, frontmatter as the graph:
 //!
 //! ```text
 //! <vault>/
 //!     charter.md            who the agent is, who the user is, what the work is for
+//!     TAXONOMY.md           the 26 fixed categories, generated
 //!     INDEX.md              generated from frontmatter, never hand edited
 //!     00 Inbox/             captures land here and only here
-//!     10 Outbox/            work that leaves the machine
-//!     20 Research/          findings, with topics and projects in frontmatter
-//!     30 Projects/          hubs
-//!     40 Topics/            the spine: one note per topic, everything links to these
+//!     10 Outbox/            work that leaves the machine, and messages for other agents
+//!     20 Research/          findings, filed under their topic
+//!     30 Projects/          hubs, one folder each, with research
+//!     40 Products/          projects that stopped moving, frozen as their own thing
+//!     50 Topics/            the spine: category / topic / subtopic
 //! ```
 //!
 //! The rules are enforced here rather than asked for. A note is **durable** only with a summary, at
@@ -58,6 +60,7 @@ pub mod seams;
 pub mod sha256;
 pub mod sqlite;
 pub mod store;
+pub mod topic;
 pub mod vault;
 
 pub use area::Area;
@@ -73,6 +76,7 @@ pub use permit::{Holder, WritePermit};
 pub use seams::{Clock, NoteStore};
 pub use sqlite::{ExportReport, ImportReport, SearchHit, SqliteStore};
 pub use store::FileVault;
+pub use topic::Category;
 pub use vault::{Filing, Vault};
 
 /// A capture or a filed note older than this many days is reported as stale, never dropped.

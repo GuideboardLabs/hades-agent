@@ -1,8 +1,8 @@
 [package]
 name = "mneme"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
-description = "Mneme, the second brain: five areas, topics as notes, governed writes. Port of the Python spec, same oracle."
+description = "Mneme, the second brain: six areas, topics as a tree, governed writes. Port of the Python spec, same oracle."
 license = "MIT"
 
 [package.metadata.hades]

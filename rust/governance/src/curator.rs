@@ -21,6 +21,10 @@ use crate::{DURABLE_AREAS, INBOX_CAP, STALE_DAYS};
 pub struct Curation {
     pub topics: Vec<String>,
     pub projects: Vec<String>,
+    /// The research a project stands on. Empty for a research note.
+    pub research: Vec<String>,
+    /// The project a product came from. Empty except for products.
+    pub from_project: Option<String>,
     pub summary: String,
     pub provenance: String,
 }
@@ -122,14 +126,18 @@ impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
         curation: &Curation,
     ) -> Result<PathBuf, Refusal> {
         let filing = self.prepared(area, curation)?;
+        let topic = filing.topics.first().cloned();
         let path = self.vault.area_path(area).join(format!("{slug}.md"));
         let permit = self.vault.permit(Holder::Curator);
         let frontmatter = Frontmatter {
             title: Some(title.to_string()),
             summary: Some(curation.summary.trim().to_string()),
             status: Some("durable".to_string()),
+            topic,
             topics: filing.topics.clone(),
             projects: filing.projects.clone(),
+            research: curation.research.clone(),
+            from_project: curation.from_project.clone(),
             source_url: filing.source_url.clone(),
             provenance: filing.provenance.clone(),
             ..Frontmatter::default()
@@ -174,6 +182,7 @@ impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
         let mut filing = Filing {
             topics,
             projects: cleaned(&curation.projects),
+            from_project: curation.from_project.clone(),
             summary: Some(curation.summary.clone()),
             ..Filing::default()
         };
@@ -208,12 +217,20 @@ impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
     pub fn audit(&self) -> Result<AuditReport, Refusal> {
         let mut report = AuditReport::new();
         for area in Area::ALL {
-            let count = self.vault.iter_notes(Some(area), &[])?.len();
+            let count = self
+                .vault
+                .iter_notes(Some(area), &[])?
+                .iter()
+                .filter(|note| !note.is_marker())
+                .count();
             report.counts.insert(area.key().to_string(), count);
         }
 
         for area in DURABLE_AREAS {
             for note in self.vault.iter_notes(Some(area), &self.fences)? {
+                if note.is_marker() {
+                    continue;
+                }
                 let path = relative_posix(&note.path, self.vault.root());
                 if note.summary().is_empty() {
                     report.problems.push(Problem::new(
@@ -255,7 +272,12 @@ impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
             }
         }
 
-        let inbox = self.vault.iter_notes(Some(Area::Inbox), &[])?;
+        let inbox: Vec<_> = self
+            .vault
+            .iter_notes(Some(Area::Inbox), &[])?
+            .into_iter()
+            .filter(|note| !note.is_marker())
+            .collect();
         report.counts.insert("stale".to_string(), 0);
         if inbox.len() > INBOX_CAP {
             report.problems.push(Problem::new(

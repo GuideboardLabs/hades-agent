@@ -104,7 +104,9 @@ impl Error for Fault {}
 impl From<VaultFault> for Fault {
     fn from(fault: VaultFault) -> Self {
         let class = match &fault {
-            VaultFault::OrphanNote { .. } | VaultFault::NoFreeName { .. } => Class::Policy,
+            VaultFault::OrphanNote { .. }
+            | VaultFault::InvalidNote { .. }
+            | VaultFault::NoFreeName { .. } => Class::Policy,
             VaultFault::MissingNote { .. } | VaultFault::Io { .. } => Class::Harness,
         };
         Fault::new(class, fault.to_string())

@@ -46,6 +46,36 @@ impl Note {
         &self.frontmatter.projects
     }
 
+    pub fn status(&self) -> &str {
+        self.frontmatter.status.as_deref().unwrap_or("")
+    }
+
+    /// Signage, not knowledge. A marker is exempt from the structural rules and is left out of the
+    /// index's lists so an empty clone still reads as empty.
+    pub fn is_marker(&self) -> bool {
+        self.status() == "marker"
+    }
+
+    pub fn category(&self) -> &str {
+        self.frontmatter.category.as_deref().unwrap_or("")
+    }
+
+    pub fn topic(&self) -> &str {
+        self.frontmatter.topic.as_deref().unwrap_or("")
+    }
+
+    pub fn parent(&self) -> &str {
+        self.frontmatter.parent.as_deref().unwrap_or("")
+    }
+
+    pub fn research(&self) -> &[String] {
+        &self.frontmatter.research
+    }
+
+    pub fn from_project(&self) -> &str {
+        self.frontmatter.from_project.as_deref().unwrap_or("")
+    }
+
     /// Summary, at least one topic, and provenance. All three, always. Without them a note cannot
     /// leave the Inbox, which is what keeps the graph free of orphans.
     pub fn is_durable(&self) -> bool {

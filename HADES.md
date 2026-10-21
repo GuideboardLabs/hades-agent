@@ -19,7 +19,7 @@ That is a rule with a guard behind it, not a convention to remember.
 |---|---|---|
 | state (sessions, approvals, snapshots, map cache) | `~/.hades` | `~/.hermes/**` |
 | Mneme, the memory record (SQLite, FTS5 recall) | `~/.hades/mneme.db` | `~/Documents/ObsidianVault/**` |
-| Mneme's markdown export (notes, `charter.md`, generated `INDEX.md`) | `~/.hades/mneme` | `~/Documents/ObsidianVault/**` |
+| Mneme's markdown export (six areas, `charter.md`, `TAXONOMY.md`, generated `INDEX.md`) | `~/.hades/mneme` | `~/Documents/ObsidianVault/**` |
 | keys | `~/.hades/.env` or the environment | `~/.hermes/.env` |
 | short-lived files | `~/.hades/tmp` | the caller's `TMPDIR` when it belongs to the other system |
 
@@ -37,12 +37,52 @@ the first machine to start, it has already moved over.
 - `~/.hades/config.json`: the provider, the model preset, the working root and the vault. A daemon or a
   bot is started with no arguments, so it reads this file; a CLI flag is an override on top of it. Secrets
   never go in it: keys and bot tokens stay in `~/.hades/.env`.
-- `~/.hades/mneme`: the five areas, `charter.md` from the interview (who the agent is, what the work is
-  for, which topics matter), and a generated `INDEX.md`.
+- `~/.hades/mneme`: the six areas, `charter.md` from the interview (who the agent is, what the work is
+  for, which topics matter), `TAXONOMY.md`, and a generated `INDEX.md`.
 - `--non-interactive` is the installer's path: flags and defaults, no prompts.
 
+## The vault
+
+The clone is generic and empty. `hades init` creates six folders and one `START HERE.md` marker in each;
+the markers carry `status: marker`, are seeded signage rather than claims, and are left out of the index
+and the audit counts.
+
+| Folder | What belongs there |
+|---|---|
+| `00 Inbox` | Captures. A queue, not memory. |
+| `10 Outbox` | Work that leaves the machine, and messages for other agents. Nothing reads it yet. |
+| `20 Research` | One finding per note, with a topic and provenance. |
+| `30 Projects` | One folder per project, naming its topic and its research. |
+| `40 Products` | A project that stopped moving: `active`, `closed`, `inactive` or `frozen`, with `from_project`. |
+| `50 Topics` | The spine: `<category>/<topic>/<subtopic>/index.md`. |
+
+`TAXONOMY.md` lists the 26 static categories, taken from Foxforge's topic types: sports, technical,
+medical, finance, history, general, science, math, politics, current_events, underground, business, law,
+education, travel, animal_care, food, gaming, books, real_estate, automotive, parenting, tv_shows, movies,
+music, art. The category never grows; the tree under a topic does. A topic is deliberately general
+(`technical/ai-inference`); a narrower thing is a subtopic (`.../kv-cache`), not a second topic for the
+same ethos.
+
+The rules are enforced by both stores, so a file-backed vault and the SQLite record refuse the same note:
+
+- every research note, project and product names a `topic`;
+- a topic names one of the 26 categories;
+- a durable project names at least one research note in `research:`;
+- a product names the project it came from in `from_project:`;
+- a product's status is `active`, `closed`, `inactive` or `frozen`.
+
+The path is part of the record. `50 Topics/technical/ai-inference/kv-cache/index.md` is the subtopic
+`technical/ai-inference/kv-cache` in `technical`, with `technical/ai-inference` as its parent. A research
+note under `20 Research/technical/ai-inference/` takes that folder as its topic when it does not state one.
+The frontmatter is the graph; the folders are how a person navigates it, and the generated `INDEX.md` is
+the view that cannot drift from either.
+
+An existing 0.0.9 vault is upgraded on first open: the record migrates to schema v2 and each research or
+project note takes its first topic tag as its primary topic. Run `hades mneme export` to write the new
+tree (`40 Products` and `50 Topics`); the old `40 Topics` folder is then stale and can be removed.
+
 `hades init` refuses a vault that already exists. `hades audit` with no flags reads the vault the config
-names, and a fresh home audits clean: five empty areas, a charter and an index.
+names, and a fresh home audits clean: six empty areas, a charter and an index.
 
 ## Installing
 

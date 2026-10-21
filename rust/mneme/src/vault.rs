@@ -20,12 +20,13 @@ use crate::seams::{Clock, NoteStore};
 pub struct Filing {
     pub topics: Vec<String>,
     pub projects: Vec<String>,
+    pub from_project: Option<String>,
     pub summary: Option<String>,
     pub source_url: Option<String>,
     pub provenance: Option<String>,
 }
 
-/// A vault: five areas under one root, over an injected store and clock.
+/// A vault: six areas under one root, over an injected store and clock.
 pub struct Vault<S: NoteStore, C: Clock> {
     root: PathBuf,
     store: S,
@@ -72,8 +73,11 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
         WritePermit::new(holder)
     }
 
-    /// Create the five areas and an initial index. Idempotent, so running it twice is not an error.
-    /// The onboarding answers, when any of them is given, become the charter.
+    /// Create the six areas, the taxonomy, the seeded markers and an initial index. Idempotent, so
+    /// running it twice is not an error, and a vault that already has a file keeps it.
+    ///
+    /// The markers are marking posts, not memory: `status: marker` is exempt from the structural
+    /// rules, so an empty clone is navigable without pretending it knows anything.
     pub fn init(&self, answers: Option<(&str, &str, &[String])>) -> Result<PathBuf, Fault> {
         for area in Area::ALL {
             self.store.make_dirs(&self.area_path(area))?;
@@ -85,8 +89,45 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
         {
             self.write_charter(name, goal, topics)?;
         }
+        self.write_taxonomy()?;
+        self.seed_markers()?;
         self.write_index(None, &[])?;
         Ok(self.root.clone())
+    }
+
+    /// The fixed 26 categories, written at the root so a fresh agent can read the doors before it
+    /// files anything. Regenerated on every init; it is a map, not a note.
+    pub fn write_taxonomy(&self) -> Result<PathBuf, Fault> {
+        let path = self.root.join("TAXONOMY.md");
+        self.store.write(&path, &crate::topic::taxonomy())?;
+        Ok(path)
+    }
+
+    /// One marker per area. A marker is a note with `status: marker`; it is deliberately exempt from
+    /// the topic/category rules because it is signage, not knowledge.
+    fn seed_markers(&self) -> Result<(), Fault> {
+        for area in Area::ALL {
+            let path = self.area_path(area).join("START HERE.md");
+            if self.store.exists(&path) {
+                continue;
+            }
+            let frontmatter = Frontmatter {
+                title: Some(format!("{}: start here", area.key())),
+                summary: Some(area.purpose().to_string()),
+                status: Some("marker".to_string()),
+                provenance: Some("seeded".to_string()),
+                ..Frontmatter::default()
+            };
+            let body = format!(
+                "# {}\n\n{}\n\nThis note is a marking post. Replace it with real work, or leave it; \
+                 either way it is not a claim about the world.\n",
+                area.key(),
+                area.purpose()
+            );
+            let written = self.write_note(&path, &frontmatter, &body)?;
+            self.store.export(&written)?;
+        }
+        Ok(())
     }
 
     /// The onboarding answers, written where a session will find them.
@@ -186,7 +227,13 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
         }
 
         let (mut frontmatter, body) = self.parts(&path)?;
-        frontmatter.topics = topics;
+        frontmatter.topics = topics.clone();
+        if frontmatter.topic.is_none() && area.needs_topic() {
+            frontmatter.topic = topics.first().cloned();
+        }
+        if area == Area::Products && frontmatter.from_project.is_none() {
+            frontmatter.from_project = filing.from_project.clone();
+        }
         if !filing.projects.is_empty() {
             frontmatter.projects = cleaned(&filing.projects);
         }
@@ -241,6 +288,12 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
         if let Some(parent) = path.parent() {
             self.store.make_dirs(parent)?;
         }
+        // The structural rules live here as well as in the SQLite store: a file-backed vault has to
+        // refuse the same note, or the rules would only exist on one of the two paths.
+        let frontmatter = match crate::sqlite::note_path(&self.root, path) {
+            Some((area, slug)) => crate::sqlite::normalize(path, area, &slug, frontmatter.clone())?,
+            None => frontmatter.clone(),
+        };
         let text = format!("{}\n{}\n", frontmatter.render(), body.trim());
         self.store.write(path, &text)?;
         Ok(path.to_path_buf())
@@ -255,7 +308,7 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
         };
         let mut notes: Vec<Note> = Vec::new();
         for folder in folders {
-            for path in self.store.list(&folder)? {
+            for path in self.store.walk(&folder)? {
                 let relative = path.strip_prefix(&self.root).unwrap_or(&path);
                 if fenced(relative, fences) {
                     continue;

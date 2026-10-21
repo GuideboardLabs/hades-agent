@@ -378,6 +378,8 @@ impl Memory for MnemeMemory {
         let curation = Curation {
             topics: outcome.topics.clone(),
             projects: Vec::new(),
+            research: Vec::new(),
+            from_project: None,
             summary: outcome.summary.clone(),
             provenance: format!(
                 "session {} run {} attempt {}",

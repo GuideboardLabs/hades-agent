@@ -6,12 +6,17 @@
 use std::collections::BTreeMap;
 
 /// The order the vault writes keys in: the ones it names, then anything a hand edit added, sorted.
-pub const ORDER: [&str; 8] = [
+pub const ORDER: [&str; 13] = [
     "title",
     "summary",
     "status",
+    "category",
+    "topic",
+    "parent",
     "topics",
     "projects",
+    "research",
+    "from_project",
     "source_url",
     "provenance",
     "captured",
@@ -32,8 +37,18 @@ pub struct Frontmatter {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub status: Option<String>,
+    /// A topic's fixed door, one of [`crate::topic::Category`]. Empty on every other kind of note.
+    pub category: Option<String>,
+    /// The primary topic, by slug. Research, projects and products name one; topics are one.
+    pub topic: Option<String>,
+    /// A subtopic's parent topic slug. Empty for a root topic.
+    pub parent: Option<String>,
     pub topics: Vec<String>,
     pub projects: Vec<String>,
+    /// The research notes a project stands on. A durable project names at least one.
+    pub research: Vec<String>,
+    /// The project a product came from. A durable product names one.
+    pub from_project: Option<String>,
     pub source_url: Option<String>,
     pub provenance: Option<String>,
     pub captured: Option<String>,
@@ -116,6 +131,11 @@ impl Frontmatter {
             "title" => self.title = as_text(field),
             "summary" => self.summary = as_text(field),
             "status" => self.status = as_text(field),
+            "category" => self.category = as_text(field),
+            "topic" => self.topic = as_text(field),
+            "parent" => self.parent = as_text(field),
+            "research" => self.research = as_list(field),
+            "from_project" => self.from_project = as_text(field),
             "source_url" => self.source_url = as_text(field),
             "provenance" => self.provenance = as_text(field),
             "captured" => self.captured = as_text(field),
@@ -135,6 +155,11 @@ impl Frontmatter {
             "title" => self.title.clone().map(Field::Scalar),
             "summary" => self.summary.clone().map(Field::Scalar),
             "status" => self.status.clone().map(Field::Scalar),
+            "category" => self.category.clone().map(Field::Scalar),
+            "topic" => self.topic.clone().map(Field::Scalar),
+            "parent" => self.parent.clone().map(Field::Scalar),
+            "research" if !self.research.is_empty() => Some(Field::List(self.research.clone())),
+            "from_project" => self.from_project.clone().map(Field::Scalar),
             "topics" if !self.topics.is_empty() => Some(Field::List(self.topics.clone())),
             "projects" if !self.projects.is_empty() => Some(Field::List(self.projects.clone())),
             "source_url" => self.source_url.clone().map(Field::Scalar),
