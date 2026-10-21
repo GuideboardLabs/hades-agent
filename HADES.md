@@ -286,6 +286,28 @@ is adopted as a pass. The number is there to aim the next repair, not to lower t
 check to pass and the holdout not to regress. Without it, a tuning loop that improves one benchmark and
 calls it general improvement looks exactly like a real gain.
 
+## The failure corpus
+
+A failed run is a task, not a story. When a walk gives up, the harness pins the tree it started from, the
+goal, the check, the policy, the model and the whole ceiling it ran under, and files it as a case. A case
+is identified by profile, goal, check and tree digest, so recording the same failure again appends a
+`seen` line rather than a second tree. It is one store, with one explicit cap and `hades case forget`.
+
+`hades eval` puts the corpus back on the bench. The check runs first in a throwaway copy: a green start is
+`stale` and costs no model call, a truncated or missing tree is `broken`, and a red start replays the goal
+under the case's own policy and bounds. `--against <harness-dir>` runs the current harness and a candidate
+over every case and names each `holds`, `fixed`, `regression`, `still failing` or `base drifted`, keeping
+the two arms separate so a candidate's pass cannot rewrite the base's history. Exit 0 is no regression, 1
+is a regression, 2 is a corpus that cannot be replayed, which is not evidence either way.
+`tune --adopt` runs the same comparison for the selected candidate and refuses an improvement that breaks
+a pinned case; `--no-regress` is the one way past it and the receipt says the corpus was skipped.
+
+A security case carries a second oracle. `--attack <cmd>` succeeds while the vulnerability is present, so
+a pass is `check passed AND attack failed`; a green check beside a working exploit is red, and an attack
+that cannot run is a fault rather than a blocked one. The attack command, and any script it names, are
+frozen by the ruler with the check, and the case carries the attack so the gate refuses a candidate that
+revives it.
+
 ## The ledger
 
 Every tool call a chat or a scheduled job decides writes one line to `<state>/activity.jsonl`: when
@@ -359,7 +381,8 @@ the JSON; the file endpoints are the only place it travels.
 ## What the Rust tree is
 
 `rust/` is the harness: `session-tree` (append-only logs), `vault` (notes and fences), `governance` (audit and
-curation), `harness` (turn, graph, daemon, CLI). The Python under `agent/`, `hermes_state*.py` and the rest is
+curation), `harness` (turn, graph, daemon, CLI, and the failure corpus in `cases.rs` and `eval.rs`). The
+Python under `agent/`, `hermes_state*.py` and the rest is
 the copy this tree started from, kept as reference for behaviour that was ported. The executable spec for the
 substrate is the Python; the engine is the Rust.
 

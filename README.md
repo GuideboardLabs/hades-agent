@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.8-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.9-blue">
   <img alt="Tests" src="https://img.shields.io/badge/tests-855%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.8 |
+| **Version** | 0.0.9 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -64,6 +64,44 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Tests** | 855 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.9 adds
+
+The learning loop: a failed run becomes a dataset, a fix is measured against what came before, and a
+procedure has to say what it is for before it can be loaded.
+
+- **A failure becomes a case.** A giving-up run pins its starting tree, the goal, the oracle, the policy,
+  model and the full ceiling it failed under. `hades cases` lists them, `hades case <id>` prints one,
+  `hades case forget <id>` retires the tree and keeps the line. A case is a task, not a transcript: the
+  copy is atomic, a deduplicated record appends `seen` rather than a second tree, and a tree past the
+  snapshot limit is declined with the reason instead of being stored half-written.
+- **`hades eval` replays the corpus.** A green start is `stale` with no model call; a red one re-runs the
+  goal under the case's own policy and bounds in a throwaway copy. `--against <harness-dir>` runs the
+  current harness and a candidate over every case and classifies each as `holds`, `fixed`, `regression`,
+  `still failing` or `base drifted`, with exit 1 on a regression and 2 on a broken case or missing tree.
+  `--dry-run` prints the cases, arms and attempt ceiling before anything is spent.
+- **Adoption is gated.** `tune --adopt` runs the corpus for the base and the selected candidate before it
+  copies anything and refuses an improvement that regresses a pinned case, with the case ids and goals on
+  the receipt. `--no-regress` is the one way past it and the receipt says the corpus was skipped.
+- **A security fix has to attack its own patch.** `--attack <cmd>` adds a second oracle: the attack
+  succeeds while the vulnerability is present, so a green check beside a working exploit is a failed
+  result, and an attack that cannot run is a fault rather than a blocked one. The attack command and any
+  script it names are frozen by the ruler, the receipt names both oracles, and the case carries the attack
+  so the gate refuses a candidate that revives it.
+- **Dead ends and handover.** A giving-up run records why it was abandoned, deduplicated by goal and check
+  fingerprint and capped at 200 per profile by recorded retirement, and recall tells the next run what was
+  already tried. The harness also writes a handover before the walk ends: goal, attempts, best candidate,
+  blockers, the case it became, and a next step only when one can be derived. `hades session handover`
+  prints it.
+- **The skill contract.** A proposal now carries `contract`, `regression`, `holdout` and `version`.
+  Promotion refuses a `TODO` contract, fewer than two regression cases, or no holdout; `skills verify`
+  installs the proposal in a throwaway state, runs the cases it names and writes a receipt promotion
+  reads. `--force` promotes with the warning recorded. `skills report` prints proposals per 20 accepted
+  runs and the regression pass rate of installed skills, and says when a number is unmeasured.
+- **First-attempt rate and judge identity.** The scoreboard prints `first n/m` beside the pass rate, so a
+  high pass rate with a low first-attempt rate reads as a slow profile. A judgement now carries the model
+  and prompt digest that produced it, and the receipt prints them; a scripted judge says nothing rather
+  than implying a model.
 
 ## What 0.0.8 adds
 
