@@ -149,13 +149,17 @@ hades — the harness, one turn or a whole graph
       the version of this build (`--version` and `-V` are the same)
 
   hades research <question> [--queries 12] [--sources 12] [--fetches 24]
-                 [--minutes 60] [--claims 3] [--judge on|off] [--state <dir>] [--json]
+                 [--minutes 60] [--claims 3] [--judge on|off] [--workers 4]
+                 [--entailment] [--state <dir>] [--json]
                  [--offline] [--library <dir>]
       one evidence-first run: plan, search, fetch, extract, verify. Every published
       claim cites a byte-verified quote in a stored source. The check proves
       provenance, not truth. --offline reads only the local library and makes no
       network call. --judge compares claims from different sources on one
-      subquestion; --judge off skips that pass
+      subquestion; --judge off skips that pass. --workers fetches a batch of
+      candidates in parallel (1..8); --workers 1 reproduces the serial order.
+      --entailment asks the model whether each verified quote actually supports
+      its claim; the labels are advisory and never change the check
 
   hades research check <run-id> | show <run-id> | list [--state <dir>] [--strict]
       re-read a run without asking a model; check exits 0 green, 1 red, 2 unreadable.
@@ -3799,8 +3803,9 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
             "claims",
             "library",
             "judge",
+            "workers",
         ],
-        &["json", "offline"],
+        &["json", "offline", "entailment"],
     )?;
     let question = flags.positional.join(" ");
     if question.trim().is_empty() {
@@ -3836,6 +3841,11 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         .get("judge")
         .map(|value| value != "off")
         .unwrap_or(true);
+    let entailment_on = switched(&flags, "entailment");
+    let entailment = crate::research::ModelEntailmentAuditor {
+        harness: answerer.harness(),
+    };
+    let workers = number(&flags, "workers", if offline { 1 } else { 4 })?.clamp(1, 8);
     let library_root = library_path(&flags)?;
     let web: Box<dyn crate::research::Web> = if offline {
         let library = crate::library::Library::open(&library_root)?;
@@ -3855,6 +3865,12 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         planner: &planner,
         extractor: &extractor,
         judge: if judge_on { Some(&judge) } else { None },
+        entailment: if entailment_on {
+            Some(&entailment)
+        } else {
+            None
+        },
+        workers,
         mode: if offline {
             crate::research::RunMode::Offline
         } else {
@@ -3878,7 +3894,7 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
     }
 
     let mut text = format!(
-        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\ncross-source disputes: {}\nmodel tokens: planner {}+{}, extractor {}+{}, judge {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
+        "research: {} ({:?})\nquestion: {}\nmodel: {}\nsearches: {}\nfetches: {}\nworkers: {workers} (fetches)\nsources: {}\nclaims: {}\nverified quotes: {}\noff-question claims: {}\ncross-source disputes: {}\nmodel tokens: planner {}+{}, extractor {}+{}, judge {}+{}, entailment {}+{}\nelapsed: {} ms\nrun: {}\nreport: {}\n",
         run.id,
         run.status,
         run.question,
@@ -3896,10 +3912,26 @@ fn research_run_cmd(args: &[String]) -> Result<(String, i32), String> {
         run.usage.extractor_generated_tokens,
         run.usage.judge_prompt_tokens,
         run.usage.judge_generated_tokens,
+        run.usage.entailment_prompt_tokens,
+        run.usage.entailment_generated_tokens,
         run.usage.elapsed_ms,
         store.dir(&run.id).display(),
         store.dir(&run.id).join("report.md").display(),
     );
+    if !run.entailments.is_empty() {
+        let count = |label: &str| {
+            run.entailments
+                .values()
+                .filter(|value| value.starts_with(label))
+                .count()
+        };
+        text.push_str(&format!(
+            "entailment labels: {} supported, {} partial, {} unsupported\n",
+            count("supported"),
+            count("partial"),
+            count("unsupported")
+        ));
+    }
     if !check.failures.is_empty() {
         text.push_str("\ncheck failures:\n");
         for failure in &check.failures {

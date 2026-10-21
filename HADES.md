@@ -123,6 +123,21 @@ capped pairs. `--judge on|off` controls it. A pair the judge calls contradictory
 still byte-checked. The section records a conflict, not a verdict, and judge token counts are kept
 separate on the usage ledger.
 
+A social URL is now a pointer, not a source. When a search hit is on a social host, Hades fetches the post as raw
+markup, skips same-host navigation and `t.co` shorteners, resolves the first external link and fetches that
+artifact. The artifact supplies the canonical text and hash; `url` stays the post while `artifact_url` and
+`final_url` name the evidence, and the report prints `artifact via post`. A post with no visible artifact is a
+named gate failure. The post read and the artifact read both draw from the fetch budget.
+
+Candidates are fetched in a batch. `--workers` (1..8, default 4 on the live web and 1 offline) runs the batch in
+parallel, then processes results in candidate order, so `--workers 1` is the old serial order. Every candidate
+still passes the URL, private-address and deadline gates individually, and the budget is checked before the batch
+starts.
+
+`--entailment` adds an advisory pass: one capped model call per verified claim labels the quote `supported`,
+`partial` or `unsupported` and gives a reason. Labels are printed under the claim and stored in `entailments`;
+their tokens are separate on the ledger. The label never changes the byte check or the run status.
+
 `hades research bench <questions.json>` runs a question set and reports published, claims, verified
 quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid,
 not a truth score. `--grades <grades.json>` compares that coverage band with a human `pass`, `partial`
@@ -539,8 +554,11 @@ These are decisions, not omissions. Each has a reason and the seam it would chan
 - **The dispute judge is an opinion, capped.** It compares only cross-source pairs on one subquestion,
   stops at sixteen pairs, and can call an unrelated pair contradictory or miss one. Every quote in the
   section is byte-checked; the label is not a verdict.
-- **A social URL is still refused on its own.** The gate requires a linked artifact, and artifact-link
-  extraction is not built; until then an X post cannot be a source by itself.
+- **An entailment label is also an opinion, capped.** It stops at 32 claims and answers from one quote.
+  `supported` does not prove the claim is true; `unsupported` does not prove it false.
+- **Social artifact extraction reads the first external link, not the author's intent.** A post that links
+  a profile, an unrelated page or nothing visible fails the gate; a post whose artifact is behind a login
+  or a shortener that does not expand also fails. The post itself is never evidence.
 - **Hades writes only its own vault.** WEFT is read by its owner, not by Hades; `mneme export` is the
   one-way path.
 - **`skills report` says which numbers are unmeasured.** It does not estimate them.

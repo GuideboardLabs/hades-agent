@@ -126,6 +126,8 @@ fn run() -> (Store, harness::research::ResearchRun) {
         planner: &planner,
         extractor: &extractor,
         judge: None,
+        entailment: None,
+        workers: 1,
         mode: RunMode::Web,
     };
     let run = engine
@@ -220,6 +222,8 @@ fn a_run_with_no_verified_claim_is_not_published() {
         planner: &planner,
         extractor: &extractor,
         judge: None,
+        entailment: None,
+        workers: 1,
         mode: RunMode::Web,
     };
     let error = engine
@@ -316,6 +320,8 @@ fn one_bad_quote_is_retried_once_with_the_mismatch_as_a_hint() {
         planner: &planner,
         extractor: &extractor,
         judge: None,
+        entailment: None,
+        workers: 1,
         mode: RunMode::Web,
     };
     let run = engine
@@ -368,6 +374,8 @@ fn a_contradiction_is_verified_and_printed_in_the_disputed_section() {
         planner: &planner,
         extractor: &extractor,
         judge: None,
+        entailment: None,
+        workers: 1,
         mode: RunMode::Web,
     };
     let run = engine
@@ -508,6 +516,8 @@ fn a_cross_source_dispute_is_recorded_in_the_run_and_the_report() {
         planner: &planner,
         extractor: &extractor,
         judge: Some(&judge),
+        entailment: None,
+        workers: 1,
         mode: RunMode::Web,
     };
     let run = engine
@@ -646,6 +656,436 @@ fn a_grade_for_an_unknown_question_is_a_named_error() {
     )
     .expect_err("a grade for a missing question is an error");
     assert!(error.contains("q9"), "{error}");
+}
+
+struct SocialWeb;
+
+impl Web for SocialWeb {
+    fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>, String> {
+        Ok(vec![SearchHit {
+            title: "A post".to_string(),
+            url: "https://x.com/lab/status/1".to_string(),
+            snippet: String::new(),
+        }])
+    }
+
+    fn fetch(&self, url: &str) -> Result<Fetched, String> {
+        if url.contains("x.com") {
+            return Err("the engine must use fetch_raw for a post".to_string());
+        }
+        Ok(Fetched {
+            url: url.to_string(),
+            final_url: url.to_string(),
+            title: "The paper".to_string(),
+            status: Some(200),
+            content_type: "text/html".to_string(),
+            body: format!(
+                "The measured value is 410 tokens per second. {}",
+                "The artifact explains the method and the condition in enough detail. ".repeat(7)
+            ),
+            excerpt: None,
+        })
+    }
+
+    fn fetch_raw(&self, url: &str) -> Result<String, String> {
+        if !url.contains("x.com") {
+            return Err("not a post".to_string());
+        }
+        Ok(r#"<html><a href="/home">home</a><a href="https://arxiv.org/abs/2610.23839">paper</a></html>"#.to_string())
+    }
+}
+
+struct NoArtifactWeb;
+
+impl Web for NoArtifactWeb {
+    fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>, String> {
+        Ok(vec![SearchHit {
+            title: "A post".to_string(),
+            url: "https://x.com/lab/status/2".to_string(),
+            snippet: String::new(),
+        }])
+    }
+
+    fn fetch(&self, _url: &str) -> Result<Fetched, String> {
+        Err("the post has no artifact".to_string())
+    }
+
+    fn fetch_raw(&self, _url: &str) -> Result<String, String> {
+        Ok(r#"<a href="/home">home</a><a href="https://t.co/abc">short</a>"#.to_string())
+    }
+}
+
+struct SocialExtractor;
+
+impl Extractor for SocialExtractor {
+    fn extract(
+        &self,
+        _subquestion: &str,
+        _source: &Source,
+        _body: &str,
+        _budget: &ResearchBudget,
+    ) -> Result<Vec<ClaimDraft>, String> {
+        Ok(vec![ClaimDraft {
+            text: "The measured value is 410 tokens per second.".to_string(),
+            quote: "The measured value is 410 tokens per second.".to_string(),
+            kind: ClaimKind::Sourced,
+            decision: None,
+            alternatives: Vec::new(),
+            contradicts: Vec::new(),
+        }])
+    }
+}
+
+struct TwoPostWeb {
+    fetched: AtomicUsize,
+}
+
+impl Web for TwoPostWeb {
+    fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>, String> {
+        Ok((1..=2)
+            .map(|index| SearchHit {
+                title: format!("Post {index}"),
+                url: format!("https://x.com/lab/status/{index}"),
+                snippet: String::new(),
+            })
+            .collect())
+    }
+
+    fn fetch(&self, url: &str) -> Result<Fetched, String> {
+        self.fetched.fetch_add(1, Ordering::SeqCst);
+        Ok(Fetched {
+            url: url.to_string(),
+            final_url: url.to_string(),
+            title: "The paper".to_string(),
+            status: Some(200),
+            content_type: "text/html".to_string(),
+            body: format!(
+                "The measured value is 410 tokens per second. {}",
+                "The artifact explains the method and the condition in enough detail. ".repeat(7)
+            ),
+            excerpt: None,
+        })
+    }
+
+    fn fetch_raw(&self, _url: &str) -> Result<String, String> {
+        Ok(r#"<a href="https://arxiv.org/abs/2610.23839">paper</a>"#.to_string())
+    }
+}
+
+struct FixedAuditor;
+
+impl harness::research::EntailmentAuditor for FixedAuditor {
+    fn audit(
+        &self,
+        claim: &harness::research::Claim,
+        _quote: &str,
+    ) -> Result<(String, Option<harness::task::Usage>), String> {
+        let label = if claim.id == "c1" {
+            "partial: the quote drops the batch size"
+        } else {
+            "unsupported: the quote does not establish the claim"
+        };
+        Ok((label.to_string(), None))
+    }
+}
+
+struct SlowWeb {
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl SlowWeb {
+    fn new() -> SlowWeb {
+        SlowWeb {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Web for SlowWeb {
+    fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>, String> {
+        Ok((1..=4)
+            .map(|index| SearchHit {
+                title: format!("Source {index}"),
+                url: format!("https://example.com/{index}"),
+                snippet: String::new(),
+            })
+            .collect())
+    }
+
+    fn fetch(&self, url: &str) -> Result<Fetched, String> {
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(Fetched {
+            url: url.to_string(),
+            final_url: url.to_string(),
+            title: "Source".to_string(),
+            status: Some(200),
+            content_type: "text/html".to_string(),
+            body: format!(
+                "The measured value is 410 tokens per second. {}",
+                "The source explains the method and the condition in enough detail. ".repeat(7)
+            ),
+            excerpt: None,
+        })
+    }
+}
+
+#[test]
+fn a_social_post_supplies_its_linked_artifact_as_the_evidence() {
+    let store = Store::new(&scratch::unique("research-social"));
+    let web = SocialWeb;
+    let planner = OneQuestion;
+    let extractor = SocialExtractor;
+    let engine = Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+        judge: None,
+        entailment: None,
+        workers: 1,
+        mode: RunMode::Web,
+    };
+    let run = engine
+        .run_named(
+            "r-social",
+            "What value did the source measure?",
+            ResearchBudget {
+                queries: 1,
+                fetches: 4,
+                minutes: 5,
+                claims_per_source: 1,
+            },
+        )
+        .expect("a published social run");
+    assert_eq!(run.status, RunStatus::Published, "{:?}", run.failures);
+    assert_eq!(run.sources.len(), 1);
+    let source = &run.sources[0];
+    assert_eq!(source.url, "https://x.com/lab/status/1");
+    assert_eq!(source.final_url, "https://arxiv.org/abs/2610.23839");
+    assert_eq!(
+        source.artifact_url.as_deref(),
+        Some("https://arxiv.org/abs/2610.23839")
+    );
+    assert_eq!(source.kind, harness::research::SourceKind::Primary);
+    let report = fs::read_to_string(store.dir("r-social").join("report.md")).expect("a report");
+    assert!(
+        report.contains("https://arxiv.org/abs/2610.23839"),
+        "{report}"
+    );
+    assert!(
+        report.contains("via https://x.com/lab/status/1"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_duplicate_artifact_is_not_fetched_twice() {
+    let store = Store::new(&scratch::unique("research-social-duplicate"));
+    let web = TwoPostWeb {
+        fetched: AtomicUsize::new(0),
+    };
+    let planner = OneQuestion;
+    let extractor = SocialExtractor;
+    let engine = Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+        judge: None,
+        entailment: None,
+        workers: 1,
+        mode: RunMode::Web,
+    };
+    let run = engine
+        .run_named(
+            "r-social-duplicate",
+            "What value did the source measure?",
+            ResearchBudget {
+                queries: 1,
+                fetches: 6,
+                minutes: 5,
+                claims_per_source: 1,
+            },
+        )
+        .expect("one artifact is enough");
+    assert_eq!(run.sources.len(), 1);
+    assert_eq!(web.fetched.load(Ordering::SeqCst), 1);
+    assert!(
+        run.failures
+            .iter()
+            .any(|failure| failure.reason.contains("already fetched")),
+        "{:?}",
+        run.failures
+    );
+}
+
+#[test]
+fn a_social_post_without_an_artifact_is_a_gate_failure() {
+    let store = Store::new(&scratch::unique("research-social-empty"));
+    let web = NoArtifactWeb;
+    let planner = OneQuestion;
+    let extractor = SocialExtractor;
+    let engine = Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+        judge: None,
+        entailment: None,
+        workers: 1,
+        mode: RunMode::Web,
+    };
+    let error = engine
+        .run_named(
+            "r-social-empty",
+            "What value did the source measure?",
+            ResearchBudget {
+                queries: 1,
+                fetches: 4,
+                minutes: 5,
+                claims_per_source: 1,
+            },
+        )
+        .expect_err("a post with no artifact cannot publish");
+    assert!(error.contains("no verified claim"), "{error}");
+    let run = store.load("r-social-empty").expect("the failed run");
+    assert!(
+        run.failures
+            .iter()
+            .any(|failure| failure.stage == "gate" && failure.reason.contains("no linked artifact")),
+        "{:?}",
+        run.failures
+    );
+}
+
+#[test]
+fn an_entailment_audit_is_reported_without_changing_the_check() {
+    let store = Store::new(&scratch::unique("research-entailment"));
+    let web = FixtureWeb::new();
+    let planner = FixedPlanner;
+    let extractor = FixedExtractor;
+    let auditor = FixedAuditor;
+    let engine = Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+        judge: None,
+        entailment: Some(&auditor),
+        workers: 1,
+        mode: RunMode::Web,
+    };
+    let run = engine
+        .run_named(
+            "r-entailment",
+            "What happened in the two fixture reports?",
+            ResearchBudget {
+                queries: 4,
+                fetches: 4,
+                minutes: 5,
+                claims_per_source: 2,
+            },
+        )
+        .expect("a completed run");
+    assert_eq!(run.status, RunStatus::Published, "{:?}", run.failures);
+    assert_eq!(
+        run.entailments.get("c1").map(String::as_str),
+        Some("partial: the quote drops the batch size")
+    );
+    assert_eq!(
+        run.entailments.get("c2").map(String::as_str),
+        Some("unsupported: the quote does not establish the claim")
+    );
+    let report = fs::read_to_string(store.dir("r-entailment").join("report.md")).expect("a report");
+    assert!(report.contains("Entailment: partial"), "{report}");
+    assert!(
+        check(&store, "r-entailment").expect("a check").code == harness::research::CheckCode::Green
+    );
+}
+
+#[test]
+fn parallel_fetches_overlap_and_sequential_fetches_do_not() {
+    let store = Store::new(&scratch::unique("research-workers"));
+    let web = SlowWeb::new();
+    let planner = OneQuestion;
+    let extractor = SocialExtractor;
+    let engine = Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+        judge: None,
+        entailment: None,
+        workers: 4,
+        mode: RunMode::Web,
+    };
+    let run = engine
+        .run_named(
+            "r-workers-4",
+            "What value did the source measure?",
+            ResearchBudget {
+                queries: 1,
+                fetches: 4,
+                minutes: 5,
+                claims_per_source: 1,
+            },
+        )
+        .expect("a parallel run");
+    assert_eq!(run.status, RunStatus::Published, "{:?}", run.failures);
+    assert!(
+        web.max_in_flight.load(Ordering::SeqCst) >= 2,
+        "max in flight was {}",
+        web.max_in_flight.load(Ordering::SeqCst)
+    );
+    let order: Vec<&str> = run
+        .sources
+        .iter()
+        .map(|source| source.url.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "https://example.com/1",
+            "https://example.com/2",
+            "https://example.com/3",
+            "https://example.com/4"
+        ]
+    );
+
+    let store = Store::new(&scratch::unique("research-workers-one"));
+    let web = SlowWeb::new();
+    let engine = Engine {
+        store: &store,
+        web: &web,
+        planner: &planner,
+        extractor: &extractor,
+        judge: None,
+        entailment: None,
+        workers: 1,
+        mode: RunMode::Web,
+    };
+    engine
+        .run_named(
+            "r-workers-1",
+            "What value did the source measure?",
+            ResearchBudget {
+                queries: 1,
+                fetches: 4,
+                minutes: 5,
+                claims_per_source: 1,
+            },
+        )
+        .expect("a sequential run");
+    assert_eq!(
+        web.max_in_flight.load(Ordering::SeqCst),
+        1,
+        "workers=1 must not overlap fetches"
+    );
 }
 
 #[test]

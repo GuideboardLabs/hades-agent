@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.17-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-950%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.18-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-958%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.17 |
+| **Version** | 0.0.18 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,25 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 950 passing, 13 ignored live tests |
+| **Tests** | 958 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.18 adds
+
+This release closes the last research limits.
+
+- **A social post can supply the paper it links to.** When a search hit is a social URL, Hades reads the post as raw
+  markup, skips navigation and shortener links, resolves the first link that leaves the platform, fetches that
+  artifact, and stores it as the source. The report shows the artifact URL with `via` the post; `run.json` and
+  `report.json` carry both `url` and `artifact_url`. A post with no visible artifact is a named gate failure, never
+  a source by itself, and the artifact fetch is charged to the same budget.
+- **`--entailment` audits the quote against the claim.** For each verified claim, one capped model call labels the
+  link `supported`, `partial` or `unsupported` and gives a short reason. Labels appear under the claim and in
+  `entailments`; token use is on its own ledger line. This is advisory. The byte check still decides provenance.
+- **`--workers 1..8` fetches a candidate batch in parallel.** Results are processed in candidate order, so
+  `--workers 1` reproduces the serial run exactly. Each fetch still passes the same URL, private-address and
+  deadline gates; the budget is checked before a batch starts.
 
 ## What 0.0.17 adds
 
@@ -836,7 +852,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **950 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **958 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

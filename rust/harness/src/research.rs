@@ -8,7 +8,7 @@
 //! The check is deterministic. It reads the stored canonical text and compares `body[start..end]` with
 //! the quote the report cites. A link is provenance; a byte range is a check.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -138,6 +138,8 @@ pub struct UsageLedger {
     pub extractor_generated_tokens: u64,
     pub judge_prompt_tokens: u64,
     pub judge_generated_tokens: u64,
+    pub entailment_prompt_tokens: u64,
+    pub entailment_generated_tokens: u64,
     pub elapsed_ms: u64,
 }
 
@@ -292,6 +294,8 @@ pub struct ResearchRun {
     pub claims: Vec<Claim>,
     #[serde(default)]
     pub disputes: Vec<Dispute>,
+    #[serde(default)]
+    pub entailments: BTreeMap<String, String>,
     pub failures: Vec<Failure>,
     pub usage: UsageLedger,
     pub report: Option<String>,
@@ -353,6 +357,7 @@ impl Store {
             sources: Vec::new(),
             claims: Vec::new(),
             disputes: Vec::new(),
+            entailments: BTreeMap::new(),
             failures: Vec::new(),
             usage: UsageLedger::default(),
             report: None,
@@ -491,9 +496,15 @@ pub struct ClaimDraft {
     pub contradicts: Vec<String>,
 }
 
-pub trait Web {
+pub trait Web: Send + Sync {
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String>;
     fn fetch(&self, url: &str) -> Result<Fetched, String>;
+
+    /// Raw markup for link discovery. The default refuses rather than pretending a stripped body
+    /// is markup; a source that cannot expose raw bytes cannot support a social artifact.
+    fn fetch_raw(&self, _url: &str) -> Result<String, String> {
+        Err("this web source cannot expose raw markup".to_string())
+    }
 }
 
 pub trait Planner {
@@ -557,6 +568,10 @@ pub trait DisputeJudge {
     }
 }
 
+pub trait EntailmentAuditor {
+    fn audit(&self, claim: &Claim, quote: &str) -> Result<(String, Option<Usage>), String>;
+}
+
 // ── live web ─────────────────────────────────────────────────────────────────
 
 pub struct Searx {
@@ -606,6 +621,11 @@ impl Web for Searx {
             body,
             excerpt: None,
         })
+    }
+
+    fn fetch_raw(&self, url: &str) -> Result<String, String> {
+        let allow_private = std::env::var("HADES_FETCH_ALLOW_PRIVATE").as_deref() == Ok("1");
+        crate::fetch::run_raw(url, 2_000_000, allow_private)
     }
 }
 
@@ -838,6 +858,101 @@ fn clip(text: &str, limit: usize) -> String {
     format!("{cut}...")
 }
 
+fn first_artifact_link(html: &str, base: &str) -> Option<String> {
+    let base_host = host_of(base).to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(at) = html[from..].find("href") {
+        let start = from + at;
+        let rest = &html[start + 4..];
+        let Some(eq) = rest.find('=') else {
+            break;
+        };
+        let value = &rest[eq + 1..];
+        let Some(q) = value.find(['"', '\'']) else {
+            break;
+        };
+        let quote = value[q..].chars().next().expect("a quote");
+        let Some(end) = value[q + 1..].find(quote) else {
+            break;
+        };
+        let href = &value[q + 1..q + 1 + end];
+        from = start + 4 + eq + 1 + q + 1 + end + 1;
+        let Some(url) = resolve_link(base, href) else {
+            continue;
+        };
+        let host = host_of(&url).to_ascii_lowercase();
+        if host.is_empty()
+            || host == base_host
+            || host.contains("x.com")
+            || host.contains("twitter.com")
+            || host == "t.co"
+        {
+            continue;
+        }
+        return Some(url);
+    }
+    None
+}
+
+fn resolve_link(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty()
+        || href.starts_with('#')
+        || href.starts_with("mailto:")
+        || href.starts_with("javascript:")
+        || href.starts_with("data:")
+    {
+        return None;
+    }
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    let scheme = base
+        .strip_prefix("https://")
+        .map(|_| "https")
+        .unwrap_or("http");
+    if let Some(rest) = href.strip_prefix("//") {
+        return Some(format!("{scheme}://{rest}"));
+    }
+    let host = host_of(base);
+    if host.is_empty() {
+        return None;
+    }
+    if href.starts_with('/') {
+        return Some(format!("{scheme}://{host}{href}"));
+    }
+    let path = base
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(base)
+        .trim_end_matches('/');
+    let directory = path
+        .rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .unwrap_or("");
+    Some(normalize_url_path(&format!("{directory}/{href}")))
+}
+
+fn normalize_url_path(url: &str) -> String {
+    let Some(sep) = url.find("://") else {
+        return url.to_string();
+    };
+    let (prefix, rest) = url.split_at(sep + 3);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    format!("{prefix}{host}/{}", segments.join("/"))
+}
+
 fn kind_of(url: &str) -> SourceKind {
     if url.starts_with("library://") {
         return SourceKind::Primary;
@@ -892,6 +1007,14 @@ fn source_from_fetched(id: &str, fetched: &Fetched) -> Source {
         artifact_url: None,
         snippet_only: false,
     }
+}
+
+fn source_from_artifact(id: &str, post_url: &str, artifact_url: &str, fetched: &Fetched) -> Source {
+    let mut source = source_from_fetched(id, fetched);
+    source.url = post_url.to_string();
+    source.kind = kind_of(artifact_url);
+    source.artifact_url = Some(artifact_url.to_string());
+    source
 }
 
 // ── live model seams ─────────────────────────────────────────────────────────
@@ -1031,6 +1154,47 @@ impl DisputeJudge for ModelDisputeJudge<'_> {
         Ok((reason, completion.usage))
     }
 }
+
+pub struct ModelEntailmentAuditor<'a> {
+    pub harness: &'a dyn Harness,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntailmentVerdict {
+    label: String,
+    #[serde(default)]
+    reason: String,
+}
+
+impl EntailmentAuditor for ModelEntailmentAuditor<'_> {
+    fn audit(&self, claim: &Claim, quote: &str) -> Result<(String, Option<Usage>), String> {
+        let user = format!(
+            "Claim [{}]: {}\nQuote: {}",
+            claim.id,
+            claim.text.trim(),
+            quote.trim()
+        );
+        let completion = self
+            .harness
+            .complete(ENTAILMENT_SYSTEM, &user, &Budget::new(4_000))
+            .map_err(|fault| fault.to_string())?;
+        let verdict: EntailmentVerdict = parse_object(&completion.text)?;
+        let label = match verdict.label.trim().to_ascii_lowercase().as_str() {
+            "supported" => "supported",
+            "unsupported" => "unsupported",
+            _ => "partial",
+        };
+        let reason = verdict.reason.trim();
+        let value = if reason.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}: {reason}")
+        };
+        Ok((value, completion.usage))
+    }
+}
+
+const ENTAILMENT_SYSTEM: &str = "You compare one research claim with the one quote it cites. Return only a JSON object {\"label\":\"supported\"|\"partial\"|\"unsupported\",\"reason\":\"...\"}. supported means the quote alone establishes every qualifier in the claim. partial means the quote supports the topic but drops or changes a qualifier, population, model, version or condition. unsupported means the quote does not establish the claim. Do not use outside knowledge, and do not upgrade a conditional quote into a general claim.";
 
 #[derive(Debug, Deserialize)]
 struct DisputeVerdict {
@@ -1376,12 +1540,40 @@ fn judge_disputes(store: &Store, run: &mut ResearchRun, judge: &dyn DisputeJudge
     }
 }
 
+fn audit_claims(store: &Store, run: &mut ResearchRun, auditor: &dyn EntailmentAuditor) {
+    for claim in run.claims.iter().take(32) {
+        let Some(quote) = claim.support.first().map(|quote| quote.text.clone()) else {
+            continue;
+        };
+        match auditor.audit(claim, &quote) {
+            Ok((label, usage)) => {
+                if let Some(usage) = usage {
+                    run.usage.entailment_prompt_tokens += usage.prompt_tokens;
+                    run.usage.entailment_generated_tokens += usage.generated_tokens;
+                }
+                run.entailments.insert(claim.id.clone(), label);
+            }
+            Err(reason) => {
+                let failure = Failure {
+                    stage: "entailment".to_string(),
+                    subject: claim.id.clone(),
+                    reason,
+                };
+                run.failures.push(failure.clone());
+                store.append_failure(&run.id, &failure);
+            }
+        }
+    }
+}
+
 pub struct Engine<'a> {
     pub store: &'a Store,
     pub web: &'a dyn Web,
     pub planner: &'a dyn Planner,
     pub extractor: &'a dyn Extractor,
     pub judge: Option<&'a dyn DisputeJudge>,
+    pub entailment: Option<&'a dyn EntailmentAuditor>,
+    pub workers: usize,
     pub mode: RunMode,
 }
 
@@ -1547,16 +1739,32 @@ impl<'a> Engine<'a> {
             run.usage.searches += 1;
 
             let mut new_claims = 0usize;
+            let mut normal_hits = Vec::new();
+            let mut social_hits = Vec::new();
             for hit in hits {
-                if run.usage.fetches >= budget.fetches || Instant::now() >= deadline {
+                let reserved = normal_hits.len() + social_hits.len() * 2;
+                if run.usage.fetches + reserved >= budget.fetches || Instant::now() >= deadline {
                     break;
                 }
                 let key = normalize_url(&hit.url);
                 if key.is_empty() || !usable_url(&hit.url) || !fetched_urls.insert(key) {
                     continue;
                 }
-                run.usage.fetches += 1;
-                let fetched = match self.web.fetch(&hit.url) {
+                if kind_of(&hit.url) == SourceKind::Social {
+                    social_hits.push(hit);
+                } else {
+                    normal_hits.push(hit);
+                }
+            }
+
+            run.usage.fetches += normal_hits.len();
+            let urls: Vec<String> = normal_hits.iter().map(|hit| hit.url.clone()).collect();
+            let fetched = fetch_many(self.web, &urls, self.workers);
+            for (hit, result) in normal_hits.iter().zip(fetched) {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                let fetched = match result {
                     Ok(fetched) => fetched,
                     Err(reason) => {
                         run.failures.push(Failure {
@@ -1569,93 +1777,85 @@ impl<'a> Engine<'a> {
                 };
                 let source_id = format!("s{}", run.sources.len() + 1);
                 let source = source_from_fetched(&source_id, &fetched);
-                if let Err(reason) = source.admits(&fetched.body) {
+                fetched_urls.insert(normalize_url(&fetched.final_url));
+                new_claims += self.absorb_source(&mut run, index, &source, &fetched, &budget)?;
+                self.store.save(&run)?;
+            }
+
+            for hit in social_hits {
+                if run.usage.fetches >= budget.fetches || Instant::now() >= deadline {
+                    run.failures.push(Failure {
+                        stage: "budget".to_string(),
+                        subject: hit.url.clone(),
+                        reason: "the fetch or time budget ran out before the artifact".to_string(),
+                    });
+                    continue;
+                }
+                let raw = match self.web.fetch_raw(&hit.url) {
+                    Ok(raw) => raw,
+                    Err(reason) => {
+                        run.usage.fetches += 1;
+                        run.failures.push(Failure {
+                            stage: "fetch".to_string(),
+                            subject: hit.url.clone(),
+                            reason: format!(
+                                "the social post could not be read as markup: {reason}"
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                run.usage.fetches += 1;
+                let Some(link) = first_artifact_link(&raw, &hit.url) else {
                     run.failures.push(Failure {
                         stage: "gate".to_string(),
                         subject: hit.url.clone(),
-                        reason,
+                        reason: "a social post with no linked artifact cannot be evidence"
+                            .to_string(),
                     });
                     continue;
-                }
-                if let Err(reason) = self.store.save_source(&run.id, &source, &fetched.body) {
+                };
+                if fetched_urls.contains(&normalize_url(&link)) {
                     run.failures.push(Failure {
-                        stage: "store".to_string(),
-                        subject: hit.url.clone(),
-                        reason,
+                        stage: "gate".to_string(),
+                        subject: link.clone(),
+                        reason: "the linked artifact was already fetched".to_string(),
                     });
                     continue;
                 }
-                run.sources.push(source.clone());
-                run.usage.sources += 1;
-                self.store.save(&run)?;
-
-                let view = fetched.excerpt.as_deref().unwrap_or(&fetched.body);
-                let drafts = match self.extractor.extract_with_usage(
-                    &run.subquestions[index].text,
-                    &source,
-                    view,
-                    &budget,
-                ) {
-                    Ok((drafts, usage)) => {
-                        if let Some(usage) = usage {
-                            run.usage.extractor_prompt_tokens += usage.prompt_tokens;
-                            run.usage.extractor_generated_tokens += usage.generated_tokens;
-                        }
-                        drafts
-                    }
+                if run.usage.fetches >= budget.fetches || Instant::now() >= deadline {
+                    run.failures.push(Failure {
+                        stage: "budget".to_string(),
+                        subject: link.clone(),
+                        reason: "the fetch or time budget ran out before the artifact".to_string(),
+                    });
+                    continue;
+                }
+                let fetched = match self.web.fetch(&link) {
+                    Ok(fetched) => fetched,
                     Err(reason) => {
+                        run.usage.fetches += 1;
                         run.failures.push(Failure {
-                            stage: "extract".to_string(),
-                            subject: source.id.clone(),
+                            stage: "fetch".to_string(),
+                            subject: link.clone(),
                             reason,
                         });
                         continue;
                     }
                 };
-
-                let (mut added, verified, first_bad) = absorb_drafts(
-                    self.store,
-                    &mut run,
-                    index,
-                    &source,
-                    &fetched.body,
-                    drafts,
-                    &budget,
-                )?;
-                if verified == 0
-                    && let Some(bad) = first_bad
-                {
-                    match self.extractor.extract_with_hint(
-                        &run.subquestions[index].text,
-                        &source,
-                        view,
-                        &budget,
-                        Some(&bad),
-                    ) {
-                        Ok((retry, usage)) => {
-                            if let Some(usage) = usage {
-                                run.usage.extractor_prompt_tokens += usage.prompt_tokens;
-                                run.usage.extractor_generated_tokens += usage.generated_tokens;
-                            }
-                            let (more, _, _) = absorb_drafts(
-                                self.store,
-                                &mut run,
-                                index,
-                                &source,
-                                &fetched.body,
-                                retry,
-                                &budget,
-                            )?;
-                            added += more;
-                        }
-                        Err(reason) => run.failures.push(Failure {
-                            stage: "extract".to_string(),
-                            subject: source.id.clone(),
-                            reason: format!("the retry after a failed quote failed: {reason}"),
-                        }),
-                    }
+                run.usage.fetches += 1;
+                if !fetched_urls.insert(normalize_url(&link)) {
+                    run.failures.push(Failure {
+                        stage: "gate".to_string(),
+                        subject: link.clone(),
+                        reason: "the linked artifact was already fetched".to_string(),
+                    });
+                    continue;
                 }
-                new_claims += added;
+                let source_id = format!("s{}", run.sources.len() + 1);
+                let source = source_from_artifact(&source_id, &hit.url, &link, &fetched);
+                fetched_urls.insert(normalize_url(&fetched.final_url));
+                new_claims += self.absorb_source(&mut run, index, &source, &fetched, &budget)?;
                 self.store.save(&run)?;
             }
 
@@ -1719,6 +1919,9 @@ impl<'a> Engine<'a> {
         if let Some(judge) = self.judge {
             judge_disputes(self.store, &mut run, judge);
         }
+        if let Some(auditor) = self.entailment {
+            audit_claims(self.store, &mut run, auditor);
+        }
         run.status = RunStatus::Checking;
         self.store.save(&run)?;
         let report = write_report(self.store, &run)?;
@@ -1735,6 +1938,134 @@ impl<'a> Engine<'a> {
         self.store.save(&run)?;
         Ok(run)
     }
+    fn absorb_source(
+        &self,
+        run: &mut ResearchRun,
+        index: usize,
+        source: &Source,
+        fetched: &Fetched,
+        budget: &ResearchBudget,
+    ) -> Result<usize, String> {
+        if let Err(reason) = source.admits(&fetched.body) {
+            run.failures.push(Failure {
+                stage: "gate".to_string(),
+                subject: source.url.clone(),
+                reason,
+            });
+            return Ok(0);
+        }
+        if let Err(reason) = self.store.save_source(&run.id, source, &fetched.body) {
+            run.failures.push(Failure {
+                stage: "store".to_string(),
+                subject: source.url.clone(),
+                reason,
+            });
+            return Ok(0);
+        }
+        run.sources.push(source.clone());
+        run.usage.sources += 1;
+        self.store.save(run)?;
+
+        let view = fetched.excerpt.as_deref().unwrap_or(&fetched.body);
+        let drafts = match self.extractor.extract_with_usage(
+            &run.subquestions[index].text,
+            source,
+            view,
+            budget,
+        ) {
+            Ok((drafts, usage)) => {
+                if let Some(usage) = usage {
+                    run.usage.extractor_prompt_tokens += usage.prompt_tokens;
+                    run.usage.extractor_generated_tokens += usage.generated_tokens;
+                }
+                drafts
+            }
+            Err(reason) => {
+                run.failures.push(Failure {
+                    stage: "extract".to_string(),
+                    subject: source.id.clone(),
+                    reason,
+                });
+                return Ok(0);
+            }
+        };
+
+        let (mut added, verified, first_bad) = absorb_drafts(
+            self.store,
+            run,
+            index,
+            source,
+            &fetched.body,
+            drafts,
+            budget,
+        )?;
+        if verified == 0
+            && let Some(bad) = first_bad
+        {
+            match self.extractor.extract_with_hint(
+                &run.subquestions[index].text,
+                source,
+                view,
+                budget,
+                Some(&bad),
+            ) {
+                Ok((retry, usage)) => {
+                    if let Some(usage) = usage {
+                        run.usage.extractor_prompt_tokens += usage.prompt_tokens;
+                        run.usage.extractor_generated_tokens += usage.generated_tokens;
+                    }
+                    let (more, _, _) = absorb_drafts(
+                        self.store,
+                        run,
+                        index,
+                        source,
+                        &fetched.body,
+                        retry,
+                        budget,
+                    )?;
+                    added += more;
+                }
+                Err(reason) => run.failures.push(Failure {
+                    stage: "extract".to_string(),
+                    subject: source.id.clone(),
+                    reason: format!("the retry after a failed quote failed: {reason}"),
+                }),
+            }
+        }
+        Ok(added)
+    }
+}
+
+fn fetch_many(web: &dyn Web, urls: &[String], workers: usize) -> Vec<Result<Fetched, String>> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let workers = workers.clamp(1, 8).min(urls.len());
+    if workers == 1 {
+        return urls.iter().map(|url| web.fetch(url)).collect();
+    }
+    let chunk = urls.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = urls
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|url| web.fetch(url))
+                        .collect::<Vec<Result<Fetched, String>>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| vec![Err("a fetch worker panicked".to_string())])
+            })
+            .collect()
+    })
 }
 
 // ── report and check ─────────────────────────────────────────────────────────
@@ -1868,6 +2199,11 @@ pub fn run_bench_with_grades(
             planner,
             extractor,
             judge: None,
+            entailment: None,
+            workers: match mode {
+                RunMode::Web => 4,
+                RunMode::Offline => 1,
+            },
             mode,
         };
         let run = engine.run(&question.question, budget.clone())?;
@@ -2036,6 +2372,9 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
                 claim.text.trim(),
                 marks
             ));
+            if let Some(label) = run.entailments.get(&claim.id) {
+                text.push_str(&format!("  - Entailment: {label}\n"));
+            }
         }
         text.push('\n');
     }
@@ -2137,11 +2476,18 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
 
     text.push_str("## Sources\n\n");
     for source in &run.sources {
+        let shown = source.artifact_url.as_deref().unwrap_or(&source.url);
+        let via = if source.artifact_url.is_some() && source.url != shown {
+            format!(" via {}", source.url)
+        } else {
+            String::new()
+        };
         text.push_str(&format!(
-            "- [{}] {}: {} ({}, sha256 `{}`)\n",
+            "- [{}] {}: {}{} ({}, sha256 `{}`)\n",
             source.id,
             source.title.trim(),
-            source.url,
+            shown,
+            via,
             format!("{:?}", source.kind).to_lowercase(),
             source.sha256
         ));
@@ -2177,15 +2523,19 @@ fn write_report(store: &Store, run: &ResearchRun) -> Result<String, String> {
             "history": claim.history,
             "decision": claim.decision,
             "alternatives": claim.alternatives,
+            "entailment": run.entailments.get(&claim.id),
         })).collect::<Vec<_>>(),
         "sources": run.sources.iter().map(|source| serde_json::json!({
             "id": source.id,
             "title": source.title,
             "url": source.url,
+            "final_url": source.final_url,
+            "artifact_url": source.artifact_url,
             "sha256": source.sha256,
             "kind": source.kind,
         })).collect::<Vec<_>>(),
         "disputes": run.disputes,
+        "entailments": run.entailments,
     });
     fs::write(
         store.dir(&run.id).join("report.json"),
@@ -2693,6 +3043,36 @@ mod tests {
             "Vulkan inference on RDNA1 is limited by the driver.",
             "On RDNA1 the Vulkan backend falls back for some shaders."
         ));
+    }
+
+    #[test]
+    fn a_social_link_scanner_skips_navigation_and_shorteners() {
+        let html = r#"<a href="/home">home</a><a href="https://t.co/abc">short</a><a href="https://arxiv.org/abs/1">paper</a>"#;
+        assert_eq!(
+            first_artifact_link(html, "https://x.com/lab/status/1").as_deref(),
+            Some("https://arxiv.org/abs/1")
+        );
+        let none = r#"<a href="/home">home</a><a href="https://x.com/lab">profile</a>"#;
+        assert_eq!(
+            first_artifact_link(none, "https://x.com/lab/status/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_link_resolves_against_the_post() {
+        assert_eq!(
+            resolve_link("https://example.com/a/b", "../paper").as_deref(),
+            Some("https://example.com/paper")
+        );
+        assert_eq!(
+            resolve_link("https://example.com/a/b", "paper").as_deref(),
+            Some("https://example.com/a/paper")
+        );
+        assert_eq!(
+            resolve_link("https://example.com/a/b", "/paper").as_deref(),
+            Some("https://example.com/paper")
+        );
     }
 
     #[test]

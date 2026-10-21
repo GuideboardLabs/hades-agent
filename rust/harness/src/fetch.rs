@@ -464,6 +464,13 @@ pub fn run(url: &str, limit: usize, allow_private: bool) -> String {
     }
 }
 
+/// The same validated fetch without stripping markup. Social link discovery needs the `href`
+/// attributes that `run` intentionally removes; the caller keeps this body for scanning only and
+/// never stores it as evidence.
+pub fn run_raw(url: &str, limit: usize, allow_private: bool) -> Result<String, String> {
+    chase(url, allow_private, None).map(|text| clip(&text, limit))
+}
+
 /// The tool's entry with a CA file for the suite's TLS fixture. Production never reaches this:
 /// `run` passes `None`, so the tool trusts the system's store and nothing else. The parameter
 /// exists because a self-signed loopback certificate is the only way to prove HTTPS end to end
@@ -1003,6 +1010,22 @@ mod tests {
             resolve_location("http://example.com/page?q=1#old", "#x"),
             "http://example.com/page?q=1#x"
         );
+    }
+
+    /// The raw channel keeps the markup the canonical body throws away, which is the only way a
+    /// social post's artifact link can be seen at all.
+    #[test]
+    fn the_raw_fetch_keeps_markup_the_body_does_not() {
+        let fixture = site(&[(
+            b"/post",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\n<a href=\"/paper\">paper</a>",
+        )]);
+        let url = fixture.url("/post");
+        let raw = run_raw(&url, 12_000, true).expect("a raw body");
+        assert!(raw.contains("href=\"/paper\""), "{raw}");
+        let body = run(&url, 12_000, true);
+        assert!(!body.contains("href"), "{body}");
+        assert!(body.contains("paper"), "{body}");
     }
 
     /// A query-only `Location` replaces the query of the URL that carried it, and the result is
