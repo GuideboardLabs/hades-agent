@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Ok,
@@ -259,6 +261,25 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
             format!(
                 "activity gaps: {gaps} (last: {}); those actions are not in activity.jsonl",
                 crate::activity::last_gap().unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    });
+    // A run that stopped without reaching its end is reported here as well as in `hades status`: the same
+    // marker, two doors, because `doctor` is what a person runs when something feels wrong.
+    let interrupted = crate::daemon::interrupted(home);
+    found.push(if interrupted.is_empty() {
+        Finding::ok("interrupted", "interrupted: 0")
+    } else {
+        Finding::warn(
+            "interrupted",
+            format!(
+                "interrupted: {} run(s) never reached their end ({})",
+                interrupted.len(),
+                interrupted
+                    .iter()
+                    .filter_map(|marker| marker.get("session").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         )
     });

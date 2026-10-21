@@ -298,6 +298,44 @@ fn a_run_in_flight_is_reported_and_the_log_grows_while_it_runs() {
 
 /// The test this file exists for.
 #[test]
+fn a_state_with_an_inflight_run_reports_it_as_interrupted() {
+    // A marker is written when a run starts and removed when it ends, so one that is still there belongs to
+    // a process that is not running. The pid is deliberately not this process: a marker written by the
+    // process reading it is a run in flight, not an interruption.
+    let state = scratch("inflight");
+    let dir = state.join("inflight");
+    std::fs::create_dir_all(&dir).expect("a marker directory");
+    std::fs::write(
+        dir.join("abc.json"),
+        json!({
+            "session": "abc",
+            "run": 3,
+            "goal": "fix the parser",
+            "started": 1,
+            "pid": 999_999
+        })
+        .to_string(),
+    )
+    .expect("a marker");
+
+    let output = Command::new(binary())
+        .args(["status", "--state"])
+        .arg(&state)
+        .env("HADES_HOME", isolated_home())
+        .output()
+        .expect("status runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("interrupted: 1"), "{text}");
+    assert!(text.contains("abc"), "{text}");
+    assert!(text.contains("fix the parser"), "{text}");
+}
+
+#[test]
 fn a_kill_in_flight_is_survived_by_a_second_daemon_on_the_same_state_directory() {
     let state = scratch("kill");
     repo(&state);

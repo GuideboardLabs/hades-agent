@@ -6813,8 +6813,36 @@ fn status(args: &[String]) -> Result<(String, i32), String> {
         ),
     };
 
+    // A marker from a process that is gone. Reported, never replayed: this release says what was
+    // interrupted and leaves the decision to a person, because a replay that guesses is worse than a run
+    // that stopped. Read before the empty-sessions return, because an interrupted run is exactly the case
+    // where the log may hold nothing worth listing.
+    let interrupted = crate::daemon::interrupted(&state);
+    let mut interruptions = String::new();
+    if !interrupted.is_empty() {
+        interruptions.push_str(&format!(
+            "\ninterrupted: {} run(s) started and never reached their end\n",
+            interrupted.len()
+        ));
+        for marker in &interrupted {
+            interruptions.push_str(&format!(
+                "  {} (run {}, started {}, goal {})\n",
+                string_of(marker, "session"),
+                marker
+                    .get("run")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                string_of(marker, "started"),
+                string_of(marker, "goal")
+            ));
+        }
+    }
+
     if sessions.is_empty() {
-        return Ok((format!("{heading}no sessions have been written\n"), 0));
+        return Ok((
+            format!("{heading}no sessions have been written\n{interruptions}"),
+            0,
+        ));
     }
     let mut text = format!(
         "{heading}\n{:<14} {:>7}  {:<18} {}\n",
@@ -6837,6 +6865,7 @@ fn status(args: &[String]) -> Result<(String, i32), String> {
             run
         ));
     }
+    text.push_str(&interruptions);
     Ok((text, 0))
 }
 

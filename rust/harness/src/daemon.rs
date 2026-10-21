@@ -64,6 +64,81 @@ pub struct Daemon {
     stopping: Arc<AtomicBool>,
 }
 
+/// Where a running session leaves a marker. A marker that survives the process is the only evidence a
+/// crash leaves: the log shows the last step, and this shows that the run never reached its end.
+pub fn inflight_dir(state: &Path) -> PathBuf {
+    state.join("inflight")
+}
+
+fn inflight_path(state: &Path, session: &str) -> PathBuf {
+    // Session ids are already filename-safe, but a marker path is built from a string this function did not
+    // validate, so anything else is folded to `-` rather than being trusted as a path component.
+    let safe: String = session
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect();
+    inflight_dir(state).join(format!("{safe}.json"))
+}
+
+/// Record that this session is running. Best effort by the same contract as the ledger: a marker that
+/// cannot be written must not stop the run.
+fn mark_inflight(state: &Path, session: &str, run: u64, goal: &str) {
+    if let Err(error) = crate::scratch::state_dir(&inflight_dir(state)) {
+        eprintln!("inflight: could not make the marker directory: {error}");
+        return;
+    }
+    let value = json!({
+        "session": session,
+        "run": run,
+        "goal": goal.chars().take(160).collect::<String>(),
+        "started": SystemClock.now(),
+        "pid": std::process::id(),
+    });
+    if let Err(error) = fs::write(inflight_path(state, session), format!("{value}\n")) {
+        eprintln!("inflight: could not write the marker for {session}: {error}");
+    }
+}
+
+/// The run reached its end, so the marker goes. A marker that will not delete is reported, not swallowed:
+/// it will be read as an interruption next time.
+fn clear_inflight(state: &Path, session: &str) {
+    let path = inflight_path(state, session);
+    if path.exists()
+        && let Err(error) = fs::remove_file(&path)
+    {
+        eprintln!("inflight: could not remove {}: {error}", path.display());
+    }
+}
+
+/// Every marker left behind. A marker whose process is still the current one is still running; a marker
+/// from another pid belongs to a process that ended without reaching its end, which is what "interrupted"
+/// means here. No replay is attempted: the report names the session and the last step, and a person
+/// decides.
+pub fn interrupted(state: &Path) -> Vec<Value> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(inflight_dir(state)) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if value.get("pid").and_then(Value::as_u64) == Some(std::process::id() as u64) {
+            continue;
+        }
+        found.push(value);
+    }
+    found.sort_by_key(|value| value.get("started").and_then(Value::as_i64).unwrap_or(0));
+    found
+}
+
 impl Daemon {
     /// Bind the socket and announce itself. Nothing is read here except the state directory's existence:
     /// a daemon that fails on start because some session file is malformed would be a daemon that cannot be
@@ -240,8 +315,8 @@ impl Daemon {
         }
     }
 
-    /// Every session under this state directory, as the logs have it. Read fresh every time, because the
-    /// logs are the only place this exists.
+/// Every session under this state directory, as the logs have it. Read fresh every time, because the
+/// logs are the only place this exists.
     fn status(&self) -> Result<Value, Fault> {
         let waiting = self.questions_raw()?;
         let runs = self.runs.lock().map_err(|_| {
@@ -283,6 +358,8 @@ impl Daemon {
             "uptime_ms": self.started.elapsed().as_millis() as u64,
             "socket": self.socket.display().to_string(),
             "state": self.state.display().to_string(),
+            // Markers from a process that is not this one: a run that started and never reached its end.
+            "interrupted": interrupted(&self.state),
             "sessions": reported,
         }))
     }
@@ -565,6 +642,8 @@ impl Daemon {
         // The same memory a command-line run gets: one recall for the walk, filed once if it is accepted.
         // A daemon that walks without it is a second-class entry point, and the seam exists so it is not.
         let goal = crate::cli::goal(&flags).map_err(Fault::harness)?;
+        // The marker lands once the goal is known, so an interrupted report can say what the run was doing.
+        mark_inflight(&self.state, &session_id, run, &goal);
         let memo = crate::cli::remembered(
             &flags,
             &goal,
@@ -618,6 +697,9 @@ impl Daemon {
 
         done.store(true, Ordering::SeqCst);
         let _ = follower.join();
+        // The run reached its end, so the marker goes with the lease. A crash between here and the reply
+        // leaves nothing behind to be read as an interruption of work that did finish.
+        clear_inflight(&self.state, &session_id);
         self.runs
             .lock()
             .map_err(|_| Fault::harness("the lease table was poisoned".to_string()))?

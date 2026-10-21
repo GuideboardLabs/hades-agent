@@ -600,6 +600,12 @@ one flag at a path.
 
 These are decisions, not omissions. Each has a reason and the seam it would change.
 
+- **Crash recovery is a report, not a replay.** A run writes `<state>/inflight/<session>.json` when it
+  starts and removes it when it ends, so a marker that survives the process is a run that never reached
+  its end. `hades status` and `hades doctor` report it, naming the session, the run number, the start time
+  and the goal. Nothing is resumed automatically: a replay that guesses at the last step is worse than a
+  run that stopped and said so. The marker is the seam a replay would read.
+
 - **Verifier independence is a preset away.** No shipped profile pins a model: a profile inherits the
   run's model and may name a preset instead. `verify` is a different role, but it is the same voice until
   a second usable preset exists. The separation is data, not a second string that may not resolve.
