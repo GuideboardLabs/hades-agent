@@ -279,10 +279,16 @@ impl Session {
         let binary = find_chrome()?;
         let profile = state.join("browser").join("profile");
         let downloads = state.join("browser").join("downloads");
+        // Chromium's process singleton creates a socket in its TMPDIR and aborts with "Failed to create
+        // socket directory" when that directory does not exist. Setting the variable is not the grant; the
+        // directory has to be made as well.
+        let tmp = state.join("browser").join("tmp");
         std::fs::create_dir_all(&profile)
             .map_err(|error| format!("could not make {}: {error}", profile.display()))?;
         std::fs::create_dir_all(&downloads)
             .map_err(|error| format!("could not make {}: {error}", downloads.display()))?;
+        std::fs::create_dir_all(&tmp)
+            .map_err(|error| format!("could not make {}: {error}", tmp.display()))?;
 
         let (to_child, child_read) = UnixStream::pair()
             .map_err(|error| format!("could not make the command pipe: {error}"))?;
@@ -298,25 +304,7 @@ impl Session {
         let headed = std::env::var("HADES_HEADED")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let mut launch = Vec::new();
-        if !headed {
-            launch.push("--headless=new".to_string());
-        }
-        launch.extend(
-            [
-                "--remote-debugging-pipe",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-networking",
-                "--disable-component-update",
-                "--disable-sync",
-                "--window-size=1440,900",
-            ]
-            .iter()
-            .map(|argument| argument.to_string()),
-        );
+        let mut launch = launch_args(headed, no_sandbox_requested());
         let mut proxy_auth = None;
         if let Ok(proxy) = std::env::var("HADES_PROXY")
             && !proxy.is_empty()
@@ -348,7 +336,7 @@ impl Session {
         }
         command
             .env("HOME", state.join("browser"))
-            .env("TMPDIR", state.join("browser").join("tmp"))
+            .env("TMPDIR", &tmp)
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8");
         if headed && let Some(display) = std::env::var_os("DISPLAY") {
@@ -2504,6 +2492,46 @@ impl Session {
     }
 }
 
+/// The flags Chromium is started with.
+///
+/// Extracted so the sandbox question is a test rather than a line buried in a constructor. Chromium's
+/// sandbox is the boundary between a page and the account running the browser; a product that disables it
+/// by default has traded that boundary for convenience on one machine.
+fn launch_args(headed: bool, no_sandbox: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if !headed {
+        args.push("--headless=new".to_string());
+    }
+    args.push("--remote-debugging-pipe".to_string());
+    if no_sandbox {
+        args.push("--no-sandbox".to_string());
+    }
+    args.extend(
+        [
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-sync",
+            "--window-size=1440,900",
+        ]
+        .iter()
+        .map(|argument| argument.to_string()),
+    );
+    args
+}
+
+/// A host that cannot give Chromium a sandbox opts out by name.
+///
+/// The opt-out is an environment variable rather than a fallback: a silent downgrade when the first launch
+/// fails would make the weakest configuration the one every host ends up with.
+fn no_sandbox_requested() -> bool {
+    std::env::var("HADES_BROWSER_NO_SANDBOX")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Where a screenshot may be written: under the state's `shots` directory, and nowhere else.
 ///
 /// The path arrives from the model, so it is treated as hostile: an absolute path, a `..` component, or a
@@ -2863,6 +2891,36 @@ mod tests {
 
     static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Take the live-browser lock and tell the product this host cannot supply a Chromium sandbox.
+    ///
+    /// Unprivileged user namespaces are refused here (`kernel.apparmor_restrict_unprivileged_userns` is 1),
+    /// so the fixture opts out explicitly and the product default stays sandboxed. Taking both in one place
+    /// is what keeps a live test from failing for a reason that belongs to the host.
+    fn live() -> std::sync::MutexGuard<'static, ()> {
+        // SAFETY: every test that starts a browser holds this lock, and nothing reads the variable while
+        // another test runs.
+        unsafe {
+            std::env::set_var("HADES_BROWSER_NO_SANDBOX", "1");
+        }
+        LIVE.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn chromium_keeps_its_sandbox_by_default() {
+        let args = launch_args(false, false);
+        assert!(!args.iter().any(|arg| arg == "--no-sandbox"), "{args:?}");
+    }
+
+    #[test]
+    fn the_host_can_opt_out_of_the_sandbox_explicitly() {
+        // Chromium's sandbox needs unprivileged user namespaces, which some hosts refuse. Opting out is a
+        // decision a host makes out loud, not the shape the product ships with.
+        let args = launch_args(false, true);
+        assert!(args.iter().any(|arg| arg == "--no-sandbox"), "{args:?}");
+        let headed = launch_args(true, false);
+        assert!(!headed.contains(&"--headless=new".to_string()), "{headed:?}");
+    }
+
     #[test]
     fn a_screenshot_decodes() {
         let bytes = base64_decode("aGVsbG8=").expect("base64");
@@ -2888,7 +2946,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_is_observable() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -2906,7 +2964,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_live_page_can_be_clicked_and_typed() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-actions");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -2965,7 +3023,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_popup_becomes_a_tab_the_model_can_switch_to() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-tabs");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -3002,7 +3060,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_dialog_is_handled_and_an_upload_lands() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-dialog");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -3056,7 +3114,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_download_lands_in_the_state_directory() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-download");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -3087,7 +3145,7 @@ mod tests {
     #[test]
     #[ignore = "starts a headed Chromium under a display; run with xvfb-run"]
     fn a_headed_browser_opens_a_page() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         unsafe {
             std::env::set_var("HADES_HEADED", "1");
         }
@@ -3108,7 +3166,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium and a cross-origin server; run with --ignored"]
     fn a_cross_origin_frame_can_be_observed_and_clicked() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-oopif");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -3172,7 +3230,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a proxy port");
         let port = listener.local_addr().expect("an address").port();
         listener.set_nonblocking(true).expect("a nonblocking proxy");
@@ -3236,7 +3294,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_browser_context_isolates_its_tab() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-context");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -3289,7 +3347,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn a_same_origin_frame_can_be_observed_and_clicked() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-iframe");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
@@ -3326,7 +3384,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn humanized_refs_click_and_type() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         unsafe {
             std::env::set_var("HADES_HUMANIZE", "1");
         }
@@ -3368,7 +3426,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium and a local HTTP server; run with --ignored"]
     fn network_storage_and_cookies_are_visible() {
-        let _guard = LIVE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = live();
         let state = crate::scratch::root().join("browser-live-network");
         let _ = std::fs::remove_dir_all(&state);
         std::fs::create_dir_all(&state).expect("a scratch state");
