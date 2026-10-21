@@ -5787,7 +5787,7 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
     };
 
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\ncontext: {} tokens\ncage:    {}\n{}shadow:  {}\nmap:     {hits} hits, {misses} misses\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\ncontext: {} tokens\ncage:    {}\n{}\n{}shadow:  {}\nmap:     {hits} hits, {misses} misses\n",
         session.id(),
         session.len(),
         session.len() - before,
@@ -5804,6 +5804,12 @@ fn turn(args: &[String]) -> Result<(String, i32), String> {
         // The floor is a text heuristic and the receipt says so; a run that printed "safety: on" would be
         // claiming the sandbox this build does not have.
         format!("floor:   {}\\n", crate::floor::receipt()),
+        // A ledger that could not record something says so, rather than letting the run look complete.
+        if crate::activity::gaps() == 0 {
+            String::new()
+        } else {
+            format!("audit:   incomplete ({} gap(s) this process)\\n", crate::activity::gaps())
+        },
         engine.shadows(),
     );
     text.push_str(&format!("history: {}\n", history(&learned)));

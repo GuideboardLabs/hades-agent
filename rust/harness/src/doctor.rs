@@ -248,6 +248,20 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
     found.extend(security_findings(home));
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     found.push(Finding::ok("recipe", crate::recipe::Recipe::describe(&root)));
+    // An audit trail with a silent hole is worse than one that says where the hole is. The counter is per
+    // process, so this reports the gaps this process hit; the ledger's own history is the longer record.
+    let gaps = crate::activity::gaps();
+    found.push(if gaps == 0 {
+        Finding::ok("audit", "activity gaps: 0")
+    } else {
+        Finding::warn(
+            "audit",
+            format!(
+                "activity gaps: {gaps} (last: {}); those actions are not in activity.jsonl",
+                crate::activity::last_gap().unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    });
 
     found
 }

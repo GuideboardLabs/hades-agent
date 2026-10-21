@@ -13,6 +13,33 @@
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How many appends have failed since this process started, and the last thing the filesystem said.
+///
+/// The ledger is evidence, not a gate, so a failed append never stops the action — but an audit trail with
+/// a silent hole in it is worse than one that says where the hole is. These two are what `doctor` and the
+/// receipt read.
+static GAPS: AtomicU64 = AtomicU64::new(0);
+static LAST_GAP: Mutex<Option<String>> = Mutex::new(None);
+
+/// How many writes to the ledger failed in this process.
+pub fn gaps() -> u64 {
+    GAPS.load(Ordering::SeqCst)
+}
+
+/// The last failure, or `None` when nothing has failed.
+pub fn last_gap() -> Option<String> {
+    LAST_GAP.lock().ok().and_then(|said| said.clone())
+}
+
+fn note_gap(said: &str) {
+    GAPS.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut last) = LAST_GAP.lock() {
+        *last = Some(said.to_string());
+    }
+}
 
 /// How long an action is allowed to be in the line. A line must stay small enough to append atomically
 /// and short enough to read; the full argument is in the tool call, not here.
@@ -69,6 +96,16 @@ fn epoch() -> i64 {
 
 /// Append one decided action. Best effort by contract: the caller reports a failure and carries on.
 pub fn record(state: &Path, line: &Line) -> Result<(), String> {
+    match append(state, line) {
+        Ok(()) => Ok(()),
+        Err(said) => {
+            note_gap(&said);
+            Err(said)
+        }
+    }
+}
+
+fn append(state: &Path, line: &Line) -> Result<(), String> {
     crate::scratch::state_dir(state).map_err(|error| error.to_string())?;
     let body = json!({
         "at": line.at,
@@ -187,6 +224,18 @@ mod tests {
             reason: "permanent delete".to_string(),
             artifact: String::new(),
         }
+    }
+
+    #[test]
+    fn a_failed_record_increments_the_gap_counter() {
+        let state = scratch("audit-gap");
+        // The ledger path is a directory, so the append cannot open it.
+        std::fs::create_dir_all(path(&state)).expect("a directory where the file should be");
+        let before = gaps();
+        let result = record(&state, &line(1));
+        assert!(result.is_err(), "the append reported success");
+        assert_eq!(gaps(), before + 1);
+        assert!(last_gap().is_some_and(|said| !said.is_empty()));
     }
 
     #[test]
