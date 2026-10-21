@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.0.20"
+version = "0.1.0"
 dependencies = [
  "crossterm",
  "governance",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "mneme"
-version = "0.0.20"
+version = "0.1.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "session-tree"
-version = "0.0.20"
+version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
