@@ -1,6 +1,6 @@
 # Hades
 
-A distilled harness, built as Hermes' successor and tested on its own machine.
+A distilled harness, built as a successor to Hermes Agent and exercised against a live installation.
 
 Hades is a conscious reduction of the Hermes Agent harness: its tool loop, skills, session shape, gateway
 and memory seam, rebuilt in Rust. The terminal coding-agent pattern it follows was made familiar by Claude
@@ -8,7 +8,7 @@ Code and the Codex CLI; Hades wraps neither. It builds on Linux Landlock for iso
 memory. Its lineage and the upstream MIT notice are in `NOTICE`.
 
 **Nothing here touches the running Hermes install.** Not its vault, not its config, not its keys, not its
-sessions, not its cache. The relationship is *cloning with tweaks*, never *moving over*: this tree started as a
+sessions, not its cache. The relationship is *cloning with tweaks*, never *moving over*: the tree started as a
 copy and the Rust harness is new work, but at run time the two systems share no path and no state.
 
 That is a rule with a guard behind it, not a convention to remember.
@@ -28,7 +28,7 @@ The record is the database; the folder is its export, written on capture and on 
 `hades mneme import`. `charter.md` is configuration and `INDEX.md` is a generated view.
 
 A fresh clone plus an empty `~/.hades` is a working install. That is the test: if Hades needs something from
-the first machine to start, it has already moved over.
+another machine to start, it has already moved over.
 
 ## First run
 
@@ -280,7 +280,7 @@ empty home with a recording `systemctl`, starts and shuts the daemon down, and c
 
 ```
 $ hades audit --vault ~/Documents/ObsidianVault
-refusing the live Hermes vault under your home directory: it is the live Hermes vault (the second brain, fences and all).
+refusing the live Hermes vault inside a home directory: that is the live vault (the second brain, fences and all).
 Hades has its own vault and state, and pointing it here is the one thing the separation exists to prevent
 ```
 
@@ -299,7 +299,7 @@ Named endpoints live in the config with the *name* of the key's environment vari
 named endpoint is refused at load rather than silently substituted at the turn.
 
 The vault here also carries fences of its own. A fenced path is reported by the audit and does **not** fail it:
-the directory is the vault, the notes outside the fences are the corpus, and the corpus is something you walk.
+the directory is the vault, the notes outside the fences are the corpus, and the corpus is something to walk.
 `governance::report::AuditReport` keeps them in two lists for exactly that reason.
 
 ## What a turn remembers
@@ -621,7 +621,7 @@ the JSON; the file endpoints are the only place it travels.
 `rust/` is the harness: `session-tree` (append-only logs), `vault` (notes and fences), `governance` (audit and
 curation), `harness` (turn, graph, daemon, CLI, and the failure corpus in `cases.rs` and `eval.rs`). The
 Python under `agent/`, `hermes_state*.py` and the rest is
-the copy this tree started from, kept as reference for behaviour that was ported. The executable spec for the
+the copy the tree started from, kept as a reference for behaviour that was ported. The executable spec for the
 substrate is the Python; the engine is the Rust.
 
 Tests run inside `rust/target/scratch`, never the machine's temp directory, because under the live install

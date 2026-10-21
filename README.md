@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.20-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-986%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1037%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.20 |
+| **Version** | 0.1.0 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,38 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 984 passing, 13 ignored live tests |
+| **Tests** | 1037 passing, 13 ignored live tests |
 
 ---
+
+## What 0.1.0 adds
+
+This release hardens the boundaries the earlier versions drew, and takes the last measured cost out of the
+fetch path.
+
+- **The cage reports what it can enforce.** Unix-socket rules apply on Landlock ABI 9 and the cage says so
+  when the kernel is older; `--cage strict` narrows path grants on those kernels. The syscalls use `libc`
+  numbers, so the cage compiles on ARM64.
+- **Chromium keeps its sandbox.** `--no-sandbox` is gone from the default launch. Screenshots are confined
+  to the state's `shots` directory, every browser path resolves under the browser directory, and one
+  Chromium is held per state directory.
+- **A failed browser launch explains itself.** Chromium's stderr goes to `<state>/browser/chromium.log`, and
+  a failed first call reports its last line and the child's exit status. A state directory too long for
+  Chromium's socket is refused with the number and the limit instead of aborting inside the browser.
+- **Command output is bounded while it is read.** A `command` call caps output as it arrives and kills the
+  process group on timeout, so a background child cannot outlive the call. The cage gets a writable
+  `TMPDIR` of its own.
+- **The HTTP surface has a connection bound**, and the context builder counts tool payloads and compacts
+  completed turns rather than dropping messages.
+- **The safety floor is named as a heuristic.** `--policy strict` is a deny list over the same text, and
+  the docs say which one is a bound and which is a filter. Audit write gaps are reported, and an
+  interrupted run is named after a crash.
+- **Packs replace a case transactionally**, with caps that bind before the work starts.
+- **A fetch no longer starts a process.** One libcurl handle, loaded at run time, serves the whole run:
+  0.53 ms per fetch against 9.16 ms on loopback, 19.5 ms against 67.5 ms for a page on the internet. The
+  process path remains as the fallback and every guarantee is tested on both.
+- **The aarch64 check needs no root.** `scripts/cross-check.sh` stages the cross compiler in a cache
+  directory and checks the workspace; CI runs the same check with the distribution package.
 
 ## What 0.0.20 adds
 
@@ -91,8 +120,8 @@ This release makes a pack fit into a home, and keeps a record of what it changed
   are both read, both contracts and the conflicts are recorded with provenance, and the result is a
   proposal. It is skill-only in this release; harness merge is refused by name.
 - **The limits are explicit.** Atomicity is per item, not per pack: a failure after earlier rows have
-  landed leaves those rows and names the failure. Trust (digest pinning and unsigned-pack refusal) is
-  0.1.0 work; a pack is still unsigned and the reader says so.
+  landed leaves those rows and names the failure. A pack is still unsigned; digest pinning and a refusal
+  for unsigned packs are not shipped, and the reader says so.
 
 ## What 0.0.19 adds
 
@@ -774,9 +803,16 @@ runtime is self-contained. See `NOTICE` for the lineage.
 - Stable Rust with the 2024 edition.
 - A systemd user manager if you want the daemon or gateway units.
 - Chromium, Chrome or the patched CloakBrowser build if you want the browser tool.
+- `libcurl.so.4` is used when present, for connection reuse across fetches, and is not required: without
+  it the tool runs one `curl` process per fetch. Neither is needed at build time.
+- A C compiler for the bundled SQLite, and a cross toolchain only if the aarch64 check is wanted.
 - No Python or Node runtime is required for the Rust product.
 
 ### Build from source
+
+Nothing in the repository names a path on a particular machine. A build directory, a cache or a toolchain
+location belongs in `$CARGO_HOME/config.toml` or the environment; a checkout is expected to build into
+`./target` wherever it lands.
 
 ```sh
 git clone https://github.com/GuideboardLabs/hades-agent.git
@@ -915,7 +951,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **986 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **1037 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

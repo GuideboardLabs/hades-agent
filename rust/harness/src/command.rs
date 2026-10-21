@@ -85,7 +85,7 @@ pub fn clean_environment() -> Vec<(String, String)> {
         "LC_ALL",
         "TZ",
         "TERM",
-        // The toolchain locations this box needs. A path is not a credential.
+        // The toolchain locations a build host needs. A path is not a credential.
         "CARGO_HOME",
         "RUSTUP_HOME",
         "SSL_CERT_FILE",

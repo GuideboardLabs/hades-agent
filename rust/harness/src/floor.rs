@@ -779,7 +779,7 @@ fn written_path(path: &str, root: &Path) -> Option<Floor> {
 /// The files that are not secrets but are the thing doing the checking: the live install, the agent's own
 /// state, and the keys.
 ///
-/// The workspace wins: on this box the agent's root is `~/.hades/work`, and every write inside it would
+/// The workspace wins: in a default install the agent's root is `~/.hades/work`, and every write inside it would
 /// otherwise be its own state. A path is protected when it is under one of those directories **and** outside
 /// the root the tool was given, which is the same shape as the rule the `audit`/`init` guard already uses.
 pub(crate) fn protected(path: &str, root: &Path) -> Option<String> {

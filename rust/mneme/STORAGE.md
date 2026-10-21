@@ -193,8 +193,7 @@ connection without `foreign_keys`, and zero with it. Nothing of the store has be
 
 ## Resolved (2026-10-17)
 
-The three questions were put to the operator, who delegated the call: "make the best call based on our research and
-continue on." The answers, and why.
+The three questions were put to the operator, who delegated the call. The answers, and why.
 
 1. **One dependency, inside `mneme` only.** `rusqlite` with bundled SQLite and FTS5, nothing else. FTS5 is
    the ranked retrieval the seam needs; a pure-Rust store without it means writing a tokenizer, an index and

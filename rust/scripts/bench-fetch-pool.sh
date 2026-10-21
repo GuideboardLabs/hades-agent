@@ -25,15 +25,11 @@ server=$!
 sleep 1
 
 cd "$ROOT"
-export RUSTUP_HOME=${RUSTUP_HOME:-/mnt/ssd/home-cold/rust/rustup}
-export CARGO_HOME=${CARGO_HOME:-/mnt/ssd/home-cold/rust/cargo}
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/mnt/ssd/home-cold/hades-target}
-PATH="$CARGO_HOME/bin:$PATH"
-export PATH
 export HADES_FETCH_ALLOW_PRIVATE=1
 
+# The build directory is whatever cargo resolves: `CARGO_TARGET_DIR`, a config file, or `target/`.
 cargo build --release -q --example bench_fetch
-binary="$CARGO_TARGET_DIR/release/examples/bench_fetch"
+binary="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/release/examples/bench_fetch"
 
 echo "pooled (one libcurl handle):"
 "$binary" "http://127.0.0.1:$PORT/" "$COUNT"

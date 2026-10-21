@@ -489,7 +489,7 @@ fn the_system_clock_renders_the_python_shape() {
 fn scratch_base() -> std::path::PathBuf {
     // Off the source tree's disk: a full root filesystem must not be filled by a test run, and the build
     // directory is the natural place when Cargo names one. Without one, a directory under the Hades home
-    // is used rather than the machine's temp directory, which on this box lives under the live install and
+    // is used rather than the machine's temp directory, which on the test host lives under the live install and
     // is refused by Hades' boundary.
     let named = std::env::var("CARGO_TARGET_DIR")
         .ok()

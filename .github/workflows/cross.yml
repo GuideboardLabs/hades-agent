@@ -5,9 +5,9 @@ name: cross
 # may not. The C dependency (bundled SQLite) needs a cross C compiler, which is why the runner installs it.
 #
 # Nothing here may name a path on a specific machine. The repository used to carry `.cargo/config.toml`
-# with `target-dir = "/mnt/ssd/..."`, which is where this box keeps its build directory; on the runner
-# that turned into "failed to create directory ... Permission denied" before the first crate compiled.
-# Machine paths belong in `$CARGO_HOME/config.toml`, which is what this box now does.
+# with an absolute `build.target-dir`, which pointed at one host's build directory and turned into
+# "failed to create directory ... Permission denied" on the runner before the first crate compiled.
+# Machine paths belong in `$CARGO_HOME/config.toml`, outside the repository.
 on:
   push:
   pull_request:

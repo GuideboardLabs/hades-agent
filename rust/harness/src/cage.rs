@@ -6,7 +6,7 @@
 //! Landlock: an unprivileged process confines *itself*, and everything it goes on to start, to a set of
 //! paths and access rights. No root, no sysctl, no namespace.
 //!
-//! Why not namespaces or a container, measured on this box: unprivileged user namespaces are refused
+//! Why not namespaces or a container, measured on the machine this was built for: unprivileged user namespaces are refused
 //! (`unshare -n` is EPERM, `bwrap` fails with "setting up uid map: Permission denied") because
 //! `kernel.apparmor_restrict_unprivileged_userns` is 1. `landlock-restrict` as a separate helper is not
 //! installed either. Landlock needs none of those things, and it was reachable from a plain unprivileged

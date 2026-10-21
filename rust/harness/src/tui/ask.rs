@@ -2,7 +2,7 @@
 //! typing their own answer instead.
 //!
 //! Pure state, no rendering and no I/O, so the navigation rules can be tested without a terminal. The
-//! important one is the rule Seth asked for: moving down past the last option selects `Other` and puts the
+//! important one is the navigation rule: moving down past the last option selects `Other` and puts the
 //! caret in the input, which is the automatic decline of everything recommended.
 
 use crate::approval::Question;

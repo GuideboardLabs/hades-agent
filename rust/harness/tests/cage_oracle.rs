@@ -226,7 +226,7 @@ fn a_directory_the_cage_was_told_about_is_writable() {
 #[test]
 fn the_cage_denies_the_network() {
     let (_base, root, _outside) = scratch("net");
-    // `bash` and its `/dev/tcp`, rather than `python3`: the `python3` on this box's PATH is a virtual
+    // `bash` and its `/dev/tcp`, rather than `python3`: the `python3` on the test host's PATH is a virtual
     // environment under the home directory, so inside a cage that denies the home directory it cannot even
     // start, and a test that fails because its tool is missing proves nothing about the network.
     let program = "timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/80'";

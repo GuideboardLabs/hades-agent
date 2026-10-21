@@ -132,7 +132,7 @@ file size and modification time, which belongs with the daemon.
 The tool runs a program a model wrote, so `Cage` is what stops that program from reading your API keys. It is
 on by default and the log says what it allowed.
 
-The mechanism is Landlock, and the choice was measured rather than assumed: on this box unprivileged user
+The mechanism is Landlock, and the choice was measured rather than assumed: on the machine measured, unprivileged user
 namespaces are refused (`unshare -n` is EPERM, `bwrap` fails with "setting up uid map: Permission denied")
 because `kernel.apparmor_restrict_unprivileged_userns` is 1, so containers and `bwrap` are not available to
 an unprivileged harness. Landlock confines a process from the inside, with no root, no sysctl and no
@@ -314,7 +314,7 @@ claim that it does.
 decides when they stop. What the graph adds is not "no loops": it is that the number of them, what each one
 tells the next, and where a person has to be asked are all declared in one place.
 
-Two things the real runs taught, both mine rather than the model's:
+Two things the real runs taught, and neither came from the model:
 
 - **The instruction was ambiguous about what an answer is.** The local 3B answered with a script and the
   words "save as stats.sh", then appended `chmod +x stats.sh` to a program that never wrote the file. Its

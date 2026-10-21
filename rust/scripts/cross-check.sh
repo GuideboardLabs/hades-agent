@@ -2,25 +2,28 @@
 # Cross-check the workspace for aarch64 without root.
 #
 # `libsqlite3-sys` compiles SQLite with a C compiler, so the ARM check needs a cross gcc. Installing one
-# wants root; this stages the same Ubuntu packages under a prefix and points the build at them. The two
+# wants root; this stages the same distribution packages under a prefix the user owns and points the build
+# at them. The two
 # wrappers exist because the extracted `as` and `ar` link against libbfd and libopcodes, which the loader
 # cannot find without a search path, and setting that path for the whole build would follow every other
 # tool too.
+#
+# Everything machine-specific comes from the environment: `CROSS_PREFIX` says where to stage, and the
+# toolchain is whatever `cargo` is on `PATH`.
 #
 # Usage: scripts/cross-check.sh            (stages once, then checks)
 #        CROSS_PREFIX=/some/dir scripts/cross-check.sh
 set -eu
 
-PREFIX=${CROSS_PREFIX:-/mnt/ssd/toolchains/cross}
+PREFIX=${CROSS_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/hades-cross}
 TARGET=aarch64-unknown-linux-gnu
 PACKAGES="gcc-aarch64-linux-gnu gcc-13-aarch64-linux-gnu cpp-13-aarch64-linux-gnu \
 binutils-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross libgcc-13-dev-arm64-cross"
 
-export RUSTUP_HOME=${RUSTUP_HOME:-/mnt/ssd/home-cold/rust/rustup}
-export CARGO_HOME=${CARGO_HOME:-/mnt/ssd/home-cold/rust/cargo}
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/mnt/ssd/home-cold/hades-target}
-PATH="$CARGO_HOME/bin:$PATH"
-export PATH
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo is not on PATH" >&2
+    exit 1
+fi
 
 if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
     echo "staging the cross toolchain under $PREFIX"

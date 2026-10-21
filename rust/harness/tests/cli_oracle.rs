@@ -1149,7 +1149,7 @@ fn the_walk_and_the_turn_build_the_same_cage() {
 
 /// A cage has to let a program start the language runtime it needs.
 ///
-/// `python3` on this box resolves to a virtual environment under the home directory, and the cage refuses
+/// `python3` on the test host resolves to a virtual environment under the home directory, and the cage refuses
 /// the home directory. Unless the cage asks each runtime where its standard library lives, Python dies with
 /// `ModuleNotFoundError: No module named 'encodings'` before it runs a line, and a model that finds a broken
 /// interpreter concludes the box is broken and spends its attempts diagnosing it instead of the task.

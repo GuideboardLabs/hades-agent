@@ -247,20 +247,20 @@ mod tests {
         // SAFETY: this test sets the variable only to read it back through `render`; no other test
         // reads or writes `CARGO_TARGET_DIR`.
         unsafe {
-            std::env::set_var("CARGO_TARGET_DIR", "/mnt/ssd/home-cold/hades-target");
+            std::env::set_var("CARGO_TARGET_DIR", "/var/tmp/hades-target");
         }
         let units = render(Path::new("/opt/hades"), Path::new("/home/a/.hades")).unwrap();
         assert!(
             units
                 .daemon
-                .contains("Environment=CARGO_TARGET_DIR=/mnt/ssd/home-cold/hades-target"),
+                .contains("Environment=CARGO_TARGET_DIR=/var/tmp/hades-target"),
             "the daemon unit must carry the build directory:\n{}",
             units.daemon
         );
         assert!(
             units
                 .gateway
-                .contains("Environment=CARGO_TARGET_DIR=/mnt/ssd/home-cold/hades-target"),
+                .contains("Environment=CARGO_TARGET_DIR=/var/tmp/hades-target"),
             "the gateway unit must carry the build directory:\n{}",
             units.gateway
         );
