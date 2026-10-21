@@ -304,6 +304,37 @@ fn the_abi_probe_answers_rather_than_panicking() {
 }
 
 #[test]
+fn the_socket_right_is_handled_only_where_the_kernel_has_it() {
+    // ABI 9 (Linux 7.1) added LANDLOCK_ACCESS_FS_RESOLVE_UNIX, bit 16 of the filesystem mask. Landlock
+    // rejects a handled bit the running kernel does not know, so it is added only at ABI 9; below that the
+    // report keeps saying the sockets are not contained rather than implying they are.
+    assert_ne!(
+        harness::cage::fs_rights_for_abi(9) & harness::cage::LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+        0
+    );
+    assert_eq!(
+        harness::cage::fs_rights_for_abi(8) & harness::cage::LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+        0
+    );
+    assert_ne!(
+        harness::cage::read_rights_for_abi(9) & harness::cage::LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+        0,
+        "a readable path is also a pathname socket a program may connect to"
+    );
+    assert_eq!(
+        harness::cage::read_rights_for_abi(8) & harness::cage::LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+        0
+    );
+    if harness::cage::abi() < 9 {
+        assert!(
+            Cage::around("/work").socket_note().contains("not contained"),
+            "{}",
+            Cage::around("/work").socket_note()
+        );
+    }
+}
+
+#[test]
 fn strict_mode_does_not_grant_run() {
     let cage = Cage::strict("/work");
     assert!(

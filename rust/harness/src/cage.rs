@@ -60,6 +60,9 @@ const MAKE_SYM: u64 = 1 << 12;
 const REFER: u64 = 1 << 13;
 const TRUNCATE: u64 = 1 << 14;
 const IOCTL_DEV: u64 = 1 << 15;
+/// Look up a pathname Unix socket. Since Landlock ABI 9 (Linux 7.1); the value is the kernel's own
+/// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, read from the UAPI rather than guessed.
+pub const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 
 /// Every right this knows about. Handling all of them is what makes the cage deny by default.
 const ALL_RIGHTS: u64 = EXECUTE
@@ -81,7 +84,7 @@ const ALL_RIGHTS: u64 = EXECUTE
 
 /// Landlock rejects rights introduced after the running kernel's ABI. Match both
 /// the handled mask and every grant to the available ABI, as the kernel API requires.
-fn supported_rights(abi: isize) -> u64 {
+pub fn fs_rights_for_abi(abi: isize) -> u64 {
     let mut rights = ALL_RIGHTS;
     if abi < 5 {
         rights &= !IOCTL_DEV;
@@ -91,6 +94,20 @@ fn supported_rights(abi: isize) -> u64 {
     }
     if abi < 2 {
         rights &= !REFER;
+    }
+    if abi >= 9 {
+        rights |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
+    }
+    rights
+}
+
+/// The rights a *readable* path needs: read, list, execute, and, where the kernel can enforce it, the
+/// right to look up a pathname Unix socket under it. Without the last one, a program inside the cage could
+/// not connect to a socket the same rule says it may read, and a program outside it could.
+pub fn read_rights_for_abi(abi: isize) -> u64 {
+    let mut rights = READ;
+    if abi >= 9 {
+        rights |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
     }
     rights
 }
@@ -401,7 +418,7 @@ impl Cage {
 
         // `handled_access_net` and the size of the attribute are the ABI: a kernel older than 4 is told
         // about the filesystem only, and the caller is told that TCP stays open.
-        let rights = supported_rights(abi);
+        let rights = fs_rights_for_abi(abi);
         let attr = if abi >= 4 {
             let mut attr = Vec::with_capacity(16);
             attr.extend_from_slice(&rights.to_le_bytes());
@@ -418,7 +435,7 @@ impl Cage {
 
         let mut rules = Vec::new();
         for path in self.readable.iter() {
-            rules.push(self.rule(path, READ)?);
+            rules.push(self.rule(path, read_rights_for_abi(abi))?);
         }
         for (path, rights) in self.files.iter() {
             // A device that is not there is not a mistake worth failing over: a container may have no
