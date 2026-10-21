@@ -192,6 +192,24 @@ hades — the harness, one turn or a whole graph
       list the shelf, search it with FTS5, print one document, verify hashes and
       chunk bounds, or remove an entry to trash
 
+  hades pack export <id> --from <state> [--version 1.0.0]
+                    [--skill <name>]... [--profile <p>]... [--case <id>]...
+                    [--title <t>] [--summary <s>] [--license <l>]
+                    [--derivatives allowed|forbidden] [--network] [--writes vault]...
+                    [--requires-role <r>]... [--requires-tool <t>]... [--out <file>]
+      write a deterministic .hadepack from installed skills, one current harness per
+      --profile, and named cases. At least one selector is required. The pack records
+      only what it is given; it never reads the live Hermes home
+
+  hades pack inspect <file> [--json]
+      the manifest, every provided item, uncompressed bytes, archive hash, signature
+      status, and a warning for network or vault writes. No model and no state change
+
+  hades pack plan <file> [--state <dir>] [--json]
+      classify every provided item as new, duplicate, conflict, redundant or
+      incompatible against the live catalog. Scores are 5-gram Jaccard; a redundant
+      row prints the shared shingles so the heuristic can be rejected
+
   hades note research <topic> <title...> [--slug <slug>] [--source-url <url>]
                      [--summary <text>] [--provenance <text>] [--vault <dir>]
                      [--db <file>] [--config <file>]
@@ -451,6 +469,7 @@ fn dispatch(
         "gateway" => gateway(rest),
         "status" => status(rest),
         "submit" => submit(rest),
+        "pack" => pack_cmd(rest),
         "attach" => attach(rest),
         "models" => models(),
         "tools" => tools(rest),
@@ -2373,6 +2392,142 @@ fn case_cmd(args: &[String]) -> Result<(String, i32), String> {
             .join("runs")
             .display()
     ));
+    Ok((text, 0))
+}
+
+fn pack_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let action = args.first().map(String::as_str).unwrap_or("help");
+    let rest = &args[1..];
+    match action {
+        "export" => pack_export(rest),
+        "inspect" => pack_inspect(rest),
+        "plan" => pack_plan(rest),
+        other => Err(format!("`pack {other}`: say export, inspect or plan")),
+    }
+}
+
+fn pack_export(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "from",
+            "version",
+            "skill",
+            "profile",
+            "case",
+            "title",
+            "summary",
+            "license",
+            "derivatives",
+            "writes",
+            "requires-role",
+            "requires-tool",
+            "out",
+        ],
+        &["network"],
+    )?;
+    let id = flags.positional.first().ok_or_else(|| {
+        "`pack export` needs an id, for example `seth/research-method`".to_string()
+    })?;
+    let from = flags
+        .named
+        .get("from")
+        .ok_or_else(|| "`pack export` needs `--from <state>`".to_string())?;
+    let from = guarded(Path::new(from))?;
+    let repeated = |name: &str| flags.repeated.get(name).cloned().unwrap_or_default();
+    let options = crate::pack::ExportOptions {
+        id: id.clone(),
+        version: flags
+            .named
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| "1.0.0".to_string()),
+        from,
+        title: flags.named.get("title").cloned().unwrap_or_default(),
+        summary: flags.named.get("summary").cloned().unwrap_or_default(),
+        license: flags
+            .named
+            .get("license")
+            .cloned()
+            .unwrap_or_else(|| "NOASSERTION".to_string()),
+        derivatives: flags
+            .named
+            .get("derivatives")
+            .cloned()
+            .unwrap_or_else(|| "forbidden".to_string()),
+        network: switched(&flags, "network"),
+        writes: repeated("writes"),
+        requires_roles: repeated("requires-role"),
+        requires_tools: repeated("requires-tool"),
+        skills: repeated("skill"),
+        profiles: repeated("profile"),
+        cases: repeated("case"),
+        out: flags.named.get("out").map(PathBuf::from),
+    };
+    let path = crate::pack::export(&options)?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Ok((
+        format!(
+            "wrote: {}\nsha256: {}\n",
+            path.display(),
+            mneme::sha256::hex(&bytes)
+        ),
+        0,
+    ))
+}
+
+fn pack_inspect(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &[], &["json"])?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack inspect` needs a file".to_string())?;
+    let pack = crate::pack::Pack::open(Path::new(file))?;
+    if switched(&flags, "json") {
+        let text = serde_json::to_string_pretty(&pack.inspect_json())
+            .map_err(|error| format!("could not encode inspection: {error}"))?;
+        Ok((format!("{text}\n"), 0))
+    } else {
+        Ok((pack.inspect(), 0))
+    }
+}
+
+fn pack_plan(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state"], &["json"])?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack plan` needs a file".to_string())?;
+    let state = state_of(&flags)?;
+    let pack = crate::pack::Pack::open(Path::new(file))?;
+    let rows = crate::pack::plan(&pack, &state)?;
+    if switched(&flags, "json") {
+        let value = Value::Array(rows.iter().map(|row| row.to_value()).collect());
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|error| format!("could not encode plan: {error}"))?;
+        return Ok((format!("{text}\n"), 0));
+    }
+    let mut text = format!(
+        "{:<12} {:<9} {:<34} {:<12} {:<6} {:<8} {}\n",
+        "class", "kind", "identity", "digest", "score", "default", "reason"
+    );
+    for row in rows {
+        text.push_str(&format!(
+            "{:<12} {:<9} {:<34} {:<12} {:<6.3} {:<8} {}",
+            row.class,
+            row.kind.name(),
+            row.identity,
+            &row.digest[..12.min(row.digest.len())],
+            row.score,
+            row.default_action,
+            row.reason
+        ));
+        if !row.shared.is_empty() {
+            text.push_str(&format!("; shared: {}", row.shared.join(", ")));
+        }
+        text.push('\n');
+    }
     Ok((text, 0))
 }
 

@@ -68,6 +68,7 @@ pub mod mcp;
 pub mod memory;
 pub mod mode;
 pub mod model;
+pub mod pack;
 pub mod patch;
 pub mod path;
 pub mod policy;

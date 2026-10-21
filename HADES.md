@@ -173,6 +173,34 @@ Script, style, noscript, template, SVG and iframe bodies are removed before tags
 result set does not match two query terms, search falls back to DuckDuckGo's HTML endpoint through Jina
 Reader. Both the parser and the fallback are dependencies the run records, not silent assumptions.
 
+## Packs
+
+A `.hadepack` is how a skill, a harness and a pinned case travel together. It is a `tar.gz` with exactly
+three root shapes: `pack.json`, `SHA256SUMS`, and `files/`. The manifest is strict JSON: format 1, a pack
+id and version, title and summary, a license and a `derivatives` word, the Hades range it needs, the roles
+and tools it asks for, and one entry per item. An unknown key is an error, and `capabilities.code` is
+always false; a pack carries prompts and cases, not programs.
+
+The writer is deterministic. Every directory is set to 0755, every file keeps its mode (a case tree's
+executable bit is part of its digest), tar is run with sorted names, mtime zero, owner and group zero,
+and gzip with `-n`. Two exports of the same state are byte-identical. The reader streams the gzip
+size first, lists the archive with both `tar -tzf` and `tar -tvzf`, refuses a non-regular entry, an
+absolute path, a `..` or `.` segment, a backslash, a duplicate name, and a directory without a trailing
+slash, then extracts with permissions preserved and no owner restoration. It verifies every file against
+`SHA256SUMS`; `signature` is reported as present but never verified.
+
+`hades pack export <id> --from <state> --skill <name> --profile <p> --case <id>` writes one. A directory
+skill is copied whole. A flat skill becomes `files/skills/<name>/SKILL.md`. A harness copies `system.md`
+and, when present, `tool_guidance.md`. A case writes `case.json` and its pinned `tree/`; the tree digest
+is checked again at plan time. `--network`, `--writes vault|state`, `--requires-role` and
+`--requires-tool` are declared, not inferred, and a selector-less export is refused.
+
+`hades pack inspect` is read-only: manifest, item counts, uncompressed bytes, archive hash, signature
+status, and warnings for network or vault writes. `hades pack plan` is also read-only: each item is
+`new`, `duplicate`, `conflict`, `redundant` or `incompatible` against the live catalog. Identity and
+content digest decide duplicate versus conflict; 5-gram Jaccard decides redundancy at 0.60 and prints the
+shared shingles. `plan` never installs; fitting a plan into a state is the next release.
+
 ## Installing
 
 A release tarball is one binary, one installer and one README. On a machine with an empty home:
@@ -554,6 +582,9 @@ These are decisions, not omissions. Each has a reason and the seam it would chan
 - **The dispute judge is an opinion, capped.** It compares only cross-source pairs on one subquestion,
   stops at sixteen pairs, and can call an unrelated pair contradictory or miss one. Every quote in the
   section is byte-checked; the label is not a verdict.
+- **A pack is not signed.** The format has a place for `signature`, and `inspect` says when one is
+  present, but Hades does not verify a signature yet. A pack's integrity comes from its own
+  `SHA256SUMS`, which proves the bytes arrived together, not who made them.
 - **An entailment label is also an opinion, capped.** It stops at 32 claims and answers from one quote.
   `supported` does not prove the claim is true; `unsupported` does not prove it false.
 - **Social artifact extraction reads the first external link, not the author's intent.** A post that links

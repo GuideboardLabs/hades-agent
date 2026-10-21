@@ -461,7 +461,7 @@ fn fallback_case(run: &Run, goal: &str, check: &str, tree: &str, id: &str, sourc
 }
 
 impl Case {
-    fn to_value(&self) -> Value {
+    pub(crate) fn to_value(&self) -> Value {
         json!({
             "kind": "case",
             "id": self.id,
@@ -493,7 +493,7 @@ impl Case {
         })
     }
 
-    fn from_value(value: &Value) -> Option<Case> {
+    pub(crate) fn from_value(value: &Value) -> Option<Case> {
         let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
         let bounds = value.get("bounds").cloned().unwrap_or(Value::Null);
         Some(Case {

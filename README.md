@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.0.18-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-958%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.0.19-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-969%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.0.18 |
+| **Version** | 0.0.19 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,9 +61,29 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 958 passing, 13 ignored live tests |
+| **Tests** | 969 passing, 13 ignored live tests |
 
 ---
+
+## What 0.0.19 adds
+
+This release gives a result a container that can leave the machine without losing its evidence.
+
+- **A `.hadepack` is a deterministic tar.gz with a strict manifest.** `pack.json` names the pack, its
+  version and license, the Hades range it needs, the roles and tools it asks for, and every skill,
+  harness and case under `files/`. `SHA256SUMS` covers each file. The writer sets every directory to
+  0755, fixes mtimes, owners and ordering, compresses with `gzip -n`, and records file modes, so the same
+  inputs produce the same bytes. A reader rejects an unsafe path, a duplicate name, a symlink or special
+  entry, an unknown key, a `code: true` capability, and an archive over the size caps before trusting it.
+- **`hades pack export`** writes one. It takes `--skill`, `--profile` and `--case` selectors, records the
+  current Hades range, and never reads the live Hermes home. A directory skill is copied as a directory;
+  a flat skill becomes `files/skills/<name>/SKILL.md`; a case carries its pinned tree and `case.json`.
+- **`hades pack inspect`** reads the manifest, every item, uncompressed bytes, archive hash, signature
+  status and the network/vault warnings. It asks no model and changes no state.
+- **`hades pack plan`** classifies each item against the live catalog as `new`, `duplicate`, `conflict`,
+  `redundant` or `incompatible`. Duplicate and conflict use identity plus content digest; redundancy
+  uses 5-gram Jaccard at 0.60 and prints the shared shingles so the heuristic is reviewable. Nothing is
+  installed yet: applying a plan is 0.0.20.
 
 ## What 0.0.18 adds
 
@@ -852,7 +872,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **958 passing, 0 failing, 13 ignored** across the workspace.
+Current state: **969 passing, 0 failing, 13 ignored** across the workspace.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

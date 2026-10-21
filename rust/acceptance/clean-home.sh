@@ -189,6 +189,40 @@ AUDIT=$(HOME="$TEMP_HOME" HADES_HOME="$TEMP_HOME/.hades" "$B" audit)
 has "$AUDIT" "inbox: 0" || fail "the clean audit is not clean: $AUDIT"
 ok "a clean home audits clean"
 
+# 3. A pack exported from this home. The writer is deterministic and the reader is the same build that
+#    wrote it; a §2-conformant reader must accept the writer's own archive.
+mkdir -p "$TEMP_HOME/.hades/skills/pack-skill" "$TEMP_HOME/.hades/harness/research"
+printf '%s\n' '---' 'name: pack-skill' 'contract: acceptance' '---' '' 'Always record the command and its exit code.' \
+    > "$TEMP_HOME/.hades/skills/pack-skill/SKILL.md"
+printf '%s\n' 'You are a research harness.' > "$TEMP_HOME/.hades/harness/research/system.md"
+PACK_A="$BASE/pack-a.hadepack"
+PACK_B="$BASE/pack-b.hadepack"
+OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/acceptance --from "$TEMP_HOME/.hades" \
+    --skill pack-skill --profile research --title "Acceptance pack" \
+    --out "$PACK_A" 2>&1) || fail "pack export failed: $OUT"
+[ -f "$PACK_A" ] || fail "pack export named no file: $OUT"
+OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/acceptance --from "$TEMP_HOME/.hades" \
+    --skill pack-skill --profile research --title "Acceptance pack" \
+    --out "$PACK_B" 2>&1) || fail "the second pack export failed: $OUT"
+cmp -s "$PACK_A" "$PACK_B" || fail "two pack exports differ"
+ok "pack export is deterministic"
+
+INSPECT=$(HOME="$TEMP_HOME" "$B" pack inspect "$PACK_A")
+has "$INSPECT" "items: 1 skill, 1 harness, 0 case" || fail "inspect lost an item: $INSPECT"
+has "$INSPECT" "signature: unsigned" || fail "inspect is not honest about the signature: $INSPECT"
+ok "pack inspect reads the writer's archive"
+
+PLAN=$(HOME="$TEMP_HOME" "$B" pack plan "$PACK_A" --state "$TEMP_HOME/.hades")
+has "$PLAN" "duplicate" || fail "plan did not call the re-export a duplicate: $PLAN"
+ok "pack plan classifies a re-export as duplicate"
+
+set +e
+OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/empty --from "$TEMP_HOME/.hades" --out "$BASE/empty.hadepack" 2>&1); CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "a selector-less export exited $CODE, not 2"
+has "$OUT" "at least one" || fail "a selector-less export is not refused by name: $OUT"
+ok "pack export refuses a pack with no selector"
+
 set +e
 TOPIC=$(HOME="$TEMP_HOME" HADES_HOME="$TEMP_HOME/.hades" "$B" topic technical "Acceptance Probe" --summary "The clean-home probe can build a topic.")
 CODE=$?
