@@ -3,6 +3,11 @@ name: cross
 # The cage used raw x86-64 assembly, so the crate did not compile on ARM64 at all. A cross-check is the
 # only thing that keeps that from happening again: this machine has one architecture, and the next one
 # may not. The C dependency (bundled SQLite) needs a cross C compiler, which is why the runner installs it.
+#
+# Nothing here may name a path on a specific machine. The repository used to carry `.cargo/config.toml`
+# with `target-dir = "/mnt/ssd/..."`, which is where this box keeps its build directory; on the runner
+# that turned into "failed to create directory ... Permission denied" before the first crate compiled.
+# Machine paths belong in `$CARGO_HOME/config.toml`, which is what this box now does.
 on:
   push:
   pull_request:
@@ -16,11 +21,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version | head -1
       - name: Add the target
-        run: rustup target add aarch64-unknown-linux-gnu
-      - name: Check the harness for aarch64
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          rustc --version
+          cargo --version
+      - name: Check the workspace for aarch64
         working-directory: rust
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-        run: cargo check -p harness --target aarch64-unknown-linux-gnu
+        run: cargo check --workspace --target aarch64-unknown-linux-gnu
