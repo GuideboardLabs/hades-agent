@@ -140,6 +140,40 @@ pub struct Verification {
     pub output_digest: String,
     /// Present only when the check opted into the progress contract. A missing value is not zero progress.
     pub progress: Option<Progress>,
+    /// The attack's result, when this run carries one. A security pass is `check passed AND attack
+    /// failed`; a check that is green while the exploit still works is a failed security result.
+    pub attack: Option<AttackReport>,
+}
+
+/// What a security case's second oracle did. The attack succeeds when the vulnerability is present, so its
+/// success is the run's failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttackReport {
+    pub command: String,
+    pub succeeded: bool,
+    /// The exit status the attack returned, when it returned one. `None` means it could not run.
+    pub status: Option<i32>,
+    pub output: String,
+}
+
+impl AttackReport {
+    pub fn line(&self) -> String {
+        match (self.succeeded, self.status) {
+            (true, Some(status)) => format!("attack: succeeded (exit {status})"),
+            (false, Some(status)) => format!("attack: blocked (exit {status})"),
+            (true, None) => "attack: succeeded (no exit status)".to_string(),
+            (false, None) => "attack: could not run".to_string(),
+        }
+    }
+
+    /// `succeeded`, `blocked`, or `not_run` for a log or a result line.
+    pub fn name(&self) -> &'static str {
+        match (self.succeeded, self.status) {
+            (_, None) => "not_run",
+            (true, Some(_)) => "succeeded",
+            (false, Some(_)) => "blocked",
+        }
+    }
 }
 
 impl Verification {
@@ -153,6 +187,7 @@ impl Verification {
             status: None,
             truncated: false,
             progress: None,
+            attack: None,
         }
     }
 
@@ -225,11 +260,11 @@ impl Verifier for CommandVerifier {
                     State::Failed
                 };
                 let output = if run.passed() && !gate_ok {
-                    format!("exit 0 but the terminal gate failed\n{}", run.output)
+                    format!("exit 0 but the terminal gate failed\n{}\n", run.output)
                 } else if run.passed() {
                     run.output
                 } else {
-                    format!("exit {}\n{}", run.status, run.output)
+                    format!("exit {}\n{}\n", run.status, run.output)
                 };
                 Verification {
                     command: command.to_string(),
@@ -239,10 +274,77 @@ impl Verifier for CommandVerifier {
                     status: Some(run.status),
                     truncated: run.truncated,
                     progress,
+                    attack: None,
                 }
             }
             Err(fault) => Verification::could_not_run(command, fault.detail()),
         }
+    }
+}
+
+/// A check with a second oracle. The attack **succeeds while the vulnerability is present**, so a green
+/// check beside a working exploit is a failed security result, not a pass. A baseline that is red because
+/// the attack succeeds is the case a security run exists to fix.
+///
+/// The attack that cannot run is a fault, not a pass: an unmeasured exploit is not a blocked one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attacked {
+    check: CommandVerifier,
+    attack: String,
+    limit: usize,
+    deadline: Option<std::time::Duration>,
+}
+
+impl Attacked {
+    pub fn new(
+        limit: usize,
+        deadline: Option<std::time::Duration>,
+        attack: impl Into<String>,
+    ) -> Self {
+        Attacked {
+            check: CommandVerifier { limit, deadline },
+            attack: attack.into(),
+            limit,
+            deadline,
+        }
+    }
+}
+
+impl Verifier for Attacked {
+    fn verify(&self, task: &TaskSpec, command: &str) -> Verification {
+        let mut checked = self.check.verify(task, command);
+        let report =
+            match command::run_within(&self.attack, task.root(), self.limit, None, self.deadline) {
+                Ok(run) => AttackReport {
+                    command: self.attack.clone(),
+                    succeeded: run.passed(),
+                    status: Some(run.status),
+                    output: run.output,
+                },
+                Err(fault) => AttackReport {
+                    command: self.attack.clone(),
+                    succeeded: false,
+                    status: None,
+                    output: fault.detail().to_string(),
+                },
+            };
+        if report.status.is_none() {
+            checked.state = State::CouldNotRun;
+            checked.output = format!(
+                "{}\nthe attack could not run, so it is unmeasured: {}",
+                checked.output.trim_end(),
+                report.output.trim()
+            );
+        } else if report.succeeded && checked.state == State::Passed {
+            checked.state = State::Failed;
+            checked.output = format!(
+                "the exploit still succeeds, so the check is not evidence of a fix\n{}",
+                checked.output.trim_end()
+            );
+        }
+        checked.output_digest = mneme::sha256::hex(checked.output.as_bytes());
+        checked.attack = Some(report);
+        checked
     }
 }
 

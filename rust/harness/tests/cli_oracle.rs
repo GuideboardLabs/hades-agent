@@ -1972,6 +1972,19 @@ fn a_proposal_is_listed_promoted_and_then_installed() {
         "--state",
         state_flag,
     ]);
+    assert_ne!(code, 0, "a TODO contract must not promote: {text}");
+    assert!(
+        text.to_lowercase().contains("contract"),
+        "the refusal has to name the missing contract: {text}"
+    );
+    let (code, text) = hades(&[
+        "skills",
+        "promote",
+        "make-the-parser-strict",
+        "--force",
+        "--state",
+        state_flag,
+    ]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("promoted"), "{text}");
     assert!(

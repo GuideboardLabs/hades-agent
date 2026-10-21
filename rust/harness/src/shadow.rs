@@ -354,6 +354,10 @@ pub struct Manifest {
     /// auditing a restore needs. Older manifests parse with an empty list.
     pub skipped: u64,
     pub skipped_names: Vec<String>,
+    /// Paths that are neither a regular file nor a directory: symlinks, sockets, fifos, devices. Counted
+    /// separately from `skipped` because a case can pin a tree that skipped a `.git` by design, but a tree
+    /// that lost a symlinked fixture is not the tree the failure happened in.
+    pub special: u64,
 }
 
 /// The manifest, written and read by hand for the same reason the session store does it by hand: the crate
@@ -368,6 +372,7 @@ impl Manifest {
         out.insert("millis".into(), json!(self.millis));
         out.insert("skipped".into(), json!(self.skipped));
         out.insert("skipped_names".into(), json!(self.skipped_names));
+        out.insert("special".into(), json!(self.special));
         out.insert(
             "files".into(),
             Value::Array(
@@ -424,6 +429,7 @@ impl Manifest {
                         .collect()
                 })
                 .unwrap_or_default(),
+            special: object.get("special").and_then(Value::as_u64).unwrap_or(0),
         })
     }
 }
@@ -460,6 +466,7 @@ impl Checkpointer for Shadows {
         let mut bytes = 0u64;
         let mut skipped = 0u64;
         let mut skipped_names = Vec::new();
+        let mut special = 0u64;
         copy_tree(
             &subject,
             subject.root(),
@@ -468,6 +475,7 @@ impl Checkpointer for Shadows {
             &mut bytes,
             &mut skipped,
             &mut skipped_names,
+            &mut special,
         )?;
 
         let millis = started.elapsed().as_millis() as u64;
@@ -479,6 +487,7 @@ impl Checkpointer for Shadows {
             millis,
             skipped,
             skipped_names,
+            special,
         };
         write_json(&self.manifest_of(&id), &manifest.to_value())?;
         // The cost is a fact in the log, not an estimate in a comment: a copy per attempt is only
@@ -626,6 +635,7 @@ fn staging_path(target: &Path) -> PathBuf {
 /// Copy the tree, recording what went where. Directories are recreated; regular files are copied; anything
 /// else (a symlink, a fifo, a socket) is skipped and counted, because a snapshot cannot promise to put back
 /// something it does not understand.
+#[allow(clippy::too_many_arguments)]
 fn copy_tree(
     subject: &Subject,
     from: &Path,
@@ -634,6 +644,7 @@ fn copy_tree(
     bytes: &mut u64,
     skipped: &mut u64,
     skipped_names: &mut Vec<String>,
+    special: &mut u64,
 ) -> Result<(), Fault> {
     let listing = match fs::read_dir(from) {
         Ok(listing) => listing,
@@ -680,7 +691,16 @@ fn copy_tree(
             crate::scratch::state_dir(&target).map_err(|error| {
                 Fault::harness(format!("could not make {}: {error}", target.display()))
             })?;
-            copy_tree(subject, &path, to, files, bytes, skipped, skipped_names)?;
+            copy_tree(
+                subject,
+                &path,
+                to,
+                files,
+                bytes,
+                skipped,
+                skipped_names,
+                special,
+            )?;
         } else if metadata.is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
@@ -709,6 +729,13 @@ fn copy_tree(
             *bytes += metadata.len();
         } else {
             *skipped += 1;
+            *special += 1;
+            skipped_names.push(
+                path.strip_prefix(subject.root())
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
         }
     }
     Ok(())

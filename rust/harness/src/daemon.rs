@@ -490,6 +490,7 @@ impl Daemon {
         }
 
         let flags = crate::cli::flags_from(request).map_err(Fault::harness)?;
+        let attack = crate::cli::attack_of(&flags);
         let (mut engine, answerer, _, judge) =
             crate::cli::assemble(&flags, "daemon").map_err(Fault::harness)?;
         let session_id = engine.session_id().to_string();
@@ -570,6 +571,10 @@ impl Daemon {
             (engine.profile().context_tokens / 10).min(2_000),
         );
         let protect = crate::cli::protect_of(&flags, engine.root()).map_err(Fault::harness)?;
+        let policy_name = engine.policy_name().to_string();
+        let model_name = answerer.describe();
+        let check = engine.profile().verify.clone();
+        let case_mode = crate::cli::case_mode(&flags).map_err(Fault::harness)?;
         let walked = {
             let mut runner = crate::graph::Runner::new(
                 engine.parts(
@@ -585,7 +590,12 @@ impl Daemon {
             .with_stop(cancel.as_ref())
             .with_baseline(crate::cli::baseline_of(&flags).map_err(Fault::harness)?)
             .with_protect(protect)
-            .with_scoreboard(&self.state);
+            .with_scoreboard(&self.state)
+            .with_identity(model_name, policy_name)
+            .with_call_tokens(crate::cli::call_tokens(&flags));
+            if let Some(attack) = &attack {
+                runner = runner.with_attack(attack.clone());
+            }
             if let (Some(section), Some(writer)) = (memo.section.clone(), memo.memory.as_ref()) {
                 runner = runner.with_memory(crate::graph::Remembering {
                     section: crate::context::Section::new(section.0, section.1),
@@ -618,6 +628,36 @@ impl Daemon {
 
         match walked {
             Ok(walked) => {
+                // The failure corpus, recorded before the reply: the client sees the case id in the same
+                // message that says how the run ended. A write failure is a line, never a failed run.
+                let case = crate::cases::record(
+                    &self.state,
+                    &walked,
+                    &goal,
+                    &session_id,
+                    &check,
+                    attack.as_deref(),
+                    case_mode,
+                );
+                let (case_id, case_line, case_error) = match case {
+                    Ok(crate::cases::Recorded::Case(case)) => (
+                        Some(case.id.clone()),
+                        Some(format!(
+                            "{} recorded ({} files, tree {})",
+                            case.id,
+                            case.files,
+                            case.tree.get(..12).unwrap_or(&case.tree)
+                        )),
+                        None,
+                    ),
+                    Ok(crate::cases::Recorded::Skipped(why)) => {
+                        (None, Some(format!("not recorded ({why})")), None)
+                    }
+                    Err(said) => {
+                        eprintln!("case: not recorded, {said}");
+                        (None, Some(format!("not recorded ({said})")), Some(said))
+                    }
+                };
                 let ended = ended_line(&walked.ended);
                 writeln!(
                     stream,
@@ -636,6 +676,9 @@ impl Daemon {
                         "memory_recalled": memo.recalled,
                         "recorded": walked.recorded.as_ref().map(|path| path.display().to_string()),
                         "memory_error": walked.memory_error,
+                        "case": case_id,
+                        "case_line": case_line,
+                        "case_error": case_error,
                         "compacted": session.entries()[before..]
                             .iter()
                             .any(|entry| entry.kind == Kind::Compaction),

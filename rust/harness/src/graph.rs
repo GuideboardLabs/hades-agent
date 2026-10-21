@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use session_tree::{Clock, Session, SessionStore};
 
 use crate::approval::{ApprovalBroker, ApprovalRequest};
@@ -604,14 +604,135 @@ pub struct Run {
     /// The last attempt's check state, whether it passed or not. `learned` only carries failures forward,
     /// so a passing attempt leaves no try behind and the state has to be kept here to be reportable.
     pub check: Option<crate::verify::State>,
+    /// The attack's result on the last attempt, when the run carried an attack. The receipt names both sides:
+    /// what the exploit did before the attempt and what it did after.
+    pub last_attack: Option<crate::verify::AttackReport>,
     /// The check as it was before the first write. `None` when no check ran first, which is what
     /// `--baseline off` and a read-only profile produce.
     pub baseline: Option<crate::verify::Verification>,
     /// The frozen check and protected files the run started with. `None` when the profile has no check.
     pub ruler: Option<crate::ruler::Ruler>,
+    /// The snapshot label **this walk** took before its first write, e.g. `s-42#3`. Read from the log this
+    /// run appended to, not from `shadows/<session>/1`: a resumed session appends to an old log, and its
+    /// first snapshot is not the tree this run started from. `None` when no snapshot was taken.
+    pub snapshot: Option<String>,
+    /// Why there is no snapshot, when there is none. A decline with a reason is a fact a case needs; an
+    /// absent tree with no explanation reads like a bug.
+    pub snapshot_declined: Option<String>,
+    /// The ceiling this walk ran under, resolved. A case replays all of it, not only what was spent.
+    pub bounds: Bounds,
+    /// The policy's name (`open` or `guarded`). A failure under a guarded policy is a different task from
+    /// the same goal under an open one, so the name travels with the result.
+    pub policy: String,
+    /// The profile id, so a result knows the role and tool surface that produced it.
+    pub profile: String,
+    /// What the model was, as the surface describes it. A replay on another model is another experiment.
+    pub model: String,
+    /// The dead-end record a giving-up run wrote, when a memory was attached. `None` for a run that did
+    /// not give up, or one with no memory to tell.
+    pub dead_end: Option<std::path::PathBuf>,
 }
 
-/// One candidate of a speculative attempt: its own session, its own check result, and the program it ran.
+/// A giving-up or stopped run's note to whoever picks it up: what was tried, where it got, and what the
+/// harness could actually derive. Written by the harness, never by a model, so it cannot invent a next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handover {
+    pub goal: String,
+    pub ended: String,
+    pub attempts: u32,
+    pub best_candidate: Option<String>,
+    pub last_check: Option<String>,
+    pub next: Option<String>,
+    pub blockers: Vec<String>,
+    pub case_id: Option<String>,
+    pub session: String,
+}
+
+impl Handover {
+    /// One line for a prompt or a compaction summary. The full record is in the log.
+    pub fn line(&self) -> String {
+        let mut text = format!(
+            "{} after {} attempt(s); last check {}",
+            self.ended,
+            self.attempts,
+            self.last_check.as_deref().unwrap_or("not run")
+        );
+        if let Some(candidate) = &self.best_candidate {
+            text.push_str(&format!(
+                "; best candidate: {}",
+                cut_program(candidate, 200)
+            ));
+        }
+        if !self.blockers.is_empty() {
+            text.push_str(&format!("; blocked by: {}", self.blockers.join("; ")));
+        }
+        text.push_str(&format!(
+            "; next: {}",
+            self.next.as_deref().unwrap_or("no next step was recorded")
+        ));
+        if let Some(case) = &self.case_id {
+            text.push_str(&format!("; case {case}"));
+        }
+        text
+    }
+}
+
+/// The files an attack command names, resolved when the walk starts. Only a token that is a real file under
+/// the root is frozen: `sh exploit.sh` freezes `exploit.sh`, `python -c` freezes nothing, and an output the
+/// program has not created yet is not a rule.
+fn resolve_attack_rules(attack: &str, root: &std::path::Path) -> Vec<Protect> {
+    let mut rules = Vec::new();
+    for token in attack.split_whitespace() {
+        let token = token.trim_matches(|character| character == '"' || character == '\'');
+        if token.is_empty() || token.starts_with('-') {
+            continue;
+        }
+        if root.join(token).is_file()
+            && let Ok(rule) = Protect::parse(token, root)
+        {
+            rules.push(rule);
+        }
+    }
+    rules
+}
+
+fn cut_program(program: &str, limit: usize) -> String {
+    let flat = program.replace('\n', " ");
+    if flat.chars().count() <= limit {
+        flat
+    } else {
+        let kept: String = flat.chars().take(limit).collect();
+        format!("{kept}...")
+    }
+}
+
+#[cfg(test)]
+mod handover_tests {
+    use super::Handover;
+
+    #[test]
+    fn a_handover_never_invents_a_next_step() {
+        let handover = Handover {
+            goal: "make the parser strict".to_string(),
+            ended: "gave up".to_string(),
+            attempts: 3,
+            best_candidate: Some("cargo test --quiet".to_string()),
+            last_check: Some("failed".to_string()),
+            next: None,
+            blockers: vec!["attempts: three programs did not pass".to_string()],
+            case_id: None,
+            session: "s1".to_string(),
+        };
+        let line = handover.line();
+        assert!(line.contains("no next step was recorded"), "{line}");
+        assert!(line.contains("gave up after 3 attempt(s)"), "{line}");
+        assert!(
+            line.contains("best candidate: cargo test --quiet"),
+            "{line}"
+        );
+        assert!(line.contains("blocked by: attempts"), "{line}");
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub session: String,
@@ -738,6 +859,22 @@ where
     /// The completion cap a model call sends. Reserved before the call together with the context budget,
     /// so a run cannot start a call that the allowance cannot pay for.
     call_tokens: u64,
+    /// The surface's name for the model, carried into the result. The walk does not call the model's name to
+    /// reason about it; a case has to be replayed on the same model or the comparison is a different one.
+    model_name: String,
+    /// The policy's name, carried into the result beside the rules themselves.
+    policy_name: String,
+    /// Where this walk's entries begin. A resumed session's log already holds a snapshot label from an
+    /// earlier run, and that tree is not the one this walk started from.
+    walk_start: usize,
+    /// The attack result of the last attempt, when the run carried an attack. The receipt names both sides:
+    /// what the exploit did before the attempt and what it did after.
+    pub last_attack: Option<crate::verify::AttackReport>,
+    /// The attack command, when this run carries one, so the ruler can freeze it beside the check.
+    attack: Option<String>,
+    /// The rules the attack command names, resolved once when the attack is set. Resolving at check time
+    /// would freeze a file the program just created: `test -f fixed.txt` names the output, not an oracle.
+    attack_rules: Vec<Protect>,
 }
 
 impl<'a, S, C> Runner<'a, S, C>
@@ -779,7 +916,63 @@ where
             protect: Vec::new(),
             ruler: None,
             call_tokens: DEFAULT_CALL_TOKENS,
+            model_name: String::new(),
+            policy_name: String::new(),
+            walk_start: 0,
+            attack: None,
+            attack_rules: Vec::new(),
+            last_attack: None,
         }
+    }
+
+    /// The model and policy a result cites. Set by every surface that walks, because a case replayed on a
+    /// different model or under a different policy is a different experiment.
+    pub fn with_identity(
+        mut self,
+        model: impl Into<String>,
+        policy_name: impl Into<String>,
+    ) -> Self {
+        self.model_name = model.into();
+        self.policy_name = policy_name.into();
+        self
+    }
+
+    /// A security run's second oracle. The attack succeeds while the vulnerability is present; a green
+    /// check beside a working exploit is not a pass.
+    pub fn with_attack(mut self, attack: impl Into<String>) -> Self {
+        self.attack = Some(attack.into());
+        self.attack_rules = self
+            .attack
+            .as_deref()
+            .map(|attack| resolve_attack_rules(attack, self.task.root()))
+            .unwrap_or_default();
+        self
+    }
+
+    /// The snapshot this walk took, read from the entries it appended. The first `snapshot` field in this
+    /// walk's part of the log is the tree before the first write; a resumed session's earlier labels are
+    /// before `walk_start` and are not this run's. A decline is carried with its reason rather than dropped.
+    fn walk_snapshot(&self) -> (Option<String>, Option<String>) {
+        for entry in self.session.entries().iter().skip(self.walk_start) {
+            let Some(label) = entry.payload.get("snapshot").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(inside) = label.strip_prefix("declined (") {
+                let why = inside
+                    .strip_suffix(')')
+                    .unwrap_or(inside)
+                    .trim()
+                    .to_string();
+                return (None, Some(why));
+            }
+            return (Some(label.to_string()), None);
+        }
+        let why = if self.checkpointer.is_none() {
+            "shadowing is off, so the tree was not snapshotted".to_string()
+        } else {
+            "this run took no snapshot".to_string()
+        };
+        (None, Some(why))
     }
 
     /// What the last attempt's judge said, when one ran.
@@ -848,10 +1041,43 @@ where
         self
     }
 
+    /// The harness's own account of a run that stopped short. `next` stays `None`: a next step the harness
+    /// cannot derive is not written, and the line says so rather than inventing one.
+    fn handover(&self, ended: &Ended, attempts: u32, best_candidate: Option<String>) -> Handover {
+        let (name, blockers, next) = match ended {
+            Ended::GaveUp {
+                reason, exhausted, ..
+            } => (
+                "gave up".to_string(),
+                vec![format!("{}: {}", exhausted.name(), reason)],
+                None,
+            ),
+            Ended::Stopped { .. } => (
+                "stopped".to_string(),
+                vec!["a person stopped the run".to_string()],
+                None,
+            ),
+            _ => ("ended".to_string(), Vec::new(), None),
+        };
+        let best_candidate = best_candidate.or_else(|| self.asked.clone());
+        Handover {
+            goal: self.task.goal().to_string(),
+            ended: name,
+            attempts,
+            best_candidate,
+            last_check: self.last_check.map(|state| state.name().to_string()),
+            next,
+            blockers,
+            case_id: None,
+            session: self.session.id().to_string(),
+        }
+    }
+
     /// Every rule the ruler reads: the profile's defaults, then the run's extra paths.
     fn protected(&self) -> Vec<Protect> {
         let mut rules = self.profile.protect.clone();
         rules.extend(self.protect.iter().cloned());
+        rules.extend(self.attack_rules.iter().cloned());
         rules
     }
 
@@ -861,9 +1087,14 @@ where
         if check.is_empty() {
             return Ok(None);
         }
-        crate::ruler::Ruler::take(check, self.task.root(), &self.protected())
-            .map(Some)
-            .map_err(Fault::harness)
+        crate::ruler::Ruler::take_with(
+            check,
+            self.attack.as_deref(),
+            self.task.root(),
+            &self.protected(),
+        )
+        .map(Some)
+        .map_err(Fault::harness)
     }
 
     /// Re-hash after a check and name the first difference, if the verifier moved under the run.
@@ -871,8 +1102,13 @@ where
         let Some(before) = &self.ruler else {
             return Ok(None);
         };
-        let now = crate::ruler::Ruler::take(&before.check, self.task.root(), &self.protected())
-            .map_err(Fault::harness)?;
+        let now = crate::ruler::Ruler::take_with(
+            &before.check,
+            self.attack.as_deref(),
+            self.task.root(),
+            &self.protected(),
+        )
+        .map_err(Fault::harness)?;
         Ok(before.diff(&now))
     }
 
@@ -907,6 +1143,7 @@ where
                 "attempt": attempts,
             }),
         )?;
+        let (snapshot, snapshot_declined) = self.walk_snapshot();
         Ok(Run {
             visits,
             ended: Ended::RulerChanged { attempts, detail },
@@ -917,8 +1154,16 @@ where
             memory_error: None,
             verdict: self.last_verdict.clone(),
             check: self.last_check,
+            last_attack: self.last_attack.clone(),
             baseline: self.baseline.clone(),
             ruler: self.ruler.clone(),
+            snapshot,
+            snapshot_declined,
+            bounds: self.bounds,
+            policy: self.policy_name.clone(),
+            profile: self.profile.id.as_str().to_string(),
+            model: self.model_name.clone(),
+            dead_end: None,
         })
     }
 
@@ -967,6 +1212,9 @@ where
     /// Walk the graph until a terminal node. Every step is recorded, and the log is the session's.
     pub fn run(&mut self) -> Result<Run, Fault> {
         let started = Instant::now();
+        // Where this walk's entries begin. Everything before it is an earlier run on a resumed session,
+        // including its snapshot label; the case a failure produces must pin this run's starting tree.
+        self.walk_start = self.session.len();
         // Where the reading starts: what this session already established, rather than an empty mind. A
         // second run on a session id is a resume, and a resume that hands the next attempt the same prompt
         // as the first is a second roll of the same dice wearing the word "retry".
@@ -1010,8 +1258,19 @@ where
                     memory_error: None,
                     verdict: None,
                     check: Some(State::Passed),
+                    last_attack: None,
                     baseline: Some(baseline),
                     ruler: self.ruler.clone(),
+                    // No turn ran, so no snapshot was taken: there is nothing to reproduce in a green tree.
+                    snapshot: None,
+                    snapshot_declined: Some(
+                        "the check already passed, so no attempt was made".to_string(),
+                    ),
+                    bounds: self.bounds,
+                    policy: self.policy_name.clone(),
+                    profile: self.profile.id.as_str().to_string(),
+                    model: self.model_name.clone(),
+                    dead_end: None,
                 });
             }
             self.baseline = Some(baseline);
@@ -1066,6 +1325,53 @@ where
                         "attempt": attempts,
                     }),
                 )?;
+                // A handover is written before the cut, because the point of the cut is that the next run
+                // cannot see what came before. It is harness text: the facts are the walk's own, and a next
+                // step is stated only when one can be derived.
+                if matches!(ended, Ended::GaveUp { .. } | Ended::Stopped { .. }) {
+                    // The candidate that got furthest: a gate that passed outranks a higher count, because a
+                    // passing gate is a different kind of progress from a partial one.
+                    let best = branches
+                        .iter()
+                        .max_by(|a, b| {
+                            let score = |candidate: &Candidate| {
+                                candidate
+                                    .progress
+                                    .as_ref()
+                                    .map(|progress| {
+                                        if progress.gate {
+                                            1.0 + progress.passed as f64
+                                                / progress.total.max(1) as f64
+                                        } else {
+                                            progress.passed as f64 / progress.total.max(1) as f64
+                                        }
+                                    })
+                                    .unwrap_or(0.0)
+                            };
+                            score(a)
+                                .partial_cmp(&score(b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|candidate| candidate.program.clone());
+                    let handover = self.handover(&ended, attempts, best);
+                    self.session.append(
+                        session_tree::Kind::Checkpoint,
+                        json!({
+                            "node": "handover",
+                            "handover": handover.line(),
+                            "goal": handover.goal,
+                            "ended": handover.ended,
+                            "attempts": handover.attempts,
+                            "best_candidate": handover.best_candidate,
+                            "last_check": handover.last_check,
+                            "next": handover.next,
+                            "blockers": handover.blockers,
+                            "case_id": handover.case_id,
+                            "session": handover.session,
+                        }),
+                    )?;
+                    learned.note_handover(handover.line());
+                }
                 // Atropos, at the end of the walk: what this run *read* is history now, and if it is too
                 // much of the next bundle it is cut here, before the caller releases the session's lease. A
                 // compaction that cannot be written does not fail a run that already succeeded; it says so
@@ -1077,6 +1383,7 @@ where
                 }
                 let mut recorded = None;
                 let mut memory_error = None;
+                let mut dead_end = None;
                 if let (Some(memory), Ended::Accepted { attempts, program }) =
                     (&self.memory, &ended)
                 {
@@ -1102,6 +1409,36 @@ where
                     };
                     match memory.writer.record(&note) {
                         Ok(done) => recorded = Some(done.path),
+                        Err(said) => memory_error = Some(said),
+                    }
+                }
+                // A giving-up run leaves a dead end, not an outcome: nothing was established, and the next
+                // run that shares this goal should be told what was already tried. `Stopped` and `Awaiting`
+                // are not dead ends; a person ended one and a question ended the other.
+                if let (
+                    Some(memory),
+                    Ended::GaveUp {
+                        attempts,
+                        reason,
+                        exhausted,
+                    },
+                ) = (&self.memory, &ended)
+                {
+                    let dead = crate::memory::DeadEnd {
+                        goal: self.task.goal().to_string(),
+                        session: self.session.id().to_string(),
+                        cause: exhausted.name().to_string(),
+                        attempts: *attempts,
+                        check_sha256: self
+                            .ruler
+                            .as_ref()
+                            .map(|ruler| ruler.check_sha256.clone())
+                            .unwrap_or_default(),
+                        evidence: reason.clone(),
+                        case_id: None,
+                    };
+                    match memory.writer.record_dead_end(&dead) {
+                        Ok(done) => dead_end = Some(done.path),
                         Err(said) => memory_error = Some(said),
                     }
                 }
@@ -1141,6 +1478,7 @@ where
                         },
                     );
                 }
+                let (snapshot, snapshot_declined) = self.walk_snapshot();
                 return Ok(Run {
                     visits,
                     ended,
@@ -1151,8 +1489,16 @@ where
                     memory_error,
                     verdict: self.last_verdict.clone(),
                     check: self.last_check,
+                    last_attack: self.last_attack.clone(),
                     baseline: self.baseline.clone(),
                     ruler: self.ruler.clone(),
+                    snapshot,
+                    snapshot_declined,
+                    bounds: self.bounds,
+                    policy: self.policy_name.clone(),
+                    profile: self.profile.id.as_str().to_string(),
+                    model: self.model_name.clone(),
+                    dead_end,
                 });
             }
 
@@ -1698,6 +2044,7 @@ where
             } => {
                 self.last_verdict = Some(verdict);
                 self.last_check = Some(verification.state);
+                self.last_attack = verification.attack.clone();
                 let program = answer.rendered();
                 // Every call this turn made reported what it cost — the answer's call and the judge's,
                 // which is why the total comes from the turn rather than from the answer alone.

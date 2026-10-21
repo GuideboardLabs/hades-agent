@@ -65,7 +65,7 @@ pub fn propose(
         .map(|since| since.as_secs())
         .unwrap_or(0);
     let text = format!(
-        "---\nname: {name}\nstatus: proposed\nprofile: {profile}\ncheck_fingerprint: {fingerprint}\nsession: {session}\nattempts: {attempts}\nat: {at}\n---\n\n# {goal}\n\n## When to use\n\n{goal}\n\n## What worked\n\n```sh\n{program}\n```\n\n## How it was checked\n\nThe run's check passed. Its command is withheld from this proposal; `check_fingerprint` records which check it was.\n\nPromote this with `hades skills promote {name}` only after reading it.\n",
+        "---\nname: {name}\nstatus: proposed\nprofile: {profile}\ncheck_fingerprint: {fingerprint}\nsession: {session}\nattempts: {attempts}\ncontract: TODO\nregression: []\nholdout: []\nversion: 1\nat: {at}\n---\n\n# {goal}\n\n## When to use\n\n{goal}\n\n## What worked\n\n```sh\n{program}\n```\n\n## How it was checked\n\nThe run's check passed. Its command is withheld from this proposal; `check_fingerprint` records which check it was. Fill in `contract` with inputs, outputs, scope and failure modes, name at least two regression cases and one holdout in `regression:` and `holdout:`, then run `hades skills verify {name}`.\n\nPromote this with `hades skills promote {name}` only after reading it.\n",
         goal = goal.trim(),
         program = program.trim(),
         fingerprint = fingerprint(check),
@@ -100,7 +100,7 @@ pub fn propose_runbook(
         .map(|since| since.as_secs())
         .unwrap_or(0);
     let text = format!(
-        "---\nname: {name}\nstatus: proposed\nprofile: {profile}\ncheck_fingerprint: {fingerprint}\nsession: {session}\nreplay: {replay}\nat: {at}\nsummary: {summary}\n---\n\n# {name}\n\n{runbook}\n\nPromote this with `hades skills promote {name}` only after reading it and the replay session.\n",
+        "---\nname: {name}\nstatus: proposed\nprofile: {profile}\ncheck_fingerprint: {fingerprint}\nsession: {session}\nreplay: {replay}\ncontract: TODO\nregression: []\nholdout: []\nversion: 1\nat: {at}\nsummary: {summary}\n---\n\n# {name}\n\n{runbook}\n\nFill in `contract`, `regression:` and `holdout:` before promotion, then run `hades skills verify {name}`.\n",
         fingerprint = fingerprint(check),
         summary = summary.trim(),
         runbook = runbook.trim(),
@@ -198,11 +198,160 @@ fn collect_skills(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// What a proposal's frontmatter says about the evidence behind it. A legacy proposal (written before the
+/// contract existed) has no `version` and no `contract` key at all, which is different from a `TODO`: the
+/// first can be promoted with `--force`, the second is a procedure nobody has described yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub legacy: bool,
+    pub contract: Option<String>,
+    pub regression: Vec<String>,
+    pub holdout: Vec<String>,
+    pub version: Option<String>,
+}
+
+pub fn evidence(text: &str) -> Evidence {
+    let Some(front) = frontmatter(text) else {
+        return Evidence {
+            legacy: true,
+            contract: None,
+            regression: Vec::new(),
+            holdout: Vec::new(),
+            version: None,
+        };
+    };
+    let contract = front.get("contract").cloned();
+    let version = front.get("version").cloned();
+    let legacy = contract.is_none() && version.is_none();
+    Evidence {
+        legacy,
+        contract,
+        regression: list(front.get("regression")),
+        holdout: list(front.get("holdout")),
+        version,
+    }
+}
+
+/// The `key: value` lines between the first two `---` fences. Deliberately not a YAML parser: a proposal is
+/// written by this program, and a parser that accepts more than it writes is a second format to maintain.
+fn frontmatter(text: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let text = text.strip_prefix("---\n")?;
+    let end = text.find("\n---")?;
+    let mut fields = std::collections::BTreeMap::new();
+    for line in text[..end].lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        fields.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    Some(fields)
+}
+
+fn list(value: Option<&String>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// Refuse a promotion that has no evidence. Returns the warnings a `--force` promotion must print.
+pub fn promotable(
+    evidence: &Evidence,
+    verification: Option<&serde_json::Value>,
+) -> Result<Vec<String>, String> {
+    if evidence.legacy {
+        return Ok(vec![
+            "this proposal predates the contract; it has no inputs, outputs, scope or failure modes"
+                .to_string(),
+        ]);
+    }
+    match evidence.contract.as_deref() {
+        None | Some("") | Some("TODO") => {
+            return Err(
+                "this proposal has no contract: fill in inputs, outputs, scope and failure modes"
+                    .to_string(),
+            );
+        }
+        Some(_) => {}
+    }
+    if evidence.regression.len() < 2 {
+        return Err(format!(
+            "this proposal names {} regression case(s); a skill needs at least two",
+            evidence.regression.len()
+        ));
+    }
+    if evidence.holdout.is_empty() {
+        return Err("this proposal names no holdout case".to_string());
+    }
+    let Some(receipt) = verification else {
+        return Err(
+            "this proposal has not been verified: run `hades skills verify <name>` first"
+                .to_string(),
+        );
+    };
+    if receipt.get("passed").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("the last verification did not pass".to_string());
+    }
+    let verified: Vec<String> = receipt
+        .get("cases")
+        .and_then(serde_json::Value::as_array)
+        .map(|cases| {
+            cases
+                .iter()
+                .filter_map(|case| case.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut wanted = evidence.regression.clone();
+    wanted.extend(evidence.holdout.clone());
+    if !wanted.iter().all(|case| verified.contains(case)) {
+        return Err(
+            "the verification receipt does not cover every case this proposal names".to_string(),
+        );
+    }
+    Ok(Vec::new())
+}
+
+/// The verify receipt's path, written beside the proposal so promotion reads one file.
+pub fn verification_path(state: &Path, name: &str) -> PathBuf {
+    proposed_dir(state).join(format!("{name}.verify.json"))
+}
+
+/// The profile a proposal was written for, from its frontmatter.
+pub fn proposal_profile(text: &str) -> Option<String> {
+    frontmatter(text).and_then(|fields| fields.get("profile").cloned())
+}
+
 /// Move a proposal into the directory the agent reads, flipping `status: proposed` to `status: active`.
 pub fn promote(state: &Path, name: &str) -> Result<PathBuf, String> {
+    promote_with(state, name, false)
+}
+
+/// The same, with the contract gate. `force` promotes and prints the warnings instead of refusing; it never
+/// erases the missing evidence, and the installed file keeps the `TODO` it was promoted with.
+pub fn promote_with(state: &Path, name: &str, force: bool) -> Result<PathBuf, String> {
     let from = proposed_dir(state).join(format!("{name}.md"));
     let text = std::fs::read_to_string(&from)
         .map_err(|_| format!("there is no proposal called `{name}`"))?;
+    let evidence = evidence(&text);
+    let receipt = std::fs::read_to_string(verification_path(state, name))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let warnings = match promotable(&evidence, receipt.as_ref()) {
+        Ok(warnings) => warnings,
+        Err(said) if !force => return Err(said),
+        Err(said) => vec![said],
+    };
+    for warning in &warnings {
+        eprintln!("warning: {name}: {warning}");
+    }
     let text = text.replace("status: proposed", "status: active");
     let dir = installed_dir(state).join(name);
     crate::scratch::state_dir(&dir)
@@ -292,7 +441,7 @@ mod tests {
             2,
         )
         .expect("a proposal");
-        let target = promote(&state, "make-the-test-pass").expect("a promotion");
+        let target = promote_with(&state, "make-the-test-pass", true).expect("a forced promotion");
         assert_eq!(
             target,
             state.join("skills/make-the-test-pass/SKILL.md"),
@@ -307,6 +456,44 @@ mod tests {
         let text = std::fs::read_to_string(&target).expect("the promoted file");
         assert!(text.contains("status: active"), "{text}");
         assert!(proposed(&state).is_empty());
+    }
+
+    #[test]
+    fn a_todo_contract_blocks_promotion_without_force() {
+        let state = scratch("todo");
+        propose(
+            &state,
+            "fix",
+            "make the test pass",
+            "cargo test",
+            "true",
+            "s1",
+            2,
+        )
+        .expect("a proposal");
+        assert!(
+            promote(&state, "make-the-test-pass").is_err(),
+            "a proposal with a TODO contract is not evidence"
+        );
+        assert!(
+            promote_with(&state, "make-the-test-pass", true).is_ok(),
+            "--force promotes and keeps the warning"
+        );
+    }
+
+    #[test]
+    fn a_filled_contract_still_needs_a_verification_receipt() {
+        let text = "---\nname: x\nprofile: fix\ncontract: takes a goal, returns a patch\nregression: [a, b]\nholdout: [c]\nversion: 1\n---\n\nbody\n";
+        let evidence = evidence(text);
+        assert!(!evidence.legacy);
+        assert_eq!(evidence.regression, vec!["a", "b"]);
+        assert_eq!(evidence.holdout, vec!["c"]);
+        assert!(
+            promotable(&evidence, None).is_err(),
+            "a contract with no receipt is a claim, not evidence"
+        );
+        let receipt = serde_json::json!({"passed": true, "cases": ["a", "b", "c"]});
+        assert!(promotable(&evidence, Some(&receipt)).is_ok());
     }
 
     #[test]

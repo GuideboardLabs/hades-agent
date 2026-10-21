@@ -257,9 +257,12 @@ const OUTPUT_TAIL_SHARE: usize = 5;
 /// how long the run has been going.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Learned {
-    /// What the last compaction said, verbatim. A cut that leaves no note leaves the next run blind to
+    /// The last compaction said, verbatim. A cut that leaves no note leaves the next run blind to
     /// everything before it, which is a compaction that costs evidence rather than context.
     summary: Option<String>,
+    /// The last harness handover, as one line. It survives a compaction because the next run needs to know
+    /// what was already abandoned, and that is exactly what the cut would otherwise remove.
+    handover: Option<String>,
     /// The plan the session wrote, kept across a compaction because it governs every later attempt.
     plan: Option<String>,
     constraints: Vec<Constraint>,
@@ -284,6 +287,16 @@ impl Learned {
 
     pub fn summary(&self) -> Option<&str> {
         self.summary.as_deref()
+    }
+
+    pub fn handover(&self) -> Option<&str> {
+        self.handover.as_deref()
+    }
+
+    /// A handover the walk just wrote, so this run's own compaction can carry it even though the log entry
+    /// came after this reading began.
+    pub fn note_handover(&mut self, line: impl Into<String>) {
+        self.handover = Some(line.into());
     }
 
     pub fn plan(&self) -> Option<&str> {
@@ -358,6 +371,12 @@ impl Learned {
                 learned.plan = Some(field(&entry.payload, "plan"));
                 continue;
             }
+            if entry.kind == Kind::Checkpoint && field(&entry.payload, "node") == "handover" {
+                let line = field(&entry.payload, "handover");
+                if !line.is_empty() {
+                    learned.handover = Some(line);
+                }
+            }
             let tool = field(&entry.payload, "tool");
             if entry.kind == Kind::ToolCall && (tool == SHELL || tool == PATCH) {
                 // A program and an edit are both "the work" a check is about. The edit is read from the
@@ -421,6 +440,10 @@ impl Learned {
                 "summary of compacted history",
                 summary.clone(),
             ));
+        }
+
+        if let Some(handover) = &self.handover {
+            sections.push(Section::new("handover from the last run", handover.clone()));
         }
 
         if !self.constraints.is_empty() {

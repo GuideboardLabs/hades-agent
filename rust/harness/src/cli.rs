@@ -73,9 +73,30 @@ hades — the harness, one turn or a whole graph
       what our own finished runs say per profile: runs, pass rate, mean time, and
       what the router would pick. Rules always win; this answers only the fall-through
 
-  hades skills [list | seed | promote <name> | reject <name>] [--state <dir>]
-      the eleven built-in procedures, proposals from a run that took more than one
-      attempt, and the decision to load one. `seed` writes built-ins that are missing
+  hades skills [list | seed | promote <name> [--force] | reject <name> | verify <name> | report]
+               [--state <dir>] [--profile <id>]
+      the built-in procedures, proposals from a run that took more than one attempt, and
+      the decision to load one. A proposal needs a filled-in `contract`, at least two
+      `regression` cases and one `holdout`, and a passing `skills verify` receipt before
+      promotion; `--force` promotes anyway and records the warning. `skills report`
+      prints proposals per 20 accepted runs and the regression pass rate of installed
+      skills. `verify` runs the proposal in a throwaway state and never touches the live
+      `skills/` directory
+
+  hades cases [--profile <id>] [--state <dir>] [--sized] [--json]
+      the failure corpus: every failed run that was pinned as a task, its status,
+      the ceiling it failed under, and the size of its tree. `--sized` stats the trees
+
+  hades case <id> | forget <id> [--profile <id>] [--state <dir>]
+      one case in full, or retire it: the case line stays as evidence, the tree goes
+
+  hades eval [--case <id>]... [--profile <id>] [--against <harness-dir>]
+             [--state <dir>] [--model <preset>] [--attempts <n>] [--minutes <m>]
+             [--check-minutes <m>] [--include-partial] [--include-stale] [--dry-run]
+             [--keep] [--json]
+      replay the corpus against this harness: a green start is stale, a red one runs the
+      case's goal again under its own policy, model and full bounds. --against runs the
+      current harness and a candidate, and exits 1 when the candidate regresses a case
 
   hades explain <session> [--state <dir>]
       a turn map for one finished session: tool, check state, tokens, and the turns
@@ -96,8 +117,10 @@ hades — the harness, one turn or a whole graph
   hades config [--state <dir>] [--config <file>]
       the config a headless process reads, field by field. It holds no secrets
 
-  hades session [list | show <id>] [--state <dir>]
-      the logs under the state directory, and one log entry by entry
+  hades session [list | show <id> | handover [<id>]] [--state <dir>]
+      the logs under the state directory, one log entry by entry, or the harness's
+      handover for a run that gave up or was stopped: goal, attempts, best candidate,
+      blockers, the case it became, and a next step only when one can be derived
 
   hades update [--from <path>]
       what is running; with --from, install that file over the binary atomically.
@@ -223,9 +246,14 @@ hades — the harness, one turn or a whole graph
       stop every run and end the daemon. Stopping is not undo
 
   hades run <goal> --model <preset> [--attempts n] [--minutes m] [--budget-tokens n] [--branch n]
-             [--baseline red|off] [--strict-model] [...]
+             [--baseline red|off] [--case auto|off|force] [--attack <cmd>] [--check-minutes m]
+             [--strict-model] [...]
       walk the graph: try, accept a pass, retry a failure while the bounds hold, hand a
-      refusal to a person. --budget-tokens caps the spend the endpoint reports for the whole
+      refusal to a person. --case controls the failure corpus: a giving-up run becomes a
+      pinned, replayable case by default; off writes none and force keeps a partial tree.
+      --attack adds a second oracle to a security fix: the attack must fail once the
+      check passes, and an attack that cannot run is a fault rather than a pass.
+      --budget-tokens caps the spend the endpoint reports for the whole
       run, prompt and generated together; the end names which bound ran out. --branch n runs
       n candidate turns from the same tree and keeps the first pass (1 to 4); the attempts
       budget is shared, so width is model calls, not a second budget. --baseline red (the
@@ -313,6 +341,9 @@ fn dispatch(
         "refine" => refine(rest),
         "route" => route(rest),
         "skills" => skills_cmd(rest),
+        "cases" => cases_cmd(rest),
+        "case" => case_cmd(rest),
+        "eval" => eval_cmd(rest),
         "explain" => explain(rest),
         "distill" => distill(rest),
         "replay" => replay(rest),
@@ -373,7 +404,7 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
     }
     flags.positional.push(goal);
 
-    const NAMED: [&str; 20] = [
+    const NAMED: [&str; 23] = [
         "root",
         "profile",
         "policy",
@@ -394,7 +425,11 @@ pub(crate) fn flags_from(request: &Value) -> Result<Flags, String> {
         "baseline",
         "strict-model",
         "protect",
+        "case",
+        "attack",
+        "check-minutes",
     ];
+
     for key in NAMED {
         let Some(value) = request.get(key) else {
             continue;
@@ -504,6 +539,16 @@ fn parse_with(args: &[String], known: &[&str], switches: &[&str]) -> Result<Flag
     }
 
     Ok(flags)
+}
+
+/// The completion cap a run sends: the declared `--max-tokens`, or the shipped default. One reader, so the
+/// daemon and the CLI cannot reserve different amounts for the same request.
+pub(crate) fn call_tokens(flags: &Flags) -> u64 {
+    flags
+        .named
+        .get("max-tokens")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(crate::graph::DEFAULT_CALL_TOKENS)
 }
 
 /// Whether a switch was given. `--non-interactive=off` is accepted because a wrapper script that builds
@@ -1171,7 +1216,7 @@ impl Answerer {
     }
 
     /// What a person may see: where the answer came from. Never a key, which is not in here to leak.
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self {
             Answerer::Model(open) => match open.thinking() {
                 Some(false) => format!("{} (thinking off)", open.display()),
@@ -1370,13 +1415,31 @@ fn probe(
     for (name, value) in &flags.named {
         if matches!(
             name.as_str(),
-            "harness" | "candidate" | "program" | "session" | "state" | "adopt" | "holdout"
+            "harness"
+                | "candidate"
+                | "program"
+                | "session"
+                | "state"
+                | "adopt"
+                | "holdout"
+                | "case"
+                | "attack"
+                | "auto"
+                | "regress"
+                | "no-regress"
+                | "check-minutes"
         ) {
             continue;
         }
         if name == "config" {
             let path = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
             command.arg("--config").arg(path);
+        } else if value == "true" {
+            // A switch is forwarded by name. Forwarding `--auto true` gives the child a flag it does not take
+            // or a stray positional goal; a switch this child does not know is not forwarded at all.
+            if matches!(name.as_str(), "strict-model") {
+                command.arg(format!("--{name}"));
+            }
         } else {
             command.arg(format!("--{name}")).arg(value);
         }
@@ -1392,6 +1455,9 @@ fn probe(
     // A tune measures what a harness does with a model. A check that is already green would let the probe
     // pass without asking one, which is a measurement of nothing: the gate is for a fix, not for a probe.
     command.arg("--baseline").arg("off");
+    // A probe is a measurement, not a failure of the real tree: recording a case from it would pin a tree
+    // whose goal is the probe's and whose check is the tuning check. Fixed, not inherited.
+    command.arg("--case").arg("off");
     if let Some(harness) = harness {
         command.arg("--harness").arg(harness);
     }
@@ -1434,6 +1500,20 @@ fn probe(
     Ok(receipt)
 }
 
+/// Why a corpus replay blocks adoption, by exit code. `None` is a clean corpus. A corpus that could not run
+/// is not a pass: an unverified candidate is refused for the same reason a regressing one is.
+fn gate_refusal(code: i32) -> Option<&'static str> {
+    match code {
+        0 => None,
+        2 => Some(
+            "the candidate was not adopted: the corpus could not be replayed, so nothing proves it is safe",
+        ),
+        _ => Some(
+            "the candidate was not adopted: a harness that fixes the target and breaks a pinned case is not an improvement",
+        ),
+    }
+}
+
 /// Propose, probe, compose. With `--candidate`, the proposals are directories and no model is asked; without
 /// it, two candidates are edited from a reference run and then probed against the same check.
 fn tune(args: &[String]) -> Result<(String, i32), String> {
@@ -1464,7 +1544,14 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
             "harness",
             "candidate",
         ],
-        &["adopt", "auto"],
+        &[
+            "adopt",
+            "auto",
+            "regress",
+            "no-regress",
+            "include-partial",
+            "include-stale",
+        ],
     )?;
     let goal = goal(&flags)?;
     let config = config_of(&flags)?;
@@ -1639,12 +1726,14 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
     }
 
     let pick = crate::tuning::choose(&rows);
-    let adopted = match pick {
+    let mut adopted = match pick {
         Some(at) if crate::tuning::beats_base(&rows[0], &rows[at]) => Some(at),
         _ => None,
     };
 
     let mut adopted_line = "none (base kept)".to_string();
+    let mut gate_line = String::new();
+    let mut refused = false;
     if let Some(at) = adopted {
         let name = rows[at].name.clone();
         // `--auto` is the same decision with the person out of the loop for a candidate that already beat the
@@ -1659,29 +1748,89 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
             let source = sources
                 .get(&name)
                 .ok_or_else(|| format!("no candidate directory recorded for `{name}`"))?;
-            // One call, so the copy and the number that makes it undoable cannot come apart. `--auto` takes
-            // the same path: the decision is automatic, the record of it is not optional.
-            let generation = crate::tuning::record_adoption(
-                &hades_home()?,
-                profile.id.as_str(),
-                &target,
-                &state,
-                source,
-                labels.get(&name).map(String::as_str).unwrap_or("tune"),
-                &rows[at].receipt.check,
-                &crate::tuning::guard_digest(),
-            )?;
-            adopted_line = match generation {
-                Some(generation) => format!(
-                    "{name} (copied to {}; generation {} keeps what it replaced)",
-                    target.display(),
-                    generation.id
-                ),
-                None => format!(
-                    "{name} (copied to {}; it was already the harness, so no generation was written)",
-                    target.display()
-                ),
-            };
+            // The corpus gate runs before the copy, on the base and the selected candidate only: a
+            // candidate compared to a stale base result is not a comparison. `--no-regress` is the one
+            // way past it, and the receipt says the corpus was skipped rather than implying it passed.
+            if switched(&flags, "no-regress") {
+                gate_line = "corpus: skipped (--no-regress)\n".to_string();
+            } else {
+                let cases = crate::cases::load(&state, profile.id.as_str());
+                if cases.is_empty() {
+                    gate_line = "corpus: no cases for this profile\n".to_string();
+                } else {
+                    let ceiling: u32 = cases.iter().map(|case| case.bounds.attempts).sum();
+                    gate_line = format!(
+                        "corpus: {} case(s), 2 arms, up to {ceiling} model calls per arm\n",
+                        cases.len()
+                    );
+                    let mut passthrough = Vec::new();
+                    for key in [
+                        "endpoint",
+                        "key",
+                        "temperature",
+                        "max-tokens",
+                        "context",
+                        "program",
+                    ] {
+                        if let Some(value) = flags.named.get(key) {
+                            passthrough.push(format!("--{key}"));
+                            passthrough.push(value.clone());
+                        }
+                    }
+                    let options = crate::eval::options_from(
+                        Vec::new(),
+                        vec![profile.id.as_str().to_string()],
+                        Some(target.clone()),
+                        Some(source.clone()),
+                        flags.named.get("model").cloned(),
+                        None,
+                        None,
+                        None,
+                        switched(&flags, "include-partial"),
+                        switched(&flags, "include-stale"),
+                        false,
+                        false,
+                        passthrough,
+                    );
+                    let report = crate::eval::execute(&state, &options)?;
+                    if let Some(why) = gate_refusal(report.code) {
+                        refused = true;
+                        gate_line.push_str(&report.text);
+                        gate_line.push_str(&format!("\n{why}"));
+                    } else {
+                        gate_line.push_str("corpus: no regression\n");
+                    }
+                }
+            }
+            if refused {
+                adopted_line =
+                    format!("none (the corpus refused the candidate; {name} was not copied)");
+                adopted = None;
+            } else {
+                // One call, so the copy and the number that makes it undoable cannot come apart. `--auto` takes
+                // the same path: the decision is automatic, the record of it is not optional.
+                let generation = crate::tuning::record_adoption(
+                    &hades_home()?,
+                    profile.id.as_str(),
+                    &target,
+                    &state,
+                    source,
+                    labels.get(&name).map(String::as_str).unwrap_or("tune"),
+                    &rows[at].receipt.check,
+                    &crate::tuning::guard_digest(),
+                )?;
+                adopted_line = match generation {
+                    Some(generation) => format!(
+                        "{name} (copied to {}; generation {} keeps what it replaced)",
+                        target.display(),
+                        generation.id
+                    ),
+                    None => format!(
+                        "{name} (copied to {}; it was already the harness, so no generation was written)",
+                        target.display()
+                    ),
+                };
+            }
         } else {
             adopted_line = format!("{name} (not copied; pass --adopt)");
         }
@@ -1748,11 +1897,15 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
              measure unattended.\n"
         ));
     }
+    if !gate_line.is_empty() {
+        text.push('\n');
+        text.push_str(&gate_line);
+    }
     text.push_str(&format!(
         "\nadopted: {adopted_line}\nlibrary: {}\n",
         library.display()
     ));
-    Ok((text, 0))
+    Ok((text, if refused { 1 } else { 0 }))
 }
 
 /// The numbered generations of a profile's harness, and the one command that puts one back.
@@ -1898,10 +2051,257 @@ fn profiles(_args: &[String]) -> Result<(String, i32), String> {
     Ok((text, 0))
 }
 
+/// The failure corpus: replay the whole thing, or compare a candidate against the current harness.
+fn eval_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &[
+            "state",
+            "config",
+            "profile",
+            "case",
+            "harness",
+            "against",
+            "model",
+            "endpoint",
+            "key",
+            "temperature",
+            "max-tokens",
+            "context",
+            "attempts",
+            "minutes",
+            "check-minutes",
+            "program",
+        ],
+        &[
+            "include-partial",
+            "include-stale",
+            "dry-run",
+            "keep",
+            "json",
+        ],
+    )?;
+    let state = state_of(&flags)?;
+    let number = |key: &str| -> Result<Option<u64>, String> {
+        match flags.named.get(key) {
+            Some(value) => {
+                Ok(Some(value.parse::<u64>().map_err(|_| {
+                    format!("`--{key} {value}` is not a number")
+                })?))
+            }
+            None => Ok(None),
+        }
+    };
+    let attempts = number("attempts")?.map(|value| value.max(1) as u32);
+    let minutes = number("minutes")?;
+    let check_minutes = number("check-minutes")?;
+    // A scripted program is forwarded for the same reason the endpoint is: a replay is a real run, and a test
+    // that cannot name a model should still be able to replay a case.
+    let mut passthrough = Vec::new();
+    if let Some(programs) = flags.repeated.get("program") {
+        for program in programs {
+            passthrough.push("--program".to_string());
+            passthrough.push(program.clone());
+        }
+    }
+    let options = crate::eval::options_from(
+        flags.repeated.get("case").cloned().unwrap_or_default(),
+        flags.repeated.get("profile").cloned().unwrap_or_default(),
+        flags.named.get("harness").map(PathBuf::from),
+        flags.named.get("against").map(PathBuf::from),
+        flags.named.get("model").cloned(),
+        attempts,
+        minutes,
+        check_minutes,
+        switched(&flags, "include-partial"),
+        switched(&flags, "include-stale"),
+        switched(&flags, "dry-run"),
+        switched(&flags, "keep"),
+        passthrough,
+    );
+    let report = crate::eval::execute(&state, &options)?;
+    if switched(&flags, "json") {
+        return Ok((format!("{}\n", report.json), report.code));
+    }
+    Ok((report.text, report.code))
+}
+
+/// The failure corpus: what has been pinned, its status, and the two decisions on one case.
+///
+/// A case is a task with a starting tree, not a transcript. `hades eval` replays them; this surface only
+/// reads the ledger and, for `forget`, retires one.
+fn cases_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state", "profile", "config"], &["json", "sized"])?;
+    let state = state_of(&flags)?;
+    let wanted: Vec<String> = match flags.named.get("profile") {
+        Some(profile) => vec![crate::cases::safe_profile(profile)],
+        None => crate::cases::profiles(&state),
+    };
+    if wanted.is_empty() {
+        return Ok((
+            format!(
+                "no cases under {}: a giving-up run records one by default\n",
+                crate::cases::cases_dir(&state).display()
+            ),
+            0,
+        ));
+    }
+    let sized = switched(&flags, "sized");
+    if switched(&flags, "json") {
+        let all: Vec<serde_json::Value> = wanted
+            .iter()
+            .flat_map(|profile| crate::cases::load(&state, profile))
+            .map(|case| {
+                serde_json::json!({
+                    "id": case.id,
+                    "profile": case.profile,
+                    "goal": case.goal,
+                    "check": case.check,
+                    "status": case.status,
+                    "cause": case.cause,
+                    "attempts_used": case.attempts_used,
+                    "bounds": {
+                        "attempts": case.bounds.attempts,
+                        "minutes": case.bounds.minutes,
+                        "budget_tokens": case.bounds.tokens,
+                        "width": case.bounds.width,
+                    },
+                    "tree": case.tree,
+                    "snapshot": case.snapshot,
+                    "source": case.source,
+                    "partial": case.partial,
+                    "bytes": case.bytes,
+                    "files": case.files,
+                    "attack": case.attack,
+                    "at": case.at,
+                })
+            })
+            .collect();
+        return Ok((format!("{}\n", serde_json::json!(all)), 0));
+    }
+    let mut text = String::new();
+    for profile in &wanted {
+        text.push_str(&crate::cases::table(&state, profile, sized));
+        let (bytes, open) = crate::cases::size(&state, profile);
+        text.push_str(&format!(
+            "  {open} open, {bytes} bytes{} \n",
+            if bytes > crate::cases::WARN_BYTES {
+                format!(
+                    " (past the {} MB warning; `hades case forget <id>` retires one)",
+                    crate::cases::WARN_BYTES / (1024 * 1024)
+                )
+            } else {
+                String::new()
+            }
+        ));
+    }
+    Ok((text, 0))
+}
+
+/// One case in full, or the decision to retire it.
+fn case_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state", "profile", "config"], &[])?;
+    let state = state_of(&flags)?;
+    let action = flags.positional.first().map(String::as_str).unwrap_or("");
+    let (verb, id) = if action == "forget" {
+        (
+            "forget",
+            flags
+                .positional
+                .get(1)
+                .map(String::as_str)
+                .ok_or_else(|| "forget needs a case id".to_string())?,
+        )
+    } else {
+        ("show", action)
+    };
+    if id.is_empty() {
+        return Err("say `hades case <id>` or `hades case forget <id>`".to_string());
+    }
+    let profile = match flags.named.get("profile") {
+        Some(profile) => {
+            let profile = crate::cases::safe_profile(profile);
+            if crate::cases::find(&state, &profile, id)?.is_none() {
+                return Err(format!("there is no case `{id}` under profile {profile}"));
+            }
+            profile
+        }
+        None => crate::cases::profiles(&state)
+            .into_iter()
+            .find(|profile| {
+                crate::cases::find(&state, profile, id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .ok_or_else(|| format!("there is no case `{id}` in {}", state.display()))?,
+    };
+    if verb == "forget" {
+        let case = crate::cases::forget(&state, &profile, id)?;
+        return Ok((
+            format!(
+                "retired {} ({}); its tree is gone, the case line remains\n",
+                case.id, case.goal
+            ),
+            0,
+        ));
+    }
+    let case = crate::cases::find(&state, &profile, id)?
+        .ok_or_else(|| format!("there is no case `{id}`"))?;
+    let mut text = format!(
+        "id:       {}\nprofile:  {}\nstatus:   {}\ngoal:     {}\ncheck:    {}\ncause:    {} after {} attempt(s)\nbounds:   {}\npolicy:   {}\nmodel:    {}\nsnapshot: {}\nsource:   {}\ntree:     {} ({} files, {} bytes)\npartial:  {} ({})\nignored:  {}\n",
+        case.id,
+        case.profile,
+        case.status,
+        case.goal,
+        case.check,
+        case.cause,
+        case.attempts_used,
+        case.bounds.line(),
+        case.policy,
+        case.model,
+        case.snapshot,
+        case.source,
+        case.tree,
+        case.files,
+        case.bytes,
+        case.partial,
+        case.skipped_special,
+        case.ignored.join(", ")
+    );
+    if let Some(ruler) = &case.ruler {
+        text.push_str(&format!("ruler:    {}\n", ruler.get(..12).unwrap_or(ruler)));
+    }
+    if let Some(attack) = &case.attack {
+        text.push_str(&format!("attack:   {attack}\n"));
+    }
+    text.push_str(&format!(
+        "log:      {}\n",
+        crate::cases::profile_dir(&state, &case.profile)
+            .join(&case.id)
+            .join("runs")
+            .display()
+    ));
+    Ok((text, 0))
+}
+
 /// Proposals from finished work, and the two decisions a person can take on one. A proposal is never loaded
 /// until it is promoted, because a skill is an instruction.
 fn skills_cmd(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(args, &["state"])?;
+    let flags = parse_with(
+        args,
+        &[
+            "state",
+            "profile",
+            "model",
+            "endpoint",
+            "key",
+            "temperature",
+            "max-tokens",
+            "context",
+        ],
+        &["force"],
+    )?;
     let state = state_of(&flags)?;
     let action = flags
         .positional
@@ -1963,9 +2363,11 @@ fn skills_cmd(args: &[String]) -> Result<(String, i32), String> {
                 .positional
                 .get(1)
                 .ok_or_else(|| "promote needs a proposal name".to_string())?;
-            let path = crate::skills::promote(&state, name)?;
+            let path = crate::skills::promote_with(&state, name, switched(&flags, "force"))?;
             Ok((format!("promoted: {}\n", path.display()), 0))
         }
+        "verify" => skills_verify(&state, &flags),
+        "report" => Ok((skills_report(&state), 0)),
         "reject" => {
             let name = flags
                 .positional
@@ -1975,9 +2377,178 @@ fn skills_cmd(args: &[String]) -> Result<(String, i32), String> {
             Ok((format!("rejected: {name}\n"), 0))
         }
         other => Err(format!(
-            "`skills {other}`: say list, promote <name> or reject <name>"
+            "`skills {other}`: say list, seed, promote <name>, reject <name>, verify <name> or report"
         )),
     }
+}
+
+/// Run one proposal in a throwaway state, over the cases it names. The live `skills/` is never touched: the
+/// proposal is installed in a copy, the corpus is copied beside it, and the receipt records what passed.
+fn skills_verify(state: &Path, flags: &Flags) -> Result<(String, i32), String> {
+    let name = flags
+        .positional
+        .get(1)
+        .ok_or_else(|| "verify needs a proposal name".to_string())?;
+    let path = crate::skills::proposed_dir(state).join(format!("{name}.md"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| format!("there is no proposal called `{name}`"))?;
+    let evidence = crate::skills::evidence(&text);
+    if evidence.regression.len() < 2 || evidence.holdout.is_empty() {
+        return Err(format!(
+            "`{name}` names {} regression case(s) and {} holdout; verify needs at least two regressions and one holdout",
+            evidence.regression.len(),
+            evidence.holdout.len()
+        ));
+    }
+    let profile = flags
+        .named
+        .get("profile")
+        .cloned()
+        .or_else(|| crate::skills::proposal_profile(&text))
+        .ok_or_else(|| format!("`{name}` names no profile; pass --profile"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let thrown = state
+        .join("skills")
+        .join("verify")
+        .join(format!("{name}-{stamp}"));
+    // The throwaway state is the real state minus the proposal: the corpus is what is being tested, and a
+    // copy is the only way to install a procedure without it becoming live.
+    crate::scratch::state_dir(&thrown)
+        .map_err(|error| format!("could not make {}: {error}", thrown.display()))?;
+    if state.join("cases").is_dir() {
+        crate::cases::copy_dir(&state.join("cases"), &thrown.join("cases"))?;
+    }
+    let active = thrown.join("skills").join(name);
+    crate::scratch::state_dir(&active)
+        .map_err(|error| format!("could not make {}: {error}", active.display()))?;
+    std::fs::write(
+        active.join("SKILL.md"),
+        text.replace("status: proposed", "status: active"),
+    )
+    .map_err(|error| format!("could not write the throwaway skill: {error}"))?;
+    let mut passthrough = Vec::new();
+    for key in ["endpoint", "key", "temperature", "max-tokens", "context"] {
+        if let Some(value) = flags.named.get(key) {
+            passthrough.push(format!("--{key}"));
+            passthrough.push(value.clone());
+        }
+    }
+    let mut cases = evidence.regression.clone();
+    cases.extend(evidence.holdout.clone());
+    let options = crate::eval::options_from(
+        cases.clone(),
+        vec![profile.clone()],
+        None,
+        None,
+        flags.named.get("model").cloned(),
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        passthrough,
+    );
+    let report = crate::eval::execute(&thrown, &options)?;
+    let passed = report.code == 0;
+    let receipt = serde_json::json!({
+        "name": name,
+        "profile": profile,
+        "cases": cases,
+        "passed": passed,
+        "code": report.code,
+        "at": stamp,
+        "text": report.text,
+    });
+    let receipt_path = crate::skills::verification_path(state, name);
+    std::fs::write(&receipt_path, format!("{receipt}\n"))
+        .map_err(|error| format!("could not write {}: {error}", receipt_path.display()))?;
+    let mut out = report.text;
+    out.push_str(&format!(
+        "\nverified: {} ({})\nreceipt: {}\n",
+        if passed { "passed" } else { "failed" },
+        if evidence.contract.as_deref().unwrap_or("TODO") == "TODO" {
+            "the contract is still TODO"
+        } else {
+            "the contract is filled in"
+        },
+        receipt_path.display()
+    ));
+    Ok((out, report.code))
+}
+
+/// Library hygiene, two numbers and no score: are proposals generalizing, and are installed skills still
+/// correct? A number with no measurement behind it is worse than no number, so each is reported with its
+/// denominator or with the reason it cannot be computed.
+fn skills_report(state: &Path) -> String {
+    let records = crate::scoreboard::load(state);
+    let standings = crate::scoreboard::standings(&records);
+    let accepted: usize = standings.iter().map(|standing| standing.passes).sum();
+    let proposals = crate::skills::proposed(state);
+    let proposals_text = if accepted == 0 {
+        "new proposals: unmeasured (no accepted runs in the scoreboard)".to_string()
+    } else {
+        format!(
+            "new proposals: {} over {} accepted run(s) = {:.2} per 20",
+            proposals.len(),
+            accepted,
+            proposals.len() as f64 / accepted as f64 * 20.0
+        )
+    };
+    let mut cases_by_profile: std::collections::BTreeMap<String, Vec<crate::cases::Case>> =
+        std::collections::BTreeMap::new();
+    for profile in crate::cases::profiles(state) {
+        cases_by_profile.insert(profile.clone(), crate::cases::load(state, &profile));
+    }
+    let mut lines = Vec::new();
+    for skill in crate::skills::installed(state) {
+        let Ok(text) = std::fs::read_to_string(&skill.path) else {
+            continue;
+        };
+        let evidence = crate::skills::evidence(&text);
+        if evidence.regression.is_empty() {
+            continue;
+        }
+        let profile = crate::skills::proposal_profile(&text).unwrap_or_default();
+        let corpus = cases_by_profile.get(&profile).cloned().unwrap_or_default();
+        let mut passed = 0;
+        let mut measured = 0;
+        for id in &evidence.regression {
+            let Some(case) = corpus.iter().find(|case| &case.id == id) else {
+                continue;
+            };
+            measured += 1;
+            if case.status == "pass" || case.status == "fixed" {
+                passed += 1;
+            }
+        }
+        if measured == 0 {
+            lines.push(format!(
+                "{:<24} regression: unmeasured (none of its cases are in the corpus)",
+                skill.name
+            ));
+        } else {
+            lines.push(format!(
+                "{:<24} regression: {passed}/{measured} ({:.0}%)",
+                skill.name,
+                passed as f64 / measured as f64 * 100.0
+            ));
+        }
+    }
+    let mut text = format!("{proposals_text}\n");
+    if lines.is_empty() {
+        text.push_str("installed skills: none with a regression set\n");
+    } else {
+        text.push_str("installed skills with a regression set:\n");
+        for line in lines {
+            text.push_str(&format!("  {line}\n"));
+        }
+    }
+    text
 }
 
 /// What is running, and installing a build over it when one is named. A copy is written beside the target
@@ -2291,12 +2862,22 @@ fn run_replay(
                 | "run"
                 | "candidate"
                 | "program"
+                | "case"
+                | "attack"
+                | "auto"
+                | "regress"
+                | "no-regress"
+                | "check-minutes"
         ) {
             continue;
         }
         if name == "config" {
             let path = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
             command.arg("--config").arg(path);
+        } else if value == "true" {
+            if matches!(name.as_str(), "strict-model") {
+                command.arg(format!("--{name}"));
+            }
         } else {
             command.arg(format!("--{name}")).arg(value);
         }
@@ -2309,7 +2890,11 @@ fn run_replay(
         .arg("--session")
         .arg(label)
         .arg("--verify")
-        .arg(check);
+        .arg(check)
+        // A replay is evidence for a runbook, not a failure of the tree the runbook came from. A case here
+        // would pin a copy whose goal is the runbook text.
+        .arg("--case")
+        .arg("off");
     if let Some(profile) = profile.filter(|profile| !profile.is_empty()) {
         command.arg("--profile").arg(profile);
     }
@@ -2361,7 +2946,7 @@ fn read_runbook(path: &Path) -> Result<String, String> {
 }
 
 fn session_cmd(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(args, &["state"])?;
+    let flags = parse(args, &["state", "session"])?;
     let home = state_of(&flags)?;
     let dir = home.join("sessions");
     let action = flags
@@ -2404,6 +2989,115 @@ fn session_cmd(args: &[String]) -> Result<(String, i32), String> {
                 text.push_str(&format!("{id}  {count} entries  modified {at}\n"));
             }
             Ok((text, 0))
+        }
+        "handover" => {
+            // The record the run wrote before it stopped, plus the case link the surface appended after
+            // the case existed. Later records override earlier ones field by field.
+            let wanted = flags
+                .named
+                .get("session")
+                .cloned()
+                .or_else(|| flags.positional.get(1).cloned());
+            let path = match wanted {
+                Some(id) => dir.join(format!("{id}.jsonl")),
+                None => std::fs::read_dir(&dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|kind| kind == "jsonl"))
+                    .max_by_key(|entry| entry.metadata().and_then(|meta| meta.modified()).ok())
+                    .map(|entry| entry.path())
+                    .ok_or_else(|| format!("no session logs under {}", dir.display()))?,
+            };
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            let mut merged = serde_json::Map::new();
+            for line in text.lines() {
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let payload = entry.get("payload").unwrap_or(&serde_json::Value::Null);
+                if payload.get("node").and_then(serde_json::Value::as_str) != Some("handover") {
+                    continue;
+                }
+                for (key, value) in payload.as_object().into_iter().flatten() {
+                    if key == "node" || value.is_null() {
+                        continue;
+                    }
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+            if merged.is_empty() {
+                return Ok((
+                    format!(
+                        "no handover in {}: none is written for an accepted run\n",
+                        path.display()
+                    ),
+                    0,
+                ));
+            }
+            let field = |key: &str| {
+                merged
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let attempts = merged
+                .get("attempts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let mut out = format!("session: {}\n", field("session"));
+            out.push_str(&format!("goal:    {}\n", field("goal")));
+            out.push_str(&format!(
+                "ended:   {} after {} attempt(s)\n",
+                field("ended"),
+                attempts
+            ));
+            out.push_str(&format!(
+                "check:   {}\n",
+                match field("last_check").as_str() {
+                    "" => "not run".to_string(),
+                    other => other.to_string(),
+                }
+            ));
+            out.push_str(&format!(
+                "next:    {}\n",
+                match field("next").as_str() {
+                    "" => "no next step was recorded".to_string(),
+                    other => other.to_string(),
+                }
+            ));
+            let blockers: Vec<String> = merged
+                .get("blockers")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "blockers: {}\n",
+                if blockers.is_empty() {
+                    "none recorded".to_string()
+                } else {
+                    blockers.join("; ")
+                }
+            ));
+            if let Some(case) = merged.get("case_id").and_then(serde_json::Value::as_str) {
+                out.push_str(&format!("case:    {case}\n"));
+            }
+            if let Some(candidate) = merged
+                .get("best_candidate")
+                .and_then(serde_json::Value::as_str)
+            {
+                out.push_str(&format!("best candidate:\n{candidate}\n"));
+            }
+            Ok((out, 0))
         }
         "show" => {
             let id = flags
@@ -2633,6 +3327,20 @@ fn open_memory(flags: &Flags) -> Result<Option<MnemeMemory>, String> {
     let Some(config) = config_of(flags)? else {
         return Ok(None);
     };
+    // A named state with no vault or config of its own is an isolated install. Its record lives beside it,
+    // not in the live home: a test that points at /tmp must not recall what the live run learned. An explicit
+    // `--vault` or `--config` is a caller who named their record, and is honoured.
+    let isolated = flags.named.contains_key("state")
+        && !flags.named.contains_key("vault")
+        && !flags.named.contains_key("config");
+    if isolated {
+        let state = state_of(flags)?;
+        let vault = state.join("vault");
+        if !vault.is_dir() {
+            return Ok(None);
+        }
+        return MnemeMemory::open(&vault, state.join("mneme.db")).map(Some);
+    }
     MnemeMemory::open(&config.vault, db_path(flags)?).map(Some)
 }
 
@@ -3180,6 +3888,26 @@ pub(crate) fn assemble(
         Some("on") => Some(state.join("shadows")),
         Some(other) => return Err(format!("`--shadow {other}`: say on or off")),
     };
+    // A verifier deadline belongs to the check, not the walk. `--check-minutes` is what makes a cold
+    // `cargo test` viable in a replay whose tree has no `target/`.
+    let check_minutes = match flags.named.get("check-minutes") {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("`--check-minutes {value}` is not a number"))?
+                .max(1),
+        ),
+        None => None,
+    };
+    // The second oracle. Empty is not a command: an attack that cannot run is unmeasured, not blocked, and
+    // a run that asked for one with no text is a mistake worth refusing before the model is called.
+    let attack = match flags.named.get("attack").map(String::as_str) {
+        Some(text) if text.trim().is_empty() => {
+            return Err("`--attack` needs a command".to_string());
+        }
+        Some(text) => Some(text.to_string()),
+        None => None,
+    };
 
     let engine = Engine::open(Assembly {
         state,
@@ -3193,6 +3921,8 @@ pub(crate) fn assemble(
         caged,
         shadow,
         prompt: Some(harness.prompt().fact()),
+        check_minutes,
+        attack,
     })?;
     Ok((engine, answerer, harness, judge))
 }
@@ -3416,6 +4146,25 @@ pub(crate) fn baseline_of(flags: &Flags) -> Result<BaselineGate, String> {
     }
 }
 
+/// The attack a run was asked for, read in one place so the daemon and the CLI cannot disagree about
+/// whether a security case has a second oracle.
+pub(crate) fn attack_of(flags: &Flags) -> Option<String> {
+    flags
+        .named
+        .get("attack")
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Whether a run records the failure it produced. Default is on: a corpus that depends on remembering a
+/// flag is empty when it matters.
+pub(crate) fn case_mode(flags: &Flags) -> Result<crate::cases::Mode, String> {
+    match flags.named.get("case") {
+        None => Ok(crate::cases::Mode::Auto),
+        Some(text) => crate::cases::Mode::parse(text),
+    }
+}
+
 /// Run the graph: attempts, the return path, and the declared way out. The command a person uses when the
 /// task is not one the model gets right first time.
 fn run_graph(args: &[String]) -> Result<(String, i32), String> {
@@ -3447,6 +4196,9 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             "memory",
             "harness",
             "protect",
+            "case",
+            "attack",
+            "check-minutes",
         ],
         &["strict-model"],
     )?;
@@ -3472,6 +4224,8 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         None => None,
     };
     let gate = baseline_of(&flags)?;
+    let attack = flags.named.get("attack").cloned();
+    let attack_for_runner = attack.clone();
     let (mut engine, answerer, harness, judge) = assemble(&flags, "run")?;
     let protect = protect_of(&flags, engine.root())?;
     let mut session = engine.session()?;
@@ -3514,6 +4268,8 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         .unwrap_or(crate::graph::DEFAULT_CALL_TOKENS);
 
     let before = session.len();
+    let policy_name = engine.policy_name().to_string();
+    let model_name = answerer.describe();
     let memo = remembered(
         &flags,
         &goal,
@@ -3532,7 +4288,11 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
     .with_call_tokens(call_tokens)
     .with_baseline(gate)
     .with_protect(protect)
-    .with_scoreboard(&score_state);
+    .with_scoreboard(&score_state)
+    .with_identity(model_name, policy_name);
+    if let Some(attack) = &attack_for_runner {
+        runner = runner.with_attack(attack.clone());
+    }
     if let (Some(section), Some(writer)) = (memo.section.clone(), memo.memory.as_ref()) {
         runner = runner.with_memory(Remembering {
             section: Section::new(section.0, section.1),
@@ -3547,6 +4307,43 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
             fault.detail()
         )
     })?;
+
+    // The failure corpus: a giving-up run becomes a task with a pinned tree. A case that cannot be written
+    // is a warning and a receipt line, never a failed run; the run already happened.
+    let case_line = {
+        let check = engine.profile().verify.clone();
+        match crate::cases::record(
+            &score_state,
+            &walked,
+            &goal,
+            session.id().as_str(),
+            &check,
+            attack.as_deref(),
+            case_mode(&flags)?,
+        ) {
+            Ok(crate::cases::Recorded::Case(case)) => {
+                // The handover was written before the case existed, so the link is appended now rather than
+                // left for a reader to infer from a receipt line.
+                let _ = session.append(
+                    session_tree::Kind::Checkpoint,
+                    serde_json::json!({ "node": "handover", "case_id": case.id }),
+                );
+                format!(
+                    "case:    {} recorded ({} files, tree {})\n",
+                    case.id,
+                    case.files,
+                    case.tree.get(..12).unwrap_or(&case.tree)
+                )
+            }
+            Ok(crate::cases::Recorded::Skipped(why)) => {
+                format!("case:    not recorded ({why})\n")
+            }
+            Err(said) => {
+                eprintln!("case: not recorded, {said}");
+                format!("case:    not recorded ({said})\n")
+            }
+        }
+    };
 
     if let Err(said) = engine.save_cache() {
         eprintln!("repomap: the cache was not written, {said}");
@@ -3584,23 +4381,45 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         )
     };
     let judge_line = match &walked.verdict {
-        Some(judged) => format!("{}: {}", judged.verdict.name(), judged.reason),
+        Some(judged) => match &judged.identity {
+            Some(identity) => format!(
+                "{}: {} [{}]",
+                judged.verdict.name(),
+                judged.reason,
+                identity.short()
+            ),
+            None => format!("{}: {}", judged.verdict.name(), judged.reason),
+        },
         None if engine.profile().judge => "unjudged (no judged attempt)".to_string(),
         None => "unjudged (the profile did not ask)".to_string(),
     };
     let baseline_line = match &walked.baseline {
         Some(baseline) => format!(
-            "baseline: {} (exit {})\n",
+            "baseline: {} (exit {}){}\n",
             baseline.state.name(),
             baseline
                 .status
                 .map(|status| status.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            match &baseline.attack {
+                Some(attack) => format!(
+                    "\n{}",
+                    attack.line().replacen("attack:", "attack (before):", 1)
+                ),
+                None => String::new(),
+            }
         ),
         None => String::new(),
     };
-    // The ruler is what the green check is worth: a short digest, and how much was frozen beside the
-    // command. A run with no protected file says so rather than implying the check covered the tests.
+    // The attack is a second oracle, so the receipt carries both sides of it: what the exploit did before the
+    // attempt and what it did after. A run with no attack prints neither line.
+    let attack_line = match &walked.last_attack {
+        Some(report) => format!(
+            "{}\n",
+            report.line().replacen("attack:", "attack (after):", 1)
+        ),
+        None => String::new(),
+    };
     let ruler_line = match &walked.ruler {
         Some(ruler) if ruler.files.is_empty() && ruler.rules == 0 => {
             format!("ruler:   {} (command only)\n", ruler.short())
@@ -3616,11 +4435,17 @@ fn run_graph(args: &[String]) -> Result<(String, i32), String> {
         ),
         None => String::new(),
     };
+    // A giving-up run says where its dead end went, so a person can read it rather than guess that memory
+    // was told. A run with no memory attached says nothing, because nothing was written.
+    let dead_line = match &walked.dead_end {
+        Some(path) => format!("dead end: {}\n", path.display()),
+        None => String::new(),
+    };
     // A run with no boundary says so on its receipt, the way `hades turn` does: a person reading
     // `--cage off` output otherwise sees the same shape as a confined run.
     let cage_line = engine.cage();
     let mut text = format!(
-        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}{ruler_line}cage:    {cage_line}\ncontext: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n",
+        "session: {} ({} entries, {} appended)\nprofile: {}\npolicy:  {}\nmodel:   {}\nharness: {}\nplan:    {}\njudge:   {judge_line}\n{baseline_line}{attack_line}{ruler_line}cage:    {cage_line}\ncontext: {} tokens\nbounds:  {}\n{branch_line}map:     {hits} hits, {misses} misses\ncompacted: {}\n{case_line}{dead_line}",
         session.id(),
         session.len(),
         session.len() - before,
@@ -4292,11 +5117,22 @@ fn submit(args: &[String]) -> Result<(String, i32), String> {
             "endpoint",
             "key",
             "program",
+            "temperature",
+            "max-tokens",
+            "context",
+            "thinking",
             "attempts",
             "minutes",
             "budget-tokens",
+            "branch",
             "baseline",
             "protect",
+            "config",
+            "memory",
+            "harness",
+            "case",
+            "attack",
+            "check-minutes",
         ],
         &["strict-model"],
     )?;
@@ -4722,4 +5558,16 @@ fn a_boundary(text: &str, at: usize) -> usize {
 /// which is why this lives here and not in a seam.
 fn default_state() -> Result<PathBuf, String> {
     hades_home()
+}
+
+#[cfg(test)]
+mod gate_tests {
+    #[test]
+    fn a_corpus_that_could_not_run_is_not_a_pass() {
+        assert!(super::gate_refusal(0).is_none());
+        let regression = super::gate_refusal(1).expect("a failing corpus refuses adoption");
+        assert!(regression.contains("breaks a pinned case"), "{regression}");
+        let broken = super::gate_refusal(2).expect("a corpus that could not run refuses adoption");
+        assert!(broken.contains("could not be replayed"), "{broken}");
+    }
 }

@@ -50,6 +50,9 @@ pub struct Facts {
     pub verdict: Option<String>,
     pub turns: Vec<Turn>,
     pub snapshot: Option<PathBuf>,
+    /// The number of attempts the terminal checkpoint recorded. Read from the log for the manual path
+    /// (`hades distill`); a live run knows it without re-reading.
+    pub attempts_used: u32,
     /// The log recorded that the verifier moved during the run. Read from the `ruler` checkpoint, so a
     /// distilled claim cannot climb on a tampered check.
     pub ruler_changed: bool,
@@ -90,6 +93,8 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut open: Option<usize> = None;
     let mut ruler_changed = false;
+    let mut snapshot_label: Option<String> = None;
+    let mut attempts_used = 0u32;
 
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -113,6 +118,13 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
                 }
             }
             "tool_call" => {
+                // The first snapshot label in the log is the tree the session's first run started from. A
+                // later label is a later turn's tree and cannot stand in for it.
+                if snapshot_label.is_none()
+                    && let Some(label) = payload.get("snapshot").and_then(Value::as_str)
+                {
+                    snapshot_label = Some(label.to_string());
+                }
                 let tool = payload
                     .get("tool")
                     .and_then(Value::as_str)
@@ -188,6 +200,8 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
                     ruler_changed = true;
                 }
                 if payload.get("ended").and_then(Value::as_bool) == Some(true) {
+                    attempts_used =
+                        payload.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u32;
                     let node = payload
                         .get("node")
                         .and_then(Value::as_str)
@@ -232,10 +246,22 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
     }
 
     // A snapshot with no files still has a manifest. That is a valid empty starting tree, not a missing
-    // snapshot: the first run in an empty directory produces exactly this shape.
-    let snapshot_dir = state.join("shadows").join(session).join("1");
-    let snapshot_manifest = state.join("shadows").join(session).join("1.json");
-    let snapshot = snapshot_manifest.is_file().then_some(snapshot_dir);
+    // snapshot: the first run in an empty directory produces exactly this shape. The label is the log's
+    // own record of which tree this run started from; `shadows/<session>/1` is wrong for a resumed session
+    // or a second run, both of which append to a log that already has an earlier snapshot.
+    let snapshot = snapshot_label.and_then(|label| {
+        if label.starts_with("declined (") {
+            return None;
+        }
+        let (session, n) = label.split_once('#')?;
+        let n: u64 = n.parse().ok()?;
+        let dir = state.join("shadows").join(session).join(n.to_string());
+        let manifest = state
+            .join("shadows")
+            .join(session)
+            .join(format!("{n}.json"));
+        manifest.is_file().then_some(dir)
+    });
 
     Ok(Facts {
         session: session.to_string(),
@@ -251,6 +277,7 @@ pub fn load(state: &Path, session: &str) -> Result<Facts, String> {
         verdict,
         turns,
         snapshot,
+        attempts_used,
         ruler_changed,
     })
 }

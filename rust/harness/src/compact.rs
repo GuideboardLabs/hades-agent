@@ -58,6 +58,10 @@ pub fn summary(learned: &Learned) -> String {
         text.push_str(" Earlier: ");
         text.push_str(&cut_head(older, SUMMARY_CHARS));
     }
+    if let Some(handover) = learned.handover() {
+        text.push_str(" Handover: ");
+        text.push_str(handover);
+    }
     text
 }
 

@@ -39,6 +39,9 @@ pub struct Standing {
     pub mean_ms: u64,
     pub prompt_tokens: u64,
     pub generated_tokens: u64,
+    /// Runs that passed on their first attempt. A run that failed once and passed on the second is not a
+    /// first-attempt pass, and a high pass rate beside a low first-attempt rate is a slow profile.
+    pub first_attempts: usize,
 }
 
 impl Standing {
@@ -65,14 +68,25 @@ impl Standing {
         }
     }
 
+    /// The share of runs that passed without a second attempt.
+    pub fn first_attempt_rate(&self) -> f64 {
+        if self.runs == 0 {
+            0.0
+        } else {
+            self.first_attempts as f64 / self.runs as f64
+        }
+    }
+
     pub fn line(&self) -> String {
         format!(
-            "{:<10} {:>3} run(s)  {:>3}/{:<3}  {:>5.1}%  {:>6} ms mean  {:>7} tokens  {:>7}/pass{}",
+            "{:<10} {:>3} run(s)  {:>3}/{:<3}  {:>5.1}%  first {:>2}/{:<2}  {:>6} ms mean  {:>7} tokens  {:>7}/pass{}",
             self.profile,
             self.runs,
             self.passes,
             self.runs,
             self.rate() * 100.0,
+            self.first_attempts,
+            self.runs,
             self.mean_ms,
             self.tokens(),
             self.tokens_per_pass(),
@@ -147,12 +161,14 @@ pub fn standings(records: &[Record]) -> Vec<Standing> {
         millis: u64,
         prompt_tokens: u64,
         generated_tokens: u64,
+        first_attempts: usize,
     }
     let mut by_profile: BTreeMap<String, Tally> = BTreeMap::new();
     for record in records {
         let tally = by_profile.entry(record.profile.clone()).or_default();
         tally.runs += 1;
         tally.passes += usize::from(record.passed);
+        tally.first_attempts += usize::from(record.passed && record.attempts == 1);
         tally.millis += record.millis;
         tally.prompt_tokens += record.prompt_tokens;
         tally.generated_tokens += record.generated_tokens;
@@ -166,6 +182,7 @@ pub fn standings(records: &[Record]) -> Vec<Standing> {
             mean_ms: tally.millis / tally.runs.max(1) as u64,
             prompt_tokens: tally.prompt_tokens,
             generated_tokens: tally.generated_tokens,
+            first_attempts: tally.first_attempts,
         })
         .collect()
 }
@@ -201,7 +218,7 @@ pub fn report(records: &[Record]) -> String {
         return "no finished runs yet: the scoreboard is written by `hades run`\n".to_string();
     }
     let mut text = format!(
-        "profile    runs    passes   rate      mean           tokens     per pass{}\n",
+        "profile    runs    passes   rate      first     mean           tokens     per pass{}\n",
         if records.len() == 1 {
             " (1 record)"
         } else {
@@ -250,6 +267,30 @@ mod tests {
         let dir = crate::scratch::root().join(format!("scoreboard-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn a_second_attempt_pass_is_not_a_first_attempt_pass() {
+        let state = scratch("first");
+        let mut slow = spent("fix", true, 100, 0, 0);
+        slow.attempts = 2;
+        record(&state, &row("fix", true, 50)).expect("a first-attempt pass");
+        record(&state, &slow).expect("a second-attempt pass");
+        record(&state, &row("fix", false, 10)).expect("a failure");
+        let standings = standings(&load(&state));
+        let standing = standings.iter().find(|s| s.profile == "fix").expect("fix");
+        assert_eq!(standing.runs, 3);
+        assert_eq!(standing.passes, 2);
+        assert_eq!(
+            standing.first_attempts, 1,
+            "only the one-attempt pass counts"
+        );
+        assert!((standing.first_attempt_rate() - 1.0 / 3.0).abs() < 1e-9);
+        assert!(
+            standing.line().contains("first  1/3"),
+            "{}",
+            standing.line()
+        );
     }
 
     #[test]

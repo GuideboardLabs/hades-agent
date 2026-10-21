@@ -561,6 +561,8 @@ impl<'a> Seams<'a> {
                 "progress": verification.progress.as_ref().map(|progress| progress.json()),
                 "verdict": verdict.verdict.name(),
                 "reason": verdict.reason,
+                "judge_model": verdict.identity.as_ref().map(|identity| identity.model.clone()),
+                "judge_prompt": verdict.identity.as_ref().map(|identity| identity.prompt_sha256.clone()),
             }),
         )?);
         let usage = total(answer.usage(), verdict.usage.as_deref().copied());
@@ -697,6 +699,9 @@ impl<'a> Seams<'a> {
                 "sha256": verification.output_digest,
                 "output": verification.output,
                 "progress": verification.progress.as_ref().map(|progress| progress.json()),
+                "attack": verification.attack.as_ref().map(|attack| attack.name()),
+                "attack_line": verification.attack.as_ref().map(|attack| attack.line()),
+                "attack_output": verification.attack.as_ref().map(|attack| attack.output.clone()),
             }),
         )?);
         Ok(verification)

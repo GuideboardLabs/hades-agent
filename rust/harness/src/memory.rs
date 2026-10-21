@@ -109,27 +109,72 @@ pub struct Recorded {
     pub path: PathBuf,
 }
 
+/// A failure worth remembering: the goal, why it was abandoned, and the evidence a later run would need
+/// to tell whether it is still a dead end. A dead end is not an outcome note: nothing was established.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeadEnd {
+    pub goal: String,
+    pub session: String,
+    pub cause: String,
+    pub attempts: u32,
+    pub check_sha256: String,
+    pub evidence: String,
+    pub case_id: Option<String>,
+}
+
+impl DeadEnd {
+    /// The identity a duplicate is folded into: the goal and the oracle that judged it. A new check
+    /// means new evidence, which is exactly when a dead end is worth retrying.
+    pub fn id(&self) -> String {
+        let text = format!(
+            "{}\0{}",
+            self.goal.trim().to_lowercase(),
+            self.check_sha256.trim()
+        );
+        mneme::sha256::hex(text.as_bytes())[..16].to_string()
+    }
+}
+
 /// A turn's two questions. `recall` is answered before the prompt is built, `record` after the
 /// outcome is accepted.
 pub trait Memory {
     fn recall(&self, goal: &str, topics: &[String], budget: usize) -> Result<Recall, String>;
     fn record(&self, outcome: &OutcomeNote) -> Result<Recorded, String>;
+
+    /// A failure, kept so the next run does not try the same thing again. The default refuses rather
+    /// than silently dropping it: a memory that cannot keep a dead end should say so.
+    fn record_dead_end(&self, _dead: &DeadEnd) -> Result<Recorded, String> {
+        Err("this memory does not keep dead ends".to_string())
+    }
 }
 
 /// The implementation over the record. Holds the curator and not just the vault, because a note that
 /// is written without passing the curator's rules is not a memory, it is a file.
 pub struct MnemeMemory {
     curator: Curator<SqliteStore, mneme::SystemClock, SystemTimestamp>,
+    /// One append-only file per profile, beside the record rather than in it: a dead end is not a vault
+    /// note, and filing one as research would put it on the knowledge graph as if it were a finding.
+    dead_ends: PathBuf,
 }
 
 impl MnemeMemory {
     pub fn open(root: impl AsRef<Path>, db: impl AsRef<Path>) -> Result<Self, String> {
         let root = root.as_ref().to_path_buf();
+        let dead_ends = db
+            .as_ref()
+            .parent()
+            .map(|parent| parent.join("dead-ends.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("dead-ends.jsonl"));
         let store = SqliteStore::open(db, &root).map_err(|fault| fault.to_string())?;
         let vault = Vault::new(root, store, mneme::SystemClock);
         Ok(MnemeMemory {
             curator: Curator::new(vault, SystemTimestamp),
+            dead_ends,
         })
+    }
+
+    pub fn dead_ends(&self) -> &Path {
+        &self.dead_ends
     }
 
     pub fn vault(&self) -> &Vault<SqliteStore, mneme::SystemClock> {
@@ -204,6 +249,9 @@ fn inside(root: &Path, given: &str) -> Result<PathBuf, String> {
 impl Memory for MnemeMemory {
     fn recall(&self, goal: &str, topics: &[String], budget: usize) -> Result<Recall, String> {
         let terms = terms(goal);
+        // Dead ends are read first: a goal that already failed is the most useful thing a prompt can be
+        // told, and it must survive a vault with no matching note.
+        let dead = dead_end_text(&fold_dead_ends(&read_dead_ends(&self.dead_ends)), goal);
         let topics: Vec<String> = topics
             .iter()
             .map(|topic| topic.trim().to_lowercase())
@@ -216,6 +264,14 @@ impl Memory for MnemeMemory {
             .map_err(|fault| fault.to_string())?;
 
         if hits.is_empty() {
+            if !dead.is_empty() && estimate(&dead) <= budget {
+                return Ok(Recall {
+                    hits: Vec::new(),
+                    reason: None,
+                    tokens: estimate(&dead),
+                    text: dead,
+                });
+            }
             return Ok(Recall {
                 hits: Vec::new(),
                 reason: Some(RecallReason::NoMatch),
@@ -260,12 +316,27 @@ impl Memory for MnemeMemory {
         }
 
         if kept.is_empty() {
+            if !dead.is_empty() && estimate(&dead) <= budget {
+                return Ok(Recall {
+                    hits: Vec::new(),
+                    reason: None,
+                    tokens: estimate(&dead),
+                    text: dead,
+                });
+            }
             return Ok(Recall {
                 hits: Vec::new(),
                 reason: Some(RecallReason::BudgetTooSmall),
                 tokens: 0,
                 text: "The memory budget is too small for one note.".to_string(),
             });
+        }
+
+        let dead_cost = estimate(&dead);
+        if !dead.is_empty() && tokens + dead_cost <= budget {
+            text.push('\n');
+            text.push_str(&dead);
+            tokens += dead_cost;
         }
 
         Ok(Recall {
@@ -319,6 +390,175 @@ impl Memory for MnemeMemory {
             .map_err(|refusal| refusal.to_string())?;
         Ok(Recorded { path: filed })
     }
+
+    fn record_dead_end(&self, dead: &DeadEnd) -> Result<Recorded, String> {
+        use std::io::Write as _;
+        if let Some(parent) = self.dead_ends.parent() {
+            crate::scratch::state_dir(parent)
+                .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+        }
+        let id = dead.id();
+        let events = read_dead_ends(&self.dead_ends);
+        let active = fold_dead_ends(&events);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.dead_ends)
+            .map_err(|error| format!("could not open {}: {error}", self.dead_ends.display()))?;
+        crate::scratch::private_file(&self.dead_ends)
+            .map_err(|error| format!("could not restrict {}: {error}", self.dead_ends.display()))?;
+        // Seen again is evidence about the same dead end, not a second one. Appending the fact keeps the
+        // count without rewriting the record that explains it.
+        if active.iter().any(|entry| entry.id == id) {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({ "kind": "seen", "id": id, "at": now, "session": dead.session })
+            )
+            .map_err(|error| {
+                format!("could not append to {}: {error}", self.dead_ends.display())
+            })?;
+            return Ok(Recorded {
+                path: self.dead_ends.clone(),
+            });
+        }
+        // The cap retires the oldest active entry with a record, never by deletion: an eviction that
+        // erases the evidence turns a memory into a rumour.
+        if active.len() >= DEAD_END_CAP
+            && let Some(oldest) = active.first()
+        {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({ "kind": "retire", "id": oldest.id, "at": now })
+            )
+            .map_err(|error| format!("could not retire: {error}"))?;
+        }
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "kind": "dead_end",
+                "id": id,
+                "goal": dead.goal,
+                "session": dead.session,
+                "cause": dead.cause,
+                "attempts": dead.attempts,
+                "check_sha256": dead.check_sha256,
+                "evidence": dead.evidence,
+                "case_id": dead.case_id,
+                "at": now,
+            })
+        )
+        .map_err(|error| format!("could not append to {}: {error}", self.dead_ends.display()))?;
+        Ok(Recorded {
+            path: self.dead_ends.clone(),
+        })
+    }
+}
+
+/// How many dead ends one profile keeps before the oldest is retired.
+pub const DEAD_END_CAP: usize = 200;
+
+/// One live dead-end entry, as recall reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadEntry {
+    pub id: String,
+    pub goal: String,
+    pub cause: String,
+    pub attempts: u32,
+    pub evidence: String,
+    pub seen: usize,
+    pub path: PathBuf,
+}
+
+pub fn read_dead_ends(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Fold the append-only events into the live set. `seen` counts repeats, a `retire` removes an entry,
+/// and the order is insertion order so "oldest" means what it says.
+pub fn fold_dead_ends(events: &[serde_json::Value]) -> Vec<DeadEntry> {
+    let mut live: Vec<DeadEntry> = Vec::new();
+    for event in events {
+        let kind = event
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let id = event
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        match kind {
+            "dead_end" => live.push(DeadEntry {
+                id: id.to_string(),
+                goal: event
+                    .get("goal")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                cause: event
+                    .get("cause")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                attempts: event
+                    .get("attempts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                evidence: event
+                    .get("evidence")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                seen: 1,
+                path: PathBuf::new(),
+            }),
+            "seen" => {
+                if let Some(entry) = live.iter_mut().find(|entry| entry.id == id) {
+                    entry.seen += 1;
+                }
+            }
+            "retire" => live.retain(|entry| entry.id != id),
+            _ => {}
+        }
+    }
+    live
+}
+
+/// The matching dead ends, newest last, as the lines a prompt is given. Empty when none match.
+pub fn dead_end_text(entries: &[DeadEntry], goal: &str) -> String {
+    let wanted = terms(goal);
+    let matches: Vec<&DeadEntry> = entries
+        .iter()
+        .filter(|entry| {
+            let have = terms(&entry.goal);
+            wanted.iter().any(|term| have.contains(term))
+        })
+        .collect();
+    if matches.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("Tried and failed; do not retry unless the evidence changed:\n");
+    for entry in matches {
+        text.push_str(&format!(
+            "- {} ({} after {} attempt(s), seen {}x): {}\n",
+            entry.goal,
+            entry.cause,
+            entry.attempts,
+            entry.seen,
+            entry.evidence.replace('\n', " ")
+        ));
+    }
+    text
 }
 
 /// A goal as terms: alphanumeric runs of three or more characters, lowercased, deduplicated, capped.

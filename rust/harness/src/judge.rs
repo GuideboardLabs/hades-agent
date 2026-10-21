@@ -61,6 +61,27 @@ pub struct Judgement {
     pub verdict: Verdict,
     pub reason: String,
     pub usage: Option<Box<crate::task::Usage>>,
+    /// Which model and prompt produced the verdict. `None` for a scripted judge, which is not a model and
+    /// must not read like one in a receipt.
+    pub identity: Option<Identity>,
+}
+
+/// The judge's own name and prompt digest. A receipt that says `judge: qwen` when the judge is the same
+/// endpoint the turn used is overclaiming an independence the run does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub model: String,
+    pub prompt_sha256: String,
+}
+
+impl Identity {
+    pub fn short(&self) -> String {
+        format!(
+            "{} ({})",
+            self.model,
+            &self.prompt_sha256[..12.min(self.prompt_sha256.len())]
+        )
+    }
 }
 
 impl Judgement {
@@ -69,6 +90,7 @@ impl Judgement {
             verdict,
             reason: reason.into(),
             usage: None,
+            identity: None,
         }
     }
 
@@ -79,6 +101,11 @@ impl Judgement {
     /// The same judgement with the cost of the call that produced it.
     pub fn with_usage(mut self, usage: crate::task::Usage) -> Self {
         self.usage = Some(Box::new(usage));
+        self
+    }
+
+    pub fn with_identity(mut self, identity: Identity) -> Self {
+        self.identity = Some(identity);
         self
     }
 }
@@ -96,6 +123,12 @@ pub struct Report<'a> {
 /// Asking the judge.
 pub trait Evaluator {
     fn judge(&self, report: &Report<'_>) -> Judgement;
+
+    /// Which model and prompt this evaluator is. The default is `None`: a scripted judge is not a model,
+    /// and a new evaluator should have to say so rather than inherit a claim.
+    fn identity(&self) -> Option<Identity> {
+        None
+    }
 }
 
 /// Answers from a queue, then repeats the last one. Repeating the last is what makes it usable for a run
@@ -151,6 +184,13 @@ impl Endpoint {
 }
 
 impl Evaluator for Endpoint {
+    fn identity(&self) -> Option<Identity> {
+        Some(Identity {
+            model: self.client.model().to_string(),
+            prompt_sha256: mneme::sha256::hex(PROMPT.as_bytes()),
+        })
+    }
+
     fn judge(&self, report: &Report<'_>) -> Judgement {
         // The exit status is stated rather than left for the judge to infer from the state: a check that
         // was killed reports -1 and no verdict, and a judge that reads that as a wrong answer is wrong.
@@ -180,16 +220,26 @@ impl Evaluator for Endpoint {
         ) {
             Ok(reply) => {
                 let said = parse(&reply.content);
-                match reply.usage {
+                let said = match reply.usage {
                     Some(usage) => said.with_usage(usage),
+                    None => said,
+                };
+                match self.identity() {
+                    Some(identity) => said.with_identity(identity),
                     None => said,
                 }
             }
-            Err(fault) => Judgement::unjudged(format!(
-                "the judge could not be asked: {} fault: {}",
-                fault.class(),
-                fault.detail()
-            )),
+            Err(fault) => {
+                let said = Judgement::unjudged(format!(
+                    "the judge could not be asked: {} fault: {}",
+                    fault.class(),
+                    fault.detail()
+                ));
+                match self.identity() {
+                    Some(identity) => said.with_identity(identity),
+                    None => said,
+                }
+            }
         }
     }
 }

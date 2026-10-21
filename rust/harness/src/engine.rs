@@ -37,7 +37,7 @@ use crate::shadow::{Checkpointer, Nothing, Shadows};
 use crate::task::TaskSpec;
 use crate::tool::{Shell, Tool};
 use crate::turn::Seams;
-use crate::verify::CommandVerifier;
+use crate::verify::{CommandVerifier, Verifier};
 
 /// Bytes of a program's output the harness keeps, wherever it runs one.
 pub const LIMIT: usize = 8 * 1024;
@@ -63,6 +63,11 @@ pub struct Assembly {
     /// What prompt the model was given: one size and one digest, recorded in the session at creation so a
     /// reader can tell which harness text produced the run. `None` for a caller that has no prompt in hand.
     pub prompt: Option<crate::harness_files::PromptFact>,
+    /// How long the check may run, when the caller declared it. `None` is the profile check's own untimed
+    /// run. A cold build in a replay needs its own clock, so it is not charged to the walk's `--minutes`.
+    pub check_minutes: Option<u64>,
+    /// The second oracle for a security run. `None` is an ordinary check.
+    pub attack: Option<String>,
 }
 
 /// Everything one run needs except the model and the program.
@@ -75,7 +80,7 @@ pub struct Engine {
     session_id: SessionId,
     store: FileStore,
     shell: Shell,
-    verifier: CommandVerifier,
+    verifier: Box<dyn Verifier>,
     broker: OnDisk,
     checkpointer: Box<dyn Checkpointer>,
     /// The map's scan, held across turns. The daemon is why it is a field: a turn that does not consult the
@@ -111,7 +116,20 @@ impl Engine {
             Shell::new(spec.root.clone(), LIMIT)
         };
 
-        let verifier = CommandVerifier::new(LIMIT);
+        let deadline = spec
+            .check_minutes
+            .map(|minutes| std::time::Duration::from_secs(minutes.max(1) * 60));
+        let verifier: Box<dyn Verifier> = match &spec.attack {
+            Some(attack) => Box::new(crate::verify::Attacked::new(
+                LIMIT,
+                deadline,
+                attack.clone(),
+            )),
+            None => match deadline {
+                Some(deadline) => Box::new(CommandVerifier::with_deadline(LIMIT, deadline)),
+                None => Box::new(CommandVerifier::new(LIMIT)),
+            },
+        };
         let broker = OnDisk::open(spec.state.join("approvals.jsonl")).map_err(|fault| {
             format!("could not open the record of questions: {}", fault.detail())
         })?;
@@ -269,7 +287,7 @@ impl Engine {
             context,
             model,
             &self.shell,
-            &self.verifier,
+            self.verifier.as_ref(),
         )
         .brokering(&self.broker)
         .checkpointing(&*self.checkpointer)
@@ -288,7 +306,7 @@ impl Engine {
             policy: &self.policy,
             model,
             tool: &self.shell,
-            verifier: &self.verifier,
+            verifier: self.verifier.as_ref(),
             broker: Some(&self.broker as &dyn ApprovalBroker),
             checkpointer: Some(&*self.checkpointer),
             evaluator,
@@ -362,6 +380,8 @@ mod tests {
             caged: false,
             shadow: None,
             prompt,
+            check_minutes: None,
+            attack: None,
         }
     }
 

@@ -32,6 +32,9 @@ use crate::profile::Protect;
 pub struct Ruler {
     pub check: String,
     pub check_sha256: String,
+    /// The attack command's digest, when the run carries one. A candidate that edits the exploit script
+    /// changed the second oracle, not the fix.
+    pub attack_sha256: Option<String>,
     pub files: BTreeMap<String, String>,
     /// How many rules were declared. Kept because `files` empty is ambiguous: a run with no rule and a
     /// run whose rule matched nothing are both command-only, and only one of them was meant to protect.
@@ -45,6 +48,17 @@ impl Ruler {
     /// Freeze the check and every declared path under `root`. A rule that escapes the root is refused
     /// here as well as at parse time: the caller may build a [`Protect`] directly.
     pub fn take(check: &str, root: &Path, protect: &[Protect]) -> Result<Ruler, String> {
+        Ruler::take_with(check, None, root, protect)
+    }
+
+    /// The same, with an attack command frozen beside the check. A security run's ruler covers both
+    /// oracles: a candidate that weakens the exploit proves nothing about the fix.
+    pub fn take_with(
+        check: &str,
+        attack: Option<&str>,
+        root: &Path,
+        protect: &[Protect],
+    ) -> Result<Ruler, String> {
         let check = check.trim().to_string();
         let mut files: BTreeMap<String, String> = BTreeMap::new();
         for rule in protect {
@@ -132,6 +146,7 @@ impl Ruler {
         }
         Ok(Ruler {
             check_sha256: mneme::sha256::hex(check.as_bytes()),
+            attack_sha256: attack.map(|text| mneme::sha256::hex(text.trim().as_bytes())),
             check,
             files,
             rules: protect.len(),
@@ -150,6 +165,9 @@ impl Ruler {
                 "the check command changed: `{}` became `{}`",
                 self.check, other.check
             ));
+        }
+        if self.attack_sha256 != other.attack_sha256 {
+            return Some("the attack command changed".to_string());
         }
         for (path, digest) in &self.files {
             match other.files.get(path) {
@@ -172,6 +190,19 @@ impl Ruler {
     /// rulers by eye.
     pub fn short(&self) -> &str {
         self.check_sha256.get(..12).unwrap_or(&self.check_sha256)
+    }
+
+    /// The whole ruler as one digest: the check's hash plus every protected path and its hash, sorted by
+    /// path. This is what a case stores, so a replay can refuse a candidate that edited the oracle.
+    pub fn digest(&self) -> String {
+        let mut text = format!("check\0{}\n", self.check_sha256);
+        if let Some(attack) = &self.attack_sha256 {
+            text.push_str(&format!("attack\0{attack}\n"));
+        }
+        for (path, digest) in &self.files {
+            text.push_str(&format!("{path}\0{digest}\n"));
+        }
+        mneme::sha256::hex(text.as_bytes())
     }
 
     /// The sentence a refusal uses, so the run's end line and the receipt cannot drift.
