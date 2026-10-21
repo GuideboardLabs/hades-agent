@@ -41,6 +41,9 @@ pub struct Config {
     pub mcp: crate::mcp::McpConfig,
     /// Endpoints this owner named, so a model that is not a shipped preset is still choosable by id.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Toolchains under the home directory, named explicitly. Discovery never walks the home, so a rustup,
+    /// nvm, pyenv or uv install there is unreadable inside the cage unless it is listed here.
+    pub runtime_paths: Vec<PathBuf>,
 }
 
 impl Config {
@@ -255,6 +258,7 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         profile_models: profile_models(object.get("profile_models"), &endpoints, path)?,
         mcp: crate::mcp::McpConfig::from_value(object.get("mcp"), path)?,
         endpoints,
+        runtime_paths: runtime_paths(object.get("runtime_paths"), path)?,
     }))
 }
 
@@ -273,6 +277,11 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         "vault": config.vault.to_string_lossy(),
         "profile_models": config.profile_models,
         "mcp": config.mcp.to_value(),
+        "runtime_paths": config
+            .runtime_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<String>>(),
         "endpoints": config.endpoints.iter().map(|(name, endpoint)| {
             let mut value = json!({
                 "url": endpoint.url,
@@ -315,6 +324,50 @@ fn field(object: &Map<String, Value>, key: &str, path: &Path) -> Result<String, 
                 path.display()
             )
         })
+}
+
+/// The optional `runtime_paths` list: toolchains under the home directory that the cage may read.
+///
+/// Each entry is a path to a directory. A relative path is refused because it would resolve against
+/// whatever directory the process happened to start in; a path equal to or above the home directory is
+/// refused here as well as in the cage, so the error arrives where the person wrote it rather than as a
+/// silent non-grant at the first shell call.
+fn runtime_paths(value: Option<&Value>, path: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let list = value
+        .as_array()
+        .ok_or_else(|| format!("{}: `runtime_paths` is not a list", path.display()))?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for entry in list {
+        let text = entry
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| format!("{}: `runtime_paths` holds something that is not a path", path.display()))?;
+        let candidate = PathBuf::from(text);
+        if !candidate.is_absolute() {
+            return Err(format!(
+                "{}: `runtime_paths` entry `{text}` is relative; a toolchain is named by its absolute path",
+                path.display()
+            ));
+        }
+        if let Some(home) = &home
+            && (candidate == *home || home.starts_with(&candidate))
+        {
+            return Err(format!(
+                "{}: `runtime_paths` entry `{text}` is the home directory or above it; name the toolchain, not the home",
+                path.display()
+            ));
+        }
+        if !kept.contains(&candidate) {
+            kept.push(candidate);
+        }
+    }
+    crate::cage::declare_toolchains(kept.clone());
+    Ok(kept)
 }
 
 /// The optional `profile_models` map. Every key must name a shipped profile and every value a preset
@@ -413,6 +466,7 @@ mod tests {
                 Path::new("sample"),
             )
             .expect("the sample mcp section"),
+            runtime_paths: Vec::new(),
             endpoints: BTreeMap::new(),
         }
     }
@@ -513,6 +567,67 @@ mod tests {
         .expect("write");
         let config = load(&path).expect("load").expect("a config");
         assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn a_declared_toolchain_survives_a_round_trip() {
+        let dir = scratch("toolchain-round-trip");
+        let path = dir.join("config.json");
+        let toolchain = dir.join("toolchain");
+        std::fs::create_dir_all(&toolchain).expect("a toolchain");
+        let mut config = Config {
+            provider: "local".into(),
+            model: crate::model::presets()[0].id.to_string(),
+            root: dir.clone(),
+            vault: dir.join("vault"),
+            profile_models: Default::default(),
+            mcp: crate::mcp::McpConfig::default(),
+            endpoints: Default::default(),
+            runtime_paths: vec![toolchain.clone()],
+        };
+        save(&path, &config).expect("a save");
+        let read = load(&path).expect("a read").expect("a config");
+        assert_eq!(read.runtime_paths, vec![toolchain.clone()]);
+        // The load is what arms the cage's declared list, so the path has to be there afterwards.
+        assert!(crate::cage::declared().contains(&toolchain));
+        config.runtime_paths.clear();
+        save(&path, &config).expect("a save");
+    }
+
+    #[test]
+    fn a_relative_or_home_toolchain_is_refused_by_name() {
+        let dir = scratch("toolchain-refused");
+        let text = std::fs::read_to_string(dir.join("config.json")).unwrap_or_default();
+        let _ = text;
+        let path = dir.join("config.json");
+        let base = || {
+            Config {
+                provider: "local".into(),
+                model: crate::model::presets()[0].id.to_string(),
+                root: dir.clone(),
+                vault: dir.join("vault"),
+                profile_models: Default::default(),
+                mcp: crate::mcp::McpConfig::default(),
+                endpoints: Default::default(),
+                runtime_paths: Vec::new(),
+            }
+        };
+        let mut config = base();
+        config.runtime_paths = vec![PathBuf::from("relative/toolchain")];
+        save(&path, &config).expect("a save");
+        let error = load(&path).expect_err("a relative path is refused");
+        assert!(error.contains("is relative"), "{error}");
+
+        let home = PathBuf::from(std::env::var_os("HOME").expect("a home"));
+        let mut config = base();
+        config.runtime_paths = vec![home];
+        save(&path, &config).expect("a save");
+        let error = load(&path).expect_err("the home directory is refused");
+        assert!(error.contains("home directory or above"), "{error}");
+
+        let mut config = base();
+        config.runtime_paths.clear();
+        save(&path, &config).expect("a clean save");
     }
 
     #[test]

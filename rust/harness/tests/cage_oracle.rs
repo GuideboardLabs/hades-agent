@@ -122,6 +122,47 @@ fn the_runtime_grant_is_read_only_and_does_not_reach_the_secrets() {
 }
 
 #[test]
+fn a_named_toolchain_is_readable_and_an_unnamed_home_path_is_not() {
+    // Discovery cannot look under the home without granting it, so a rustup under `~/.cargo` is invisible
+    // unless the config names it. Naming it grants that directory and nothing around it.
+    let (base, _root, _outside) = scratch("toolchain-named");
+    let toolchain = base.join("home/.cargo");
+    std::fs::create_dir_all(toolchain.join("bin")).expect("a toolchain");
+    let cage = Cage::around("/work").with_runtime_paths([toolchain.clone()]);
+    assert!(cage.grants_read(&toolchain));
+    assert!(cage.grants_read(toolchain.join("bin/cargo")));
+    assert!(
+        !cage.grants_read(base.join("home/.ssh")),
+        "the rest of the home stays denied"
+    );
+}
+
+#[test]
+fn a_toolchain_path_that_is_the_home_or_above_it_is_refused() {
+    // A grant that resolves to the home directory is the whole filesystem with extra steps, and a path that
+    // does not exist is a typo; neither may become a silent grant.
+    let (base, root, _outside) = scratch("toolchain-refused");
+    let cage = Cage::around(&root);
+    // The real home, not a synthetic one: a made-up directory under the scratch tree is somewhere this cage
+    // may legitimately grant, and testing it would prove nothing about the home rule.
+    let real_home = PathBuf::from(std::env::var_os("HOME").expect("a home directory"));
+    assert!(
+        !cage
+            .clone()
+            .with_runtime_paths([real_home.clone()])
+            .grants_read(&real_home)
+    );
+    assert!(
+        !cage
+            .clone()
+            .with_runtime_paths([PathBuf::from("/")])
+            .grants_read(Path::new("/"))
+    );
+    let missing = base.join("home/does-not-exist");
+    assert!(!cage.with_runtime_paths([missing.clone()]).grants_read(&missing));
+}
+
+#[test]
 fn without_the_cage_the_same_read_succeeds() {
     // The twin. Without this, a denied read could be a broken path, a missing file or a typo.
     let (_base, root, outside) = scratch("read-free");

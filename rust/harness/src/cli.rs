@@ -5344,6 +5344,7 @@ fn init(
         profile_models: std::collections::BTreeMap::new(),
         mcp: crate::mcp::McpConfig::default(),
         endpoints: std::collections::BTreeMap::new(),
+        runtime_paths: Vec::new(),
     };
     config::save(&config_path, &config).map_err(|error| {
         format!(
@@ -7366,6 +7367,7 @@ mod profile_model_tests {
                 .collect(),
             mcp: Default::default(),
             endpoints: Default::default(),
+            runtime_paths: Vec::new(),
         }
     }
 

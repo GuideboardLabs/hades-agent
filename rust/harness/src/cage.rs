@@ -25,7 +25,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::fault::Fault;
 
@@ -235,15 +235,57 @@ impl Cage {
     /// The prefixes are discovered by asking, in the parent (which is not caged), where each runtime on
     /// `PATH` lives: its own directory, its prefix, and for a Python, the two prefixes it reports, because a
     /// virtual environment's interpreter loads its standard library from a directory that is not under the
-    /// environment at all. Nothing at or above the home directory is ever granted, so the config and the key
-    /// file stay denied; what is granted is read and execute, never write.
+    /// environment at all. Discovery cannot look under the home directory without becoming a grant of the
+    /// home directory, so a toolchain installed there is named in the config and added by
+    /// [`Cage::with_runtime_paths`]. Nothing at or above the home directory is ever granted, so the config
+    /// and the key file stay denied; what is granted is read and execute, never write.
     pub fn with_runtimes(mut self) -> Cage {
-        for path in runtime_paths() {
-            if !self.readable.contains(&path) {
-                self.readable.push(path);
-            }
+        for path in runtime_paths().into_iter().chain(declared_toolchains()) {
+            self = self.grant_toolchain(path);
         }
         self
+    }
+
+    /// Grant a toolchain the person named, read and execute only.
+    ///
+    /// A named path is a specific toolchain, so a path that is the home directory, anything above it, `/`,
+    /// a non-directory or a path that no longer exists is refused rather than granted: a grant that
+    /// resolves to `$HOME` is the whole filesystem with extra steps, and a typo should be a `doctor` line,
+    /// not a cage that silently covers nothing.
+    pub fn with_runtime_paths<I, P>(mut self, paths: I) -> Cage
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        for path in paths {
+            self = self.grant_toolchain(path.into());
+        }
+        self
+    }
+
+    fn grant_toolchain(mut self, path: PathBuf) -> Cage {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if !path.is_dir() || !self.toolchain_acceptable(&path) {
+            return self;
+        }
+        if !self.readable.contains(&path) {
+            self.readable.push(path);
+        }
+        self
+    }
+
+    /// Whether a path may be granted as a toolchain: never `/`, never `$HOME` or anything above it, and
+    /// never an ancestor of the workspace, which would grant the workspace's parents along with it.
+    fn toolchain_acceptable(&self, path: &Path) -> bool {
+        if path == Path::new("/") {
+            return false;
+        }
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+            && (path == home || home.starts_with(path))
+        {
+            return false;
+        }
+        !self.writable.iter().any(|root| root.starts_with(path))
     }
 
     /// The cage a chat's shell runs under: the workspace writable, the system and language runtimes
@@ -475,6 +517,54 @@ impl Cage {
         rule.extend_from_slice(&fd.as_raw_fd().to_le_bytes());
         Ok((rule, fd))
     }
+}
+
+/// Toolchains a person declared in `runtime_paths`, in the config.
+///
+/// Discovery asks the `PATH`, and the `PATH` of a caged program is the parent's; a toolchain installed under
+/// the home directory is therefore invisible to it, because walking the home is the grant the cage exists to
+/// refuse. Naming the path in the config is the explicit way in, and this is where that list is held.
+static DECLARED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Replace the declared toolchain list. Called once, when the config is loaded.
+pub fn declare_toolchains(paths: impl IntoIterator<Item = PathBuf>) {
+    let mut held = DECLARED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    held.clear();
+    held.extend(paths);
+}
+
+fn declared_toolchains() -> Vec<PathBuf> {
+    DECLARED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+/// The toolchain directories a config may name, as the report reads them.
+pub fn declared() -> Vec<PathBuf> {
+    declared_toolchains()
+}
+
+/// The directories a person is likely to have installed a runtime into, under the home directory.
+///
+/// `doctor` names these when they exist and are not declared: the cage cannot discover them, so an
+/// undeclared one is a runtime that will fail inside a run with a message about a missing library.
+pub fn likely_home_toolchains(home: &Path) -> Vec<PathBuf> {
+    [
+        ".cargo",
+        ".rustup",
+        ".nvm",
+        ".pyenv",
+        ".local/share/uv",
+        ".local/share/pnpm",
+        ".bun",
+    ]
+    .iter()
+    .map(|name| home.join(name))
+    .filter(|path| path.is_dir())
+    .collect()
 }
 
 /// The directories a program needs in order to start the runtimes it needs, discovered by asking.

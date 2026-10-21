@@ -253,6 +253,45 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
         "recipe",
         crate::recipe::Recipe::describe(&root),
     ));
+    // A toolchain the cage cannot see is a runtime that dies inside a run with a message about a missing
+    // library. Discovery cannot look under the home, so an install there is named in the config or it is not
+    // reachable; this is where a person finds out which of the two it is.
+    let declared = crate::cage::declared();
+    let undeclared: Vec<PathBuf> = crate::cage::likely_home_toolchains(home)
+        .into_iter()
+        .filter(|path| !declared.iter().any(|grant| path.starts_with(grant)))
+        .collect();
+    if declared.is_empty() && undeclared.is_empty() {
+        found.push(Finding::ok(
+            "toolchains",
+            "none declared; none found under the home",
+        ));
+    } else if undeclared.is_empty() {
+        found.push(Finding::ok(
+            "toolchains",
+            format!(
+                "declared: {}",
+                declared
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+        ));
+    } else {
+        found.push(Finding::warn(
+            "toolchains",
+            format!(
+                "{} is under the home and not declared; the cage cannot read it. Add it to `runtime_paths` in {}",
+                undeclared
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<String>>()
+                    .join(", "),
+                config.display()
+            ),
+        ));
+    }
     // An audit trail with a silent hole is worse than one that says where the hole is. The counter is per
     // process, so this reports the gaps this process hit; the ledger's own history is the longer record.
     let gaps = crate::activity::gaps();
