@@ -74,6 +74,7 @@ pub mod patch;
 pub mod path;
 pub mod policy;
 pub mod profile;
+pub mod recipe;
 pub mod question;
 pub mod repomap;
 pub mod research;

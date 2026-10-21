@@ -246,6 +246,8 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
     // The security section is read-only and cheap, so it runs on every `doctor` rather than behind a flag:
     // a limit nobody sees is a limit that gets assumed away.
     found.extend(security_findings(home));
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    found.push(Finding::ok("recipe", crate::recipe::Recipe::describe(&root)));
 
     found
 }

@@ -140,7 +140,7 @@ hades — the harness, one turn or a whole graph
 
   hades init [--non-interactive] [--config <file>] [--vault <dir>] [--root <dir>]
              [--model <preset>] [--provider <name>] [--name <name>] [--goal <text>]
-             [--topics <a,b>] [--db <file>]
+             [--topics <a,b>] [--db <file>] [--recipe]
       write the config, the record and the Mneme vault: six areas, the charter, a generated index
 
   hades service install [--prefix <dir>] [--home <dir>] [--out <dir>] [--force]
@@ -5188,7 +5188,7 @@ fn init(
         &[
             "config", "vault", "root", "model", "provider", "name", "goal", "topics", "db",
         ],
-        &["non-interactive"],
+        &["non-interactive", "recipe"],
     )?;
 
     let config_path = config_path(&flags)?;
@@ -5301,6 +5301,20 @@ fn init(
     // a release tarball needs no second directory and a person can read and edit what the agent follows.
     let seeded = crate::builtin::write_all(&hades_home()?)?;
 
+    // A recipe is only written when the caller asks: guessing a language from the files in `root` would
+    // produce a check that looks configured and runs the wrong thing.
+    let recipe_written = if switched(&flags, "recipe") {
+        let example = root.join(format!("{}.example", crate::recipe::FILE));
+        std::fs::write(
+            &example,
+            "{\n  \"version\": 1,\n  \"verify\": \"<the command that decides this repository is done>\",\n  \"protect\": [\"<a path that command reads>\"]\n}\n",
+        )
+        .map_err(|error| format!("could not write {}: {error}", example.display()))?;
+        Some(example)
+    } else {
+        None
+    };
+
     let areas = mneme::Area::ALL
         .iter()
         .map(|area| area.folder())
@@ -5329,6 +5343,9 @@ fn init(
         "\nopen charter: {}\n",
         vault_path.join(mneme::charter::CHARTER_NAME).display()
     ));
+    if let Some(example) = recipe_written {
+        text.push_str(&format!("recipe:  example at {}\n", example.display()));
+    }
     Ok((text, 0))
 }
 
@@ -5449,6 +5466,11 @@ pub(crate) fn assemble(
             .ok_or_else(|| format!("the rules picked {routed}, which this build does not ship"))?,
     };
     let mut profile = profile;
+    // A repository's own recipe sets the check and the files that check reads, as a pair. A `--verify`
+    // below still overrides the command, but it cannot remove the protection the recipe declared.
+    if let Some(recipe) = crate::recipe::Recipe::load(&root)? {
+        recipe.apply(&mut profile);
+    }
     if let Some(command) = flags.named.get("verify") {
         profile.verify = command.clone();
     }
