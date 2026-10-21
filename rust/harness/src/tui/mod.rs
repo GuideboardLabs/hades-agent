@@ -41,7 +41,7 @@ Ctrl+N new conversation Ctrl+E export   Ctrl+B inspector   Ctrl+T tool details
 F1 help   F2 model picker   F3 sessions   F4 approvals   F5 refresh
 Esc cancel current turn / close overlay   Ctrl+C cancel or quit   Ctrl+Q quit
 
-Slash commands: /help /new /model /mode read|act /sessions /resume ID /jobs
+Slash commands: /help /new /model /mode read|plan|act /sessions /resume ID /jobs
 /approvals /activity /skills /usage /run GOAL /stop /export /clear /motion /quit
 
 Account usage is fetched from the configured provider when supported. Session tokens

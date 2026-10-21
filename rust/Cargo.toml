@@ -2,9 +2,5 @@
 resolver = "3"
 members = ["session-tree", "mneme", "governance", "harness"]
 
-# The target directory lives on the big drive, deliberately. Measured 2026-10-17: a small warm
-# build is disk-independent (2.9s on the USB HDD against 3.6s on the internal SATA SSD), and a
-# build directory is regenerable, so keeping it off root costs nothing and buys headroom.
-#
 # Which Python file each crate ports, and the suite that decides when it is done, lives in that
 # crate's own `[package.metadata.hades]`.

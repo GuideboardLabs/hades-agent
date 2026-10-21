@@ -65,339 +65,11 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 ---
 
-## What 0.1.0 adds
+## Releases
 
-This release hardens the boundaries the earlier versions drew, and takes the last measured cost out of the
-fetch path.
+What each version added, newest first: [`RELEASES.md`](RELEASES.md).
 
-- **The cage reports what it can enforce.** Unix-socket rules apply on Landlock ABI 9 and the cage says so
-  when the kernel is older; `--cage strict` narrows path grants on those kernels. The syscalls use `libc`
-  numbers, so the cage compiles on ARM64.
-- **Chromium keeps its sandbox.** `--no-sandbox` is gone from the default launch. Screenshots are confined
-  to the state's `shots` directory, every browser path resolves under the browser directory, and one
-  Chromium is held per state directory.
-- **A failed browser launch explains itself.** Chromium's stderr goes to `<state>/browser/chromium.log`, and
-  a failed first call reports its last line and the child's exit status. A state directory too long for
-  Chromium's socket is refused with the number and the limit instead of aborting inside the browser.
-- **Command output is bounded while it is read.** A `command` call caps output as it arrives and kills the
-  process group on timeout, so a background child cannot outlive the call. The cage gets a writable
-  `TMPDIR` of its own.
-- **The HTTP surface has a connection bound**, and the context builder counts tool payloads and compacts
-  completed turns rather than dropping messages.
-- **The safety floor is named as a heuristic.** `--policy strict` is a deny list over the same text, and
-  the docs say which one is a bound and which is a filter. Audit write gaps are reported, and an
-  interrupted run is named after a crash.
-- **Packs replace a case transactionally**, with caps that bind before the work starts.
-- **A fetch no longer starts a process.** One libcurl handle, loaded at run time, serves the whole run:
-  0.53 ms per fetch against 9.16 ms on loopback, 19.5 ms against 67.5 ms for a page on the internet. The
-  process path remains as the fallback and every guarantee is tested on both.
-- **The aarch64 check needs no root.** `scripts/cross-check.sh` stages the cross compiler in a cache
-  directory and checks the workspace; CI runs the same check with the distribution package.
-
-## What 0.0.20 adds
-
-This release makes a pack fit into a home, and keeps a record of what it changed.
-
-- **`hades pack apply` installs only the rows a person accepted.** The decision file names a kind,
-  identity and one of `install`, `replace` or `skip`; a row outside the plan is refused. Skills land
-  under `skills/proposed/` unless `--activate` names them active. A conflict may be replaced, and the
-  old live path is moved to `packs/replaced/<pack>/<time>/` first. A skill installed as a proposal is
-  not loaded as active work.
-- **Every installed item lands in a catalog.** `packs/catalog.jsonl` records the pack, version, pack
-  digest, item digest, the live digest at install time, the live path and the content path. The content
-  is a copy under `packs/<id>/<version>/`; nothing is symlinked. A second apply of the same version is
-  refused before it writes.
-- **`hades pack uninstall` removes what the pack owns.** It removes a live copy only when its digest
-  still matches, so a skill edited after install is kept and named in the receipt. A promoted skill is
-  kept as active. A case is retired in its ledger rather than left as a broken directory. Shared
-  content is removed only when no remaining row references it, and an uninstall event is appended.
-- **`hades pack adapt` makes a local draft.** One model call reads the pack text, the local catalog
-  brief and the license. It returns rewritten text, a change list and any unresolved conflicts; the
-  result is shown as a diff and written only with `--accept`. Derivatives must be allowed. The draft
-  carries `contract: TODO`, empty regression and holdout lists, so it cannot pass as evidence until a
-  person fills them in.
-- **`hades pack merge` composes a draft, never an overwrite.** The incoming skill and the installed one
-  are both read, both contracts and the conflicts are recorded with provenance, and the result is a
-  proposal. It is skill-only in this release; harness merge is refused by name.
-- **The limits are explicit.** Atomicity is per item, not per pack: a failure after earlier rows have
-  landed leaves those rows and names the failure. A pack is still unsigned; digest pinning and a refusal
-  for unsigned packs are not shipped, and the reader says so.
-
-## What 0.0.19 adds
-
-This release gives a result a container that can leave the machine without losing its evidence.
-
-- **A `.hadepack` is a deterministic tar.gz with a strict manifest.** `pack.json` names the pack, its
-  version and license, the Hades range it needs, the roles and tools it asks for, and every skill,
-  harness and case under `files/`. `SHA256SUMS` covers each file. The writer sets every directory to
-  0755, fixes mtimes, owners and ordering, compresses with `gzip -n`, and records file modes, so the same
-  inputs produce the same bytes. A reader rejects an unsafe path, a duplicate name, a symlink or special
-  entry, an unknown key, a `code: true` capability, and an archive over the size caps before trusting it.
-- **`hades pack export`** writes one. It takes `--skill`, `--profile` and `--case` selectors, records the
-  current Hades range, and never reads the live Hermes home. A directory skill is copied as a directory;
-  a flat skill becomes `files/skills/<name>/SKILL.md`; a case carries its pinned tree and `case.json`.
-- **`hades pack inspect`** reads the manifest, every item, uncompressed bytes, archive hash, signature
-  status and the network/vault warnings. It asks no model and changes no state.
-- **`hades pack plan`** classifies each item against the live catalog as `new`, `duplicate`, `conflict`,
-  `redundant` or `incompatible`. Duplicate and conflict use identity plus content digest; redundancy
-  uses 5-gram Jaccard at 0.60 and prints the shared shingles so the heuristic is reviewable. Nothing is
-  installed yet: applying a plan is 0.0.20.
-
-## What 0.0.18 adds
-
-This release closes the last research limits.
-
-- **A social post can supply the paper it links to.** When a search hit is a social URL, Hades reads the post as raw
-  markup, skips navigation and shortener links, resolves the first link that leaves the platform, fetches that
-  artifact, and stores it as the source. The report shows the artifact URL with `via` the post; `run.json` and
-  `report.json` carry both `url` and `artifact_url`. A post with no visible artifact is a named gate failure, never
-  a source by itself, and the artifact fetch is charged to the same budget.
-- **`--entailment` audits the quote against the claim.** For each verified claim, one capped model call labels the
-  link `supported`, `partial` or `unsupported` and gives a short reason. Labels appear under the claim and in
-  `entailments`; token use is on its own ledger line. This is advisory. The byte check still decides provenance.
-- **`--workers 1..8` fetches a candidate batch in parallel.** Results are processed in candidate order, so
-  `--workers 1` reproduces the serial run exactly. Each fetch still passes the same URL, private-address and
-  deadline gates; the budget is checked before a batch starts.
-
-## What 0.0.17 adds
-
-This release closes the limits named at 0.0.16. The library reads more kinds of documents, and research
-records a disagreement between sources instead of averaging it away.
-
-### The library reads structure, not just bytes
-
-- **A scanned PDF falls back to OCR.** Hades still tries `pdftotext` first. When the text layer is empty it
-  rasterizes each page with `pdftoppm` at 300 dpi and runs `tesseract`; the page marker records `ocr=1`, and
-  the entry carries the tag `ocr` in `library list`, `library show` and `library list --json`. Page and byte
-  caps stop a runaway scan. `--ocr-lang` selects the language pack, and the scratch directory is removed on
-  every exit path.
-- **An EPUB is read in spine order.** The extractor follows `META-INF/container.xml` to the OPF package,
-  then the manifest and spine, instead of trusting the zip listing. EPUB3 `nav` and EPUB2 `ncx` supply the
-  table of contents; footnote asides stay as footnote text; image `alt` text is folded into the body.
-- **LaTeX math becomes readable Markdown math.** `\[...\]`, `\(...\)`, `equation`, `align` and `gather`
-  convert to display and inline math, and escaped dollars survive. This is still a reading view, not
-  rendered math.
-
-### Research can record a dispute
-
-- **`--judge on|off`** (default on) compares claims from different sources on the same subquestion, in
-  capped pairs. A contradictory pair is written to `## Cross-source disputes` in the report and to
-  `disputes` in `run.json` and `report.json`. Both quotes are still byte-verified; the section records a
-  conflict, not a verdict.
-- **`--judge off`** keeps the old behavior. Judge token counts are recorded separately on the usage ledger,
-  and older runs still load because every new field is serde-defaulted.
-- **`hades research bench <questions.json> --grades <grades.json>`** compares key-term coverage with a human
-  verdict. The bench prints `grades: N pass, N partial, N fail` and
-  `coverage predicted N/M grades; this is a calibration, not truth`. A grade that names a question the
-  bench does not have is a named error, not a silent skip.
-- **The parent-log race test waits 30 seconds**, not 10, so a loaded full-suite run cannot turn endpoint
-  latency into a false log-collision failure.
-
-## What 0.0.16 adds
-
-### The offline library
-
-Hades can read a local shelf with no network.
-
-- **Every install starts empty.** `hades library list` on a fresh state prints that the shelf is empty. There is no seed corpus, no sample paper, no placeholder entry. A document exists only after you add it.
-- **`hades library add <file-or-directory>`** imports PDF, EPUB, LaTeX, Markdown, plain text and reStructuredText. Directories are walked. The original is kept on disk and the readable text is extracted into the shelf.
-- **PDF text comes from `pdftotext`** (poppler), not a browser or a model. EPUB is unpacked with a member cap and refuses path traversal. LaTeX is converted to Markdown by a small deterministic reader, so a paper stored as source remains readable without a TeX installation.
-- **The index is SQLite with FTS5.** `hades library search <words>` returns ranked passages; `hades library read <id>` prints the stored text; `hades library verify` re-reads every original and recomputes its hash.
-- **`hades research <question> --offline`** plans, searches the shelf, fetches a library document and runs the same byte-verified quote check. The report records `mode "offline library"`.
-- **The shelf is per state.** A process started with `--state X` cannot read `--state Y`'s books. The agent's `library` tool uses the same resolved shelf.
-- **`--strict` upgrades an off-question claim from a warning to a failed check.** The normal check still exits 0 so an honest report with a flagged claim remains inspectable.
-
-### Research depth
-
-- **A structural relevance gate.** Each extracted claim is compared with its subquestion on distinctive terms. A claim that only matches the source's general subject is marked `off-question`, kept in the report under its own heading, and counted. It is never silently promoted into findings.
-- **Fan-out is deduplicated and ranked.** Search hits are de-duplicated by normalized URL; primary documents are fetched before secondary pages, and social posts last.
-- **Contradictions are first-class evidence.** An extractor may return a `contradicts` quote. The quote goes through the same byte check and appears in a `## Disputed` section instead of being averaged away.
-- **A claim can be revised in place.** When a later source supports the same normalized claim with a new quote, the old text and support are kept in `history`; the report marks the claim as revised.
-- **One retry on a bad quote.** If every draft from a source fails the byte check, the extractor is called once more with the mismatch as a hint. A second failure is recorded, not repeated.
-- **`hades research bench <questions.json>`** runs a question set and reports published, claims, verified quotes, off-question count, sources, wall time, tokens and key-term coverage. Coverage is a reading aid, not a truth score.
-- **`hades research file <run-id> --topic <category/topic>`** files a published, strict-green report as a Mneme research note with provenance and a `hades://research/<id>` source link.
-
-The check proves provenance, not truth. The relevance gate catches a claim that is about the wrong subject, but it cannot prove that a correctly quoted sentence is representative, current or complete.
-
-## What 0.0.15 adds
-
-Research is an evidence-first run, not a chat that summarizes links.
-
-- **`hades research <question>`** plans subquestions, searches, fetches, extracts and checks. Each worker gets one subquestion and one source; the run owns the state, so nothing depends on a growing conversation.
-- **Every published claim carries a byte-verified quote.** `report.md` and `report.json` cite claims, and `hades research check <run-id>` re-reads the stored canonical text and compares the byte range. Exit 0 is green, 1 is a bad quote or missing citation, 2 is an unreadable source.
-- **A run is a directory, not a transcript.** `run.json`, `assignments.jsonl`, `evidence.jsonl`, `failures.jsonl`, `sources/`, `report.md` and `report.json` live under `<state>/research/<run-id>/`. `hades research list` and `show` read it without asking a model.
-- **The source gate refuses snippets and empty pages.** A source needs an HTTP URL, a body of at least 400 characters and a hash; a search snippet is never evidence.
-- **`hades note research`** is now the vault-note verb. `hades note topic|project|product` are the same creation verbs, and the old top-level `topic`, `project` and `product` names remain aliases.
-- **The HTML parser drops code before prose.** Script, style, noscript, template, SVG and iframe bodies are removed before tags, so a JavaScript-heavy page is not mistaken for a wall of evidence.
-- **Search falls back when the local result set is blind.** If SearXNG cannot match two query terms, Hades reads DuckDuckGo's HTML results through Jina Reader rather than treating a single-token match as a source.
-
-The check proves provenance, not truth. A quote can be real while the claim around it overgeneralizes; the report says so, and the extractor prompt now requires platform, driver, version and condition qualifiers to survive into the claim.
-
-## What 0.0.14 adds
-
-- **`config.json` can set a model per profile.** `profile_models` maps a shipped profile id to a preset; a profile with no entry inherits the config's `model`. An unknown id or preset is refused when the config is read, with the valid names in the message.
-- **`hades route` prints the effective model**, including a `profile_models` override, so the choice is visible without starting a run.
-
-## What 0.0.13 adds
-
-- **Profiles can name a model, and inherit one when they do not.** `--model` still wins, then `profile_models.<id>` from `config.json`, then the profile's own setting, then the config's model. No shipped profile pins a model, so `verify` no longer asks for a preset this build does not ship.
-- **The per-profile setting is validated when the config is read.** An unknown profile id or an unknown preset is refused by name, not silently ignored.
-- **`hades profiles` and `hades route` say `inherit`** where a profile has no model of its own.
-
-## What 0.0.12 adds
-
-The limits left by 0.0.11 are closed, or written down where they are decisions.
-
-- **An import is one transaction.** A failure after the first note rolls back every row it wrote, including the exported hash. The success path and the rollback path each have a test.
-- **`hades audit --refresh`** imports the config's vault, refreshes `INDEX.md` and audits what is on disk. It is refused with `--vault`, where the import already happens on a throwaway record.
-- **The clean-home acceptance script names six areas** and probes one creation verb, so the packaged install is checked against the vault the binary actually writes.
-- **The residual limits have a ledger** in `HADES.md`: the TUI is a chat surface, Discord is deferred, the network is per role, WEFT stays read-only, and `skills report` does not estimate unmeasured numbers.
-
-## What 0.0.11 adds
-
-The vault can be built from the command line, and its links are resolved rather than declared.
-
-- **Four creation verbs.** `hades topic <category> <name...> [--parent <topic>]`, `hades research <topic> <title>` (now `hades note research`; the top-level name is the engine), `hades project <name> [--topic <topic>] [--research <ref>...]`, and `hades product <name> --from <project>` write through `Vault`, so the CLI cannot author a note the store would refuse. Each refreshes `INDEX.md`.
-- **A reference resolves to one note.** `research: [...]` and `from_project:` accept the full record path (`technical/ai-inference/kv-cache/kv-cache-at-32k`), the slug below its area (`kv-cache-at-32k`), or a bare trailing name (`kv-cache-at-32k`). A bare name two notes share is refused as ambiguous instead of guessing.
-- **A dangling link is a finding, not a crash.** `hades audit` reports `dangling_research` and `dangling_project` with the missing name and the note that named it. `hades audit --vault` imports leniently for exactly this reason; `hades mneme import` stays strict.
-- **An import reads the whole tree before it writes a row.** A tree that would leave an unresolvable reference is refused with zero rows written, including when the research note sorts after the project that names it.
-- **Upgrading is a command.** `hades mneme upgrade [--retire-old]` writes the six-area tree, and with `--retire-old` moves the stale `40 Topics` folder to `mneme-archive/` rather than deleting it. Schema v3 adds the CHECK constraints the v1 rebuild dropped and files a legacy flat topic under `general`.
-- **Outbox is explicitly inert.** The index says nothing reads it, and recall skips both Outbox and Inbox; a message left there cannot become context by accident.
-
-## What 0.0.10 adds
-
-The vault is a clone of WEFT, generic and empty, with marking posts a fresh agent can navigate.
-
-- **Six areas.** `00 Inbox`, `10 Outbox` (for work that leaves the machine and, later, messages for other agents), `20 Research`, `30 Projects`, `40 Products`, `50 Topics`.
-- **Topics are a tree.** The 26 categories are fixed from Foxforge's topic types, written to `TAXONOMY.md`; a topic is general (`technical/ai-inference`) and narrower things nest beneath it (`.../kv-cache`) instead of becoming a second topic for the same ethos.
-- **The rules are structural.** Every research note, project and product names a topic; a durable project names its research; a product names the project it came from and is `active`, `closed`, `inactive` or `frozen`. Both the SQLite store and the file vault refuse a note that breaks a rule.
-- **A fresh install reads as empty.** `hades init` seeds one `status: marker` note per area, and markers are excluded from the index, the audit counts and recall.
-- **The index is a view.** `INDEX.md` groups topics by category, research by topic, and shows each project's research count and each product's origin; `mneme import` refreshes it so a vault cannot audit correctly and read as empty.
-- **The record migrates.** Schema v2 rebuilds the note table for Products and nested slugs, keeps every row, tag and hash, and backfills each note's primary topic from its first tag.
-
-## What 0.0.9 adds
-
-The learning loop: a failed run becomes a dataset, a fix is measured against what came before, and a
-procedure has to say what it is for before it can be loaded.
-
-- **A failure becomes a case.** A giving-up run pins its starting tree, the goal, the oracle, the policy,
-  model and the full ceiling it failed under. `hades cases` lists them, `hades case <id>` prints one,
-  `hades case forget <id>` retires the tree and keeps the line. A case is a task, not a transcript: the
-  copy is atomic, a deduplicated record appends `seen` rather than a second tree, and a tree past the
-  snapshot limit is declined with the reason instead of being stored half-written.
-- **`hades eval` replays the corpus.** A green start is `stale` with no model call; a red one re-runs the
-  goal under the case's own policy and bounds in a throwaway copy. `--against <harness-dir>` runs the
-  current harness and a candidate over every case and classifies each as `holds`, `fixed`, `regression`,
-  `still failing` or `base drifted`, with exit 1 on a regression and 2 on a broken case or missing tree.
-  `--dry-run` prints the cases, arms and attempt ceiling before anything is spent.
-- **Adoption is gated.** `tune --adopt` runs the corpus for the base and the selected candidate before it
-  copies anything and refuses an improvement that regresses a pinned case, with the case ids and goals on
-  the receipt. `--no-regress` is the one way past it and the receipt says the corpus was skipped.
-- **A security fix has to attack its own patch.** `--attack <cmd>` adds a second oracle: the attack
-  succeeds while the vulnerability is present, so a green check beside a working exploit is a failed
-  result, and an attack that cannot run is a fault rather than a blocked one. The attack command and any
-  script it names are frozen by the ruler, the receipt names both oracles, and the case carries the attack
-  so the gate refuses a candidate that revives it.
-- **Dead ends and handover.** A giving-up run records why it was abandoned, deduplicated by goal and check
-  fingerprint and capped at 200 per profile by recorded retirement, and recall tells the next run what was
-  already tried. The harness also writes a handover before the walk ends: goal, attempts, best candidate,
-  blockers, the case it became, and a next step only when one can be derived. `hades session handover`
-  prints it.
-- **The skill contract.** A proposal now carries `contract`, `regression`, `holdout` and `version`.
-  Promotion refuses a `TODO` contract, fewer than two regression cases, or no holdout; `skills verify`
-  installs the proposal in a throwaway state, runs the cases it names and writes a receipt promotion
-  reads. `--force` promotes with the warning recorded. `skills report` prints proposals per 20 accepted
-  runs and the regression pass rate of installed skills, and says when a number is unmeasured.
-- **First-attempt rate and judge identity.** The scoreboard prints `first n/m` beside the pass rate, so a
-  high pass rate with a low first-attempt rate reads as a slow profile. A judgement now carries the model
-  and prompt digest that produced it, and the receipt prints them; a scripted judge says nothing rather
-  than implying a model.
-
-## What 0.0.8 adds
-
-Truth, boundary and cost: a result cannot be bought by moving the check, a model cannot read what it was
-never given, and a pass now carries what it cost.
-
-- **The check is frozen before the first write.** The check command and every file the profile declares
-  protected are hashed before the baseline run and re-hashed after every passing check. A change ends the
-  run as `RulerChanged`, exit 1, with no accepted claim; the claim ladder refuses at `Attempted` before it
-  reads the check, and a distilled case reads the ruler checkpoint from the log rather than trusting a
-  green line. `--protect <path>` adds a file or directory for one run; `--protect inline-tests` adds every
-  `#[cfg(test)]` item in every `*.rs`, and `--protect manifest:<path>` freezes a manifest's structure. The
-  shipped `fix` and `sweep` profiles carry all three, plus `.cargo/config.toml`, `rust-toolchain.toml` and
-  `build.rs`: those decide what the check runs, so a `[target.*] runner` entry or a `[[test]] path` cannot
-  move the verifier without touching a test file. Inline test modules are frozen where they live, keyed by
-  file and item name so an edit above them is not a change, and a manifest keeps its dependency tables free
-  so `cargo add` stays a normal fix. Symlinks are entries in their own right and a symlinked directory is
-  entered, so a link added under a protected path, or an edit to what it points at, is a change.
-- **The browser has a scheme policy.** HTTP, HTTPS and `about:blank` only; `file://` is refused unless a
-  fixture opts in. The policy is checked before `Page.navigate`, on every tab refresh (clicks, tab switches,
-  redirects) and before observation text is returned; `upload` reads local files only under the same opt-in
-  that `file://` needs, because the browser runs outside the cage. Chromium starts with a cleared
-  environment and a HOME inside the state directory. The floor records `file:`, `data:`, `javascript:` and `vbscript:` opens as
-  security access.
-- **A model-run shell cannot read the harness' keys.** The child starts from `env_clear` plus PATH, HOME,
-  TMPDIR, locale and the toolchain locations; this is the tool every governed run gives the model, not only
-  the chat shell. The checker keeps the caller's environment because it is the caller's own command.
-- **State is private.** `state_dir` makes 0700 directories and tightens existing ones, and every path that
-  opens a session goes through it, so `turn`, `submit` and the daemon no longer leave a 0755 transcript
-  behind. Scoreboard rows and the generated HTTP token are 0600, the token created with the mode rather than
-  chmod'd after. Snapshots skip credential names (`.env`, `.netrc`, `.npmrc`, `.git-credentials`, `id_*`,
-  `credentials`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.tfstate`) and the manifest names what it skipped. A
-  directory is never treated as a credential, whatever it is called.
-- **The HTTP surface has no open mode.** Every bind needs a token, loopback included. With none configured
-  the server generates one at `<state>/http.token` (0600) and reuses it on restart; the path is printed,
-  never the token. Behind it, a present `Origin` must name the connected address and a POST must be
-  `application/json`.
-- **A call reserves its prompt and its cap.** The token budget was checked only after a call reported its
-  cost, so a run could overshoot by one completion cap. The runner now estimates the prompt, adds the call
-  cap, and refuses to start a call the allowance cannot cover.
-- **Cost sits beside the result.** The tuning receipt prints prompt and generated tokens beside the check,
-  and the scoreboard reports tokens per pass rather than only a total.
-
-## What 0.0.7 adds
-
-The ask bar: a question is part of the input, not a modal, and the answer is one record any surface can
-read.
-
-- **A question anchored to the composer.** A floor refusal or a model fork draws on the input's top edge:
-  the reason in one line, ranked options, one recommended and preselected, and `Other` reached by moving
-  past the last row. Enter takes the selection. Typing moves into the input and selects `Other`, so a typed
-  answer declines the recommendation by construction. `Esc` collapses the bar to one line; it never stops
-  the run.
-- **Two axes, kept separate.** The floor decides whether an action may run. A per-run budget decides
-  whether the model may interrupt: two blocking and three advisory questions, enforced in code. A spent
-  budget tells the model to decide and name its assumption instead of asking again.
-- **Advisory questions continue the run.** The recommendation is taken, the assumption is recorded, and a
-  later answer is delivered at the next step boundary with the assumption it replaces. Nothing already
-  done is rewound.
-- **Plan mode.** Read → Plan → Act, cycled with `Shift+Tab` or `/mode plan`. Plan mode has no mutating
-  tools and asks at real forks before writing a plan: goal or scope, architecture, and how a step should be
-  done when more than one way is valid.
-- **One record, any surface.** Questions live in `approvals.jsonl`. `hades approvals` prints every option
-  and the recommendation, `hades answer <id> <key|other>` answers from another terminal, and
-  `hades log --asks <session>` prints one session. The F4 Approvals view lists the same options; Enter
-  opens the bar on that row. A live daemon remains the only writer.
-- **Taste, small and inspectable.** `state/taste.jsonl` records one line per answered question, scoped to
-  its root. Three consistent choices move the recommendation; five agreeing choices stop that family being
-  asked; permissions are never silenced; two `Other` declines are printed as a proposal, not applied.
-  `hades taste` shows counts, recommendation, streak and proposals; `hades taste forget <n|all>` removes
-  lines.
-
-It follows 0.0.4's admission handles, goals and budgets. The session format is unchanged.
-
-<details>
-<summary>Earlier: what 0.0.4 added</summary>
-
-0.0.4 was Part I of the 0.0.3 plan: five changes to the runtime itself, with the session format unchanged.
-
-- **Admission handles.** `spawn` returns `{child_id, session, state:"admitted"}` before the child's first model call. A gateway-owned registry caps live children at 16, records them under `<state>/children/`, and marks a crashed gateway's children `lost` on restart instead of resuming them silently. `tell`, `children` and `result` are the tools a parent uses to work with a live child.
-- **Goals that outlive a turn.** A goal is session state (`open`, `paused`, `done`, `cleared`) with its chat, model, check and budget. The gateway heartbeat re-enters an idle session on schedule. A goal closes when its recorded check passes or when a person closes it. When its total budget of model calls is spent it pauses with `budget` recorded, and `hades goal resume` puts it back to work.
-- **Budgets that name their cause.** `hades run` and `hades submit` take `--budget-tokens`; the end of a run names `attempts`, `minutes` or `tokens`, and the scoreboard sums the spend the endpoint reported.
-- **Numbered harness generations.** Every `tune --adopt` writes `~/.hades/control/harness/<profile>/<n>/` (under `HADES_HOME`) with a manifest naming every captured file, its hash, and the harness and state roots it came from. `hades refine --rollback <n>` restores exactly those files in two passes, and refuses to cross a floor change. The floor and policy guard lists are enumerated by the type system rather than by hand.
-- **Strict model requests.** `--strict-model` preflights the endpoint and key before a session exists. A configured but unreachable endpoint fails on the first call naming the model instead of substituting another.
-
-</details>
+---
 
 ## Why this exists
 
@@ -623,7 +295,7 @@ Proposals are reviewed before promotion.
 ## Interfaces
 
 - **Terminal workspace.** `hades`, `hades tui`, or `hades chat`: streaming chat, framed messages, sessions, jobs, approvals, activity, skills, and usage.
-- **CLI.** `hades chat`, `hades run`, `hades job`, `hades doctor`, and the rest of the command set.
+- **CLI.** `hades chat`, `hades run`, `hades jobs`, `hades doctor`, and the rest of the command set.
 - **ACP.** `hades acp` serves the Agent Client Protocol over stdio for an editor.
 - **HTTP.** A local read-and-control surface for status, sessions and approvals.
 - **Telegram.** Long polling with a numeric user allowlist and an approval flow. The gateway is opt-in.
@@ -819,21 +491,22 @@ git clone https://github.com/GuideboardLabs/hades-agent.git
 cd hades-agent/rust
 
 cargo build --release
-./install.sh --bin target/release/hades --home ~/.hades --root ~/.hades/work
+./install.sh
 
-hades init
 hades doctor
 ```
 
-`install.sh` writes:
+`install.sh` takes `--prefix`, `--home`, `--root`, `--bin`, `--no-init`, `--no-service`, `--no-start` and
+`--with-gateway`; the defaults are `~/.local`, `~/.hades` and `~/hades-work`. It writes:
 
 - `~/.local/bin/hades`
 - `~/.hades/` for config, sessions, memory and approvals
-- `~/.hades/work/` as the default working tree
+- `~/hades-work/` as the default working tree, unless `--root` names another
 - `hades-daemon.service` and `hades-gateway.service` under the user systemd directory
 
-It does not start the services unless you ask. It never uses `sudo`, downloads anything, or reads
-`~/.hermes`.
+It starts the daemon when a user systemd manager answers; the gateway starts only with `--with-gateway`,
+because it needs `HADES_TELEGRAM_TOKEN` and an allowed-users list first. It never uses `sudo`, reads
+`~/.hermes`, or fetches anything of its own.
 
 ### First run
 
@@ -880,12 +553,12 @@ is refused when the config is read, not silently ignored. Precedence is `--model
 | `hades cases` / `hades case <id>` | List the failure corpus, print one case, `forget <id>` retires its tree |
 | `hades eval [--against <dir>]` | Replay the corpus: stale, holds, fixed, regression, still failing; `--dry-run` prices it |
 | `hades refine --rollback <n>` | Restore the files named in harness generation n |
-| `hades job <spec>` | Write a scheduled job |
-| `hades jobs` | List scheduled jobs |
-| `hades goal set\|list\|pause\|clear` | A goal kept for one chat; the gateway heartbeat continues it when idle |
+| `hades jobs` | The standing jobs, with the fields a correction edits; the agent's `job` tool writes one |
+| `hades cancel <job>` | Remove a standing job and its pending retry |
+| `hades goal set\|list\|pause\|resume\|clear` | A goal kept for one chat; the gateway heartbeat continues it when idle |
 | `hades profiles` | Show the five profiles and their parameters |
 | `hades approvals` | Every question with its options, recommendation and answer |
-| `hades answer <id> <key\|other>` | Answer from any process; `--note` carries a steer |
+| `hades answer <id> <option\|allow\|deny>` | Answer from any process; `--note` carries a steer, `--scope once\|session` sets how long it holds |
 | `hades log --asks <session>` | One session's questions and answers |
 | `hades taste [forget <n\|all>]` | What the answers taught, and how to forget it |
 | `hades route <goal>` | Show which profile the rules pick, and why |
@@ -896,8 +569,17 @@ is refused when the config is read, not silently ignored. Precedence is `--model
 | `hades acp` | Serve ACP on stdio for an editor |
 | `hades doctor [--services on]` | Describe this install; writes nothing |
 | `hades config` | Print the config a headless process reads |
-| `hades topic\|research\|project\|product` | Create a topic, research note, project or product through the store |
+| `hades topic\|project\|product` | Create a topic, a project or a product through the store |
+| `hades note <kind>` | Write one note of a given kind into the store |
+| `hades research <question>` | One evidence-first run: plan, search, fetch, extract, verify; `--offline` reads only the local library |
+| `hades library add\|list\|search\|show\|verify\|remove` | The local shelf of documents, with FTS5 search and a hash check |
 | `hades mneme import\|export\|upgrade` | Move a vault in or out of the record; `upgrade` writes the new tree and can retire `40 Topics` |
+| `hades pack export\|inspect\|plan\|apply\|uninstall\|list` | Move skills, a harness and cases between installs as a signed-shaped archive with a decision file |
+| `hades mcp list\|tools\|call` | The MCP servers the config names, what each offers, and a call to one allowed tool |
+| `hades context <goal>` / `hades map <goal>` | Build the context for a goal, or rank the tree for one and say what the map cache did |
+| `hades daemon\|http\|status\|submit\|attach` | Own the sessions under one state directory, or reach a running one |
+| `hades service install` / `hades update` / `hades version` | Write the two user units, replace the binary atomically, print the build |
+| `hades undo <session>` | Put a tree back the way a shadow snapshot found it |
 | `hades audit` | Run the governance audit over the record; `--refresh` imports the config's vault first |
 
 `hades help` lists every command and flag.
@@ -918,8 +600,18 @@ is refused when the config is read, not silently ignored. Precedence is `--model
 ├── control/           numbered harness generations
 ├── approvals/         append-only approval ledger
 ├── skills/            built-in, installed and proposed skills
-└── work/              default working tree for runs
+├── library/           documents added to the local shelf
+├── browser/           Chromium profile and its log, one per state
+├── shots/             screenshots, confined to this directory
+├── shadows/           snapshots an undo restores from
+├── attempts/          what each governed attempt returned
+├── runbooks/          distilled procedures and their proofs
+├── tmp/               short-lived files the cage may write
+└── work/              working tree when config names none
 ```
+
+`install.sh` sets the root to `~/hades-work` unless `--root` names another tree; `<state>/work` is the
+fallback a run uses when the config names no root.
 
 Keep `~/.hades` out of version control. The repository contains no state, no sessions, no keys and no
 provider configuration.
@@ -1002,6 +694,7 @@ These are current limits, not aspirations hidden in a roadmap:
 ## Documentation
 
 - [`HADES.md`](HADES.md): the design rule, the architecture and the long-form reasoning.
+- [`RELEASES.md`](RELEASES.md): what each version added, newest first.
 - [`rust/README.md`](rust/README.md): the crate map and porting notes.
 - [`NOTICE`](NOTICE): lineage and upstream attribution.
 - [`LICENSE`](LICENSE): MIT.
