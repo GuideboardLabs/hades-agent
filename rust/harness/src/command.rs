@@ -115,6 +115,10 @@ fn run_inner(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Its own process group, so a deadline can end everything the program started rather than only the
+    // shell. `kill(-pid)` reaches a grandchild that a `kill(pid)` leaves running, and a runaway test
+    // runner is exactly the case this exists for.
+    command.process_group(0);
     if clean {
         command.env_clear();
         for (key, value) in clean_environment() {
@@ -135,10 +139,14 @@ fn run_inner(
     let mut child = command
         .spawn()
         .map_err(|error| Fault::harness(format!("could not run the program: {error}")))?;
+    let child_pid = child.id();
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
-    let out_reader = std::thread::spawn(move || read_pipe(out_pipe));
-    let err_reader = std::thread::spawn(move || read_pipe(err_pipe));
+    // Half the budget per pipe, so the two together cannot exceed the limit and the final text needs no
+    // second cut. The margin covers the two omission markers.
+    let budget = (limit / 2).saturating_sub(64).max(64);
+    let out_reader = std::thread::spawn(move || read_pipe(out_pipe, budget));
+    let err_reader = std::thread::spawn(move || read_pipe(err_pipe, budget));
 
     let started = std::time::Instant::now();
     let mut timed_out = false;
@@ -147,8 +155,7 @@ fn run_inner(
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                end_group(&mut child, child_pid);
                 return Err(Fault::harness(format!(
                     "could not read the program's status: {error}"
                 )));
@@ -156,28 +163,27 @@ fn run_inner(
         }
         if deadline.is_some_and(|limit| started.elapsed() >= limit) {
             timed_out = true;
-            let _ = child.kill();
-            let _ = child.wait();
+            end_group(&mut child, child_pid);
             break -1;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
 
-    let (out_bytes, err_bytes) = if timed_out {
-        // The shell was killed, but a grandchild it started can hold the pipes open; waiting for them
-        // would undo the deadline. The readers are left to finish on their own and no output is
-        // claimed, which is the honest report: what was written before the kill is not what it said.
+    let (out, err) = if timed_out {
+        // The group was killed, but a process that escaped it can still hold a pipe open; waiting for one
+        // would undo the deadline. The readers are left to finish on their own and no output is claimed,
+        // which is the honest report: what was written before the kill is not what it said.
         drop(out_reader);
         drop(err_reader);
-        (Vec::new(), Vec::new())
+        (Captured::default(), Captured::default())
     } else {
         (
             out_reader.join().unwrap_or_default(),
             err_reader.join().unwrap_or_default(),
         )
     };
-    let mut text = String::from_utf8_lossy(&out_bytes).into_owned();
-    let stderr = String::from_utf8_lossy(&err_bytes);
+    let mut text = render(&out);
+    let stderr = render(&err);
     if timed_out {
         if !text.is_empty() {
             text.push('\n');
@@ -194,36 +200,116 @@ fn run_inner(
         text.push_str(&stderr);
     }
 
-    let (output, truncated) = truncate(&text, limit);
+    let (output, truncated) = cap_to(text, limit, 0);
     Ok(Run {
         status,
         output,
-        truncated,
+        truncated: truncated || out.omitted > 0 || err.omitted > 0,
         timed_out,
     })
 }
 
-/// Everything a child wrote to one pipe, or nothing when it had none.
-fn read_pipe<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut bytes);
+/// The readable form of one pipe: the head, the tail, and the marker between them when bytes were dropped.
+///
+/// The marker is inserted here rather than at the end because joining a head to a tail with nothing
+/// between them invents an adjacency that never existed: two halves of a number become one number.
+fn render(captured: &Captured) -> String {
+    let head = String::from_utf8_lossy(&captured.head);
+    let tail = String::from_utf8_lossy(&captured.tail);
+    if captured.omitted == 0 {
+        format!("{head}{tail}")
+    } else {
+        format!("{head}\n… {} bytes omitted …\n{tail}", captured.omitted)
     }
-    bytes
+}
+
+/// End the child and everything it started.
+///
+/// A signal to the negated pid reaches the whole group, which is why the child was spawned into its own.
+/// If the group signal cannot be sent (the child already reaped, a host without process groups), the
+/// single-process kill is the fallback rather than nothing.
+fn end_group(child: &mut std::process::Child, pid: u32) {
+    let sent = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    if sent != 0 {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// What one pipe contributed: the head, the tail, and how many bytes were dropped between them.
+///
+/// The point is the order of the cut. Collecting the stream and truncating it afterwards means a program
+/// that prints two gigabytes has already allocated two gigabytes, so the cap has to run while the bytes
+/// are being read, and the count has to be of the *stream* or the marker lies about what was lost.
+#[derive(Debug, Default)]
+struct Captured {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    omitted: usize,
+}
+
+/// Everything a child wrote to one pipe, bounded by `limit` while it is read.
+fn read_pipe<R: std::io::Read>(pipe: Option<R>, limit: usize) -> Captured {
+    let mut captured = Captured::default();
+    let Some(mut pipe) = pipe else {
+        return captured;
+    };
+    let head_limit = limit / 2;
+    let tail_limit = limit - head_limit;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let mut bytes = &chunk[..read];
+                if captured.head.len() < head_limit {
+                    let room = head_limit - captured.head.len();
+                    let take = room.min(bytes.len());
+                    captured.head.extend_from_slice(&bytes[..take]);
+                    bytes = &bytes[take..];
+                }
+                if !bytes.is_empty() {
+                    // Past the head, bytes go to a rolling tail: push, and drop from the front once the
+                    // tail is full, counting each dropped byte as omitted.
+                    captured.tail.extend_from_slice(bytes);
+                    if captured.tail.len() > tail_limit {
+                        let excess = captured.tail.len() - tail_limit;
+                        captured.tail.drain(..excess);
+                        captured.omitted += excess;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    captured
 }
 
 /// Keep the head and the tail, and say what was left out. Both ends, because a failure usually announces
 /// itself at one end and explains itself at the other.
 fn truncate(text: &str, limit: usize) -> (String, bool) {
+    cap_to(text.to_string(), limit, 0)
+}
+
+/// Cut `text` to `limit` bytes, adding `seen_omitted` bytes that were already dropped while reading.
+fn cap_to(text: String, limit: usize, seen_omitted: usize) -> (String, bool) {
+    if text.len() <= limit && seen_omitted == 0 {
+        return (text, false);
+    }
     if text.len() <= limit {
-        return (text.to_string(), false);
+        // Everything that survived fits; only the already-dropped bytes need saying.
+        return (
+            format!("{text}\n… {seen_omitted} bytes omitted …"),
+            true,
+        );
     }
 
     let head = limit * 2 / 3;
     let tail = limit - head;
-    let cut = floor_boundary(text, head);
-    let back = ceil_boundary(text, text.len() - tail);
-    let omitted = text.len() - cut - (text.len() - back);
+    let cut = floor_boundary(&text, head);
+    let back = ceil_boundary(&text, text.len().saturating_sub(tail)).max(cut);
+    let omitted = seen_omitted + text.len() - cut - (text.len() - back);
 
     (
         format!(
@@ -298,6 +384,73 @@ mod tests {
         assert!(run.timed_out, "{run:?}");
         assert_eq!(run.status, -1);
         assert!(run.output.contains("wall-clock deadline"), "{}", run.output);
+    }
+
+    #[test]
+    fn a_huge_stream_is_capped_before_it_is_joined() {
+        // Two megabytes through a 2000-byte limit. The cut has to happen while reading, and the omitted
+        // count has to describe the stream rather than the bytes that survived the first cut.
+        let root = crate::scratch::root().join("bounded-output");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a root");
+        let run = run_within(
+            "yes x | head -c 2000000",
+            &root,
+            2000,
+            None,
+            Some(std::time::Duration::from_secs(20)),
+        )
+        .expect("a run");
+        assert!(run.output.len() < 4000, "{}", run.output.len());
+        assert!(run.output.contains("omitted"), "{}", &run.output[..200.min(run.output.len())]);
+        assert!(run.truncated);
+        let counted: usize = run
+            .output
+            .split('…')
+            .nth(1)
+            .and_then(|part| part.split_whitespace().next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or(0);
+        assert!(counted > 1_900_000, "the marker undercounts the stream: {counted}");
+    }
+
+    #[test]
+    fn a_timeout_kills_the_grandchild_too() {
+        // The program starts a child and waits. Killing only `sh` leaves `sleep 60` holding the pipes and
+        // the work; the group signal is what makes "stopped" mean stopped.
+        let root = crate::scratch::root().join("process-group");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a root");
+        let run = run_within(
+            "sleep 60 & echo $! > child.pid; wait",
+            &root,
+            2000,
+            None,
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .expect("a run");
+        assert!(run.timed_out);
+        let pid: i32 = std::fs::read_to_string(root.join("child.pid"))
+            .expect("the child pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the grandchild still exists: {pid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]
