@@ -53,6 +53,63 @@ const SESSION_LIMIT_MAX: usize = 500;
 const ACTIVITY_LIMIT: usize = 100;
 const ACTIVITY_LIMIT_MAX: usize = 1000;
 
+/// How many connections one server handles at once. A thread per connection is the whole shape, so the
+/// count is also the thread count: a local process that opens a thousand idle sockets would otherwise cost
+/// a thousand stacks and a thousand descriptors that never time out.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 32;
+
+/// A count of connections in flight, with a way to wait for one.
+struct Permits {
+    free: std::sync::Mutex<usize>,
+    ready: std::sync::Condvar,
+}
+
+/// One held permit. Dropping it is the only way to give it back, which is what makes a panic in the handler
+/// release the slot instead of leaking it.
+struct Permit(std::sync::Arc<Permits>);
+
+impl Permits {
+    fn new(count: usize) -> Permits {
+        Permits {
+            free: std::sync::Mutex::new(count.max(1)),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Take a permit, or give up after `wait`. `None` is the server's answer to a client it cannot serve.
+    fn acquire(permits: &std::sync::Arc<Permits>, wait: Duration) -> Option<Permit> {
+        let mut free = match permits.free.lock() {
+            Ok(free) => free,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let deadline = Instant::now() + wait;
+        while *free == 0 {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            let (held, timeout) = match permits.ready.wait_timeout(free, left) {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            free = held;
+            if timeout.timed_out() && *free == 0 {
+                return None;
+            }
+        }
+        *free -= 1;
+        Some(Permit(std::sync::Arc::clone(permits)))
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut free = match self.0.free.lock() {
+            Ok(free) => free,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *free += 1;
+        self.0.ready.notify_one();
+    }
+}
+
 /// What to serve, and where. Owned by the CLI command; cloned once per connection.
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -62,6 +119,8 @@ pub struct Server {
     pub token: String,
     /// Accept one request and return. A scripted probe should not leave a server behind.
     pub once: bool,
+    /// How many connections may be in flight at once.
+    pub max_connections: usize,
 }
 
 impl Server {
@@ -85,12 +144,29 @@ impl Server {
             return Ok(());
         }
 
+        let permits = std::sync::Arc::new(Permits::new(self.max_connections));
         for incoming in listener.incoming() {
             let Ok(stream) = incoming else {
                 continue;
             };
+            let Some(permit) = Permits::acquire(&permits, Duration::from_secs(1)) else {
+                // No slot within a second: say so and close. Dropping the connection silently would look
+                // like a crash to a client that cannot tell a refusal from a fault.
+                let mut stream = stream;
+                let refusal = Reply::new(
+                    503,
+                    json!({"ok": false, "error": "too many connections in flight"}),
+                );
+                let _ = write_reply(&mut stream, refusal);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                continue;
+            };
             let server = self.clone();
-            std::thread::spawn(move || server.handle(stream));
+            std::thread::spawn(move || {
+                server.handle(stream);
+                drop(permit);
+            });
         }
         Ok(())
     }

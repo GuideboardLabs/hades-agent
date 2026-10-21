@@ -291,6 +291,7 @@ hades — the harness, one turn or a whole graph
       own the sessions under one state directory, in the foreground
 
   hades http [--bind 127.0.0.1:8787] [--state <dir>] [--token-file <path>] [--once]
+      [--max-connections n]
       one read-and-control API over the daemon, for a local client. Every bind needs a
       token: HADES_HTTP_TOKEN, --token-file, or one generated at <state>/http.token and
       reused on restart. The token is never taken as an argument because argv is visible
@@ -6550,7 +6551,7 @@ fn acp(args: &[String], input: &mut dyn BufRead) -> Result<(String, i32), String
 /// The HTTP surface. A thin client of the daemon: it binds a listener and turns each request into an op on
 /// the socket, or a read of the same files the daemon answers from.
 fn http(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse_with(args, &["bind", "state", "token-file"], &["once"])?;
+    let flags = parse_with(args, &["bind", "state", "token-file", "max-connections"], &["once"])?;
     let state = state_of(&flags)?;
     let bind = match flags.named.get("bind") {
         Some(text) => text.parse::<std::net::SocketAddr>().map_err(|_| {
@@ -6566,11 +6567,19 @@ fn http(args: &[String]) -> Result<(String, i32), String> {
     // not break every client.
     let token = token_of(&flags, &state)?;
     let once = flags.named.contains_key("once");
+    let max_connections = match flags.named.get("max-connections") {
+        Some(text) => text
+            .parse::<usize>()
+            .map_err(|_| format!("`--max-connections {text}` is not a number"))?
+            .max(1),
+        None => crate::httpd::DEFAULT_MAX_CONNECTIONS,
+    };
     crate::httpd::Server {
         state,
         bind,
         token,
         once,
+        max_connections,
     }
     .serve()?;
     Ok((String::new(), 0))

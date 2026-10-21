@@ -251,6 +251,53 @@ fn ask(socket: &Path, request: Value) -> Result<Value, String> {
 }
 
 #[test]
+fn the_server_refuses_more_connections_than_its_limit() {
+    // One thread per connection means the connection count is the thread count. Two sockets that say
+    // nothing hold both permits; the third client gets a status it can read rather than a silent close.
+    let state = scratch("connection-limit");
+    let server = Http::start(&state, &["--max-connections", "2"], &[]);
+
+    let held: Vec<TcpStream> = (0..2)
+        .map(|_| TcpStream::connect(server.address).expect("a held connection"))
+        .collect();
+    // The accept loop takes a permit before it spawns the handler, so both are held as soon as the
+    // connections are accepted. Poll for the refusal rather than assume the scheduler ran.
+    let mut refusal = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let answer = request(
+            server.address,
+            "GET /api/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
+        );
+        if answer.status == 503 {
+            refusal = Some(answer);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let refusal = refusal.expect("the third connection was refused");
+    assert!(
+        refusal.body.to_string().contains("too many connections"),
+        "{:?}",
+        refusal.body
+    );
+
+    // The twin: once the held sockets are gone, the same request is served.
+    drop(held);
+    let mut served = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let answer = server.get("/api/health");
+        if answer.status == 200 {
+            served = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(served, "the server never accepted another connection");
+}
+
+#[test]
 fn health_answers_without_a_daemon() {
     let state = scratch("health");
     let server = Http::start(&state, &[], &[]);
