@@ -89,8 +89,10 @@ share is refused. The audit reports a reference that resolves to nothing as `dan
 `dangling_project` rather than aborting.
 
 `hades init` refuses a vault that already exists. `hades audit` reads the record the config names;
+`hades audit --refresh` imports the config's vault, refreshes `INDEX.md` and audits what is on disk.
 `hades audit --vault <dir>` imports a markdown tree into a throwaway record and audits that, which is how
-a hand-edited tree is checked. A fresh home audits clean: six empty areas, a charter and an index.
+a hand-edited tree is checked without touching the record. A fresh home audits clean: six empty areas, a
+charter and an index.
 
 ## Installing
 
@@ -445,3 +447,22 @@ place. It does not read or write WEFT: its vault is its own, and the fences it c
 Telegram gateway runs against a real bot, and Discord is the one transport still not built. When Hades
 becomes the main place, that is a decision with a migration in it, not something that happens by pointing
 one flag at a path.
+
+## Residual limits
+
+These are decisions, not omissions. Each has a reason and the seam it would change.
+
+- **`profile.model` is advisory.** A run uses `--model`, then the config's model. The profile's model is
+  recorded in the session, not selected, because the only distinct value among the shipped profiles
+  (`verify` = `glm-5.3-flash`) is not a preset in this build and was retired by the account. Wiring the
+  field before choosing an independent verifier would silently make `verify` the same voice as `fix`.
+- **The TUI is a chat surface.** `cases`, `eval` and `skills verify` are CLI verbs with receipts. A palette
+  entry that cannot show the receipt would be a weaker second surface, so the TUI links to `/run` and the
+  terminal instead.
+- **Telegram is the only transport.** Discord is deferred; `gateway/` is transport-shaped, so it can land
+  without moving the core.
+- **The network is open or closed per role.** There is no per-domain egress proxy. Research must say this
+  before it widens a fetch tool.
+- **Hades writes only its own vault.** WEFT is read by its owner, not by Hades; `mneme export` is the
+  one-way path.
+- **`skills report` says which numbers are unmeasured.** It does not estimate them.

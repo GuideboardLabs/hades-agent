@@ -5,7 +5,7 @@
 //! refused instead of guessed at.
 //!
 //! The path rule from the decision is the whole routing table: a path is a note if and only if it is
-//! `*.md` and its parent is exactly one of the five area folders under the root. Every other path is
+//! `*.md` and its parent is exactly one of the six area folders under the root. Every other path is
 //! a plain file on disk, which is how `charter.md` and `INDEX.md` stay files while notes are rows.
 
 use std::collections::{BTreeMap, HashMap};
@@ -36,6 +36,14 @@ use crate::topic::Category;
 /// the `general` category. The v1 migration had rebuilt the table without them; a vault that had
 /// already opened once at v2 would never see the repair if the change lived only in v1.
 pub const SCHEMA_VERSION: i64 = 3;
+
+// A test-only failpoint for the import's write phase. Phase 1 refuses every bad note, so a rollback
+// test cannot reach the loop without help; this cell is compiled out of a release build.
+#[cfg(test)]
+thread_local! {
+    static FAIL_IMPORT_AFTER: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS note (
@@ -564,12 +572,26 @@ impl SqliteStore {
 
     fn store_note(&self, area: Area, slug: &str, text: &str) -> Result<(), Fault> {
         let path = self.path_of(area, slug);
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|error| io(&path, error))?;
+        self.store_note_in(&transaction, area, slug, text)?;
+        transaction.commit().map_err(|error| io(&path, error))
+    }
+
+    /// The write half, inside a transaction the caller owns. It must not open, commit or roll back:
+    /// an import needs every row in one transaction, and a nested write would be refused by SQLite.
+    fn store_note_in(
+        &self,
+        transaction: &Transaction<'_>,
+        area: Area,
+        slug: &str,
+        text: &str,
+    ) -> Result<(), Fault> {
+        let path = self.path_of(area, slug);
         let (frontmatter, body) = Frontmatter::parse(text);
         let frontmatter = normalize(&path, area, slug, frontmatter)?;
         let extra = encode_extra(&frontmatter.extra);
         let research = encode_list(&frontmatter.research);
-        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
-            .map_err(|error| io(&path, error))?;
         transaction
             .execute(
                 "INSERT INTO note (area, slug, title, summary, status, category, topic, parent, \
@@ -627,7 +649,7 @@ impl SqliteStore {
                     .map_err(|error| io(&path, error))?;
             }
         }
-        transaction.commit().map_err(|error| io(&path, error))
+        Ok(())
     }
 
     fn delete_note(&self, area: Area, slug: &str) -> Result<(), Fault> {
@@ -959,11 +981,26 @@ impl SqliteStore {
             }
         }
 
+        // One transaction for the whole import. Phase 1 has already refused every note that breaks a
+        // structural rule, so the only way out of this loop is an infrastructure failure; if one
+        // happens, the rows written before it must not survive as a half-imported tree.
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|error| io(&self.root, error))?;
         for note in pending {
-            self.store_note(note.area, &note.slug, &note.text)?;
+            #[cfg(test)]
+            if FAIL_IMPORT_AFTER.with(|at| at.get()) == report.imported {
+                return Err(Fault::Io {
+                    path: note.path.display().to_string(),
+                    detail: "test: the import stopped after an earlier write".to_string(),
+                });
+            }
+            self.store_note_in(&transaction, note.area, &note.slug, &note.text)?;
             self.set_exported_hash(note.area, &note.slug, &sha256::hex(note.text.as_bytes()))?;
             report.imported += 1;
         }
+        transaction
+            .commit()
+            .map_err(|error| io(&self.root, error))?;
         Ok(report)
     }
 
@@ -2010,6 +2047,102 @@ mod tests {
             .query_row("SELECT count(*) FROM note", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn an_import_writes_the_row_and_the_exported_hash() {
+        let (store, root) = fresh("import-hash");
+        let source = root
+            .parent()
+            .expect("scratch parent")
+            .join("import-hash-source");
+        let _ = fs::remove_dir_all(&source);
+        for (name, topic) in [("one", "technique-a"), ("two", "technique-b")] {
+            let dir = source.join(format!("20 Research/technical/{topic}"));
+            fs::create_dir_all(&dir).expect("research dir");
+            fs::write(
+                dir.join(format!("{name}.md")),
+                format!(
+                    "---\ntitle: {name}\nsummary: s.\nstatus: durable\ntopic: technical/{topic}\nprovenance: measured\n---\n\nbody\n"
+                ),
+            )
+            .expect("research");
+        }
+
+        let report = store.import_tree(&source, &[]).expect("the tree is valid");
+        assert_eq!(report.imported, 2);
+        for (name, topic) in [("one", "technique-a"), ("two", "technique-b")] {
+            let source_path = source.join(format!("20 Research/technical/{topic}/{name}.md"));
+            let text = fs::read_to_string(&source_path).expect("source");
+            let slug = format!("technical/{topic}/{name}");
+            let hash: String = store
+                .connection()
+                .query_row(
+                    "SELECT exported_hash FROM note WHERE area = 'research' AND slug = ?1",
+                    [&slug],
+                    |row| row.get(0),
+                )
+                .expect("row");
+            assert_eq!(hash, sha256::hex(text.as_bytes()), "{slug}");
+        }
+    }
+
+    /// Restores the failpoint on `Drop`, so an assertion failure on a pooled test thread cannot arm
+    /// the next import.
+    struct ArmImport;
+
+    impl ArmImport {
+        fn after(n: usize) -> Self {
+            FAIL_IMPORT_AFTER.with(|at| at.set(n));
+            ArmImport
+        }
+    }
+
+    impl Drop for ArmImport {
+        fn drop(&mut self) {
+            FAIL_IMPORT_AFTER.with(|at| at.set(usize::MAX));
+        }
+    }
+
+    #[test]
+    fn a_failed_import_rolls_back_the_rows_it_already_wrote() {
+        let (store, root) = fresh("import-rollback");
+        let source = root
+            .parent()
+            .expect("scratch parent")
+            .join("import-rollback-source");
+        let _ = fs::remove_dir_all(&source);
+        for (name, topic) in [("one", "technique-a"), ("two", "technique-b")] {
+            let dir = source.join(format!("20 Research/technical/{topic}"));
+            fs::create_dir_all(&dir).expect("research dir");
+            fs::write(
+                dir.join(format!("{name}.md")),
+                format!(
+                    "---\ntitle: {name}\nsummary: s.\nstatus: durable\ntopic: technical/{topic}\nprovenance: measured\n---\n\nbody\n"
+                ),
+            )
+            .expect("research");
+        }
+
+        let _armed = ArmImport::after(1);
+        let error = store
+            .import_tree(&source, &[])
+            .expect_err("the failpoint fired");
+        assert!(error.to_string().contains("test: the import stopped"));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT count(*) FROM note", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "the first row survived the rollback");
+        let hashes: i64 = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM note WHERE exported_hash IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hashes, 0);
     }
 
     #[test]

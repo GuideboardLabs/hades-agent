@@ -131,8 +131,9 @@ hades — the harness, one turn or a whole graph
   hades context <goal> [--root <dir>]
       the bundle a turn would build, what fits and what was dropped
 
-  hades audit [--vault <dir>] [--db <file>] [--config <file>]
-      run the governance audit over the record, or over a tree imported into a temporary one
+  hades audit [--vault <dir>] [--db <file>] [--config <file>] [--refresh]
+      run the governance audit over the record, or over a tree imported into a temporary one;
+      --refresh imports the config's vault into the record first
 
   hades init [--non-interactive] [--config <file>] [--vault <dir>] [--root <dir>]
              [--model <preset>] [--provider <name>] [--name <name>] [--goal <text>]
@@ -3269,7 +3270,7 @@ fn sections(task: &TaskSpec, profile: &Profile, budget: usize) -> Result<Vec<Sec
 /// there is one audit implementation and a receipt can still be taken for a tree that was never
 /// opened. The temporary files are removed before the command returns.
 fn audit(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse(args, &["vault", "config", "db"])?;
+    let flags = parse_with(args, &["vault", "config", "db"], &["refresh"])?;
     let (root, explicit) = match flags.named.get("vault") {
         Some(path) => (guarded(Path::new(path))?, true),
         // The config exists so that a command with no flags can find the home `hades init` made. An
@@ -3285,6 +3286,12 @@ fn audit(args: &[String]) -> Result<(String, i32), String> {
             }
         },
     };
+    if explicit && switched(&flags, "refresh") {
+        return Err(
+            "`--refresh` applies to the record; `--vault` already imports the tree it audits"
+                .to_string(),
+        );
+    }
 
     let (db, temporary) = if explicit {
         let dir = hades_home()?.join("tmp");
@@ -3304,12 +3311,21 @@ fn audit(args: &[String]) -> Result<(String, i32), String> {
     let outcome = (|| {
         let store = mneme::SqliteStore::open(&db, &root).map_err(|fault| fault.to_string())?;
         let empty = store.is_empty().map_err(|fault| fault.to_string())?;
-        if explicit || empty {
+        // `--vault` is a read-only probe of a tree: it imports into a throwaway record and must not
+        // write the user's INDEX.md. The config's record is the one an operator builds, so a
+        // refresh there also refreshes the view, exactly as `hades mneme import` does.
+        let refreshed = !explicit && (empty || switched(&flags, "refresh"));
+        if explicit || refreshed {
             store
                 .import_tree_lenient(&root, &[])
                 .map_err(|fault| fault.to_string())?;
         }
         let vault = mneme::Vault::new(root.clone(), store, mneme::SystemClock);
+        if refreshed {
+            vault
+                .write_index(None, &[])
+                .map_err(|fault| fault.to_string())?;
+        }
         let curator = governance::Curator::new(vault, governance::SystemTimestamp);
         curator.audit().map_err(|refusal| refusal.to_string())
     })();
@@ -3941,7 +3957,7 @@ fn init(
     vault
         .init(Some((name.as_str(), goal.as_str(), topics.as_slice())))
         .map_err(|fault| format!("the vault could not be created: {fault}"))?;
-    // The record is the source and the tree is its export: init must leave five folders a person can
+    // The record is the source and the tree is its export: init must leave six folders a person can
     // open, not only rows in a database beside them.
     vault
         .store()

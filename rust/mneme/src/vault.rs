@@ -596,12 +596,20 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
     ) -> Result<PathBuf, Fault> {
         let project = match self.resolve_project(from_project)? {
             ResearchRef::Found(project) => project,
-            other => {
+            ResearchRef::Missing => {
                 return Err(Fault::InvalidNote {
                     path: self.area_path(Area::Products).display().to_string(),
-                    detail: other
-                        .reason(from_project)
-                        .unwrap_or_else(|| "that project does not exist".to_string()),
+                    detail: format!("`{from_project}` does not name an existing project"),
+                });
+            }
+            ResearchRef::Ambiguous(candidates) => {
+                return Err(Fault::InvalidNote {
+                    path: self.area_path(Area::Products).display().to_string(),
+                    detail: format!(
+                        "`{from_project}` matches {} projects: {}",
+                        candidates.len(),
+                        candidates.join(", ")
+                    ),
                 });
             }
         };

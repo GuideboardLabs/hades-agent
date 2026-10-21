@@ -262,8 +262,8 @@ pub struct Profile {
     pub id: ProfileId,
     /// What the profile may do. Enforced in the tool schema and in `execute`.
     pub role: Role,
-    /// The model this kind of work asks for. Nothing calls it yet; it is recorded now so that the choice
-    /// is in the log from the first turn instead of being bolted on after the first bad comparison.
+    /// The model this kind of work asks for. Advisory until an independent verifier is chosen; a run
+    /// uses `--model`, then the config, and records this value in the session. See HADES.md.
     pub model: String,
     pub effort: Effort,
     pub context_tokens: usize,

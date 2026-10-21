@@ -177,17 +177,25 @@ esac
 ok "the installed binary answers $VERSION_TEXT"
 
 [ -f "$TEMP_HOME/.hades/config.json" ] || fail "no config.json"
-for area in "00 Inbox" "10 Outbox" "20 Research" "30 Projects" "40 Topics"; do
+for area in "00 Inbox" "10 Outbox" "20 Research" "30 Projects" "40 Products" "50 Topics"; do
     [ -d "$TEMP_HOME/.hades/mneme/$area" ] || fail "the vault is missing $area"
 done
 [ -f "$TEMP_HOME/.hades/mneme/charter.md" ] || fail "no charter"
 [ -f "$TEMP_HOME/.hades/mneme/INDEX.md" ] || fail "no index"
 [ -d "$TEMP_HOME/work" ] || fail "the work root was not made"
-ok "init writes the config, five areas, the charter and the index"
+ok "init writes the config, six areas, the charter and the index"
 
 AUDIT=$(HOME="$TEMP_HOME" HADES_HOME="$TEMP_HOME/.hades" "$B" audit)
 has "$AUDIT" "inbox: 0" || fail "the clean audit is not clean: $AUDIT"
 ok "a clean home audits clean"
+
+set +e
+TOPIC=$(HOME="$TEMP_HOME" HADES_HOME="$TEMP_HOME/.hades" "$B" topic technical "Acceptance Probe" --summary "The clean-home probe can build a topic.")
+CODE=$?
+set -e
+[ "$CODE" -eq 0 ] || fail "the topic verb exited $CODE: $TOPIC"
+has "$TOPIC" "50 Topics/technical/acceptance-probe/index.md" || fail "the topic verb did not write the tree: $TOPIC"
+ok "the topic verb writes a topic through the store"
 
 STATUS=$(HOME="$TEMP_HOME" "$B" status --state "$TEMP_HOME/.hades")
 has "$STATUS" "daemon: none" || fail "the first status is not honest: $STATUS"

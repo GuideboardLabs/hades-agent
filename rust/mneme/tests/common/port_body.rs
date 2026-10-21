@@ -1,7 +1,7 @@
 // The porting oracle: the behaviours of the Python suite in `tests/test_hades_vault.py`, restated
 // against this crate.
 //
-// When these pass, the vault has been ported, because they pin the same contracts: five areas, a
+// When these pass, the vault has been ported, because they pin the same contracts: six areas, a
 // capture that lands in the Inbox and only there, filing that refuses an orphan and leaves it alone,
 // durability as summary plus topic plus provenance, recall by topic and project, an index that is a
 // view of the frontmatter, stale reporting, and the fence.
@@ -59,7 +59,7 @@ impl TestStore for SqliteStore {
     }
 }
 
-/// A vault with its five areas already made, which is where every test starts.
+/// A vault with its six areas already made, which is where every test starts.
 fn vault(name: &str) -> (TestVault, PathBuf) {
     let root = scratch(name);
     let vault = Vault::new(root.clone(), Store::open_at(&root), FixedClock(today()));
@@ -87,7 +87,7 @@ fn titles(notes: &[Note]) -> Vec<String> {
     notes.iter().map(Note::title).collect()
 }
 
-// ---------------- the five areas, and the charter ----------------
+// ---------------- the six areas, and the charter ----------------
 
 #[test]
 fn init_creates_the_six_areas() {
@@ -611,6 +611,23 @@ fn a_project_refuses_a_research_reference_that_does_not_exist() {
     assert!(matches!(error, Fault::InvalidNote { .. }), "{error:?}");
     assert!(
         error.to_string().contains("does not name an existing"),
+        "{error}"
+    );
+
+    let error = vault
+        .create_product(
+            "Loom 1.0",
+            "missing-project",
+            None,
+            "frozen",
+            "A release.",
+            "release",
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not name an existing project"),
         "{error}"
     );
 }

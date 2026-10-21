@@ -65,7 +65,7 @@ fn today() -> Date {
     Date::parse_iso(TODAY).expect("a fixed day")
 }
 
-/// A vault with its five areas made, under a curator with the default fences.
+/// A vault with its six areas made, under a curator with the default fences.
 fn fresh(name: &str) -> (TestCurator, PathBuf) {
     let root = scratch(name);
     let vault = Vault::new(root.clone(), Store::open_at(&root), FixedClock(today()));

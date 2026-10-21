@@ -253,6 +253,53 @@ fn mneme_upgrade_moves_the_old_topics_folder_out_of_the_vault() {
 }
 
 #[test]
+fn an_audit_refresh_sees_a_hand_edited_note() {
+    let dir = scratch("weft-audit-refresh");
+    std::fs::create_dir_all(dir.join("work")).expect("work");
+    let config = dir.join("config.json").display().to_string();
+    let vault = dir.join("mneme").display().to_string();
+    let work = dir.join("work").display().to_string();
+    let (code, text) = hades(&[
+        "init",
+        "--config",
+        &config,
+        "--vault",
+        &vault,
+        "--root",
+        &work,
+        "--non-interactive",
+    ]);
+    assert_eq!(code, 0, "{text}");
+
+    let project = dir.join("mneme/30 Projects/manual/index.md");
+    std::fs::create_dir_all(project.parent().expect("parent")).expect("project dir");
+    std::fs::write(
+        &project,
+        "---\ntitle: Manual\nsummary: A stack.\nstatus: durable\ntopic: technical/ai-inference\nresearch: [missing]\nprovenance: hand\n---\n\nbody\n",
+    )
+    .expect("project");
+
+    let (code, text) = hades(&["audit", "--config", &config]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("projects: 0"), "{text}");
+
+    let (code, text) = hades(&["audit", "--refresh", "--config", &config]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("projects: 1"), "{text}");
+    assert!(text.contains("dangling_research"), "{text}");
+    let index = std::fs::read_to_string(dir.join("mneme/INDEX.md")).expect("index");
+    assert!(index.contains("Manual"), "{index}");
+
+    let (code, text) = hades(&["audit", "--refresh", "--config", &config]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("projects: 1"), "{text}");
+
+    let (code, text) = hades(&["audit", "--refresh", "--vault", &vault]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("already imports the tree"), "{text}");
+}
+
+#[test]
 fn profiles_lists_what_the_build_ships() {
     let (code, text) = hades(&["profiles"]);
     assert_eq!(code, 0);
