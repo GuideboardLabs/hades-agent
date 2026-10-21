@@ -270,6 +270,45 @@ impl Drop for Session {
     }
 }
 
+/// The three directories a browser run owns. All of them live under `<state>/browser`, and that is checked
+/// rather than assumed: a symlink where the directory should be would otherwise put the profile, the
+/// downloads and Chromium's temp files wherever the link pointed.
+#[derive(Debug)]
+struct StatePaths {
+    profile: PathBuf,
+    downloads: PathBuf,
+    tmp: PathBuf,
+}
+
+fn state_paths(state: &Path) -> Result<StatePaths, String> {
+    let root = state.join("browser");
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("could not make {}: {error}", root.display()))?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(|error| format!("could not resolve {}: {error}", root.display()))?;
+    let under = |name: &str| -> Result<PathBuf, String> {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("could not make {}: {error}", path.display()))?;
+        let resolved = std::fs::canonicalize(&path)
+            .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
+        if !resolved.starts_with(&root) {
+            return Err(format!(
+                "{} resolves to {}, which is outside {}",
+                path.display(),
+                resolved.display(),
+                root.display()
+            ));
+        }
+        Ok(resolved)
+    };
+    Ok(StatePaths {
+        profile: under("profile")?,
+        downloads: under("downloads")?,
+        tmp: under("tmp")?,
+    })
+}
+
 impl Session {
     fn start(state: &Path) -> Result<Self, String> {
         Session::start_with(state, BrowserPolicy::deny())
@@ -277,18 +316,10 @@ impl Session {
 
     fn start_with(state: &Path, policy: BrowserPolicy) -> Result<Self, String> {
         let binary = find_chrome()?;
-        let profile = state.join("browser").join("profile");
-        let downloads = state.join("browser").join("downloads");
         // Chromium's process singleton creates a socket in its TMPDIR and aborts with "Failed to create
-        // socket directory" when that directory does not exist. Setting the variable is not the grant; the
-        // directory has to be made as well.
-        let tmp = state.join("browser").join("tmp");
-        std::fs::create_dir_all(&profile)
-            .map_err(|error| format!("could not make {}: {error}", profile.display()))?;
-        std::fs::create_dir_all(&downloads)
-            .map_err(|error| format!("could not make {}: {error}", downloads.display()))?;
-        std::fs::create_dir_all(&tmp)
-            .map_err(|error| format!("could not make {}: {error}", tmp.display()))?;
+        // socket directory" when that directory does not exist, so the paths are made here and the
+        // variable is set below. The paths are resolved and checked under `<state>/browser` first.
+        let StatePaths { profile, downloads, tmp } = state_paths(state)?;
 
         let (to_child, child_read) = UnixStream::pair()
             .map_err(|error| format!("could not make the command pipe: {error}"))?;
@@ -2919,6 +2950,23 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--no-sandbox"), "{args:?}");
         let headed = launch_args(true, false);
         assert!(!headed.contains(&"--headless=new".to_string()), "{headed:?}");
+    }
+
+    #[test]
+    fn every_browser_path_is_under_the_state_directory() {
+        let state = crate::scratch::root().join("browser-state");
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).expect("a state directory");
+        let paths = state_paths(&state).expect("state paths");
+        let root = std::fs::canonicalize(state.join("browser")).expect("the browser root");
+        for path in [&paths.profile, &paths.downloads, &paths.tmp] {
+            assert!(path.starts_with(&root), "{} escaped {}", path.display(), root.display());
+        }
+        // A symlink where one of the directories should be is refused rather than followed.
+        std::fs::remove_dir_all(root.join("downloads")).expect("remove");
+        std::os::unix::fs::symlink("/tmp", root.join("downloads")).expect("symlink");
+        let said = state_paths(&state).expect_err("a link out of the root is not a download directory");
+        assert!(said.contains("outside"), "{said}");
     }
 
     #[test]
