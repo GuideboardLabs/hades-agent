@@ -53,6 +53,15 @@ build one to wrap a workflow that a skill can already describe.
 
 ## Check
 
+Probe the server through the protocol before registering it:
+
+```bash
+python3 "$(hades skills path build-an-mcp-server)/scripts/mcp_probe.py" \
+  --tool search_notes --args '{"query": "release"}' -- python3 server.py
+```
+
+It sends `initialize`, `tools/list` and one call, validates the shape and prints the server's own error.
+
 The server answers `tools/list`, a valid call returns content, an invalid call returns a clear error, and
 `hades doctor` still passes. A tool that is advertised but not in `allow` must be refused when called.
 

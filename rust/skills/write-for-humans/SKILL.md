@@ -34,6 +34,17 @@ Good prose is not decoration. It is the shortest path from what you know to what
 - Do not stack three adjectives where one noun would do.
 - A list is for parallel items. Prose is for an argument.
 
+## Script
+
+Lint the draft for the mechanical habits:
+
+```bash
+python3 "$(hades skills path write-for-humans)/scripts/prose_lint.py" draft.md
+```
+
+It flags filler, hype, weak modifiers, em dashes and sentences over 35 words. It has no opinion on whether
+the piece is worth reading.
+
 ## Editing pass
 
 - Delete 10 percent. Then delete the sentence you are proudest of and see whether the piece still works.

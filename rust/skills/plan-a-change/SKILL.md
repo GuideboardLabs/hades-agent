@@ -30,6 +30,17 @@ A plan is a cheap way to find the wrong assumption before it costs an edit. Skip
 - Do not plan around a check you have not run once. Run it on the current tree to see the baseline.
 - Keep the plan where the work is: a note, a file, or the session. If it only exists in your head, it cannot be reviewed.
 
+## Script
+
+Lint the plan before acting on it:
+
+```bash
+python3 "$(hades skills path plan-a-change)/scripts/plan_lint.py" plan.md --json
+```
+
+It refuses a plan with no exact check command and no named file, and warns when the risk or exclusion is
+missing. It does not decide whether the plan is right.
+
 ## Pitfalls
 
 - A plan that lists every file in the repo is a survey, not a plan.

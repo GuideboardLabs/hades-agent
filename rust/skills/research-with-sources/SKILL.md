@@ -42,6 +42,17 @@ The output of research is not a longer answer. It is a smaller set of claims you
 - When sources disagree, state both and say which is newer or more authoritative.
 - Keep raw material out of the final note. Summarize the claim, keep the link, and put the transcript in an archive.
 
+## Script
+
+Check that every cited link resolves before repeating its claim:
+
+```bash
+python3 "$(hades skills path research-with-sources)/scripts/source_check.py" https://example.com/paper
+```
+
+It reports status, final URL, content type, title and publication date when the page exposes one. It does
+not read the claim for you.
+
 ## Pitfalls
 
 - A confident secondary summary that has drifted from the primary text.

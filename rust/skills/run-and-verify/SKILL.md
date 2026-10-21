@@ -35,9 +35,16 @@ For a failing check with a known error, use `repair-a-failing-check` instead.
 
 ## Check
 
-The exact command and port are named, the process was observed ready, the response or exit code is quoted,
-the negative case behaved as specified, and the process is stopped. If any step could not run, say which and
-why.
+Wait for readiness before exercising the path:
+
+```bash
+python3 "$(hades skills path run-and-verify)/scripts/wait_ready.py" --url http://127.0.0.1:8000/health \
+  --pid 12345 --timeout 30 --json
+```
+
+It polls the port or URL with a deadline and fails when the process exits. The exact command and port are
+named, the process was observed ready, the response or exit code is quoted, the negative case behaved as
+specified, and the process is stopped. If any step could not run, say which and why.
 
 ## Pitfalls
 

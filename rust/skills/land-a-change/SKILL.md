@@ -32,6 +32,17 @@ A commit is a claim about what changed. Make the claim true before writing it.
 7. **Verify the remote state.** Read back `gh pr view --json state,mergeable,statusCheckRollup` or the
    equivalent. A push that printed no error is not a green check.
 
+## Script
+
+Read the tree and the check result before staging:
+
+```bash
+python3 "$(hades skills path land-a-change)/scripts/preflight.py" --check "cargo test --workspace"
+```
+
+It prints the working tree, the staged stat, staged secret patterns and each check's real exit code. It
+never stages or commits.
+
 ## Check
 
 The commit exists on the branch, the working tree has no unintended leftovers, the pull request page shows

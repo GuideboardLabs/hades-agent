@@ -32,6 +32,17 @@ The goal is a green check for the right reason. A check that passes because it w
 - If two attempts fail for different reasons, stop and re-read the failure. The model is not the problem yet.
 - Keep a note of what you tried. A repair loop that forgets attempt one repeats it.
 
+## Script
+
+Run the check and record each attempt:
+
+```bash
+python3 "$(hades skills path repair-a-failing-check)/scripts/check_loop.py" --attempts 3 -- cargo test parser
+```
+
+The JSON form reports the exit code, duration and signature of every attempt, so a failure that moves is
+visible before anyone calls it flaky.
+
 ## Pitfalls
 
 - Caching. A stale build can hide the fix or repeat a failure that no longer exists.

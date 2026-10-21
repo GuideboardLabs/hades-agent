@@ -215,13 +215,24 @@ pub fn installed(state: &Path) -> Vec<Skill> {
     found
 }
 
-/// The seven procedures shipped in the binary and seeded into the state at init.
+/// The eleven procedures shipped in the binary and seeded into the state at init.
 pub fn builtin_dir(state: &Path) -> PathBuf {
     state.join("skills").join("builtin")
 }
 
 pub fn builtin(state: &Path) -> Vec<Skill> {
     directories_with_skill(&builtin_dir(state))
+}
+
+/// Resolve a skill by name across installed, proposed and built-in directories. Installed wins, because a
+/// person's promoted copy is the one they mean when both exist. The returned path is the SKILL.md file.
+pub fn find(state: &Path, name: &str) -> Option<Skill> {
+    for list in [installed(state), proposed(state), builtin(state)] {
+        if let Some(skill) = list.into_iter().find(|skill| skill.name == name) {
+            return Some(skill);
+        }
+    }
+    None
 }
 
 fn directories_with_skill(dir: &Path) -> Vec<Skill> {
@@ -697,5 +708,28 @@ mod tests {
         .expect("a proposal");
         reject(&state, "make-the-test-pass").expect("a rejection");
         assert!(proposed(&state).is_empty());
+    }
+
+    #[test]
+    fn find_prefers_an_installed_copy_and_falls_back_to_builtin() {
+        let state = scratch("find");
+        for at in ["skills/builtin/one", "skills/one"] {
+            std::fs::create_dir_all(state.join(at)).expect("a skill directory");
+            std::fs::write(state.join(at).join("SKILL.md"), at).expect("a skill");
+        }
+        let found = find(&state, "one").expect("the installed copy");
+        assert!(
+            found.path.ends_with("skills/one/SKILL.md"),
+            "{}",
+            found.path.display()
+        );
+        std::fs::remove_dir_all(state.join("skills/one")).expect("removed the installed copy");
+        let found = find(&state, "one").expect("the built-in copy");
+        assert!(
+            found.path.ends_with("skills/builtin/one/SKILL.md"),
+            "{}",
+            found.path.display()
+        );
+        assert!(find(&state, "missing").is_none());
     }
 }

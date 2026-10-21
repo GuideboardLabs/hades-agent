@@ -28,6 +28,17 @@ Stop before:
 5. **Wait for an explicit yes.** Silence is not consent. A previous yes for a similar action is not consent for this one.
 6. **Record what was approved.** Who said yes, to what, and when.
 
+## Script
+
+Classify a command before running it:
+
+```bash
+python3 "$(hades skills path safety-before-acting)/scripts/risk_scan.py" -- rm -rf build
+```
+
+It exits 2 for a critical or high hit, 0 for a clean command, and prints the exact pattern it matched. A
+hit means ask; it does not mean the command is wrong.
+
 ## Rules
 
 - Never put a secret in a command line, a log, a commit or a config file that is shared.

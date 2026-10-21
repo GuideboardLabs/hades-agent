@@ -37,6 +37,17 @@ Memory is a tool with a budget. A store that keeps everything answers nothing qu
 5. **Review the inbox.** A capture that has not been developed in two weeks is clutter. Promote, merge or archive it.
 6. **Re-read what you saved.** If it does not make sense without the conversation, it is not durable.
 
+## Script
+
+Check that a note is retrievable and sourced:
+
+```bash
+python3 "$(hades skills path keep-memory-useful)/scripts/note_check.py" note.md
+```
+
+It requires a summary, title, ISO date and a source field, and refuses a likely credential. It cannot tell
+whether the claim is true or whether one note holds two ideas.
+
 ## Rules
 
 - A note without a summary is a note nobody will find.

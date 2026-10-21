@@ -393,11 +393,11 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
             "type": "function",
             "function": {
                 "name": "skills",
-                "description": "List the skills available, or read one by name. A skill is a procedure worth following; read it before doing a task it covers.",
+                "description": "List the skills available, read one by name, or resolve its folder with path. A skill is a procedure worth following; read it before doing a task it covers. Its scripts live under <path>/scripts.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["list", "read"]},
+                        "action": {"type": "string", "enum": ["list", "read", "path"]},
                         "name": {"type": "string"}
                     },
                     "required": ["action"]
@@ -2670,6 +2670,16 @@ fn skills(args: &Value, world: &World) -> String {
     // One name, one skill. The directories are searched in the order the surface named them, so a
     // promoted skill in Hades' own state wins over a same-named one it inherited.
     found.dedup_by(|a, b| a.0 == b.0);
+    if action == "path" {
+        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+        let Some((_, path)) = found.iter().find(|(skill, _)| skill == name) else {
+            return format!("there is no skill called {name}");
+        };
+        return match path.parent() {
+            Some(folder) => folder.display().to_string(),
+            None => format!("{} has no folder", path.display()),
+        };
+    }
     if action == "read" {
         let name = args.get("name").and_then(Value::as_str).unwrap_or("");
         let Some((_, path)) = found.iter().find(|(skill, _)| skill == name) else {

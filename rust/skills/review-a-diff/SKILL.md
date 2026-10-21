@@ -24,6 +24,17 @@ A review is a search for the case the author did not consider. It is not a summa
 6. **Check scope.** Did the change alter something it did not need to touch?
 7. **Report with evidence.** File, line, input, and the behavior you expect. Separate a bug from a preference.
 
+## Script
+
+Read the mechanical shape of the diff before reading the code:
+
+```bash
+python3 "$(hades skills path review-a-diff)/scripts/diff_brief.py" --base main --require-tests
+```
+
+It lists changed files, line counts and test files, and exits non-zero when source changed with no test.
+It cannot tell you whether the tests prove the behavior.
+
 ## Rules
 
 - A finding without a reproduction is a suspicion. Label it.

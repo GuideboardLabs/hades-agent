@@ -173,6 +173,20 @@ Script, style, noscript, template, SVG and iframe bodies are removed before tags
 result set does not match two query terms, search falls back to DuckDuckGo's HTML endpoint through Jina
 Reader. Both the parser and the fallback are dependencies the run records, not silent assumptions.
 
+## Built-in skills carry helpers
+
+Every built-in skill ships a `scripts/` helper beside `SKILL.md`. `hades init` seeds both, and `hades
+skills seed` restores a helper that was deleted without overwriting an edited body. `hades skills path
+<name>` prints the folder, which is how a skill names its script without hardcoding a home directory:
+
+```bash
+python3 "$(hades skills path review-a-diff)/scripts/diff_brief.py" --base main --require-tests
+```
+
+The helper is for the mechanical half: validating frontmatter, running a check repeatedly, summarising a
+diff, scanning a command, waiting for readiness, probing an MCP server. The body keeps the trigger, the
+judgement and the check that a person still has to make.
+
 ## Packs
 
 A `.hadepack` is how a skill, a harness and a pinned case travel together. It is a `tar.gz` with exactly

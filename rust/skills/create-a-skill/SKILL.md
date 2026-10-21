@@ -57,6 +57,15 @@ skill is used; a reference loads only when the procedure needs it.
 
 ## Verify before calling it done
 
+Run the validator on the folder:
+
+```bash
+python3 "$(hades skills path create-a-skill)/scripts/validate_skill.py" ~/.hades/skills/release-a-build
+```
+
+It checks the frontmatter, the folder/name match, the description prefix and the body length. It does not
+judge whether the procedure is worth keeping.
+
 - `hades skills list` shows it under built-in, installed or proposed, with the expected name.
 - Read `<state>/skills/<name>/SKILL.md` and confirm the body is the procedure you wrote, not a placeholder.
 - Read the description as if you were the router: would it fire for the request that should use it, and stay

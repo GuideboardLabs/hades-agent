@@ -75,10 +75,12 @@ hades — the harness, one turn or a whole graph
       what our own finished runs say per profile: runs, pass rate, mean time, and
       what the router would pick. Rules always win; this answers only the fall-through
 
-  hades skills [list | seed | promote <name> [--force] | reject <name> | verify <name> | report]
+  hades skills [list | seed | path <name> | promote <name> [--force] | reject <name> |
+                verify <name> | report]
                [--state <dir>] [--profile <id>]
       the built-in procedures, proposals from a run that took more than one attempt, and
-      the decision to load one. A proposal needs a filled-in `contract`, at least two
+      the decision to load one. `path` prints the folder holding SKILL.md, so a helper
+      under scripts/ can be run by absolute path. A proposal needs a filled-in `contract`, at least two
       `regression` cases and one `holdout`, and a passing `skills verify` receipt before
       promotion; `--force` promotes anyway and records the warning. `skills report`
       prints proposals per 20 accepted runs and the regression pass rate of installed
@@ -2891,6 +2893,19 @@ fn skills_cmd(args: &[String]) -> Result<(String, i32), String> {
                 0,
             ))
         }
+        "path" => {
+            let name = flags
+                .positional
+                .get(1)
+                .ok_or_else(|| "path needs a skill name".to_string())?;
+            let skill = crate::skills::find(&state, name)
+                .ok_or_else(|| format!("there is no skill called {name}"))?;
+            let folder = skill
+                .path
+                .parent()
+                .ok_or_else(|| format!("{} has no folder", skill.path.display()))?;
+            Ok((format!("{}\n", folder.display()), 0))
+        }
         "promote" => {
             let name = flags
                 .positional
@@ -2910,7 +2925,7 @@ fn skills_cmd(args: &[String]) -> Result<(String, i32), String> {
             Ok((format!("rejected: {name}\n"), 0))
         }
         other => Err(format!(
-            "`skills {other}`: say list, seed, promote <name>, reject <name>, verify <name> or report"
+            "`skills {other}`: say list, seed, path <name>, promote <name>, reject <name>, verify <name> or report"
         )),
     }
 }
