@@ -142,6 +142,13 @@ With those four, the GNU artifact links, `assert-floor.sh` reports **GLIBC_2.30*
 `arm64-check.sh --require` runs it through version, doctor, init, an offline pack export/add, a second add and
 audit under qemu.
 
+Verifying the *downloaded* artifacts is a separate job with an empty cache, and that exposed two assumptions
+the build job had hidden: a dynamically linked ARM64 binary needs the ARM64 loader beside qemu, which the
+build had just staged and the verifier had not; and the workflow passes `dist/hades-arm64-gnu` relative to the
+checkout, while the pack step changes directory. The verifier now stages a runtime sysroot when it has none
+and resolves the binary to an absolute path once. Both were reproduced with an empty prefix and a relative
+path before the fix.
+
 ## 9. A config could name a vault the flags would refuse (found in review, fixed)
 
 `open_memory()` opened `config.vault` directly. Every other reader guarded it, so `audit` refused a vault that

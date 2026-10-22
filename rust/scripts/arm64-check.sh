@@ -32,6 +32,10 @@ fail() {
 }
 
 [ -f "$BIN" ] || fail "no binary at $BIN"
+# The pack step runs from a temporary directory, and the workflow passes a path relative to the checkout.
+# Resolve once so every later invocation names the same file.
+BIN=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+[ -f "$BIN" ] || fail "no binary at $BIN"
 
 # An ARM64 artifact that is not ARM64 would pass every later check on this host, because it is the host's own
 # architecture. Name the machine before running anything.
@@ -64,7 +68,37 @@ fi
 
 SYSCALL_PREFIX=()
 if ! file -b "$BIN" | grep -qE 'static-pie linked|statically linked'; then
-  SYSCALL_PREFIX=(-L "$PREFIX/root/usr/aarch64-linux-gnu")
+  # A dynamically linked ARM64 binary needs the ARM64 loader and libc beside qemu. The build job has the
+  # sysroot it just compiled against; a separate verifier starts with nothing, so stage the runtime (not the
+  # headers) here rather than passing `-L` at a directory that does not exist.
+  SYSROOT=""
+  if [ -f "$PREFIX/bullseye/lib/ld-linux-aarch64.so.1" ]; then
+    SYSROOT=$PREFIX/bullseye
+  elif [ -f "$PREFIX/runtime/lib/ld-linux-aarch64.so.1" ]; then
+    SYSROOT=$PREFIX/runtime
+  else
+    ROOT=$PREFIX/runtime
+    mkdir -p "$ROOT/debs"
+    BASE=https://deb.debian.org/debian
+    if curl -sSL --max-time 60 "$BASE/dists/bullseye/main/binary-arm64/Packages.gz" -o "$ROOT/Packages.gz" &&
+      gzip -dc "$ROOT/Packages.gz" >"$ROOT/Packages"; then
+      for package in libc6 libgcc-s1; do
+        file=$(awk -v want="$package" '/^Package: /{name=$2} name==want && /^Filename: /{print $2; exit}' "$ROOT/Packages")
+        if [ -n "$file" ] &&
+          curl -sSL --max-time 60 "$BASE/$file" -o "$ROOT/debs/$(basename "$file")" &&
+          dpkg-deb -x "$ROOT/debs/$(basename "$file")" "$ROOT" >/dev/null 2>&1; then
+          :
+        fi
+      done
+    fi
+    [ -f "$ROOT/lib/ld-linux-aarch64.so.1" ] && SYSROOT=$ROOT
+  fi
+  if [ -z "$SYSROOT" ]; then
+    [ "$REQUIRE" -eq 1 ] && fail "no ARM64 runtime sysroot for $BIN, so it was not run"
+    echo "SKIP no ARM64 runtime sysroot; $BIN was not run"
+    exit 0
+  fi
+  SYSCALL_PREFIX=(-L "$SYSROOT")
 fi
 
 run() {
