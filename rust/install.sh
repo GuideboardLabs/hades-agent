@@ -98,14 +98,88 @@ fi
 # Another agent's home and a notes vault are refused here as well as in the binary: the installer is the first
 # thing a person runs, and a refusal that comes after a binary was copied and a work root made is a refusal
 # that has already written.
-case "$HOME_DIR" in
-    "${HOME%/}/.hermes"|"${HOME%/}/.hermes/"*)
-        die "refusing $HOME_DIR: it belongs to another agent. Hades keeps its own state; pass --home <dir>" 2
-        ;;
-esac
-if [ -d "$HOME_DIR/.obsidian" ]; then
-    die "refusing $HOME_DIR: it is somebody's notes vault. Pass --home <dir>" 2
-fi
+#
+# The vault walk resolves the path first. A symlink into a vault carries no marker in its own name, and a note
+# deep in a tree carries no marker above it for the first few parents; both were misses in the binary's guard,
+# so both are checked here with the same rule: the real path, and every parent to the root.
+resolve_path() {
+    case "$1" in
+        /*) p=$1 ;;
+        *) p="$PWD/$1" ;;
+    esac
+    out=""
+    rest=${p#/}
+    hops=0
+    while [ -n "$rest" ]; do
+        comp=${rest%%/*}
+        case "$rest" in
+            */*) rest=${rest#*/} ;;
+            *) rest="" ;;
+        esac
+        case "$comp" in
+            ""|.) continue ;;
+            ..)
+                out=${out%/*}
+                continue
+                ;;
+        esac
+        candidate="$out/$comp"
+        if [ -L "$candidate" ]; then
+            hops=$((hops + 1))
+            if [ "$hops" -gt 40 ]; then
+                # A loop the kernel would refuse with ELOOP. Keep the spelling; nothing can be written through it.
+                out="$candidate"
+                continue
+            fi
+            target=$(readlink "$candidate")
+            case "$target" in
+                /*) out=""; rest="${target#/}${rest:+/$rest}" ;;
+                *) rest="$target${rest:+/$rest}" ;;
+            esac
+            continue
+        fi
+        out="$candidate"
+    done
+    printf '%s' "${out:-/}"
+}
+
+is_vault() {
+    dir=$(resolve_path "$1")
+    while :; do
+        if [ -d "$dir/.obsidian" ]; then
+            return 0
+        fi
+        [ "$dir" = "/" ] && return 1
+        parent=$(dirname "$dir")
+        [ "$parent" = "$dir" ] && return 1
+        dir=$parent
+    done
+}
+
+is_below() {
+    case "$1" in
+        "$2"|"$2"/*) return 0 ;;
+    esac
+    return 1
+}
+
+refuse_crossing() {
+    label=$1
+    dir=$2
+    if is_below "$(resolve_path "$dir")" "$AGENT_HOME"; then
+        die "refusing $dir: it belongs to another agent. Hades keeps its own state; pass a different $label" 2
+    fi
+    if is_vault "$dir"; then
+        die "refusing $dir: it is somebody's notes vault. Pass a different $label" 2
+    fi
+}
+
+AGENT_HOME=$(resolve_path "${HOME%/}/.hermes")
+refuse_crossing --home "$HOME_DIR"
+# The work root and the prefix are written too: a root made inside a vault is a refusal that has already
+# written, and a binary copied into one is worse.
+refuse_crossing --root "$ROOT"
+refuse_crossing --prefix "$PREFIX"
 
 # A half-finished init leaves a populated vault and no config. `hades init` refuses that by design, so the
 # installer names the state before it copies a binary rather than relaying a failure after one.

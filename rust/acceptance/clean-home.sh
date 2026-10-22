@@ -138,6 +138,59 @@ has "$OUT" "another agent" || fail "the crossing is not named: $OUT"
 [ ! -e "$TEMP_HOME/never" ] || fail "a refused install created its prefix"
 ok "another agent's home is refused before anything is written"
 
+# A vault is judged by its real path, and the marker is looked for at every parent. Both were misses in the
+# binary's guard and in this script: a symlink carries no marker in its name, and a deep note has none within
+# the first twelve parents.
+VAULT="$TEMP_HOME/notes-vault"
+mkdir -p "$VAULT/.obsidian" "$VAULT/Research/notes"
+set +e
+OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --home "$VAULT" --prefix "$TEMP_HOME/never4" 2>&1); CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "a marked vault exited $CODE, not 2"
+has "$OUT" "notes vault" || fail "a marked vault is not named: $OUT"
+[ ! -e "$TEMP_HOME/never4" ] || fail "a refused vault created its prefix"
+ok "a marked vault is refused before anything is written"
+
+ln -s "$VAULT/Research/notes" "$TEMP_HOME/vault-alias"
+set +e
+OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --home "$TEMP_HOME/vault-alias" --prefix "$TEMP_HOME/never5" 2>&1); CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "a symlink into a vault exited $CODE, not 2"
+has "$OUT" "notes vault" || fail "a symlink into a vault is not named: $OUT"
+[ ! -e "$TEMP_HOME/never5" ] || fail "a refused symlink created its prefix"
+ok "a symlink into a vault is refused before anything is written"
+
+DEEP="$VAULT"
+for level in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do DEEP="$DEEP/d$level"; done
+mkdir -p "$DEEP"
+set +e
+OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --home "$DEEP" --prefix "$TEMP_HOME/never6" 2>&1); CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "a deep path inside a vault exited $CODE, not 2"
+has "$OUT" "notes vault" || fail "a deep path inside a vault is not named: $OUT"
+[ ! -e "$TEMP_HOME/never6" ] || fail "a refused deep path created its prefix"
+ok "a path fourteen levels into a vault is refused before anything is written"
+
+# The work root and the prefix are written too. Both are checked before the binary is copied or `mkdir` runs.
+set +e
+OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --home "$TEMP_HOME/clean-home" \
+  --root "$VAULT/Research/notes" --prefix "$TEMP_HOME/never7" 2>&1); CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "a work root inside a vault exited $CODE, not 2"
+has "$OUT" "notes vault" || fail "a work root inside a vault is not named: $OUT"
+[ ! -e "$TEMP_HOME/never7" ] || fail "a refused work root created its prefix"
+[ ! -e "$VAULT/Research/notes/hades-work" ] || fail "a refused work root was created"
+ok "a work root inside a vault is refused before the binary is copied"
+
+set +e
+OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --home "$TEMP_HOME/clean-home2" \
+  --root "$TEMP_HOME/work-clean" --prefix "$VAULT/prefix" 2>&1); CODE=$?
+set -e
+[ "$CODE" -eq 2 ] || fail "a prefix inside a vault exited $CODE, not 2"
+has "$OUT" "notes vault" || fail "a prefix inside a vault is not named: $OUT"
+[ ! -e "$VAULT/prefix" ] || fail "a refused prefix was created"
+ok "a prefix inside a vault is refused before anything is written"
+
 set +e
 OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --with-gateway --prefix "$TEMP_HOME/never2" 2>&1); CODE=$?
 set -e
