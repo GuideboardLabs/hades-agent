@@ -3,6 +3,22 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.17
+
+Two things the first CI run found, both in the gate itself.
+
+- **The uninstall tests raced each other.** Both cases set and cleared the same process-wide variable, and cargo
+  runs a test binary's cases in parallel. On a two-core runner one case cleared the variable between the other's
+  set and its call, so the injected failure never happened and the assertion failed. It passed on a workstation
+  with more cores, which is the worst way for a test to be wrong. They are one test now, because one test cannot
+  race itself.
+- **The gate names what failed.** `cargo test` exits 101 and prints the names a thousand lines up, so the job
+  summary said "2 targets failed" and nothing else. `scripts/ci-test.sh` re-prints every failing test as a GitHub
+  annotation, which appears on the run and is readable through the API. A failure that cannot be reproduced on a
+  workstation now still says which test it was.
+
+No product code changed. 1079 tests, 12 live browser tests.
+
 ## 0.1.16
 
 The release builds itself, and refuses to publish a binary it cannot vouch for.

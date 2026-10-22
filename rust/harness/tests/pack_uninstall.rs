@@ -44,7 +44,6 @@ fn pack(work: &Path, name: &str) -> PathBuf {
 
 /// A catalog that cannot be committed must leave the files alone: a row naming a directory that is gone is a
 /// worse state than a directory nobody has removed yet.
-#[test]
 fn a_failed_catalog_commit_removes_nothing() {
     let work = std::env::temp_dir().join(format!("hades-uninstall-catalog-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
@@ -76,7 +75,6 @@ fn a_failed_catalog_commit_removes_nothing() {
 
 /// An uninstall whose event cannot be written is committed, and says so, rather than reporting a failure for
 /// something that is already done.
-#[test]
 fn an_uninstall_whose_event_failed_is_reported_as_committed() {
     let work = std::env::temp_dir().join(format!("hades-uninstall-event-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
@@ -110,4 +108,16 @@ fn an_uninstall_whose_event_failed_is_reported_as_committed() {
             .is_empty()
     );
     let _ = std::fs::remove_dir_all(&work);
+}
+
+/// One test, not two.
+///
+/// Both cases set and clear the same process-wide variable, and cargo runs the tests in a binary in parallel.
+/// With two threads the cases interleave: one clears `HADES_TEST_FAIL` between the other's set and its call, the
+/// injected failure never happens, and the assertion fails on a machine with a small core count while passing on
+/// a large one. A single test cannot race itself.
+#[test]
+fn uninstall_at_its_two_failure_boundaries() {
+    a_failed_catalog_commit_removes_nothing();
+    an_uninstall_whose_event_failed_is_reported_as_committed();
 }
