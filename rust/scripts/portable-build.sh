@@ -38,8 +38,8 @@ case "$FLAVOUR" in
   *) echo "unknown flavour: $FLAVOUR" >&2; exit 2 ;;
 esac
 
-# Default next to the checkout, not to one machine's disk: a release builder that writes to /mnt/ssd only
-# works on the machine it was written on.
+# Default next to the checkout: a release builder that writes to a path outside the repository only works on
+# the machine it was written on.
 [ -n "$OUT" ] || OUT=$ROOT/dist
 mkdir -p "$OUT"
 # Docker only accepts absolute bind sources, and `--out dist` is the natural thing to type in a checkout.

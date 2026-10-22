@@ -2,7 +2,7 @@
 # Hades, installed in one command.
 #
 # This script copies a binary, initialises a home once, writes the two systemd user units and starts the
-# daemon. It never runs sudo, never downloads anything, and never reads the live Hermes install.
+# daemon. It never runs sudo, never downloads anything, and never reads another agent's install.
 #
 # Two layouts are supported: a release tarball (`bin/hades` beside this script) and a checkout
 # (`Cargo.toml` here or one directory up), which is built with the caller's toolchain.
@@ -95,16 +95,17 @@ if [ "$WITH_GATEWAY" -eq 1 ]; then
         || die "--with-gateway needs HADES_TELEGRAM_TOKEN in the environment or in $HOME_DIR/.env" 2
 fi
 
-# The live install is refused here as well as in the binary: the installer is the first thing a person runs,
-# and a refusal that comes after a binary was copied and a work root made is a refusal that already wrote.
+# Another agent's home and a notes vault are refused here as well as in the binary: the installer is the first
+# thing a person runs, and a refusal that comes after a binary was copied and a work root made is a refusal
+# that has already written.
 case "$HOME_DIR" in
     "${HOME%/}/.hermes"|"${HOME%/}/.hermes/"*)
-        die "refusing $HOME_DIR: it is the live Hermes home. Hades keeps its own state; pass --home <dir>" 2
-        ;;
-    "${HOME%/}/Documents/ObsidianVault"|"${HOME%/}/Documents/ObsidianVault/"*)
-        die "refusing $HOME_DIR: it is the live Hermes vault. Pass --home <dir>" 2
+        die "refusing $HOME_DIR: it belongs to another agent. Hades keeps its own state; pass --home <dir>" 2
         ;;
 esac
+if [ -d "$HOME_DIR/.obsidian" ]; then
+    die "refusing $HOME_DIR: it is somebody's notes vault. Pass --home <dir>" 2
+fi
 
 # A half-finished init leaves a populated vault and no config. `hades init` refuses that by design, so the
 # installer names the state before it copies a binary rather than relaying a failure after one.

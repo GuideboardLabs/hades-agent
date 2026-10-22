@@ -3,7 +3,7 @@
 //! A port of the Python spec at `hades/curator.py`. The tests in `tests/port_oracle.rs` mirror the
 //! Python suite, and the port counts as done when those behaviours hold here unchanged.
 //!
-//! Carried over from our own OverCR work, and the reason Mneme is a substrate rather than a folder:
+//! The reason Mneme is a substrate rather than a folder:
 //! provenance on every write, exactly one writer, fences that are never read and never indexed, and an
 //! audit that reports what is wrong instead of reassuring.
 //!

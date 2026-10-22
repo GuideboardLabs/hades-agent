@@ -87,7 +87,7 @@ fn init_writes_a_config_a_vault_and_an_auditable_home() {
     );
 
     let index = std::fs::read_to_string(vault.join("INDEX.md")).expect("an index");
-    assert!(index.starts_with("# WEFT: index"), "{index}");
+    assert!(index.starts_with("# Vault: index"), "{index}");
     assert!(index.contains("No topics yet"), "{index}");
     assert!(vault.join("TAXONOMY.md").is_file(), "the taxonomy ships");
 
@@ -240,10 +240,10 @@ fn a_run_with_no_model_reads_the_preset_from_the_config() {
 }
 
 #[test]
-fn init_refuses_the_live_vault_and_writes_nothing() {
-    let home = std::env::var("HOME").expect("a home");
-    let live = PathBuf::from(home).join("Documents/ObsidianVault");
+fn init_refuses_a_notes_vault_and_writes_nothing() {
     let dir = scratch("guard");
+    let live = dir.join("notes");
+    std::fs::create_dir_all(live.join(".obsidian")).expect("a marker");
 
     let args = vec![
         "init".to_string(),
@@ -259,7 +259,7 @@ fn init_refuses_the_live_vault_and_writes_nothing() {
     let (code, text) = hades(args, "");
     assert_eq!(code, 2, "{text}");
     assert!(text.contains("refusing"), "{text}");
-    assert!(text.contains("the live Hermes vault"), "{text}");
+    assert!(text.contains("a notes vault"), "{text}");
     assert!(
         !dir.join("config.json").exists(),
         "a refused init writes nothing"

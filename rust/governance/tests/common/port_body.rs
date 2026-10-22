@@ -670,7 +670,7 @@ fn end_to_end_on_disk_with_the_real_timestamp() {
 fn scratch_base() -> std::path::PathBuf {
     // Off the source tree's disk: a full root filesystem must not be filled by a test run, and the build
     // directory is the natural place when Cargo names one. Without one, a directory under the Hades home
-    // is used rather than the machine's temp directory, which on the test host lives under the live install and
+    // is used rather than the machine's temp directory, which on some hosts lives outside the cage and
     // is refused by Hades' boundary.
     let named = std::env::var("CARGO_TARGET_DIR")
         .ok()

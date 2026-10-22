@@ -1,7 +1,7 @@
 //! The cage: what a program the harness runs is allowed to touch.
 //!
 //! The tool runs a program. Without a cage that program runs with the caller's rights, which means a model
-//! that writes `cat ~/.hermes/config.yaml` reads the API keys, and one that writes `rm -rf ~` is stopped
+//! that writes `cat ~/.aws/credentials` reads the keys, and one that writes `rm -rf ~` is stopped
 //! only if the policy asked a person first. Both are avoidable, and the mechanism that avoids them here is
 //! Landlock: an unprivileged process confines *itself*, and everything it goes on to start, to a set of
 //! paths and access rights. No root, no sysctl, no namespace.
@@ -615,7 +615,7 @@ pub fn likely_home_toolchains(home: &Path) -> Vec<PathBuf> {
 ///
 /// Asking the runtime is the only honest way: a virtual environment's interpreter is a symlink to a system
 /// binary whose standard library lives under the environment, except when it does not, which is exactly the
-/// case here (`sys.base_prefix` is inside `.hermes-runtime`, not inside `venv`). Guessing from the `PATH`
+/// case here (`sys.base_prefix` is beside the environment, not inside it). Guessing from the `PATH`
 /// entry alone found one of the two and the interpreter still died with no `encodings` module.
 ///
 /// The answer is cached for the life of the process: discovery starts a Python and asks it two questions,

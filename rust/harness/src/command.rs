@@ -64,7 +64,7 @@ pub fn run_clean(
 /// [`run_clean`] with a temporary directory the program may actually write in.
 ///
 /// A caged program that calls `tempfile` or writes `$TMPDIR/x` reads the variable the harness inherited,
-/// which points into the live install and is denied by the cage; the error then reads like a broken
+/// which points outside the cage's readable paths and is denied; the error then reads like a broken
 /// toolchain. The directory is made here, named in the environment, and expected to be granted writable by
 /// the caller's cage, which is the only arrangement in which the three agree.
 pub fn run_clean_in(
@@ -161,7 +161,7 @@ fn run_inner(
         }
     }
     // After the passlist, so it is the last word: a model's program must find a temp directory it can
-    // write in, and the one this process inherited is inside the live install that the cage denies.
+    // write in, and the one this process inherited is outside what the cage grants.
     if let Some(tmp) = tmp {
         std::fs::create_dir_all(tmp).map_err(|error| {
             Fault::harness(format!("could not make {}: {error}", tmp.display()))
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn a_caged_program_has_a_writable_tmpdir() {
         // `tempfile` and every `$TMPDIR` write read the variable the harness inherited, which points into
-        // the live install and is denied by the cage. Setting it is half the fix; the cage has to grant the
+        // outside the cage and is denied. Setting it is half the fix; the cage has to grant the
         // same directory, or the program gets a path it still cannot write.
         let state = crate::scratch::root().join("tmpdir-cage");
         let _ = std::fs::remove_dir_all(&state);

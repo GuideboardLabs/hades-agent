@@ -46,16 +46,14 @@ fn base() -> PathBuf {
         return PathBuf::from(dir).join("scratch");
     }
     let temp = std::env::temp_dir().join("hades-scratch");
-    // The live install's own tree is refused by Hades' boundary, and a test that points its state there
-    // would be asking the guard to make an exception. A temp directory inside it is therefore not
-    // usable; Hades' own home is.
+    // A path the boundary refuses cannot host a scratch directory: a test that pointed its state there would
+    // be asking the guard to make an exception. Hades' own home is used instead.
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);
-        let refused = [
-            home.join(".hermes"),
-            home.join("Documents").join("ObsidianVault"),
-        ];
-        if refused.iter().any(|guarded| temp.starts_with(guarded)) {
+        let refused = [home.join(".hermes")];
+        if crate::boundary::foreign(&temp, &home).is_some()
+            || refused.iter().any(|guarded| temp.starts_with(guarded))
+        {
             return home.join(".hades").join("test-scratch");
         }
     }

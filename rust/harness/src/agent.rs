@@ -2144,7 +2144,7 @@ fn read_file(args: &Value, world: &World) -> String {
         Err(reason) => return format!("Refused: {reason}."),
     };
     if let Some(reason) = crate::floor::protected(&path.to_string_lossy(), root) {
-        return format!("Refused: {reason}. A chat does not read the live install.");
+        return format!("Refused: {reason}. A chat does not read another agent's install.");
     }
     match std::fs::read_to_string(&path) {
         Ok(text) => clip(&text, 30000),
@@ -2183,7 +2183,7 @@ fn list_dir(args: &Value, world: &World) -> String {
         Err(reason) => return format!("Refused: {reason}."),
     };
     if let Some(reason) = crate::floor::protected(&path.to_string_lossy(), root) {
-        return format!("Refused: {reason}. A chat does not list the live install.");
+        return format!("Refused: {reason}. A chat does not list another agent's install.");
     }
     let entries = match std::fs::read_dir(&path) {
         Ok(entries) => entries,
@@ -2226,7 +2226,7 @@ fn search(args: &Value, world: &World) -> String {
         Err(said) => return said,
     };
     if let Some(reason) = crate::floor::protected(&path.to_string_lossy(), root) {
-        return format!("Refused: {reason}. A chat does not search the live install.");
+        return format!("Refused: {reason}. A chat does not search another agent's install.");
     }
     let rg = Command::new("rg")
         .arg("-n")
@@ -2609,7 +2609,7 @@ fn image(args: &Value, world: &World) -> String {
         Err(reason) => return format!("Refused: {reason}."),
     };
     if let Some(reason) = crate::floor::protected(&resolved.to_string_lossy(), &world.root) {
-        return format!("Refused: {reason}. A chat does not read the live install.");
+        return format!("Refused: {reason}. A chat does not read another agent's install.");
     }
     match crate::vision::describe(&resolved, &question) {
         Ok(said) => said,

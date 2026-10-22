@@ -28,7 +28,7 @@ impl Area {
     ];
 
     /// The folder on disk. The numbers leave room for a new door without renumbering an installed
-    /// vault, which is the one thing a clone of WEFT must get right on day one.
+    /// vault, which is the one thing a first-release vault layout must get right.
     pub fn folder(self) -> &'static str {
         match self {
             Area::Inbox => "00 Inbox",

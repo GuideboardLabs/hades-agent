@@ -28,7 +28,7 @@ journalctl --user -u hades-gateway -f
 ```
 
 A second run of `install.sh` replaces the binary and the units and leaves an existing home alone. It never
-runs `sudo`, never downloads anything, and never reads `~/.hermes`.
+runs `sudo`, never downloads anything, and never reads another agent's home.
 
 Keys live in `~/.hades/.env`, never in `config.json`. See `hades models` for the presets this build ships.
 

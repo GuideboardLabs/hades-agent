@@ -12,7 +12,7 @@ use crate::problem::{Problem, ProblemKind};
 pub struct AuditReport {
     pub counts: BTreeMap<String, usize>,
     /// Paths behind a fence: printed as a record that the boundary is where it should be, never counted as a
-    /// defect. The vault is the directory; WEFT is the part of it outside these paths, so finding one is the
+    /// defect. The vault is the directory; the audited part is what lies outside these paths, so finding one is the
     /// fence working, not the vault being wrong.
     pub fenced: Vec<Problem>,
     pub problems: Vec<Problem>,

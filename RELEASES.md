@@ -3,6 +3,23 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.21
+
+The guard stopped naming one directory.
+
+- **A vault is recognised by its marker.** The boundary used to refuse one named path in one person's home.
+  It now refuses any directory carrying an `.obsidian` folder, and everything below it, which is both a
+  broader rule and one that works on a machine it has never seen. Another agent's home is refused exactly as
+  before.
+- **The installer refuses a marked vault too**, before it copies anything, because a refusal that arrives after
+  a work root exists is a refusal that already wrote.
+- **No path or name from the development machine survives in the tree.** Build defaults, test scratch names,
+  documentation examples and the parity receipt path now describe what the code does rather than where it was
+  written. The `.gitignore` is this repository's own rather than an inherited one.
+- **Commit metadata is the project's.** Every commit in the history is authored by Guideboard Labs.
+
+1081 tests, 12 live browser tests.
+
 ## 0.1.20
 
 The portability re-audit. Six findings, all in the automation rather than the runtime.
@@ -14,8 +31,8 @@ The portability re-audit. Six findings, all in the automation rather than the ru
   and packaging ran a 0644 file. Both jobs chmod after download.
 - **The output directory is absolute before it reaches Docker.** `--out dist` was passed as a bind source, which
   Docker reads as a named volume; the binary landed in the volume and the checkout's `dist/` stayed empty.
-- **The default output directory is the checkout.** `dist/` beside the repository, not `/mnt/ssd`, which was one
-  machine's disk.
+- **The default output directory is the checkout.** `dist/` beside the repository, not a path outside it that
+  only exists on one machine.
 - **Every validated address is tried, not just the first.** Names that answer both families keep both answers,
   each attempt stays pinned to one validated address, and a refused connect moves to the next before the fetch is
   reported as failed. IPv4 is tried first because a v4-only listener behind a v6-first resolver is the common
@@ -591,7 +608,7 @@ The limits left by 0.0.11 are closed, or written down where they are decisions.
 - **An import is one transaction.** A failure after the first note rolls back every row it wrote, including the exported hash. The success path and the rollback path each have a test.
 - **`hades audit --refresh`** imports the config's vault, refreshes `INDEX.md` and audits what is on disk. It is refused with `--vault`, where the import already happens on a throwaway record.
 - **The clean-home acceptance script names six areas** and probes one creation verb, so the packaged install is checked against the vault the binary actually writes.
-- **The residual limits have a ledger** in `HADES.md`: the TUI is a chat surface, Discord is deferred, the network is per role, WEFT stays read-only, and `skills report` does not estimate unmeasured numbers.
+- **The residual limits have a ledger** in `HADES.md`: the TUI is a chat surface, Discord is deferred, the network is per role, a vault Hades did not create stays read-only, and `skills report` does not estimate unmeasured numbers.
 
 ## 0.0.11
 
@@ -606,7 +623,7 @@ The vault can be built from the command line, and its links are resolved rather 
 
 ## 0.0.10
 
-The vault is a clone of WEFT, generic and empty, with marking posts a fresh agent can navigate.
+The vault is generic and empty, with marking posts a fresh agent can navigate.
 
 - **Six areas.** `00 Inbox`, `10 Outbox` (for work that leaves the machine and, later, messages for other agents), `20 Research`, `30 Projects`, `40 Products`, `50 Topics`.
 - **Topics are a tree.** The 26 categories are fixed from Foxforge's topic types, written to `TAXONOMY.md`; a topic is general (`technical/ai-inference`) and narrower things nest beneath it (`.../kv-cache`) instead of becoming a second topic for the same ethos.

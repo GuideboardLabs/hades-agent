@@ -207,7 +207,7 @@ hades — the harness, one turn or a whole graph
       named cases. The skill defaults to <id>, found installed, proposed or built in; --dir
       packs a folder that was never installed. The summary and keywords come from SKILL.md
       unless they are given, and the id defaults to the folder's name. The pack records
-      only what it is given; it never reads the live Hermes home
+      only what it is given; it never reads another agent's home
 
   hades pack inspect <file> [--json]
       the manifest, every provided item, uncompressed bytes, archive hash, signature
@@ -405,7 +405,7 @@ hades — the harness, one turn or a whole graph
 
 Policies: open runs the program, guarded asks first and remembers the answer for the session.
 A key is named, never typed: `--key env:OLLAMA_API_KEY` or `--key OLLAMA_API_KEY` for Hades' own file,
-which is ~/.hades/.env. Hades does not read the live install's keys.
+which is ~/.hades/.env. Hades does not read another agent's keys.
 `hades init` writes ~/.hades/config.json with the provider, the model preset, the working root and the
 vault, then creates ~/.hades/mneme. A run with no --model uses the config's preset and a --model is an
 override; `--config <file>` reads a different file. Secrets never go in the config: they stay in .env.
@@ -1354,7 +1354,7 @@ fn answerer(
     Ok(Answerer::Model(open))
 }
 
-/// Where a key comes from: `env:NAME` for the environment, anything else for the file Hermes keeps on this
+/// Where a key comes from: `env:NAME` for the environment, anything else for the environment file on this
 /// machine. A key typed on the command line would land in the shell's history and in the process table, so
 /// this takes the *name* of a key and never a key.
 fn key_spec(spec: &str) -> Key {
@@ -1484,7 +1484,7 @@ fn config_path(flags: &Flags) -> Result<PathBuf, String> {
     }
 }
 
-/// Where Hades keeps its own things, and never the live install's.
+/// Where Hades keeps its own things, and never inside another agent's install.
 ///
 /// `HADES_HOME` exists for two callers: an installer that is staging a home before it moves it, and a
 /// test that must not see the home of the machine it is running on. An empty value is not a home.
@@ -1513,7 +1513,7 @@ fn guarded(path: &Path) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-/// The state directory, which is Hades' own by default and never inside the live install.
+/// The state directory, which is Hades' own by default and never inside another agent's install.
 fn state_of(flags: &Flags) -> Result<PathBuf, String> {
     match flags.named.get("state") {
         Some(dir) => guarded(Path::new(dir)),
@@ -2553,7 +2553,7 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
 
     // `hades pack export my-skill` means the skill by that name: the id is the name unless the caller says
     // otherwise, which is the common case and the one that has to work without flags.
-    // A namespaced id (`seth/empty`) is not a skill name; only a plain one is taken as the skill.
+    // A namespaced id (`team/empty`) is not a skill name; only a plain one is taken as the skill.
     if skills.is_empty()
         && dir.is_none()
         && !id.contains('/')
@@ -5275,7 +5275,7 @@ fn open_memory(flags: &Flags) -> Result<Option<MnemeMemory>, String> {
         return Ok(None);
     };
     // A named state with no vault or config of its own is an isolated install. Its record lives beside it,
-    // not in the live home: a test that points at /tmp must not recall what the live run learned. An explicit
+    // not in the home of another agent: a test that points at /tmp must not recall what a real run learned. An explicit
     // `--vault` or `--config` is a caller who named their record, and is honoured.
     let isolated = flags.named.contains_key("state")
         && !flags.named.contains_key("vault")

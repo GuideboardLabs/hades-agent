@@ -13,7 +13,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 IMAGE=ubuntu:24.04
 CPUS=2
-OUT=${OUT:-/mnt/ssd/hades-ci}
+OUT=${OUT:-${TMPDIR:-/tmp}/hades-ci}
 
 while [ $# -gt 0 ]; do
   case "$1" in

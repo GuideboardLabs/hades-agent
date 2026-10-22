@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.20-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.21-blue">
   <img alt="Tests" src="https://img.shields.io/badge/tests-1079%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.20 |
+| **Version** | 0.1.21 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -165,8 +165,8 @@ a safety-floor category.
   own entry, which is the one holding the keys, not a permanent restriction on everything it starts. A
   failure to set it stops the process, because a runtime that keeps running unsealed is a runtime that
   accepted the risk silently; `HADES_ALLOW_PTRACE=1` is the explicit way to accept it.
-- **The boundary** refuses `~/.hermes` and the live knowledge vault by default, so a coding run cannot
-  wander into the second brain.
+- **The boundary** refuses another agent's home and any notes vault by default, so a coding run cannot
+  wander into somebody's notes.
 
 The network is open or closed for a role. It is not filtered per host. That limitation is deliberate for
 now and is listed again below.
@@ -516,8 +516,8 @@ hades doctor
 - `hades-daemon.service` and `hades-gateway.service` under the user systemd directory
 
 It starts the daemon when a user systemd manager answers; the gateway starts only with `--with-gateway`,
-because it needs `HADES_TELEGRAM_TOKEN` and an allowed-users list first. It never uses `sudo`, reads
-`~/.hermes`, or fetches anything of its own.
+because it needs `HADES_TELEGRAM_TOKEN` and an allowed-users list first. It never uses `sudo`, never reads
+another agent's home, and never fetches anything of its own.
 
 ### First run
 

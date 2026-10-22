@@ -208,7 +208,7 @@ pub fn check(tool: &str, args: &Value, root: &Path) -> Option<Floor> {
 
 fn shell(command: &str, root: &Path) -> Option<Floor> {
     // Redirection is a write, and the segment it lives in is often not a write command at all:
-    // `echo key > ~/.hermes/config.yaml` reads as `echo`. The targets are checked before the command
+    // `echo key > ~/.aws/credentials` reads as `echo`. Targets are checked before the command
     // words, and a target the shell sends to a device or to another descriptor is not a file write.
     for target in redirections(command) {
         if let Some(floor) = written_path(&target, root) {
@@ -563,7 +563,7 @@ fn credential(word: &str, args: &[String], lower: &str, root: &Path) -> Option<F
             ));
         }
     }
-    // A write command's arguments are paths too, and the protected prefixes (the live install, the
+    // A write command's arguments are paths too, and the protected prefixes (another agent's install, the
     // agent's state, keys) are not on the credential list because they are not secrets: they are the
     // files whose change would rewrite the thing doing the checking.
     if matches!(
@@ -776,7 +776,7 @@ fn written_path(path: &str, root: &Path) -> Option<Floor> {
     None
 }
 
-/// The files that are not secrets but are the thing doing the checking: the live install, the agent's own
+/// The files that are not secrets but are the thing doing the checking: another install, the agent's own
 /// state, and the keys.
 ///
 /// The workspace wins: in a default install the agent's root is `~/.hades/work`, and every write inside it would
@@ -790,7 +790,7 @@ pub(crate) fn protected(path: &str, root: &Path) -> Option<String> {
     }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let checks = [
-        (".hermes", "the file is part of the live install"),
+        (".hermes", "the file belongs to another agent's install"),
         (".hades", "the file is the agent's own state"),
         (".ssh", "the file is a key or its configuration"),
     ];

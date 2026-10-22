@@ -7,7 +7,7 @@
 # `systemd-analyze verify` when that tool exists. The real supervisor is one command away and is not run by a
 # test that must not touch the machine it runs on.
 #
-# Scratch lives under rust/target/acceptance, never TMPDIR: under the live install TMPDIR points into
+# Scratch lives under rust/target/acceptance, never TMPDIR: in some homes TMPDIR points into
 # Hermes' cache, and a test that writes there has crossed the boundary the product exists to hold.
 
 set -eu
@@ -133,10 +133,10 @@ ok "a missing --bin is refused by name"
 set +e
 OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --home "$TEMP_HOME/.hermes" --prefix "$TEMP_HOME/never" 2>&1); CODE=$?
 set -e
-[ "$CODE" -eq 2 ] || fail "the live Hermes home exited $CODE, not 2"
-has "$OUT" "live Hermes home" || fail "the crossing is not named: $OUT"
+[ "$CODE" -eq 2 ] || fail "another agent's home exited $CODE, not 2"
+has "$OUT" "another agent" || fail "the crossing is not named: $OUT"
 [ ! -e "$TEMP_HOME/never" ] || fail "a refused install created its prefix"
-ok "the live Hermes home is refused before anything is written"
+ok "another agent's home is refused before anything is written"
 
 set +e
 OUT=$(HOME="$TEMP_HOME" "$PKG/install.sh" --with-gateway --prefix "$TEMP_HOME/never2" 2>&1); CODE=$?
@@ -197,11 +197,11 @@ printf '%s\n' '---' 'name: pack-skill' 'contract: acceptance' '---' '' 'Always r
 printf '%s\n' 'You are a research harness.' > "$TEMP_HOME/.hades/harness/research/system.md"
 PACK_A="$BASE/pack-a.hadepack"
 PACK_B="$BASE/pack-b.hadepack"
-OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/acceptance --from "$TEMP_HOME/.hades" \
+OUT=$(HOME="$TEMP_HOME" "$B" pack export guideboard/acceptance --from "$TEMP_HOME/.hades" \
     --skill pack-skill --profile research --title "Acceptance pack" \
     --out "$PACK_A" 2>&1) || fail "pack export failed: $OUT"
 [ -f "$PACK_A" ] || fail "pack export named no file: $OUT"
-OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/acceptance --from "$TEMP_HOME/.hades" \
+OUT=$(HOME="$TEMP_HOME" "$B" pack export guideboard/acceptance --from "$TEMP_HOME/.hades" \
     --skill pack-skill --profile research --title "Acceptance pack" \
     --out "$PACK_B" 2>&1) || fail "the second pack export failed: $OUT"
 cmp -s "$PACK_A" "$PACK_B" || fail "two pack exports differ"
@@ -223,7 +223,7 @@ printf '%s\n' '---' 'name: fit-skill' 'contract: acceptance' '---' '' 'Use the f
     > "$TEMP_HOME/.hades-source/skills/fit-skill/SKILL.md"
 printf '%s\n' 'You are a fit harness.' > "$TEMP_HOME/.hades-source/harness/fit/system.md"
 PACK_FIT="$BASE/fit.hadepack"
-OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/fit --from "$TEMP_HOME/.hades-source" \
+OUT=$(HOME="$TEMP_HOME" "$B" pack export guideboard/fit --from "$TEMP_HOME/.hades-source" \
     --skill fit-skill --profile fit --title "Fit pack" --out "$PACK_FIT" 2>&1) \
     || fail "the fit pack export failed: $OUT"
 printf '%s\n' '{"items":[{"kind":"skill","identity":"fit-skill","action":"install"},{"kind":"harness","identity":"fit","action":"install"}]}' \
@@ -240,7 +240,7 @@ has "$LIST" "fit-skill" || fail "pack list lost the installed skill: $LIST"
 has "$LIST" "harness/fit" || fail "pack list lost the installed harness: $LIST"
 ok "pack list reads the catalog"
 
-OUT=$(HOME="$TEMP_HOME" "$B" pack uninstall seth/fit --state "$TEMP_HOME/.hades" 2>&1) \
+OUT=$(HOME="$TEMP_HOME" "$B" pack uninstall guideboard/fit --state "$TEMP_HOME/.hades" 2>&1) \
     || fail "pack uninstall failed: $OUT"
 has "$OUT" "removed: 2" || fail "uninstall did not report two removals: $OUT"
 [ ! -e "$TEMP_HOME/.hades/skills/proposed/fit-skill" ] || fail "uninstall left the skill"
@@ -248,7 +248,7 @@ has "$OUT" "removed: 2" || fail "uninstall did not report two removals: $OUT"
 ok "pack uninstall removes the live copies"
 
 set +e
-OUT=$(HOME="$TEMP_HOME" "$B" pack export seth/empty --from "$TEMP_HOME/.hades" --out "$BASE/empty.hadepack" 2>&1); CODE=$?
+OUT=$(HOME="$TEMP_HOME" "$B" pack export guideboard/empty --from "$TEMP_HOME/.hades" --out "$BASE/empty.hadepack" 2>&1); CODE=$?
 set -e
 [ "$CODE" -eq 2 ] || fail "a selector-less export exited $CODE, not 2"
 has "$OUT" "at least one" || fail "a selector-less export is not refused by name: $OUT"
@@ -349,14 +349,15 @@ AFTER=$( cd "$PKG" && find . -type f -exec sha256sum {} + | sort )
 [ "$BEFORE" = "$AFTER" ] || fail "the install wrote into the package tree"
 ok "the install writes nothing into the package tree"
 
-# 7. The guard still holds in a home that has never seen the live install.
+# 7. The guard still holds in a home that has never held another agent's install.
 set +e
-GUARD=$(HOME="$TEMP_HOME" "$B" audit --vault "$TEMP_HOME/Documents/ObsidianVault" 2>&1)
+mkdir -p "$TEMP_HOME/notes/.obsidian"
+GUARD=$(HOME="$TEMP_HOME" "$B" audit --vault "$TEMP_HOME/notes" 2>&1)
 GUARD_CODE=$?
 set -e
 [ "$GUARD_CODE" -eq 2 ] || fail "the guard exit was $GUARD_CODE, not 2"
-has "$GUARD" "the live Hermes vault" || fail "the guard did not name the live vault: $GUARD"
-ok "the live Hermes vault is refused in a clean home"
+has "$GUARD" "a notes vault" || fail "the guard did not name the vault: $GUARD"
+ok "a notes vault is refused in a clean home"
 
 # 8. The supervisor is the optional half: a manager that answers but refuses to enable must not turn a
 # complete install into a failed one.

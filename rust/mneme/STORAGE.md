@@ -151,7 +151,7 @@ returns notes for a goal cut at a token count. `NoteStore` retires from the engi
 export writer, because writing markdown is still a file operation.
 
 Not in this decision: embeddings or vector search, retirement of notes, ranking beyond FTS5 bm25, the
-session log, and any migration of WEFT.
+session log, and any migration of an existing vault.
 
 ## Cost
 

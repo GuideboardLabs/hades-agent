@@ -1,27 +1,25 @@
 # Hades
 
-A distilled harness, built as a successor to Hermes Agent and exercised against a live installation.
+A distilled harness, derived from Hermes Agent and rebuilt in Rust.
 
 Hades is a conscious reduction of the Hermes Agent harness: its tool loop, skills, session shape, gateway
 and memory seam, rebuilt in Rust. The terminal coding-agent pattern it follows was made familiar by Claude
 Code and the Codex CLI; Hades wraps neither. It builds on Linux Landlock for isolation and SQLite FTS5 for
 memory. Its lineage and the upstream MIT notice are in `NOTICE`.
 
-**Nothing here touches the running Hermes install.** Not its vault, not its config, not its keys, not its
-sessions, not its cache. The relationship is *cloning with tweaks*, never *moving over*: the tree started as a
-copy and the Rust harness is new work, but at run time the two systems share no path and no state.
-
-That is a rule with a guard behind it, not a convention to remember.
+**Everything Hades writes is its own.** Its home, its state, its keys and its notes live under `~/.hades` and
+nowhere else. It never reads another agent's install and never writes into somebody's notes vault. That is a
+rule with a guard behind it, not a convention to remember.
 
 ## Own everything
 
-| Thing | Where | Never |
-|---|---|---|
-| state (sessions, approvals, snapshots, map cache) | `~/.hades` | `~/.hermes/**` |
-| Mneme, the memory record (SQLite, FTS5 recall) | `~/.hades/mneme.db` | `~/Documents/ObsidianVault/**` |
-| Mneme's markdown export (six areas, `charter.md`, `TAXONOMY.md`, generated `INDEX.md`) | `~/.hades/mneme` | `~/Documents/ObsidianVault/**` |
-| keys | `~/.hades/.env` or the environment | `~/.hermes/.env` |
-| short-lived files | `~/.hades/tmp` | the caller's `TMPDIR` when it belongs to the other system |
+| Thing | Where |
+|---|---|
+| state (sessions, approvals, snapshots, map cache) | `~/.hades` |
+| Mneme, the memory record (SQLite, FTS5 recall) | `~/.hades/mneme.db` |
+| Mneme's markdown export (six areas, `charter.md`, `TAXONOMY.md`, generated `INDEX.md`) | `~/.hades/mneme` |
+| keys | `~/.hades/.env` or the environment |
+| short-lived files | `~/.hades/tmp` |
 
 The record is the database; the folder is its export, written on capture and on filing and rebuilt with
 `hades mneme export`. Recall reads `mneme.db`, never the tree, so hand edits reach memory only through
@@ -256,7 +254,7 @@ cd hades-<version>-x86_64-unknown-linux-gnu
 
 The installer copies `~/.local/bin/hades`, runs `hades init --non-interactive` once, writes
 `~/.config/systemd/user/hades-daemon.service` and `hades-gateway.service`, and, when a user systemd manager
-answers, reloads it and enables the daemon. It never runs `sudo` and never touches `~/.hermes`. A second run
+answers, reloads it and enables the daemon. It never runs `sudo` and never touches another agent's home. A second run
 replaces the binary and the units and leaves an existing home alone; `--prefix`, `--home`, `--root`,
 `--no-init`, `--no-service`, `--no-start` and `--with-gateway` are the ways out.
 
@@ -276,17 +274,20 @@ empty home with a recording `systemctl`, starts and shuts the daemon down, and c
 
 ## The guard
 
-`hades::boundary` refuses the live paths by name, for every command that takes a directory:
+`hades::boundary` refuses two kinds of path, for every command that takes a directory:
+
+- **a notes vault**, recognised by the `.obsidian` folder such a tree carries. It is somebody's notebook, and
+  a harness that writes into one is not keeping to its own directory.
+- **another agent's home**, `~/.hermes`, which holds that install's config, keys, sessions and cache.
 
 ```
-$ hades audit --vault ~/Documents/ObsidianVault
-refusing the live Hermes vault inside a home directory: that is the live vault (the second brain, fences and all).
-Hades has its own vault and state, and pointing it here is the one thing the separation exists to prevent
+$ hades audit --vault ~/notes
+refusing /home/someone/notes: it is a notes vault (the directory carries an .obsidian folder). Hades keeps
+its own home and its own state, and pointing it here is the one thing that separation exists to prevent
 ```
 
-Exit code 2, and no fallback. Paths are compared by parts after `.` and `..` are resolved, so
-`ObsidianVault-notes` is somebody else's directory and is not refused; a symlink or a relative path does not
-walk around the rule.
+Exit code 2, and no fallback. Paths are compared by parts after `.` and `..` are resolved, so a directory that
+merely shares the name is not refused; a symlink or a relative path does not walk around the rule.
 
 The model does not name a program for an MCP server. `mcp.json` lists servers and, optionally, an allowlist
 of runtimes (`npx`, `bunx`, `uvx`, `python3`, `node`, `deno` by default). A server's program is matched by
@@ -691,21 +692,19 @@ the JSON; the file endpoints are the only place it travels.
 
 `rust/` is the harness: `session-tree` (append-only logs), `vault` (notes and fences), `governance` (audit and
 curation), `harness` (turn, graph, daemon, CLI, and the failure corpus in `cases.rs` and `eval.rs`). The
-Python under `agent/`, `hermes_state*.py` and the rest is
+Python under `agent/`, the state modules and the rest is
 the copy the tree started from, kept as a reference for behaviour that was ported. The executable spec for the
 substrate is the Python; the engine is the Rust.
 
-Tests run inside `rust/target/scratch`, never the machine's temp directory, because under the live install
-`TMPDIR` points into that install's cache and a test that writes there has crossed the same boundary the guard
-protects.
+Tests run inside `rust/target/scratch`, never the machine's temp directory, because a `TMPDIR` that points
+into a refused tree would ask the guard to make an exception for the test suite.
 
 ## Not yet
 
-Hades installs and is supervised now, but it is still a project under construction rather than the main
-place. It does not read or write WEFT: its vault is its own, and the fences it carries are its own. The
-Telegram gateway runs against a real bot, and Discord is the one transport still not built. When Hades
-becomes the main place, that is a decision with a migration in it, not something that happens by pointing
-one flag at a path.
+Hades installs and is supervised, but it is a project under construction. It reads and writes only its own
+vault, and the areas it marks are its own. The Telegram gateway runs against a real bot; Discord is the one
+transport still not built. A vault it has not created is somebody else's, and the guard is what keeps that
+true.
 
 ## Residual limits
 
@@ -748,6 +747,6 @@ These are decisions, not omissions. Each has a reason and the seam it would chan
 - **Social artifact extraction reads the first external link, not the author's intent.** A post that links
   a profile, an unrelated page or nothing visible fails the gate; a post whose artifact is behind a login
   or a shortener that does not expand also fails. The post itself is never evidence.
-- **Hades writes only its own vault.** WEFT is read by its owner, not by Hades; `mneme export` is the
-  one-way path.
+- **Hades writes only its own vault.** Another vault belongs to whoever made it; `mneme export` is the
+  one-way path out.
 - **`skills report` says which numbers are unmeasured.** It does not estimate them.

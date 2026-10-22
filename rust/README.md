@@ -38,8 +38,8 @@ only a write with none.
 
 Both ports were also diffed against the Python directly, over the same operation sequence, with `diff -r`
 and a sha256 per file: four files for the vault, five for the vault plus governance, all identical, the
-generated index and a curated note included. Receipts in `~/.hermes/vault-archive/parity-20261017/`,
-which also records that the Python's own audit, pointed at the Rust-built tree, reports the same counts.
+generated index and a curated note included. The parity run also records that the Python's own audit, pointed
+at the Rust-built tree, reports the same counts.
 
 ## Toolchain
 
@@ -148,9 +148,8 @@ namespace.
 - What it is not, said rather than implied: it does not hide anything (a denied path exists and the program
   gets `EACCES`, not `ENOENT`), it does not confine UDP or raw sockets, and it does not make `/proc` lie.
 
-The tests are pairs: the same program, the same tree, once caged and once not. Caged, `cat ~/.hermes/
-config.yaml` says "Permission denied"; without the cage the same program prints the provider and the model
-name out of it. That pair is the evidence, because a refusal on its own could be a broken path.
+The tests are pairs: the same program, the same tree, once caged and once not. Caged, `cat ~/.aws/credentials`
+says "Permission denied"; without the cage the same program prints the key out of it. That pair is the evidence, because a refusal on its own could be a broken path.
 
 One consequence worth knowing: a toolchain installed under your home directory is not reachable from inside
 the cage, which is why the check runs uncaged. The cage is for what the model wrote.

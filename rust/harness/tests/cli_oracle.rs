@@ -109,7 +109,7 @@ fn the_binary_says_which_version_it_is() {
 
 #[test]
 fn the_vault_can_be_built_from_the_cli() {
-    let dir = scratch("weft-create");
+    let dir = scratch("vault-create");
     std::fs::create_dir_all(dir.join("work")).expect("work");
     let config = dir.join("config.json").display().to_string();
     let vault = dir.join("mneme").display().to_string();
@@ -218,7 +218,7 @@ fn the_vault_can_be_built_from_the_cli() {
 
 #[test]
 fn an_audit_reports_a_dangling_research_reference_instead_of_aborting() {
-    let dir = scratch("weft-dangling");
+    let dir = scratch("vault-dangling");
     std::fs::create_dir_all(dir.join("work")).expect("work");
     let config = dir.join("config.json").display().to_string();
     let vault = dir.join("mneme").display().to_string();
@@ -250,7 +250,7 @@ fn an_audit_reports_a_dangling_research_reference_instead_of_aborting() {
 
 #[test]
 fn mneme_upgrade_moves_the_old_topics_folder_out_of_the_vault() {
-    let dir = scratch("weft-upgrade");
+    let dir = scratch("vault-upgrade");
     std::fs::create_dir_all(dir.join("work")).expect("work");
     let config = dir.join("config.json").display().to_string();
     let vault = dir.join("mneme").display().to_string();
@@ -289,7 +289,7 @@ fn mneme_upgrade_moves_the_old_topics_folder_out_of_the_vault() {
 
 #[test]
 fn an_audit_refresh_sees_a_hand_edited_note() {
-    let dir = scratch("weft-audit-refresh");
+    let dir = scratch("vault-audit-refresh");
     std::fs::create_dir_all(dir.join("work")).expect("work");
     let config = dir.join("config.json").display().to_string();
     let vault = dir.join("mneme").display().to_string();
@@ -800,18 +800,17 @@ fn the_audit_runs_over_a_vault_and_reports_what_it_found() {
     );
 }
 
-/// Hades is a second system. It refuses the live install's paths by name rather than trusting whoever typed
-/// the command to remember, and the refusal says why.
+/// The guard refuses a marked vault and another agent's home by path rather than trusting whoever typed the
+/// command to remember, and the refusal says why.
 #[test]
-fn the_live_hermes_paths_are_refused() {
+fn the_guarded_paths_are_refused() {
     let home = PathBuf::from(std::env::var("HOME").expect("a home"));
-    let live_vault = home.join("Documents/ObsidianVault");
-    if live_vault.exists() {
-        let (code, text) = hades(&["audit", "--vault", &live_vault.display().to_string()]);
-        assert_eq!(code, 2, "{text}");
-        assert!(text.contains("live Hermes vault"), "{text}");
-        assert!(text.contains("its own vault and state"), "{text}");
-    }
+    let vault = scratch("guarded-vault");
+    std::fs::create_dir_all(vault.join(".obsidian")).expect("a marker");
+    let (code, text) = hades(&["audit", "--vault", &vault.display().to_string()]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("a notes vault"), "{text}");
+    assert!(text.contains("its own home and its own state"), "{text}");
 
     let live_home = home.join(".hermes");
     if live_home.exists() {
@@ -822,9 +821,9 @@ fn the_live_hermes_paths_are_refused() {
         ]);
         assert_eq!(
             code, 2,
-            "a state directory inside the live install is refused: {text}"
+            "a state directory inside another agent's home is refused: {text}"
         );
-        assert!(text.contains("live Hermes home"), "{text}");
+        assert!(text.contains("another agent's home"), "{text}");
     }
 }
 

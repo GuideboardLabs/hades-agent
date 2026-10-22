@@ -1,6 +1,6 @@
 //! The index: a view of the frontmatter, so it can never drift from it.
 //!
-//! It reads like a WEFT map: the spine first (topics by category), then the work that hangs off it
+//! It reads like a knowledge map: the spine first (topics by category), then the work that hangs off it
 //! (research by topic), then what a project became (products), then the two queues. Markers are
 //! signage and are left out, so a fresh clone reads as empty rather than as six fake notes.
 
@@ -55,7 +55,7 @@ pub fn render(
     }
 
     let mut lines: Vec<String> = vec![
-        "# WEFT: index".to_string(),
+        "# Vault: index".to_string(),
         String::new(),
         format!("Generated {generated} from note frontmatter. Do not edit."),
         String::new(),

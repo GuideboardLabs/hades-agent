@@ -1,26 +1,27 @@
-//! The two systems, kept apart.
+//! Paths Hades refuses, because they belong to something else.
 //!
-//! Hades is a second system, not a second front end for the first. It has its own vault, its own state
-//! directory and its own keys, and it is built to be tested on a machine where none of the first one exists.
-//! One day it may be the main place. Until that is a decision rather than a hope, it must not read or write
-//! anything the running Hermes install uses, and the cheapest way to hold that is to refuse the paths by
-//! name rather than remember not to pass them.
+//! A run gets its own home, its own state and its own keys. Two places are somebody else's, and the cheapest
+//! way to keep them out is to refuse them by path rather than remember not to pass them:
 //!
-//! What is refused, and why each one is the whole point:
+//! - **a notes vault**, recognised by the `.obsidian` folder such a directory carries. It is a person's notes;
+//!   a harness that writes into one while claiming to keep to its own directory has already crossed the line.
+//! - **another agent's home**, `~/.hermes`. Reading it for a key is the most tempting crossing of all, and the
+//!   one that quietly makes this install depend on a different one.
 //!
-//! - `~/Documents/ObsidianVault`: the live second brain. It holds fenced personal material, and a harness
-//!   that reads it while claiming to be a separate system has already crossed the fence.
-//! - `~/.hermes`: the live install's config, keys, sessions and cache. Reading it for a key is the most
-//!   tempting crossing of all, and the one that quietly makes Hades depend on the machine it is replacing.
-//!
-//! A path is compared by its parts after `.` and `..` are resolved, never by substring: `ObsidianVault-notes`
-//! is somebody else's directory and refusing it would teach people to work around the guard.
+//! A path is compared by its parts after `.` and `..` are resolved, never by substring: `Notes-notes` is not
+//! `Notes`, and refusing by substring would teach people to work around the guard.
 
 use std::path::{Component, Path, PathBuf};
 
-/// Where the live install keeps its things, relative to the home directory.
-pub const HERMES_VAULT: &str = "Documents/ObsidianVault";
-pub const HERMES_HOME: &str = ".hermes";
+/// Another agent's home, relative to the home directory.
+pub const OTHER_AGENT_HOME: &str = ".hermes";
+
+/// The folder that marks a directory tree as somebody's notes vault.
+pub const VAULT_MARKER: &str = ".obsidian";
+
+/// How far up from a path the vault marker is looked for. A note lives some levels below the vault root, and a
+/// walk that does not stop is a walk that reads every parent on the machine.
+const VAULT_DEPTH: usize = 12;
 
 /// What a path would be crossing, or `None` when it is Hades' own business.
 ///
@@ -28,29 +29,38 @@ pub const HERMES_HOME: &str = ".hermes";
 /// directory, and so a caller that has already resolved one does not resolve it twice.
 pub fn foreign(path: &Path, home: &Path) -> Option<&'static str> {
     let path = clean(path, home);
-    for (relative, reason) in [
-        (
-            HERMES_VAULT,
-            "the live Hermes vault (the second brain, fences and all)",
-        ),
-        (
-            HERMES_HOME,
-            "the live Hermes home (config, keys, sessions, cache)",
-        ),
-    ] {
-        let guarded = clean(&home.join(relative), home);
-        if path == guarded || path.starts_with(&guarded) {
-            return Some(reason);
-        }
+
+    let other = clean(&home.join(OTHER_AGENT_HOME), home);
+    if path == other || path.starts_with(&other) {
+        return Some("another agent's home (config, keys, sessions, cache)");
     }
+
+    if inside_a_vault(&path) {
+        return Some("a notes vault (the directory carries an .obsidian folder)");
+    }
+
     None
+}
+
+/// Whether the path, or one of its parents, is marked as a vault. The path itself need not exist: a `--state`
+/// directory about to be created under a vault is exactly the case this has to catch.
+fn inside_a_vault(path: &Path) -> bool {
+    let mut current = Some(path);
+    for _ in 0..VAULT_DEPTH {
+        let Some(dir) = current else { break };
+        if dir.join(VAULT_MARKER).is_dir() {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
 }
 
 /// The reason a path is refused, as the sentence a person reads.
 pub fn refusal(path: &Path, reason: &str) -> String {
     format!(
-        "refusing {}: it is {reason}. Hades has its own vault and state, and pointing it here is the one \
-         thing the separation exists to prevent",
+        "refusing {}: it is {reason}. Hades keeps its own home and its own state, and pointing it here is the \
+         one thing that separation exists to prevent",
         path.display()
     )
 }
@@ -89,13 +99,43 @@ mod tests {
         PathBuf::from("/home/someone")
     }
 
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hades-boundary-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        dir
+    }
+
     #[test]
-    fn the_live_vault_and_the_live_home_are_refused() {
+    fn another_agents_home_is_refused() {
         let home = home();
-        assert!(foreign(&home.join(HERMES_VAULT), &home).is_some());
-        assert!(foreign(&home.join(HERMES_VAULT).join("20-29 Research"), &home).is_some());
-        assert!(foreign(&home.join(HERMES_HOME), &home).is_some());
+        assert!(foreign(&home.join(OTHER_AGENT_HOME), &home).is_some());
         assert!(foreign(&home.join(".hermes/.env"), &home).is_some());
+    }
+
+    #[test]
+    fn a_marked_vault_and_everything_below_it_is_refused() {
+        let root = scratch("vault");
+        std::fs::create_dir_all(root.join(".obsidian")).expect("a marker");
+        std::fs::create_dir_all(root.join("Research/notes")).expect("a note");
+        assert!(foreign(&root, &root).is_some(), "the vault root");
+        assert!(
+            foreign(&root.join("Research/notes"), &root).is_some(),
+            "a note"
+        );
+        assert!(
+            foreign(&root.join("Research/notes/new.md"), &root).is_some(),
+            "a note that does not exist yet"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_marked_is_not_a_vault() {
+        let root = scratch("plain");
+        std::fs::create_dir_all(root.join("Documents/Notes-notes")).expect("a lookalike");
+        assert!(foreign(&root.join("Documents/Notes-notes"), &root).is_none());
+        assert!(foreign(&root.join("projects/hades"), &root).is_none());
     }
 
     #[test]
@@ -103,16 +143,6 @@ mod tests {
         let home = home();
         assert!(foreign(&home.join(".hades"), &home).is_none());
         assert!(foreign(&home.join(".hades/mneme"), &home).is_none());
-        assert!(foreign(&home.join("projects/hades"), &home).is_none());
-    }
-
-    #[test]
-    fn a_lookalike_name_is_not_the_guarded_path() {
-        let home = home();
-        assert!(
-            foreign(&home.join("Documents/ObsidianVault-notes"), &home).is_none(),
-            "a substring is not a path"
-        );
         assert!(foreign(&home.join(".hermes-notes"), &home).is_none());
     }
 
@@ -121,8 +151,6 @@ mod tests {
         let home = home();
         let sneak = home.join(".hades/../.hermes");
         assert!(foreign(&sneak, &home).is_some(), "{}", sneak.display());
-        let vault = home.join("Documents/ObsidianVault/../ObsidianVault/21 Agent Memory");
-        assert!(foreign(&vault, &home).is_some());
     }
 
     #[test]
