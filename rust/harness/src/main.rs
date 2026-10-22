@@ -3,6 +3,12 @@
 
 fn main() {
     use std::io::IsTerminal;
+    // Before anything reads a key or takes a model call: a program this process runs must not be able to
+    // read the environment back out of /proc. Failing to seal is not fatal (an old kernel may not offer
+    // it), but it is reported once rather than assumed.
+    if let Err(error) = harness::cage::seal_environment() {
+        eprintln!("hades: {error}");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if (args.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
         || args

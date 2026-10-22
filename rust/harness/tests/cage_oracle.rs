@@ -412,3 +412,65 @@ fn scratch_base() -> std::path::PathBuf {
     std::fs::create_dir_all(&base).ok();
     std::fs::canonicalize(&base).unwrap_or(base)
 }
+
+/// A caged command gets a cleared environment, but `/proc/<parent>/environ` is a file the cage grants.
+/// Sealing the process is what keeps that read from reaching the parent's keys.
+///
+/// Yama decides whether the read was ever possible: with `ptrace_scope` above 0 a child may not read its
+/// parent's entry, so on such a host the seal is a second lock rather than the only one. The test asserts
+/// the mechanism either way, and asserts the observable difference where the kernel allows it.
+#[test]
+fn a_caged_child_cannot_read_the_parents_environment() {
+    // Putting the process back is not optional: a panic between seal and unseal would leave the rest of
+    // the suite non-dumpable.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = harness::cage::unseal_environment();
+        }
+    }
+
+    let root = scratch_base().join(format!("seal-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("a root");
+    let cage = Cage::around(&root);
+    // `PATH` is in the environment the process was started with, and is not a variable this test sets:
+    // `/proc/<pid>/environ` reports the environment at exec, so a value set later would not be there.
+    let program = "tr '\\0' '\\n' < /proc/$PPID/environ | grep -c '^PATH='";
+    let read = || {
+        harness::command::run_within(program, &root, 8192, Some(&cage), None)
+            .expect("run")
+            .output
+    };
+
+    assert!(
+        !harness::cage::is_sealed(),
+        "the test process was already sealed before the test could prove the change"
+    );
+    let before = read();
+    let readable_before = before.lines().any(|line| line.trim() == "1");
+
+    let _restore = Restore;
+    harness::cage::seal_environment().expect("seal");
+    assert!(harness::cage::is_sealed(), "the seal did not take");
+
+    let after = read();
+    assert!(
+        !after.lines().any(|line| line.trim() == "1"),
+        "a caged child read the parent's environment after sealing: {}",
+        after
+    );
+
+    if readable_before {
+        // This host allows the read, so the difference above is the proof.
+    } else {
+        // This host's Yama setting already denied it; the seal is the portable half.
+        assert!(
+            before.to_ascii_lowercase().contains("denied")
+                || before.lines().any(|line| line.trim() == "0"),
+            "the read failed for a reason this test does not understand: {}",
+            before
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}

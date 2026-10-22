@@ -132,24 +132,88 @@ fn ensure_server() -> Result<(), String> {
         .arg("4096")
         .arg("-ngl")
         .arg("99")
-        .env("GGML_VK_DISABLE_HOST_VISIBLE_VMEM", "1")
+        // The name is llama.cpp's, not a spelling of ours: `VIDMEM`, and the typo cost nothing at
+        // compile time and everything at run time.
+        .env("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM", "1")
         .arg("--no-warmup")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("could not start {binary}: {error}"))?;
-    *held = Some(child);
+    let mut child = child;
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(240) {
+    let mut checked_unit = Instant::now();
+    loop {
         if healthy() {
+            *held = Some(child);
             return Ok(());
+        }
+        // `systemd-run` exits as soon as the transient unit is started, so a non-zero status here is the
+        // launch itself failing: no user manager, no binary, a rejected property. Waiting four minutes
+        // for a server that was never started is the bug this replaces.
+        if let Ok(Some(status)) = child.try_wait() {
+            let said = child
+                .stderr
+                .take()
+                .and_then(|mut pipe| {
+                    use std::io::Read;
+                    let mut text = String::new();
+                    pipe.read_to_string(&mut text).ok().map(|_| text)
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "the vision server was not started: systemd-run exited {}: {}",
+                status.code().unwrap_or(-1),
+                clip(said.trim(), 300)
+            ));
+        }
+        // The unit can also fail after `systemd-run` returns; asking systemd is cheaper than waiting out
+        // the clock, and its last lines say why.
+        if checked_unit.elapsed() >= Duration::from_secs(15) {
+            checked_unit = Instant::now();
+            if let Some(reason) = unit_failure() {
+                let _ = child.kill();
+                return Err(reason);
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(240) {
+            let _ = child.kill();
+            return Err("the vision server did not become healthy in four minutes".to_string());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    if let Some(mut child) = held.take() {
-        let _ = child.kill();
+}
+
+/// Why the vision unit is not running, in systemd's own words, or `None` while it is starting or up.
+fn unit_failure() -> Option<String> {
+    let failed = Command::new("systemctl")
+        .args(["--user", "is-failed", "hades-vision"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !failed.success() {
+        return None;
     }
-    Err("the vision server did not become healthy in four minutes".to_string())
+    let said = Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            "hades-vision",
+            "-n",
+            "5",
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    Some(format!(
+        "the vision unit failed to start: {}",
+        clip(&said, 400)
+    ))
 }
 
 fn healthy() -> bool {

@@ -432,6 +432,14 @@ the same text after quoted spans are stripped, which catches `rm -rf` typed out 
 `sh -c 'r''m -rf /'`; the receipt says `strict deny list` for the same reason. Anything that needs a real
 boundary needs the cage, or a container around it.
 
+The cage grants `/proc` in both modes, because ordinary tools read `/proc/cpuinfo` and `/proc/self` and a
+runtime that hides them breaks more than it protects. A cleared environment is therefore not enough on its
+own: `/proc/<parent>/environ` is a file like any other, and a same-user child could read the keys the
+runtime was started with. The runtime makes itself non-dumpable at startup (`PR_SET_DUMPABLE`), which closes
+that read for the whole process tree, and `HADES_ALLOW_PTRACE=1` is the way back in when a debugger is the
+tool that is needed. On a host whose Yama `ptrace_scope` already refuses a child reading its parent, the seal
+is a second lock rather than the only one.
+
 ## Work that runs itself
 
 A job is a standing goal file under `<state>/jobs`, one file per job, and the file is the record. The body

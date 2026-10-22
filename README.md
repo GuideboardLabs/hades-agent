@@ -154,6 +154,9 @@ a safety-floor category.
 - **A run that died leaves a marker.** `<state>/inflight/<session>.json` is written when a run starts and
   removed when it ends, so `hades status` and `hades doctor` can report `interrupted: N` with the session,
   the run, the start time and the goal. Nothing is replayed automatically.
+- **The process seals itself.** `PR_SET_DUMPABLE` is cleared at startup, so a caged child cannot read the
+  runtime's own environment out of `/proc/<parent>/environ`; a cleared child environment is not enough on
+  its own. `HADES_ALLOW_PTRACE=1` opts out for a debugger.
 - **The boundary** refuses `~/.hermes` and the live knowledge vault by default, so a coding run cannot
   wander into the second brain.
 

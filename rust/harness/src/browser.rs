@@ -2629,10 +2629,40 @@ impl Session {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
         }
-        std::fs::write(&path, bytes)
-            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        write_no_follow(&path, &bytes)?;
         Ok(format!("saved to {}", path.display()))
     }
+}
+
+/// Write a screenshot without following a symlink at the final name.
+///
+/// `resolve_shot` refuses traversal and a symlink it can see, but a link can be created between that check
+/// and the write. `O_NOFOLLOW` makes the refusal the kernel's decision rather than a second check.
+fn write_no_follow(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::io::FromRawFd as _;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "the screenshot path contains a NUL".to_string())?;
+    // SAFETY: `open` with a NUL-terminated path we own; the descriptor is checked before it is wrapped.
+    let descriptor = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if descriptor < 0 {
+        return Err(format!(
+            "could not write {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the descriptor is open for writing and is owned by this `File` from here on.
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.write_all(bytes)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 /// The flags Chromium is started with.
@@ -2739,7 +2769,26 @@ fn resolve_shot(state: &Path, requested: Option<&str>) -> Result<PathBuf, String
             {
                 return Err(REFUSED.to_string());
             }
-            shots.join(relative)
+            let path = shots.join(relative);
+            // A subdirectory can be a symlink even when every component is a plain name: resolve the
+            // parent and keep the result inside the shots directory.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+                let resolved = std::fs::canonicalize(parent)
+                    .map_err(|error| format!("could not resolve {}: {error}", parent.display()))?;
+                if !resolved.starts_with(&shots) {
+                    return Err(REFUSED.to_string());
+                }
+            }
+            // And the final name may be a symlink, which `fs::write` would follow out of the directory.
+            if std::fs::symlink_metadata(&path)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err("a screenshot may not be written through a symlink".to_string());
+            }
+            path
         }
         None => {
             let stamp = SystemTime::now()
@@ -2981,6 +3030,27 @@ fn is_patched(binary: &Path) -> bool {
     binary.to_string_lossy().contains(".cloakbrowser")
 }
 
+/// Where a distribution usually puts Chromium, checked before the PATH search.
+const KNOWN_BROWSERS: [&str; 8] = [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/lib/chromium/chromium",
+    "/usr/lib/chromium-browser/chromium-browser",
+    "/opt/google/chrome/chrome",
+    "/snap/bin/chromium",
+];
+
+/// The names a browser answers to on PATH.
+const PATH_BROWSERS: [&str; 5] = [
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+    "chrome",
+];
+
 fn find_chrome() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("HADES_CHROME") {
         let path = PathBuf::from(path);
@@ -3007,14 +3077,23 @@ fn find_chrome() -> Result<PathBuf, String> {
             }
         }
     }
-    for candidate in [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/snap/bin/chromium",
-    ] {
+    for candidate in KNOWN_BROWSERS {
         let path = PathBuf::from(candidate);
         if path.is_file() {
             return Ok(path);
+        }
+    }
+    // Distributions disagree about the name and the package layout, and a browser installed by a package
+    // manager is usually on PATH even when it is not in /usr/bin under a name this file guessed. The
+    // search is last so an explicit install still wins.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            for name in PATH_BROWSERS {
+                let candidate = directory.join(name);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
         }
     }
     Err("no Chromium found; set HADES_CHROME to a browser binary".to_string())
@@ -3229,6 +3308,24 @@ mod tests {
         assert!(chromium_path_check(Path::new(&over)).is_err());
     }
 
+    /// The list has to name the packages distributions actually ship, not only the one this was built on.
+    #[test]
+    fn common_browser_locations_are_known() {
+        for expected in [
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/opt/google/chrome/chrome",
+            "/snap/bin/chromium",
+        ] {
+            assert!(
+                KNOWN_BROWSERS.contains(&expected),
+                "{expected} is missing from the search"
+            );
+        }
+        assert!(PATH_BROWSERS.contains(&"chromium"));
+    }
+
     #[test]
     fn a_screenshot_decodes() {
         let bytes = base64_decode("aGVsbG8=").expect("base64");
@@ -3249,6 +3346,46 @@ mod tests {
         let inside = resolve_shot(&state, Some("sub/page.png")).expect("an inside path");
         let shots = std::fs::canonicalize(state.join("shots")).expect("the shots directory");
         assert!(inside.starts_with(&shots), "{}", inside.display());
+    }
+
+    /// A symlink is not a name inside the directory, whatever it points at: one at the final name and one
+    /// standing in for a subdirectory both have to be refused, and the kernel has to refuse the write too.
+    #[test]
+    fn a_screenshot_cannot_be_written_through_a_symlink() {
+        let state = crate::scratch::root().join("shots-symlink");
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).expect("a scratch state");
+        let outside = state.join("outside.png");
+        std::fs::write(&outside, b"untouched").expect("a file outside shots");
+
+        let shots = state.join("shots");
+        std::fs::create_dir_all(&shots).expect("the shots directory");
+        let link = shots.join("page.png");
+        std::os::unix::fs::symlink(&outside, &link).expect("a symlink at the file name");
+        let error = resolve_shot(&state, Some("page.png"))
+            .expect_err("a symlink at the final name is refused");
+        assert!(error.contains("symlink"), "{error}");
+
+        // A directory that is really a symlink out of the shots tree is the same trick one level up.
+        let elsewhere = state.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("a directory outside shots");
+        std::os::unix::fs::symlink(&elsewhere, shots.join("sub")).expect("a symlinked directory");
+        let error = resolve_shot(&state, Some("sub/page.png"))
+            .expect_err("a symlinked directory is refused");
+        assert!(error.contains("shots"), "{error}");
+
+        // And the write itself: even if a link appears after the check, `O_NOFOLLOW` refuses it.
+        let error =
+            write_no_follow(&link, b"not the target").expect_err("a symlink is not followed");
+        assert!(
+            error.contains("symlink") || error.contains("Too many"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("the target is still there"),
+            b"untouched"
+        );
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

@@ -170,8 +170,17 @@ fn run_inner(
     // Half the budget per pipe, so the two together cannot exceed the limit and the final text needs no
     // second cut. The margin covers the two omission markers.
     let budget = (limit / 2).saturating_sub(64).max(64);
-    let out_reader = std::thread::spawn(move || read_pipe(out_pipe, budget));
-    let err_reader = std::thread::spawn(move || read_pipe(err_pipe, budget));
+    // Each reader reports on a channel rather than through `join`, because `join` has no timeout: a
+    // background child that inherited a pipe keeps it open after the shell exits, and a blocking join
+    // would wait past the deadline the caller asked for.
+    let (sender, reader) = std::sync::mpsc::channel();
+    let out_sender = sender.clone();
+    let out_reader = std::thread::spawn(move || {
+        let _ = out_sender.send((false, read_pipe(out_pipe, budget)));
+    });
+    let err_reader = std::thread::spawn(move || {
+        let _ = sender.send((true, read_pipe(err_pipe, budget)));
+    });
 
     let started = std::time::Instant::now();
     let mut timed_out = false;
@@ -194,19 +203,52 @@ fn run_inner(
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
 
-    let (out, err) = if timed_out {
+    let mut out = Captured::default();
+    let mut err = Captured::default();
+    if !timed_out {
+        // The shell exiting is not the end of the command's work: a background child may still hold
+        // stdout or stderr. The deadline therefore covers the streams too, and when it passes the group
+        // is killed and no output is claimed - what was written before the kill is not what it said.
+        let mut received = 0;
+        while received < 2 {
+            let waited = match deadline {
+                Some(limit) => {
+                    let left = limit.saturating_sub(started.elapsed());
+                    reader.recv_timeout(left)
+                }
+                None => reader
+                    .recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            match waited {
+                Ok((is_err, captured)) => {
+                    if is_err {
+                        err = captured;
+                    } else {
+                        out = captured;
+                    }
+                    received += 1;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    end_group(&mut child, child_pid);
+                    break;
+                }
+            }
+        }
+        if timed_out {
+            drop(out_reader);
+            drop(err_reader);
+            out = Captured::default();
+            err = Captured::default();
+        }
+    } else {
         // The group was killed, but a process that escaped it can still hold a pipe open; waiting for one
-        // would undo the deadline. The readers are left to finish on their own and no output is claimed,
-        // which is the honest report: what was written before the kill is not what it said.
+        // would undo the deadline. The readers are left to finish on their own and no output is claimed.
         drop(out_reader);
         drop(err_reader);
-        (Captured::default(), Captured::default())
-    } else {
-        (
-            out_reader.join().unwrap_or_default(),
-            err_reader.join().unwrap_or_default(),
-        )
-    };
+    }
     let mut text = render(&out);
     let stderr = render(&err);
     if timed_out {
@@ -390,6 +432,28 @@ mod tests {
         let run = run("definitely-not-a-command-anywhere", &here(), 1024, None).expect("run");
         assert_eq!(run.status, 127);
         assert!(!run.output.is_empty());
+    }
+
+    /// The shell exits at once, but the background child keeps stdout open. The deadline has to cover
+    /// the streams, or the call hangs until that child dies - the unattended-worker hang.
+    #[test]
+    fn a_background_child_cannot_hold_the_deadline_open() {
+        let started = std::time::Instant::now();
+        let run = run_within(
+            "sleep 300 &",
+            &here(),
+            1024,
+            None,
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .expect("run");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "the call waited {elapsed:?} for a child the shell left behind"
+        );
+        assert!(run.timed_out, "{run:?}");
+        assert!(run.output.contains("wall-clock deadline"), "{}", run.output);
     }
 
     #[test]

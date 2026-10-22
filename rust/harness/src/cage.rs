@@ -186,6 +186,52 @@ pub enum SocketState {
 }
 
 /// Scan the named sockets. Only presence is reported; nothing is opened.
+/// Keep this process's own environment out of reach of the programs it runs.
+///
+/// A caged command is started with a cleared, sanitized environment, but `/proc/<ppid>/environ` is a file
+/// like any other: both cage modes grant `/proc` because tools read `/proc/cpuinfo` and friends, and a
+/// same-user child can read its parent's *initial* environment unless the parent is non-dumpable. Clearing
+/// the child's environment removes the keys from the shell, not from the parent's proc entry.
+///
+/// `PR_SET_DUMPABLE` closes that door for the whole process tree. It also stops core dumps and same-user
+/// debuggers, which is the trade a runtime holding provider keys should make. `HADES_ALLOW_PTRACE=1` is the
+/// way back in when a debugger is what is needed.
+pub fn seal_environment() -> Result<(), String> {
+    if std::env::var("HADES_ALLOW_PTRACE").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    // SAFETY: `PR_SET_DUMPABLE` takes an integer argument and touches no memory of ours.
+    let status = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0, 0, 0) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not make the process non-dumpable: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Whether this process is currently non-dumpable, which is the state [`seal_environment`] puts it in.
+pub fn is_sealed() -> bool {
+    // SAFETY: `PR_GET_DUMPABLE` takes no argument and returns the flag.
+    unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) == 0 }
+}
+
+/// Undo [`seal_environment`]. Only tests and `HADES_ALLOW_PTRACE` have a reason to call this.
+pub fn unseal_environment() -> Result<(), String> {
+    // SAFETY: as above.
+    let status = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1 as libc::c_ulong, 0, 0, 0) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not make the process dumpable again: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
 pub fn scan_sockets(candidates: &[PathBuf]) -> Vec<(PathBuf, SocketState)> {
     candidates
         .iter()

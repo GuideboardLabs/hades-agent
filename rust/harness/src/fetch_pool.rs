@@ -58,12 +58,13 @@ struct Api {
     easy_perform: unsafe extern "C" fn(Curl) -> c_int,
     easy_getinfo: unsafe extern "C" fn(Curl, c_int, ...) -> c_int,
     easy_reset: unsafe extern "C" fn(Curl),
+    easy_cleanup: unsafe extern "C" fn(Curl),
     easy_strerror: unsafe extern "C" fn(c_int) -> *const c_char,
     slist_append: unsafe extern "C" fn(Slist, *const c_char) -> Slist,
     slist_free_all: unsafe extern "C" fn(Slist),
 }
 
-// The handle and the function table are only ever touched under `HANDLE`.
+// The function table is immutable once resolved; the handles it returns are guarded by `FREE`.
 unsafe impl Send for Api {}
 
 fn api() -> Option<&'static Api> {
@@ -101,6 +102,7 @@ fn api() -> Option<&'static Api> {
                     unsafe extern "C" fn(Curl, c_int, ...) -> c_int
                 ),
                 easy_reset: symbol!("curl_easy_reset", unsafe extern "C" fn(Curl)),
+                easy_cleanup: symbol!("curl_easy_cleanup", unsafe extern "C" fn(Curl)),
                 easy_strerror: symbol!(
                     "curl_easy_strerror",
                     unsafe extern "C" fn(c_int) -> *const c_char
@@ -115,6 +117,35 @@ fn api() -> Option<&'static Api> {
         None
     })
     .as_ref()
+}
+
+/// The handles not in use. A fetch takes one, performs its transfer outside any lock, and puts it back
+/// when the transfer ends. One handle behind a mutex would be held for the whole blocking call and would
+/// turn four research workers into a queue; this keeps them parallel without an async runtime.
+static FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// More than this many concurrent fetches queue for a handle. The workers are bounded well below it.
+const MAX_HANDLES: usize = 8;
+
+/// A handle borrowed from the pool. Dropping it returns the handle, whatever path the transfer took,
+/// so an early return cannot shrink the pool.
+struct Lease {
+    handle: Curl,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut free = match FREE.lock() {
+            Ok(free) => free,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if free.len() < MAX_HANDLES {
+            free.push(self.handle as usize);
+        } else if let Some(api) = api() {
+            // SAFETY: the handle came from `easy_init` and is not used after this point.
+            unsafe { (api.easy_cleanup)(self.handle) };
+        }
+    }
 }
 
 /// What the callbacks are handed: the body, the headers, and the cap that both are bounded by.
@@ -188,16 +219,21 @@ pub fn get(
         return None;
     }
     let api = api()?;
-    static HANDLE: Mutex<Option<usize>> = Mutex::new(None);
-    let mut held = HANDLE.lock().ok()?;
-    if held.is_none() {
-        let handle = unsafe { (api.easy_init)() };
-        if handle.is_null() {
-            return None;
+    let handle = {
+        let mut free = match FREE.lock() {
+            Ok(free) => free,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match free.pop() {
+            Some(handle) => handle as Curl,
+            // SAFETY: `easy_init` allocates a handle or returns null, which is checked below.
+            None => unsafe { (api.easy_init)() },
         }
-        *held = Some(handle as usize);
+    };
+    if handle.is_null() {
+        return None;
     }
-    let handle = held.unwrap_or(0) as Curl;
+    let _lease = Lease { handle };
 
     let mut sink = Sink {
         body: Vec::new(),

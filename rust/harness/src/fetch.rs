@@ -1131,6 +1131,32 @@ mod tests {
     /// Two sites, both named `localhost`, both on loopback and both private: the only thing that tells
     /// them apart is the port the pin names. If the pin were global (or applied once and left in place),
     /// the second fetch would reach the first site and answer with its body.
+    /// Four fetches that each take 250 ms have to finish in about 250 ms, not a second.
+    ///
+    /// This is the regression the pool of handles exists to prevent: one easy handle behind a mutex is
+    /// held for the whole blocking transfer, so research workers that should run together queue behind
+    /// each other. The fallback path also passes, which is the point of asserting on the tool.
+    #[test]
+    fn fetches_in_different_threads_do_not_queue() {
+        let site = slow_site(std::time::Duration::from_millis(250), "slow");
+        let url = site.url("/");
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let url = url.clone();
+                scope.spawn(move || {
+                    let said = run(&url, 12_000, true);
+                    assert_eq!(said, "slow\n");
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(700),
+            "four 250 ms fetches took {elapsed:?}, so they were serialized"
+        );
+    }
+
     #[test]
     fn the_second_host_of_a_run_is_pinned_to_its_own_address() {
         let first = site(&[(b"/", b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")]);
@@ -1625,6 +1651,73 @@ mod tests {
         let flag = running.clone();
         let handle = serve_until(flag, listener, addresses);
         Site {
+            port,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// A fixture that handles each connection on its own thread and waits before answering, so a test
+    /// can tell whether two fetches overlapped. The ordinary `Site` answers one connection at a time,
+    /// which would make a timing test measure the server rather than the pool.
+    struct SlowSite {
+        port: u16,
+        running: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SlowSite {
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+    }
+
+    impl Drop for SlowSite {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn slow_site(delay: std::time::Duration, body: &'static str) -> SlowSite {
+        use std::io::{Read as _, Write as _};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        listener
+            .set_nonblocking(true)
+            .expect("a nonblocking fixture");
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = running.clone();
+        let handle = std::thread::spawn(move || {
+            while flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        std::thread::spawn(move || {
+                            let _ = stream.set_nonblocking(false);
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                            let mut buffer = [0u8; 2048];
+                            let _ = stream.read(&mut buffer);
+                            std::thread::sleep(delay);
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(reply.as_bytes());
+                            let _ = stream.flush();
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        SlowSite {
             port,
             running,
             handle: Some(handle),
