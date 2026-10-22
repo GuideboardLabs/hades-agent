@@ -590,3 +590,140 @@ fn a_download_that_stops_early_is_refused() {
     drop(handle);
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// Two different packs, installed at the same moment into one state. Each install reads the catalog, changes
+/// its own row, and writes the whole file back; without a lock the second write forgets the first install,
+/// and the skill that is on disk is a skill the catalog does not know about.
+#[test]
+fn two_different_packs_installed_at_once_keep_both_rows() {
+    let work = std::env::temp_dir().join(format!("hades-lost-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+
+    let mut archives = Vec::new();
+    for name in ["alpha", "beta"] {
+        let source = work.join(format!("src-{name}"));
+        std::fs::create_dir_all(source.join("skills").join(name)).expect("a source");
+        std::fs::write(
+            source.join("skills").join(name).join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Use when {name} is the one.\n---\n\n# {name}\n"
+            ),
+        )
+        .expect("a skill");
+        // Enough files that the two installs overlap instead of finishing one after the other.
+        for i in 0..200 {
+            std::fs::write(
+                source.join("skills").join(name).join(format!("{i}.txt")),
+                format!("line {i} of {name}\n"),
+            )
+            .expect("a file");
+        }
+        let out = work.join(format!("{name}.hadepack"));
+        let options = ExportOptions {
+            id: name.to_string(),
+            version: "1.0.0".to_string(),
+            from: source.clone(),
+            title: name.to_string(),
+            summary: format!("The {name} pack."),
+            license: "MIT".to_string(),
+            derivatives: "allowed".to_string(),
+            network: false,
+            writes: Vec::new(),
+            requires_roles: Vec::new(),
+            requires_tools: Vec::new(),
+            skills: vec![name.to_string()],
+            profiles: Vec::new(),
+            cases: Vec::new(),
+            keywords: Vec::new(),
+            source: None,
+            out: Some(out.clone()),
+        };
+        harness::pack::export(&options).expect("an archive");
+        archives.push(out);
+    }
+
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut threads = Vec::new();
+    for archive in archives.clone() {
+        let home = home.clone();
+        let state = state.clone();
+        let gate = gate.clone();
+        threads.push(std::thread::spawn(move || {
+            gate.wait();
+            packs_install::add_file(&archive, None, &home, &state, true)
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("a worker").expect("an install");
+    }
+
+    let catalog = harness::pack_fit::read_catalog(&state).expect("a catalog");
+    let identities: Vec<&str> = catalog.iter().map(|row| row.identity.as_str()).collect();
+    assert!(
+        identities.contains(&"alpha") && identities.contains(&"beta"),
+        "a catalog row was lost: {identities:?}"
+    );
+    assert!(state.join("skills/alpha/SKILL.md").is_file());
+    assert!(state.join("skills/beta/SKILL.md").is_file());
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// An install that finished and then could not write its event is committed, not failed. The receipt says so,
+/// and `hades doctor` names the row that has no account of how it got there.
+#[test]
+fn an_install_whose_event_failed_is_reported_as_committed() {
+    let work = std::env::temp_dir().join(format!("hades-event-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let source = work.join("src");
+    std::fs::create_dir_all(source.join("skills/quiet")).expect("a source");
+    std::fs::write(
+        source.join("skills/quiet/SKILL.md"),
+        "---\nname: quiet\ndescription: Use when the record cannot be written.\n---\n\n# Quiet\n",
+    )
+    .expect("a skill");
+    let archive = work.join("quiet.hadepack");
+    let options = ExportOptions {
+        id: "quiet".to_string(),
+        version: "1.0.0".to_string(),
+        from: source.clone(),
+        title: "Quiet".to_string(),
+        summary: "An install that cannot say it happened.".to_string(),
+        license: "MIT".to_string(),
+        derivatives: "allowed".to_string(),
+        network: false,
+        writes: Vec::new(),
+        requires_roles: Vec::new(),
+        requires_tools: Vec::new(),
+        skills: vec!["quiet".to_string()],
+        profiles: Vec::new(),
+        cases: Vec::new(),
+        keywords: Vec::new(),
+        source: None,
+        out: Some(archive.clone()),
+    };
+    harness::pack::export(&options).expect("an archive");
+
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    // A directory where the event file belongs: every append fails, and nothing else does.
+    std::fs::create_dir_all(state.join("packs/events.jsonl")).expect("the obstruction");
+
+    let said = packs_install::add_file(&archive, None, &home, &state, true)
+        .expect("an install that is committed");
+    assert!(said.contains("the install is committed"), "{said}");
+    assert!(state.join("skills/quiet/SKILL.md").is_file());
+    // The obstruction is cleared, and the record is then a file that simply says nothing about this install.
+    std::fs::remove_dir(state.join("packs/events.jsonl")).expect("clear the obstruction");
+    let missing = harness::pack_fit::rows_without_events(&state).expect("a check");
+    assert_eq!(
+        missing,
+        vec!["skill quiet 1.0.0".to_string()],
+        "{missing:?}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}

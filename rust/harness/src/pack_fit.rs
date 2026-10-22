@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -163,6 +164,10 @@ impl Installed {
 pub struct ApplyReceipt {
     pub items: Vec<Installed>,
     pub skipped: usize,
+    /// The install is committed on disk; this says whether its audit event was written. An install that
+    /// finished and then failed to record itself is not a failed install, and reporting it as one is a lie the
+    /// operator acts on by installing again.
+    pub event_error: Option<String>,
 }
 
 impl ApplyReceipt {
@@ -183,6 +188,11 @@ impl ApplyReceipt {
             if let Some(generation) = item.generation {
                 text.push_str(&format!("    generation: {generation}\n"));
             }
+        }
+        if let Some(error) = &self.event_error {
+            text.push_str(&format!(
+                "\nwarning: the install is committed, but its audit event was not written: {error}\n"
+            ));
         }
         text
     }
@@ -425,6 +435,100 @@ pub fn read_catalog(state: &Path) -> Result<Vec<Installed>, String> {
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// An advisory lock over one state directory, held from the read of the catalog to the write of the last row.
+///
+/// The catalog is a single file that every install rewrites whole: read it, change one row, write it back. Two
+/// processes doing that at once is a lost update, not a collision: both writes succeed, and the second one
+/// forgets the first install while its skill stays on disk, unmanaged. A lock per state is the smallest thing
+/// that keeps the file and the directories it describes telling the same story.
+struct StateLock {
+    file: fs::File,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // Closing the descriptor releases the lock; the explicit unlock makes the intent readable.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn lock_state(state: &Path) -> Result<StateLock, String> {
+    let dir = state.join("packs");
+    scratch::state_dir(&dir)
+        .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
+    let path = dir.join(".lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    // A holder that never finishes should be an error with a name, not a command that hangs forever.
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if taken == 0 {
+            return Ok(StateLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        let held = matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        );
+        if !held {
+            return Err(format!("could not lock {}: {error}", path.display()));
+        }
+        if waited >= std::time::Duration::from_secs(30) {
+            return Err(format!(
+                "another install has held the pack state at {} for 30 seconds; nothing was changed",
+                path.display()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        waited += std::time::Duration::from_millis(25);
+    }
+}
+
+/// Catalog rows whose install has no apply event in the record.
+///
+/// An install that committed and then failed to write its event is consistent on disk and invisible to the
+/// record. This is what `hades doctor` reads to say so, instead of leaving a hole nobody can see.
+pub fn rows_without_events(state: &Path) -> Result<Vec<String>, String> {
+    let rows = read_catalog(state)?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = events_path(state);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let mut recorded: Vec<(String, String)> = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("event").and_then(Value::as_str) == Some("apply") {
+            let pack = value
+                .get("pack")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let version = value
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            recorded.push((pack.to_string(), version.to_string()));
+        }
+    }
+    Ok(rows
+        .iter()
+        .filter(|row| !recorded.contains(&(row.pack.clone(), row.version.clone())))
+        .map(|row| format!("{} {} {}", row.kind.name(), row.identity, row.version))
+        .collect())
 }
 
 /// Distinguishes two catalog writes in the same process without relying on the clock.
@@ -817,6 +921,12 @@ fn remove_live(path: &Path) -> Result<(), String> {
     }
 }
 
+/// A directory of this operation's own, beside the target so the final rename stays on one filesystem.
+///
+/// The name used to be `.<target>.<label>-<pid>`, which two threads in one process compute identically; the
+/// second call deleted the first one's work mid-copy. It is now unique per call and created with `create_dir`,
+/// which also means a path somebody else prepared (a symlink, say) is a failure rather than a place to write
+/// through.
 fn temp_beside(target: &Path, label: &str) -> Result<PathBuf, String> {
     let parent = target
         .parent()
@@ -827,10 +937,21 @@ fn temp_beside(target: &Path, label: &str) -> Result<PathBuf, String> {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| label.to_string());
-    let temp = parent.join(format!(".{name}.{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&temp);
+    let temp = parent.join(format!(
+        ".{name}.{label}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+        TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir(&temp).map_err(|error| format!("could not make {}: {error}", temp.display()))?;
     Ok(temp)
 }
+
+/// Distinguishes two staging directories in the same process, where the clock alone could collide.
+static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn install_skill(prepared: &Prepared, activate: bool) -> Result<Installed, String> {
     let temp = temp_beside(&prepared.target, "install")?;
@@ -1020,6 +1141,9 @@ pub fn apply(
     decisions: &[Decision],
     activate: bool,
 ) -> Result<ApplyReceipt, String> {
+    // Everything below this line reads the catalog, changes directories, and rewrites the catalog. Downloads
+    // and parsing happen before it, outside the lock; only the state mutation is serialised.
+    let _state = lock_state(state)?;
     let rows = pack::plan(pack, state)?;
     let prepared = preflight(pack, home, state, activate, decisions, &rows)?;
     let content = content_root(state, &pack.manifest.id, &pack.manifest.version)?;
@@ -1085,7 +1209,7 @@ pub fn apply(
                 .map_err(|error| format!("could not remove {}: {error}", old))?;
         }
     }
-    append_event(
+    let event = append_event(
         state,
         json!({
             "event": "apply",
@@ -1094,13 +1218,15 @@ pub fn apply(
             "items": installed.len(),
             "at": now(),
         }),
-    )?;
+    )
+    .err();
     Ok(ApplyReceipt {
         items: installed,
         skipped: decisions
             .iter()
             .filter(|decision| decision.action == Action::Skip)
             .count(),
+        event_error: event,
     })
 }
 
@@ -1135,6 +1261,9 @@ pub fn uninstall(
     id: &str,
     version: Option<&str>,
 ) -> Result<UninstallReceipt, String> {
+    // The same lock as an install: uninstall removes rows and the directories they name, and an install
+    // writing the file underneath it would put a row back for a skill that is gone.
+    let _state = lock_state(state)?;
     pack::valid_id(id)?;
     if let Some(version) = version {
         pack::valid_version(version)?;
@@ -1776,6 +1905,49 @@ fn copy_support(from: &Path, to: &Path, skip: Option<&str>) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_staging_directories_for_one_target_are_not_the_same_path() {
+        // The old name was the target, the label and the pid: two threads installing one skill computed the
+        // same path and the second deleted the first one's copy.
+        let base = crate::scratch::unique("temp-beside");
+        let target = base.join("skills").join("alpha");
+        std::fs::create_dir_all(target.parent().expect("a parent")).expect("a parent");
+        let first = temp_beside(&target, "install").expect("a first");
+        let second = temp_beside(&target, "install").expect("a second");
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_catalog_row_without_its_apply_event_is_named() {
+        let base = crate::scratch::unique("rows-without-events");
+        let state = base.join("state");
+        let row = Installed {
+            kind: Kind::Skill,
+            identity: "alpha".to_string(),
+            pack: "alpha".to_string(),
+            version: "1.0.0".to_string(),
+            pack_digest: "a".repeat(64),
+            digest: "b".repeat(64),
+            live_digest: "c".repeat(64),
+            live: "skills/alpha".to_string(),
+            content: "packs/alpha/1.0.0".to_string(),
+            generation: None,
+            at: 0,
+        };
+        write_catalog(&state, &[row]).expect("a catalog");
+        let missing = rows_without_events(&state).expect("a check");
+        assert_eq!(missing, vec!["skill alpha 1.0.0".to_string()]);
+        append_event(
+            &state,
+            serde_json::json!({"event": "apply", "pack": "alpha", "version": "1.0.0"}),
+        )
+        .expect("an event");
+        assert!(rows_without_events(&state).expect("a check").is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::*;
 
     fn hex() -> String {

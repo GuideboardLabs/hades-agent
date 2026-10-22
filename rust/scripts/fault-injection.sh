@@ -145,13 +145,15 @@ else
 fi
 # The same thing as a person: permission bits only mean something to a non-root caller.
 if [ "$(id -u)" != "0" ]; then
+  # The archive directory, not the state root: the state root is re-permissioned to 0700 by the lock itself,
+  # which is the point of that normalisation and would quietly make the case pass.
   state="$WORK/readonly-chmod"
   fresh_state "$state"
   mkdir -p "$state/.hades/packs/archives"
-  chmod -w "$state/.hades/packs"
+  chmod -w "$state/.hades/packs/archives"
   said=$(h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes 2>&1)
   code=$?
-  chmod +w "$state/.hades/packs"
+  chmod +w "$state/.hades/packs/archives"
   if [ $code -ne 0 ] && [ ! -d "$state/.hades/skills/alpha" ]; then
     ok "a read-only cache directory is refused cleanly (exit $code)"
   else
@@ -178,7 +180,27 @@ else
   bad "two simultaneous installs left $lines catalog row(s)"
 fi
 
-# 6. A replace, killed mid-way. The old skill is moved aside before the new one is renamed into place, and that
+# 6. Two different packs, installed at the same moment, as two processes rather than two threads. Each reads
+#    the catalog, changes its own row and writes the whole file back; without a lock the second write forgets
+#    the first install and leaves a skill on disk that the catalog does not know about.
+state="$WORK/lost-update"
+fresh_state "$state"
+make_pack beta 1.0.0 beta >/dev/null 2>&1 || bad "could not build a second pack"
+h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1 &
+first=$!
+h "$state" pack add "$WORK/beta-1.0.0.hadepack" --yes >/dev/null 2>&1 &
+second=$!
+wait "$first"
+wait "$second"
+rows=$(h "$state" pack list 2>/dev/null | grep -c '^  skill' || true)
+if [ "$rows" = "2" ] && [ -f "$state/.hades/skills/alpha/SKILL.md" ] && \
+   [ -f "$state/.hades/skills/beta/SKILL.md" ]; then
+  ok "two packs installed as two processes leave two catalog rows"
+else
+  bad "two processes installing different packs left ${rows} catalog row(s)"
+fi
+
+# 7. A replace, killed mid-way. The old skill is moved aside before the new one is renamed into place, and that
 #    is the window where an interrupted install could leave nothing at all. After every kill the path must be
 #    either a complete skill or gone (which the next run repairs); it must never be a half-copied directory,
 #    and the final run must land the new version.

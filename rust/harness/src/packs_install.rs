@@ -319,6 +319,11 @@ fn install(
         receipt.items.len(),
         receipt.skipped
     ));
+    if let Some(error) = &receipt.event_error {
+        text.push_str(&format!(
+            "\nwarning: the install is committed, but its audit event was not written: {error}\n"
+        ));
+    }
     for item in &receipt.items {
         text.push_str(&format!(
             "  {} {} -> {}\n",

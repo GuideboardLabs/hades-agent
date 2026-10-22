@@ -11,6 +11,8 @@ that run. Two scripts, both in `rust/scripts/`, both committed so the result is 
   and the fault cases against that binary instead of the build tree.
 - `cross-machine-container.sh <tarball>` does the same inside a container image, so the root filesystem, the
   daemon's runtime directory and every host path differ from the machine that built it.
+- `portability.sh <hades>` reads the highest GLIBC symbol the binary asks for and runs it on the current LTS and
+  the previous one, so the platform floor is a measured claim rather than a line in a README.
 
 ## What the fault cases found
 
@@ -52,7 +54,11 @@ all. Fifteen kills at increasing delays produced zero half-copied directories an
 final run landed the new version. The window is real but two syscalls wide; the repair path from finding 2 is
 what covers it when it is hit.
 
-**8. A state that cannot be written is refused, not skipped.** With a regular file where the cache directory
+**8. Two *different* packs installed as two processes.** The same lost-update race the audit found, run the way
+an operator would: two `hades pack add` calls at once, one catalog row left behind before the state lock, two
+rows after it.
+
+**9. A state that cannot be written is refused, not skipped.** With a regular file where the cache directory
 belongs, `pack add` exits 2 and writes no skill. This replaced a `chmod -w` case that quietly passed as root,
 where permission bits mean nothing.
 

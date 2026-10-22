@@ -321,6 +321,24 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
             ),
         )
     });
+    // A pack install that committed and then failed to write its event is on disk and not in the record. The
+    // catalog is the list of what is installed; the events are the account of how it got there.
+    if home.join("packs").join("catalog.jsonl").exists() {
+        match crate::pack_fit::rows_without_events(home) {
+            Ok(missing) if missing.is_empty() => {
+                found.push(Finding::ok("packs", "every catalog row has its apply event"));
+            }
+            Ok(missing) => found.push(Finding::warn(
+                "packs",
+                format!(
+                    "{} catalog row(s) have no apply event: {}; the install is committed but unrecorded",
+                    missing.len(),
+                    missing.join(", ")
+                ),
+            )),
+            Err(error) => found.push(Finding::warn("packs", error)),
+        }
+    }
     // A run that stopped without reaching its end is reported here as well as in `hades status`: the same
     // marker, two doors, because `doctor` is what a person runs when something feels wrong.
     let interrupted = crate::daemon::interrupted(home);

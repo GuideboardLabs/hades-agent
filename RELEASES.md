@@ -3,6 +3,27 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.13
+
+The fifth audit: a lost update that reproduced on the first attempt, and two smaller defects around it.
+
+- **A lock over the pack state.** `apply` and `uninstall` read the catalog, change directories and rewrite the
+  catalog; two different packs installing at once each wrote a catalog that forgot the other. Both now hold an
+  advisory `flock` on `<state>/packs/.lock` across the whole read-mutate-commit. Downloads stay outside it, and
+  waiting is bounded at 30 seconds with a named error.
+- **Staging directories are unique per operation.** `temp_beside` named them with the pid alone, so two threads
+  installing one skill shared a path and the second deleted the first one's copy. Unique name, `create_dir`.
+- **A committed install is not reported as a failure.** If the audit event could not be written, `apply`
+  returned an error for an install already on disk. The receipt carries the event result, both the command and
+  the receipt say the install is committed, and `hades doctor` names any catalog row without its apply event.
+- **Test counts are true again.** 1076 passing, 13 ignored (12 live browser), taken from one run.
+- **The platform floor is named and checked.** The binary requires glibc 2.39; `scripts/portability.sh` reads
+  that from the binary and runs it in `ubuntu:24.04` (clean) and `ubuntu:22.04` (refused, and says why). ARM64
+  is reported as untested where the kernel cannot execute it.
+
+1076 tests, 12 live browser tests, acceptance 31/31, aarch64 check green, cross-env 7/7, fault cases 9 passed
+and 1 skipped, cross-machine 5/5 on the host and in a container, portability 2/2 with ARM64 named as untested.
+
 ## 0.1.12
 
 The rest of the fault-injection gaps, and a machine the artifact has never run on.
