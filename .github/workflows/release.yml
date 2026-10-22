@@ -69,6 +69,9 @@ jobs:
         with:
           name: binaries
           path: dist
+      # upload-artifact drops the mode; a downloaded binary arrives 0644 and cannot be executed or packaged.
+      - name: Restore executable bits
+        run: chmod 755 dist/hades-portable dist/hades-musl
       - name: The portable binary on three LTS images
         run: bash rust/scripts/portability.sh dist/hades-portable
       - name: The static binary on the same three images
@@ -100,6 +103,8 @@ jobs:
         with:
           name: binaries
           path: dist
+      - name: Restore executable bits
+        run: chmod 755 dist/hades-portable dist/hades-musl
       - name: Package both artifacts
         run: |
           bash rust/package.sh --skip-build --bin dist/hades-portable --out dist

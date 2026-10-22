@@ -49,3 +49,17 @@ What it means in practice:
   directly. That is a packaging difference, stated rather than solved. Its busybox `tar` is not GNU tar, so
   pack archives need `apk add tar`; `hades doctor` reports `tar` as a capability and the failure names it.
 - **Chromium** is reported as reduced when it is not installed, which on a minimal Alpine image it is not.
+
+## What the pipeline guarantees now
+
+- The glibc assertion is part of the build: `assert-floor.sh` fails when a binary asks for a newer symbol than
+  2.30, so a newer build host cannot move the floor silently.
+- The build fails loudly. `build-inner.sh` writes cargo's status out of the pipeline, prints the log tail on
+  failure, deletes the previous binary before copying, and refuses a binary whose `version` does not match the
+  manifest. A stale artifact cannot be packaged as a new one.
+- Artifacts are re-chmodded after download. `upload-artifact` does not carry the mode, so verification and
+  packaging would otherwise run a 0644 file.
+- The default output directory is the checkout's `dist/`, not a path on one machine; Docker bind sources are
+  resolved to absolute paths before use.
+- ARM64 is reported as skipped, not passed. An emulator that exists is not an ARM64 artifact, and counting it as
+  one claimed a platform the release does not ship.

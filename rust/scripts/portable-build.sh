@@ -18,7 +18,7 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-OUT=/mnt/ssd/hades-portable
+OUT=""
 FLAVOUR=gnu
 IMAGE=""
 
@@ -38,13 +38,24 @@ case "$FLAVOUR" in
   *) echo "unknown flavour: $FLAVOUR" >&2; exit 2 ;;
 esac
 
+# Default next to the checkout, not to one machine's disk: a release builder that writes to /mnt/ssd only
+# works on the machine it was written on.
+[ -n "$OUT" ] || OUT=$ROOT/dist
 mkdir -p "$OUT"
+# Docker only accepts absolute bind sources, and `--out dist` is the natural thing to type in a checkout.
+OUT=$(cd "$OUT" && pwd -P)
 echo "building $FLAVOUR in $IMAGE; output in $OUT"
 
 docker run --rm \
   -v "$OUT:/out" \
   -v "$ROOT:/src:ro" \
   "$IMAGE" sh /src/rust/scripts/build-inner.sh "$FLAVOUR" /out /src/rust 2>&1 | tail -6
+
+# The container runs as root, so the artifact belongs to root. Give it back: the person who ran the build owns
+# the binary they are about to package, chmod and test.
+if [ "$(stat -c %u "$OUT/$NAME" 2>/dev/null || echo 0)" != "$(id -u)" ]; then
+  docker run --rm -v "$OUT:/out" alpine:3.20 chown "$(id -u):$(id -g)" "/out/$NAME" >/dev/null 2>&1 || true
+fi
 
 [ -x "$OUT/$NAME" ] || { echo "no binary at $OUT/$NAME"; exit 1; }
 echo "wrote: $OUT/$NAME"

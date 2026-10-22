@@ -413,51 +413,59 @@ fn v4_from_segments(high: u16, low: u16) -> Ipv4Addr {
 /// The address a target names. A literal is classified directly; a name is resolved and *every*
 /// answer judged, because a resolver that answers half private is doing exactly the thing this check
 /// exists to see. The first answer is returned, to pin.
-fn resolve(target: &Target, allow_private: bool) -> Result<IpAddr, String> {
-    let answer = match target.host.parse::<IpAddr>() {
-        Ok(address) => address,
-        Err(_) => {
-            let answers: Vec<IpAddr> = (target.host.as_str(), target.port)
-                .to_socket_addrs()
-                .map_err(|error| {
-                    format!(
-                        "refused: the host `{}` could not be resolved ({error})",
-                        target.host
-                    )
-                })?
-                .map(|socket| socket.ip())
-                .collect();
-            if answers.is_empty() {
-                return Err(format!(
-                    "refused: the host `{}` resolved to no address",
+fn resolve(target: &Target, allow_private: bool) -> Result<Vec<IpAddr>, String> {
+    let Ok(literal) = target.host.parse::<IpAddr>() else {
+        let answers: Vec<IpAddr> = (target.host.as_str(), target.port)
+            .to_socket_addrs()
+            .map_err(|error| {
+                format!(
+                    "refused: the host `{}` could not be resolved ({error})",
                     target.host
+                )
+            })?
+            .map(|socket| socket.ip())
+            .collect();
+        if answers.is_empty() {
+            return Err(format!(
+                "refused: the host `{}` resolved to no address",
+                target.host
+            ));
+        }
+        // Every answer is judged, because a resolver that answers half private is doing exactly the thing
+        // this check exists to see.
+        for address in &answers {
+            if is_private(*address) && !allow_private {
+                return Err(format!(
+                    "refused: the host `{}` resolves to {}, a private address, and private targets are \
+                     not allowed",
+                    target.host, address
                 ));
             }
-            for address in &answers {
-                if is_private(*address) && !allow_private {
-                    return Err(format!(
-                        "refused: the host `{}` resolves to {}, a private address, and private \
-                         targets are not allowed",
-                        target.host, address
-                    ));
-                }
-            }
-            // Pinning takes one address, so a name that answers both families needs an order. IPv4 goes
-            // first: a host that publishes both usually listens on both, and one that listens on v4 only
-            // otherwise turns a working name into "connection refused" on any machine whose resolver
-            // answers ::1 first, which is most of them. Both answers were judged above; this is only
-            // which one is tried.
-            let mut ordered = answers;
-            ordered.sort_by_key(|address| !address.is_ipv4());
-            ordered[0]
         }
+        // All of them are kept: a host that publishes both families may listen on either, and pinning one
+        // answer is a coin flip. IPv4 is tried first because a dual-stack name usually serves v4 too, and a
+        // v4-only listener is the common failure when a resolver answers ::1 first, which most do.
+        let mut ordered = answers;
+        ordered.sort_by_key(|address| !address.is_ipv4());
+        ordered.dedup();
+        return Ok(ordered);
     };
-    if is_private(answer) && !allow_private {
+    if is_private(literal) && !allow_private {
         return Err(format!(
-            "refused: {answer} is a private address, and private targets are not allowed"
+            "refused: {literal} is a private address, and private targets are not allowed"
         ));
     }
-    Ok(answer)
+    Ok(vec![literal])
+}
+
+/// How many answers one hop will try before giving up. A name with many addresses is still bounded work: each
+/// attempt costs a connect, and the whole fetch shares one deadline.
+const MAX_ADDRESSES: usize = 3;
+
+/// A failure worth trying the next address for. A policy refusal is not: the next answer would be refused for
+/// the same reason, and a body over the cap is a decision, not a bad address.
+fn another_address_may_help(error: &str) -> bool {
+    !error.starts_with("refused:") && !error.contains("passed the cap")
 }
 
 /// The tool's entry. `allow_private` comes from the surface: agent.rs reads
@@ -516,12 +524,41 @@ fn chase_bytes(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<Vec<
     let mut followed = 0usize;
     loop {
         let target = Target::parse(&current)?;
-        let address = resolve(&target, allow_private)?;
+        let addresses = resolve(&target, allow_private)?;
         // Read after the lookup, not before: resolution is part of the fetch and can take the whole budget
         // on a slow resolver, and a transfer started with the original allowance would double the declared
         // deadline. A hop with no time left is refused here rather than started with `--max-time 0`.
         let max_time = remaining_seconds(deadline)?;
-        match hop(&target, &current, address, max_time, ca)? {
+        // Each attempt stays pinned to one validated address. A refused connect on the first answer is not
+        // the host being down, it is the wrong family for this service, so the next validated answer is
+        // tried before the fetch is reported as failed.
+        let mut landed = None;
+        let mut failure = None;
+        for (index, address) in addresses.iter().take(MAX_ADDRESSES).enumerate() {
+            match hop(&target, &current, *address, max_time, ca) {
+                Ok(outcome) => {
+                    landed = Some(outcome);
+                    break;
+                }
+                Err(error) => {
+                    let more = index + 1 < addresses.len() && index + 1 < MAX_ADDRESSES;
+                    if more && another_address_may_help(&error) {
+                        failure = Some(error);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let Some(outcome) = landed else {
+            return Err(failure.unwrap_or_else(|| {
+                format!(
+                    "there is no address for `{}` to try",
+                    clip_ref(&current, 80)
+                )
+            }));
+        };
+        match outcome {
             Outcome::Page(bytes) => return Ok(bytes),
             Outcome::Oversize => {
                 return Err(
@@ -986,6 +1023,24 @@ mod tests {
         assert!(!said.contains("passwd"), "no hop past the refusal: {said}");
     }
 
+    /// A name that answers both families is kept as both, IPv4 first, so a service that listens on one of
+    /// them is reachable either way. Skipped where `localhost` is single-family, because then the property
+    /// cannot be expressed.
+    #[test]
+    fn a_dual_family_name_keeps_every_answer_and_tries_v4_first() {
+        let target = Target::parse("http://localhost:9/").expect("a target");
+        let Ok(addresses) = resolve(&target, true) else {
+            eprintln!("skipping: localhost does not resolve here");
+            return;
+        };
+        if !addresses.iter().any(IpAddr::is_ipv4) || !addresses.iter().any(IpAddr::is_ipv6) {
+            eprintln!("skipping: localhost answers one family here ({addresses:?})");
+            return;
+        }
+        assert!(addresses[0].is_ipv4(), "{addresses:?}");
+        assert!(addresses.len() >= 2, "{addresses:?}");
+    }
+
     /// A loopback target, refused unless the caller's environment allows private targets. The
     /// fixture binds `127.0.0.1:0` exactly so the two sides of the gate can be tested against the
     /// same live server.
@@ -1027,7 +1082,7 @@ mod tests {
             matches!(&closed, Err(said) if said.contains("private address")),
             "{closed:?}"
         );
-        assert_eq!(resolve(&hop, true), Ok(IpAddr::from([127, 0, 0, 1])));
+        assert_eq!(resolve(&hop, true), Ok(vec![IpAddr::from([127, 0, 0, 1])]));
         assert_eq!(run(&url, 12_000, true), "tunnelled\n");
     }
 
@@ -1442,7 +1497,7 @@ mod tests {
         let hop = Target::parse(&location).expect("the absolute Location parses");
         assert_eq!(hop.scheme, "http");
         assert_eq!(hop.port, fixture.port);
-        assert_eq!(resolve(&hop, true), Ok(IpAddr::from([127, 0, 0, 1])));
+        assert_eq!(resolve(&hop, true), Ok(vec![IpAddr::from([127, 0, 0, 1])]));
         let closed = resolve(&hop, false);
         assert!(
             matches!(&closed, Err(said) if said.contains("private address")),

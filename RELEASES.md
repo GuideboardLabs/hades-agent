@@ -3,6 +3,28 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.20
+
+The portability re-audit. Six findings, all in the automation rather than the runtime.
+
+- **A failed compile can no longer pass as a build.** `build-inner.sh` piped cargo into `tail`, so the pipeline
+  reported `tail`'s status. It now writes a log, checks cargo's own exit status, prints the tail on failure,
+  removes the previous binary before copying, and refuses a binary whose `version` does not match the manifest.
+- **Downloaded artifacts are executable again.** `upload-artifact` does not carry file modes, so verification
+  and packaging ran a 0644 file. Both jobs chmod after download.
+- **The output directory is absolute before it reaches Docker.** `--out dist` was passed as a bind source, which
+  Docker reads as a named volume; the binary landed in the volume and the checkout's `dist/` stayed empty.
+- **The default output directory is the checkout.** `dist/` beside the repository, not `/mnt/ssd`, which was one
+  machine's disk.
+- **Every validated address is tried, not just the first.** Names that answer both families keep both answers,
+  each attempt stays pinned to one validated address, and a refused connect moves to the next before the fetch is
+  reported as failed. IPv4 is tried first because a v4-only listener behind a v6-first resolver is the common
+  case; the reverse case no longer fails.
+- **ARM64 is a skip, not a pass.** The script counted "emulation exists but the binary is x86-64" as a pass,
+  which claimed a platform the release does not ship.
+
+1079 tests, 12 live browser tests, acceptance 31/31 both artifacts, faults 10 passed 1 skipped.
+
 ## 0.1.19
 
 The gate found a real one behind a test that only ran on the runner.

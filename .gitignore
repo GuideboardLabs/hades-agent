@@ -308,3 +308,9 @@ rust/target/
 rust/dist/
 # A CARGO_HOME that landed inside the tree during TUI work: a package cache, never a source.
 rust/mnt-ignore/
+
+# Build output from scripts/portable-build.sh
+/rust/dist/
+
+# Build output from scripts/portable-build.sh, which defaults to the checkout's dist/
+/dist/

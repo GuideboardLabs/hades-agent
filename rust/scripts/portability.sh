@@ -14,9 +14,11 @@ TARBALL=""
 if [ "${2:-}" = "--tarball" ]; then TARBALL=$(readlink -f "${3:?--tarball needs a file}"); fi
 PASS=0
 FAIL=0
+SKIP=0
 say() { printf '%s\n' "$*"; }
 ok() { PASS=$((PASS + 1)); say "ok   $*"; }
 bad() { FAIL=$((FAIL + 1)); say "FAIL $*"; }
+skip() { SKIP=$((SKIP + 1)); say "skip $*"; }
 
 # 1. The floor, read from the binary rather than guessed.
 floor=$(objdump -T "$BIN" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
@@ -64,12 +66,14 @@ if docker run --rm --platform linux/arm64 alpine uname -m >/dev/null 2>&1; then
   arm=$(docker run --rm --platform linux/arm64 -v "$BIN:/hades:ro" ubuntu:24.04 bash -lc '"$0" version 2>&1 | tail -1' /hades 2>&1 | tail -1)
   case "$arm" in
     hades\ [0-9]*) ok "arm64 runs it ($arm)" ;;
-    *) ok "arm64 is emulated but this binary is x86_64; a native arm64 build is a separate artifact" ;;
+    # An emulator that exists is not an ARM64 artifact. Counting this as a pass claimed a platform the release
+    # does not ship, which is the one thing this script exists to prevent.
+    *) skip "arm64: emulation exists but this binary is $(file -b "$BIN" | sed 's/,.*//'), so ARM64 is untested; it is not a release target" ;;
   esac
 else
-  say "skip arm64: this kernel has no binfmt handler for it (a native arm64 build is a separate artifact)"
+  skip "arm64: no binfmt handler here, so ARM64 is untested; it is not a release target"
 fi
 
 say ""
-say "portability: $PASS passed, $FAIL failed"
+say "portability: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
