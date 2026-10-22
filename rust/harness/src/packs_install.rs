@@ -49,9 +49,16 @@ fn cache_dir(state: &Path) -> std::path::PathBuf {
     state.join("packs")
 }
 
+/// The cached index, when this machine has read the shelf before. `pack menu` is offline by default, so a
+/// command that only lists what exists does not open a socket to say nothing new.
+pub fn cached(state: &Path) -> Option<Vec<Row>> {
+    let text = fs::read_to_string(cache_dir(state).join("INDEX.json")).ok()?;
+    packs_menu::parse(&text).ok()
+}
+
 /// The shelf: the cached index when there is one, otherwise a fetch. `refresh` always fetches, which is what
 /// makes a new pack visible without a new binary.
-pub fn index(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
+pub fn rows(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
     let path = cache_dir(state).join("INDEX.json");
     if !refresh
         && let Ok(text) = fs::read_to_string(&path)
@@ -77,13 +84,12 @@ pub fn index(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
 /// `yes` is the difference between a plan and a write, and it is the only thing `yes` does: the digest is
 /// checked, the plan is built and every preflight runs on both paths.
 pub fn add(id: &str, home: &Path, state: &Path, yes: bool) -> Result<String, String> {
-    let rows = index(state, true)?;
+    let rows = rows(state, true)?;
     let row = rows.iter().find(|row| row.id == id).ok_or_else(|| {
         format!("`{id}` is not on the shelf. `hades pack find <words>` lists what is.")
     })?;
-    // A row may name an absolute URL: that is how a pack whose bytes are not in the public repository (a
-    // commercial or NDA pack) is published. The digest is the same commitment either way, so the check below
-    // does not care where the bytes came from.
+    // A row may name an absolute URL: that is how a pack whose bytes are not in the public repository is
+    // published. The digest is the same commitment either way, so the check does not care where it came from.
     let url = if row.archive.starts_with("https://") || row.archive.starts_with("http://") {
         row.archive.clone()
     } else {
@@ -91,28 +97,70 @@ pub fn add(id: &str, home: &Path, state: &Path, yes: bool) -> Result<String, Str
     };
     let bytes = crate::fetch::bytes(&url, MAX_ARCHIVE, allow_private())
         .map_err(|error| format!("could not fetch {url}: {error}"))?;
+    install(&bytes, &url, &row.sha256, home, state, yes)
+}
+
+/// Add a pack that arrived as a file: the sharing case, where there is no shelf to ask.
+///
+/// Without a published digest there is nothing to compare against, so the file's own sha256 is printed for
+/// the person to check against what the sender said. `expect` is that check when they have one, and a
+/// mismatch is refused before the archive is read, exactly as a shelf row is.
+pub fn add_file(
+    path: &Path,
+    expect: Option<&str>,
+    home: &Path,
+    state: &Path,
+    yes: bool,
+) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let digest = mneme::sha256::hex(&bytes);
-    if digest != row.sha256 {
+    if let Some(expect) = expect
+        && !expect.eq_ignore_ascii_case(&digest)
+    {
         return Err(format!(
-            "refused: {} hashes to {digest}, and the menu says {}. The archive was not read and nothing \
-             was written.",
-            row.archive, row.sha256
+            "refused: {digest} does not match the digest you gave ({expect}). The archive was not read and \
+             nothing was written."
+        ));
+    }
+    let said = path.display().to_string();
+    let text = install(&bytes, &said, &digest, home, state, yes)?;
+    Ok(format!("sha256: {digest}\n{text}"))
+}
+
+fn install(
+    bytes: &[u8],
+    origin: &str,
+    digest: &str,
+    home: &Path,
+    state: &Path,
+    yes: bool,
+) -> Result<String, String> {
+    let found = mneme::sha256::hex(bytes);
+    if found != digest {
+        return Err(format!(
+            "refused: {origin} hashes to {found}, and {digest} was published. The archive was not read and \
+             nothing was written."
         ));
     }
 
     let dir = cache_dir(state).join("archives");
     fs::create_dir_all(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
-    let file = dir.join(format!("{}-{}.pack", row.id, row.version));
-    fs::write(&file, &bytes)
-        .map_err(|error| format!("could not write {}: {error}", file.display()))?;
+    // Read it from a copy in the cache: `Pack::open` takes a file, and the cache is where a pack lives
+    // between being checked and being installed.
+    let incoming = dir.join("incoming.hadepack");
+    fs::write(&incoming, bytes)
+        .map_err(|error| format!("could not write {}: {error}", incoming.display()))?;
+    let pack = crate::pack::Pack::open(&incoming)?;
+    let id = pack.manifest.id.clone();
+    let version = pack.manifest.version.clone();
+    let file = dir.join(format!("{id}-{version}.hadepack"));
+    fs::rename(&incoming, &file)
+        .map_err(|error| format!("could not keep {}: {error}", file.display()))?;
 
-    let pack = crate::pack::Pack::open(&file)?;
     let planned = crate::pack::plan(&pack, state)?;
-    let mut text = format!(
-        "{} {} from {}\n",
-        pack.manifest.id, pack.manifest.version, row.archive
-    );
+    let mut text = format!("{id} {version} from {origin}\n");
     text.push_str(&render(&planned));
     if !yes {
         text.push_str(

@@ -138,3 +138,64 @@ fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// The other half of sharing: a file arrives with no shelf behind it. The digest is what the sender said in
+/// the message, and it is checked before the archive is read.
+#[test]
+fn a_file_that_arrived_is_checked_against_the_digest_you_were_given() {
+    let work = std::env::temp_dir().join(format!("hades-file-add-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let source = work.join("source");
+    std::fs::create_dir_all(source.join("skills/letter")).expect("a source");
+    std::fs::write(
+        source.join("skills/letter/SKILL.md"),
+        "---\nname: letter\ndescription: Use when the words have to survive the trip.\ntags: writing\n---\n\n# Letter\n",
+    )
+    .expect("a skill");
+
+    let archive = work.join("letter-1.0.0.hadepack");
+    let options = ExportOptions {
+        id: "letter".to_string(),
+        version: "1.0.0".to_string(),
+        from: source.clone(),
+        title: "Letter".to_string(),
+        summary: "Write a letter that survives.".to_string(),
+        license: "MIT".to_string(),
+        derivatives: "allowed".to_string(),
+        network: false,
+        writes: Vec::new(),
+        requires_roles: Vec::new(),
+        requires_tools: Vec::new(),
+        skills: vec!["letter".to_string()],
+        profiles: Vec::new(),
+        cases: Vec::new(),
+        keywords: vec!["writing".to_string()],
+        source: None,
+        out: Some(archive.clone()),
+    };
+    harness::pack::export(&options).expect("an archive");
+    let digest = sha256(&std::fs::read(&archive).expect("the archive"));
+
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+
+    let refused = packs_install::add_file(&archive, Some(&"0".repeat(64)), &home, &state, true)
+        .expect_err("a digest the sender did not send");
+    assert!(
+        refused.contains("does not match the digest you gave"),
+        "{refused}"
+    );
+    assert!(
+        !state.join("skills/letter").exists(),
+        "a refused file was installed"
+    );
+
+    let applied = packs_install::add_file(&archive, Some(&digest), &home, &state, true)
+        .expect("an install from a file");
+    assert!(applied.contains("applied: 1 item"), "{applied}");
+    assert!(state.join("skills/letter/SKILL.md").is_file(), "{applied}");
+
+    let _ = std::fs::remove_dir_all(&work);
+}

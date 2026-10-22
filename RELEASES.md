@@ -3,6 +3,18 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.8
+
+- **A pack that arrives as a file is added.** `hades pack add ./thing.hadepack --yes` installs without a
+  shelf, which closes the sharing loop: one person exports, the other adds. `--digest <sha256>` checks the
+  file against what the sender said and refuses a mismatch before the archive is read; without it the file's
+  own digest is printed for the person to compare.
+- **`pack menu` and `pack find` read the same shelf.** Both use the cached index when this machine has one and
+  the copy this build ships otherwise; `--refresh` reads the live shelf, and a shelf that cannot be read is
+  named rather than silently replaced. A listing command no longer opens a socket to say nothing new.
+- **The plan is the same on both paths.** A file and a shelf row run through one installer, so the digest
+  check, the preflight and the decisions cannot drift between them.
+
 ## 0.1.7
 
 Export was the part that was not easy, and it is the part that makes a pack worth having.

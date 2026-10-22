@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.7-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1062%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.8-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1063%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.7 |
+| **Version** | 0.1.8 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1062 passing, 13 ignored live tests |
+| **Tests** | 1063 passing, 13 ignored live tests |
 
 ---
 
@@ -690,7 +690,12 @@ outside Hades can be shared without seeding a state first.
 
 `hades pack add <id>` fetches the archive named by the menu, hashes the bytes that arrived, and refuses when
 the digest is not the one the menu published, before the manifest is parsed. Without `--yes` it prints the
-plan and writes nothing; with it, the plan is applied and the pack is active. `HADES_PACKS_URL` points the
+plan and writes nothing; with it, the plan is applied and the pack is active.
+
+A pack that arrives as a file is added the same way: `hades pack add ./thing.hadepack --digest <sha256>
+--yes`. The digest is optional, and when it is given the file must hash to it; when it is not, the file's own
+digest is printed so it can be compared with what the sender said. `hades pack menu` reads the copy this
+build ships unless this machine has cached a live one; `--refresh` reads the live shelf. `HADES_PACKS_URL` points the
 shelf at a mirror, and `HADES_PACKS_ALLOW_PRIVATE=1` is what lets that mirror be a local address.
 
 The catalog is generated from a packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`
@@ -727,7 +732,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1062 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1063 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

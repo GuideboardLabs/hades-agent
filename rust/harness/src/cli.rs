@@ -2730,7 +2730,7 @@ fn pack_plan(args: &[String]) -> Result<(String, i32), String> {
 fn pack_help() -> String {
     "pack menu [--json]                      the shelf this build ships\n\
      pack find <words> [--json]              narrow it by id, title, summary or keywords\n\
-     pack add <id> [--yes] [--state <dir>]   fetch, check the digest, and show or apply the plan\n\
+     pack add <id|file> [--yes] [--digest <sha>]  fetch or read, check the digest, show or apply the plan\n\
      pack export <id> --from <state> [selectors] [--out <file>]\n\
      pack inspect <file> [--json]\n\
      pack plan <file> [--state <dir>] [--json]\n\
@@ -2745,8 +2745,26 @@ fn pack_help() -> String {
 /// `hades pack menu`: the catalog this build carries, so a person can see what exists before writing a
 /// skill by hand. Read-only: it reads the embedded index and prints it.
 fn pack_menu(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse_with(args, &[], &["json"])?;
-    let rows = crate::packs_menu::shipped()?;
+    let flags = parse_with(args, &["state"], &["json", "refresh"])?;
+    // The shipped copy is the floor: a machine with no network still answers what this build knows. A
+    // refresh replaces it with the live shelf, and says so when it cannot.
+    let state = state_of(&flags)?;
+    let (rows, note) = if switched(&flags, "refresh") {
+        match crate::packs_install::rows(&state, true) {
+            Ok(rows) => (rows, String::new()),
+            Err(error) => (
+                crate::packs_menu::shipped()?,
+                format!(
+                    "\n(the live shelf could not be read, so this is the copy this build ships: {error})\n"
+                ),
+            ),
+        }
+    } else {
+        (
+            crate::packs_install::cached(&state).unwrap_or(crate::packs_menu::shipped()?),
+            String::new(),
+        )
+    };
     if switched(&flags, "json") {
         let listed: Vec<serde_json::Value> = rows
             .iter()
@@ -2772,18 +2790,25 @@ fn pack_menu(args: &[String]) -> Result<(String, i32), String> {
             0,
         ));
     }
-    Ok((crate::packs_menu::render(&rows), 0))
+    Ok((format!("{}{note}", crate::packs_menu::render(&rows)), 0))
 }
 
 /// `hades pack find <words>`: the same shelf, filtered. Empty is an answer too: it means there is nothing to
 /// install, which is the one case where writing a new skill is the right move.
 fn pack_find(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse_with(args, &[], &["json"])?;
+    let flags = parse_with(args, &["state"], &["json", "refresh"])?;
     let query = flags
         .positional
         .first()
         .ok_or_else(|| "`pack find` needs words to look for".to_string())?;
-    let rows = crate::packs_menu::shipped()?;
+    // The same shelf `menu` reads: the cached one when there is one, the live one with --refresh. A search
+    // that answers from a different catalog than the listing is a search that misses what it just showed.
+    let state = state_of(&flags)?;
+    let rows = if switched(&flags, "refresh") {
+        crate::packs_install::rows(&state, true).or_else(|_| crate::packs_menu::shipped())?
+    } else {
+        crate::packs_install::cached(&state).unwrap_or(crate::packs_menu::shipped()?)
+    };
     let found = crate::packs_menu::find(&rows, query);
     if switched(&flags, "json") {
         let listed: Vec<serde_json::Value> = found
@@ -2823,13 +2848,26 @@ fn pack_find(args: &[String]) -> Result<(String, i32), String> {
 /// The digest is checked against the menu before the archive is read, so a pack that changed under the same
 /// URL is refused rather than inspected. Without `--yes` nothing is written beyond the cache.
 fn pack_add(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse_with(args, &["state"], &["yes"])?;
-    let id = flags.positional.first().ok_or_else(|| {
-        "`pack add` needs a pack id; `hades pack find <words>` lists ids".to_string()
+    let flags = parse_with(args, &["state", "digest"], &["yes"])?;
+    let name = flags.positional.first().ok_or_else(|| {
+        "`pack add` needs a pack id or a .hadepack file; `hades pack find <words>` lists ids"
+            .to_string()
     })?;
     let state = state_of(&flags)?;
     let home = hades_home()?;
-    let text = crate::packs_install::add(id, &home, &state, switched(&flags, "yes"))?;
+    // A path that exists is a file somebody sent. Anything else is an id to look up on the shelf.
+    let file = Path::new(name);
+    let text = if file.is_file() {
+        crate::packs_install::add_file(
+            file,
+            flags.named.get("digest").map(String::as_str),
+            &home,
+            &state,
+            switched(&flags, "yes"),
+        )?
+    } else {
+        crate::packs_install::add(name, &home, &state, switched(&flags, "yes"))?
+    };
     Ok((text, 0))
 }
 
