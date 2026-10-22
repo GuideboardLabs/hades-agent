@@ -40,6 +40,30 @@ jobs:
       - name: Tests
         working-directory: rust
         run: bash scripts/ci-test.sh
+      - name: The test count the docs claim is the count that ran
+        run: bash rust/scripts/check-claims.sh --tests "$(cat rust/.test-count)"
+
+  arm64:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl
+      # Neither build is a container job: the cross toolchains and qemu are staged under the cache with
+      # `apt-get download` and `dpkg-deb -x`, because registering binfmt needs root the runner does not give us.
+      # The artifacts are *run* here, not only compiled: version, doctor, init, pack add and audit under
+      # qemu-aarch64, with `--require` so a missing emulator fails the job instead of skipping it.
+      - name: Build and run ARM64 artifacts
+        run: bash rust/scripts/arm64-build.sh --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-arm64
+          path: |
+            dist/hades-arm64-gnu
+            dist/hades-arm64-musl
+          if-no-files-found: error
 
   artifacts:
     needs: gate
@@ -61,17 +85,24 @@ jobs:
           if-no-files-found: error
 
   verify:
-    needs: artifacts
+    needs: [artifacts, arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Both artifact sets, merged: the four binaries are verified from the bytes that will be published,
+      # not from the build directory they were copied out of.
       - uses: actions/download-artifact@v4
         with:
-          name: binaries
+          pattern: binaries*
+          merge-multiple: true
           path: dist
       # upload-artifact drops the mode; a downloaded binary arrives 0644 and cannot be executed or packaged.
       - name: Restore executable bits
-        run: chmod 755 dist/hades-portable dist/hades-musl
+        run: chmod 755 dist/hades-portable dist/hades-musl dist/hades-arm64-gnu dist/hades-arm64-musl
+      - name: The ARM64 artifacts, run rather than cross-checked
+        run: |
+          bash rust/scripts/arm64-check.sh dist/hades-arm64-gnu --require
+          bash rust/scripts/arm64-check.sh dist/hades-arm64-musl --require
       - name: The portable binary on three LTS images
         run: bash rust/scripts/portability.sh dist/hades-portable
       - name: The static binary on the same three images
@@ -101,15 +132,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: binaries
+          pattern: binaries*
+          merge-multiple: true
           path: dist
       - name: Restore executable bits
-        run: chmod 755 dist/hades-portable dist/hades-musl
+        run: chmod 755 dist/hades-portable dist/hades-musl dist/hades-arm64-gnu dist/hades-arm64-musl
       - name: Package both artifacts
         run: |
           bash rust/package.sh --skip-build --bin dist/hades-portable --out dist
           bash rust/package.sh --skip-build --bin dist/hades-musl \
             --target x86_64-unknown-linux-musl --out dist
+          bash rust/package.sh --skip-build --bin dist/hades-arm64-gnu \
+            --target aarch64-unknown-linux-gnu --out dist
+          bash rust/package.sh --skip-build --bin dist/hades-arm64-musl \
+            --target aarch64-unknown-linux-musl --out dist
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,5 +155,5 @@ jobs:
           gh release create "$tag" \
             --title "hades $tag" \
             --notes-file /tmp/notes.md \
-            dist/hades-*-x86_64-unknown-linux-*.tar.gz \
-            dist/hades-*-x86_64-unknown-linux-*.tar.gz.sha256
+            dist/hades-*.tar.gz \
+            dist/hades-*.tar.gz.sha256

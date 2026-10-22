@@ -12,13 +12,22 @@
 # toolchain is whatever `cargo` is on `PATH`.
 #
 # Usage: scripts/cross-check.sh            (stages once, then checks)
+#        scripts/cross-check.sh --stage-only
 #        CROSS_PREFIX=/some/dir scripts/cross-check.sh
 set -eu
+
+STAGE_ONLY=0
+case "${1:-}" in
+    --stage-only) STAGE_ONLY=1 ;;
+    "") ;;
+    *) echo "usage: cross-check.sh [--stage-only]" >&2; exit 2 ;;
+esac
 
 PREFIX=${CROSS_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/hades-cross}
 TARGET=aarch64-unknown-linux-gnu
 PACKAGES="gcc-aarch64-linux-gnu gcc-13-aarch64-linux-gnu cpp-13-aarch64-linux-gnu \
-binutils-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross libgcc-13-dev-arm64-cross"
+binutils-aarch64-linux-gnu libc6-dev-arm64-cross libc6-arm64-cross linux-libc-dev-arm64-cross \
+libgcc-13-dev-arm64-cross libgcc-s1-arm64-cross"
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo is not on PATH" >&2
@@ -49,10 +58,14 @@ WRAPPER
 
 cat > "$PREFIX/bin/cc" <<WRAPPER
 #!/bin/sh
-exec $PREFIX/root/usr/bin/aarch64-linux-gnu-gcc -B$PREFIX/bin "\$@"
+exec $PREFIX/root/usr/bin/aarch64-linux-gnu-gcc --sysroot=${HADES_CROSS_SYSROOT:-$PREFIX/root} -B$PREFIX/bin "\$@"
 WRAPPER
 
 chmod +x "$PREFIX/bin/as" "$PREFIX/bin/ar" "$PREFIX/bin/cc"
+
+if [ "$STAGE_ONLY" -eq 1 ]; then
+    exit 0
+fi
 
 # The cc crate reads `CC_<target>`, and a shell cannot put a hyphen in a variable name, so the target is
 # translated once. `sh` here is dash, which has no `${var//-/_}`.

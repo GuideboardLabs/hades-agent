@@ -35,7 +35,7 @@ if [ "$STATIC" = "1" ]; then
   fi
 fi
 
-floor=$(objdump -T "$BIN" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+floor=$("${OBJDUMP:-objdump}" -T "$BIN" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
 if [ -z "$floor" ]; then
   if [ "$STATIC" = "1" ]; then
     echo "ok   no glibc symbols at all"
@@ -57,5 +57,9 @@ else
   fi
 fi
 
-echo "$BIN version: $("$BIN" version 2>&1 | tail -1)"
+if [ "${HADES_ASSERT_NO_RUN:-0}" = "1" ]; then
+  echo "$BIN: cross binary, version read by the runner"
+else
+  echo "$BIN version: $("$BIN" version 2>&1 | tail -1)"
+fi
 exit "$status"
