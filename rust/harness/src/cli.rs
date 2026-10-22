@@ -2760,10 +2760,21 @@ fn pack_menu(args: &[String]) -> Result<(String, i32), String> {
             ),
         }
     } else {
-        (
-            crate::packs_install::cached(&state).unwrap_or(crate::packs_menu::shipped()?),
-            String::new(),
-        )
+        match crate::packs_install::cached(&state) {
+            Some(rows) => {
+                let age = crate::packs_install::cached_age(&state)
+                    .map(crate::packs_menu::age_text)
+                    .unwrap_or_else(|| "an unknown time ago".to_string());
+                (
+                    rows,
+                    format!("\nthis shelf was read {age}; --refresh reads it again\n"),
+                )
+            }
+            None => (
+                crate::packs_menu::shipped()?,
+                "\nthis is the copy the build ships; --refresh reads the live shelf\n".to_string(),
+            ),
+        }
     };
     if switched(&flags, "json") {
         let listed: Vec<serde_json::Value> = rows

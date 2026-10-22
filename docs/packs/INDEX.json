@@ -4,7 +4,7 @@
   "packs": [
     {
       "archive": "dist/plan-a-change-1.0.0.hadepack",
-      "bytes": 1642,
+      "bytes": 1612,
       "capabilities": {
         "code": false,
         "network": false,
@@ -29,14 +29,14 @@
       ],
       "license": "MIT",
       "requires_hades": ">=0.1.0,<0.2",
-      "sha256": "95754aa1b90933a43b194fa2dc3ead4dc0bae8a330fa24a428ea5b74ce5f2843",
+      "sha256": "b4315e24ac8af9d3e9b722bb7552e7ff3d203d39f068d81da476a006e61a77a6",
       "summary": "Break a change into steps a check can prove, before any file is touched.",
       "title": "Plan a change",
       "version": "1.0.0"
     },
     {
       "archive": "dist/research-with-sources-1.0.0.hadepack",
-      "bytes": 1719,
+      "bytes": 1687,
       "capabilities": {
         "code": false,
         "network": true,
@@ -61,14 +61,14 @@
       ],
       "license": "MIT",
       "requires_hades": ">=0.1.0,<0.2",
-      "sha256": "589e593acd8857a7dd747d1c93d5bd5fac9c99f6de93030da5d6ba94eeb0d719",
+      "sha256": "57979a5d33507c76317af2807dd92830ecb232593c8be6d243522748e2a47f89",
       "summary": "Answer a question from primary sources, with the quote and the date attached to every claim.",
       "title": "Research with sources",
       "version": "1.0.0"
     },
     {
       "archive": "dist/review-a-diff-1.0.0.hadepack",
-      "bytes": 1718,
+      "bytes": 1693,
       "capabilities": {
         "code": false,
         "network": false,
@@ -93,7 +93,7 @@
       ],
       "license": "MIT",
       "requires_hades": ">=0.1.0,<0.2",
-      "sha256": "8e230b48bb2b399da0685572ef054d938ece5d84592b1de672570b55e7c1aca1",
+      "sha256": "61f5e1089bc15e06631002279ae3d471d0b914afa061f75d694f3a0b811df2b2",
       "summary": "Read a change as a reviewer: what it does, what it breaks, what it leaves untested.",
       "title": "Review a diff",
       "version": "1.0.0"

@@ -151,12 +151,33 @@ pub fn render(rows: &[Row]) -> String {
     text
 }
 
+/// How old a cached shelf is, in words. A menu that cannot say when it was read is a menu that looks current
+/// when it is not; the shipped copy says that instead of a date, because it is as old as the binary.
+pub fn age_text(seconds: u64) -> String {
+    match seconds {
+        0..=90 => "just now".to_string(),
+        _ if seconds < 3_600 => format!("{} minutes ago", seconds / 60),
+        _ if seconds < 86_400 => format!("{} hours ago", seconds / 3_600),
+        _ if seconds < 7 * 86_400 => format!("{} days ago", seconds / 86_400),
+        _ => format!("{} days ago, older than a week", seconds / 86_400),
+    }
+}
+
 pub fn find<'a>(rows: &'a [Row], query: &str) -> Vec<&'a Row> {
     rows.iter().filter(|row| row.matches(query)).collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_age_is_said_in_words() {
+        assert_eq!(super::age_text(5), "just now");
+        assert_eq!(super::age_text(600), "10 minutes ago");
+        assert_eq!(super::age_text(7_200), "2 hours ago");
+        assert_eq!(super::age_text(2 * 86_400), "2 days ago");
+        assert!(super::age_text(9 * 86_400).contains("older than a week"));
+    }
+
     use super::*;
 
     #[test]

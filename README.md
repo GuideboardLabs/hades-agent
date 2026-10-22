@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.8-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.9-blue">
   <img alt="Tests" src="https://img.shields.io/badge/tests-1063%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.8 |
+| **Version** | 0.1.9 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -695,7 +695,8 @@ plan and writes nothing; with it, the plan is applied and the pack is active.
 A pack that arrives as a file is added the same way: `hades pack add ./thing.hadepack --digest <sha256>
 --yes`. The digest is optional, and when it is given the file must hash to it; when it is not, the file's own
 digest is printed so it can be compared with what the sender said. `hades pack menu` reads the copy this
-build ships unless this machine has cached a live one; `--refresh` reads the live shelf. `HADES_PACKS_URL` points the
+build ships unless this machine has cached a live one, and says how old a cached shelf is; `--refresh` reads
+it again. `HADES_PACKS_URL` points the
 shelf at a mirror, and `HADES_PACKS_ALLOW_PRIVATE=1` is what lets that mirror be a local address.
 
 The catalog is generated from a packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`

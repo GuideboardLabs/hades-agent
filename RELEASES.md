@@ -3,6 +3,16 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.9
+
+- **The menu says when it was read.** A cached index now records its fetch time, and `pack menu` reports it
+  ("read 2 hours ago", "9 days ago, older than a week"); the shipped copy says that instead of a date, because
+  it is as old as the binary. A catalog that looks current when it is not is worse than one that admits it.
+- **The shelf's URL is the real one**, `raw.githubusercontent.com/GuideboardLabs/hades-agent-packs`, and the
+  menu shipped in this build is the one that repository publishes.
+- **Nothing else changes behaviour.** `--refresh` still reads the live shelf, and a shelf that cannot be read
+  is still named rather than silently replaced.
+
 ## 0.1.8
 
 - **A pack that arrives as a file is added.** `hades pack add ./thing.hadepack --yes` installs without a

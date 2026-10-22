@@ -15,7 +15,8 @@ use std::path::Path;
 use crate::packs_menu::{self, Row};
 
 /// The public shelf. Raw files, so a fetch needs no API token and the URL a row names is the URL fetched.
-pub const DEFAULT_BASE: &str = "https://raw.githubusercontent.com/GuideboardLabs/packs/main/";
+pub const DEFAULT_BASE: &str =
+    "https://raw.githubusercontent.com/GuideboardLabs/hades-agent-packs/main/";
 
 /// A pack is a skill and a manifest. Four MiB is the fetch path's own body cap; a pack over it is not a pack.
 const MAX_ARCHIVE: usize = 4 * 1024 * 1024;
@@ -51,6 +52,17 @@ fn cache_dir(state: &Path) -> std::path::PathBuf {
 
 /// The cached index, when this machine has read the shelf before. `pack menu` is offline by default, so a
 /// command that only lists what exists does not open a socket to say nothing new.
+/// When the cached index was fetched, in seconds since the Unix epoch, so a menu can say how old it is.
+pub fn cached_age(state: &Path) -> Option<u64> {
+    let text = fs::read_to_string(cache_dir(state).join("INDEX.fetched")).ok()?;
+    let at: u64 = text.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(at))
+}
+
 pub fn cached(state: &Path) -> Option<Vec<Row>> {
     let text = fs::read_to_string(cache_dir(state).join("INDEX.json")).ok()?;
     packs_menu::parse(&text).ok()
@@ -76,6 +88,11 @@ pub fn rows(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
     }
     fs::write(&path, &text)
         .map_err(|error| format!("could not cache the index at {}: {error}", path.display()))?;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let _ = fs::write(cache_dir(state).join("INDEX.fetched"), at.to_string());
     Ok(rows)
 }
 
