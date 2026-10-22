@@ -3721,6 +3721,7 @@ mod tests {
     #[test]
     #[ignore = "starts a real Chromium and an authenticated proxy; run with --ignored"]
     fn proxy_credentials_are_answered() {
+        let _env = crate::test_env::hold();
         use std::io::Read;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3878,6 +3879,7 @@ mod tests {
     #[ignore = "starts a real Chromium; run with --ignored"]
     fn humanized_refs_click_and_type() {
         let _guard = live();
+        let _env = crate::test_env::hold();
         unsafe {
             std::env::set_var("HADES_HUMANIZE", "1");
         }

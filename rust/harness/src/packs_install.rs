@@ -380,6 +380,7 @@ mod tests {
 
     #[test]
     fn a_base_without_a_slash_still_joins() {
+        let _env = crate::test_env::hold();
         // SAFETY: the variable is read once, in this test binary, before any fetch. Restored after.
         unsafe { std::env::set_var("HADES_PACKS_URL", "https://example.invalid/shelf") };
         assert_eq!(base().expect("a base"), "https://example.invalid/shelf/");
@@ -388,6 +389,7 @@ mod tests {
 
     #[test]
     fn a_plain_http_shelf_is_refused_unless_it_is_a_private_mirror() {
+        let _env = crate::test_env::hold();
         // SAFETY: as above; this test restores both variables it touches.
         unsafe {
             std::env::set_var("HADES_PACKS_URL", "http://example.invalid/shelf");

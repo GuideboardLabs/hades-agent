@@ -1243,6 +1243,7 @@ mod tests {
     /// it: this is the path a machine without `libcurl.so.4` takes.
     #[test]
     fn the_process_path_still_answers_when_the_pool_is_off() {
+        let _env = crate::test_env::hold();
         let fixture = site(&[(b"/", b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nback")]);
         // SAFETY: no other test in this binary reads this variable concurrently; the fetches below are
         // the only readers and they run on this thread.

@@ -137,3 +137,24 @@ pub const PATCH: &str = "patch";
 /// The name the check answers to in the log. The check is a run like any other, so it is recorded as one
 /// rather than as a special case.
 pub const VERIFY: &str = "verify";
+
+/// Process-wide environment, shared by every test in this binary. `set_var` is not per-test: a test that sets
+/// `HADES_PROXY` or `PATH` and runs beside another one changes what that test sees, and the failure surfaces
+/// somewhere else entirely. Tests that rewrite it take this lock and put the old value back.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Held for the duration of a test that rewrites the process environment. One lock, not one per module:
+    /// a per-module lock cannot order a test in `vision` against a test in `command`, and both can be running.
+    pub(crate) fn hold() -> MutexGuard<'static, ()> {
+        lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}

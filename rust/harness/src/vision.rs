@@ -490,6 +490,7 @@ mod tests {
     /// the health endpoint and the unit.
     #[test]
     fn a_successful_launch_keeps_waiting_for_the_model() {
+        let _env = crate::test_env::hold();
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 
@@ -590,6 +591,7 @@ mod tests {
     /// the OpenAI vision shape. Without this, the image tool is tied to one machine's GGUF files.
     #[test]
     fn a_configured_endpoint_is_used_instead_of_a_local_server() {
+        let _env = crate::test_env::hold();
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 

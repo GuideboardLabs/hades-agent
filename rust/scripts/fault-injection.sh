@@ -30,16 +30,19 @@ trap cleanup EXIT
 
 # A pack with enough files that a kill has somewhere to land in the middle of the write.
 make_pack() {
-  local name=$1 dir="$WORK/src-$1"
+  local name=$1
+  local version=${2:-1.0.0}
+  local marker=${3:-first}
+  local dir="$WORK/src-$name-$version"
   mkdir -p "$dir/skills/$name/notes"
-  printf -- '---\nname: %s\ndescription: Use when %s is the one.\n---\n\n# %s\n' "$name" "$name" "$name" \
-    >"$dir/skills/$name/SKILL.md"
+  printf -- '---\nname: %s\ndescription: Use when %s is the one.\n---\n\n# %s\n\n%s\n' \
+    "$name" "$name" "$name" "$marker" >"$dir/skills/$name/SKILL.md"
   local i
   for i in $(seq 1 120); do
     printf 'line %s of %s\n' "$i" "$name" >"$dir/skills/$name/notes/$i.txt"
   done
-  "$BIN" pack export --dir "$dir/skills/$name" --license MIT --out "$WORK/$name.hadepack" \
-    >/dev/null 2>&1 || return 1
+  "$BIN" pack export --dir "$dir/skills/$name" --license MIT --version "$version" \
+    --out "$WORK/$name-$version.hadepack" >/dev/null 2>&1 || return 1
 }
 
 fresh_state() {
@@ -52,7 +55,8 @@ fresh_state() {
 
 h() { HOME="$1" HADES_HOME="$1/.hades" "$BIN" "${@:2}"; }
 
-make_pack alpha || { echo "could not build a fixture pack"; exit 2; }
+make_pack alpha 1.0.0 first || { echo "could not build a fixture pack"; exit 2; }
+make_pack alpha 1.1.0 second || { echo "could not build a second version"; exit 2; }
 
 # 1. Kill an install at twenty different moments. Every survivor has to be a state that a later install can
 #    use: catalog parses, no skill that was never finished, and a re-run succeeds.
@@ -61,7 +65,7 @@ fresh_state "$state"
 leftovers=0
 for i in $(seq 1 20); do
   delay=$(awk -v n="$i" 'BEGIN{printf "%.3f", n * 0.0015}')
-  h "$state" pack add "$WORK/alpha.hadepack" --yes >/dev/null 2>&1 &
+  h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1 &
   pid=$!
   sleep "$delay"
   kill -9 "$pid" 2>/dev/null
@@ -76,7 +80,7 @@ for i in $(seq 1 20); do
   fi
 done
 leftovers=$(find "$state/.hades/packs/archives" -name 'incoming-*' 2>/dev/null | wc -l)
-again=$(h "$state" pack add "$WORK/alpha.hadepack" --yes 2>&1)
+again=$(h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes 2>&1)
 after=$(find "$state/.hades/packs/archives" -name 'incoming-*' 2>/dev/null | wc -l)
 if [ $? -eq 0 ] && [ -f "$state/.hades/skills/alpha/SKILL.md" ]; then
   if [ "$after" = "0" ]; then
@@ -90,7 +94,7 @@ fi
 
 # 2. A truncated archive is what a dropped connection looks like. The digest is the only thing that can catch
 #    it, because the tar header can still be valid.
-head -c 900 "$WORK/alpha.hadepack" >"$WORK/alpha-cut.hadepack"
+head -c 900 "$WORK/alpha-1.0.0.hadepack" >"$WORK/alpha-cut.hadepack"
 state="$WORK/truncated"
 fresh_state "$state"
 said=$(h "$state" pack add "$WORK/alpha-cut.hadepack" --yes 2>&1)
@@ -108,41 +112,62 @@ fi
 #    disk takes (EFBIG here, ENOSPC there) without filling a real disk.
 state="$WORK/write-fails"
 fresh_state "$state"
-said=$( (ulimit -f 1; h "$state" pack add "$WORK/alpha.hadepack" --yes) 2>&1 )
+said=$( (ulimit -f 1; h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes) 2>&1 )
 code=$?
 if [ $code -ne 0 ] && [ ! -d "$state/.hades/skills/alpha" ]; then
   ok "a failing write is reported and leaves no skill (exit $code)"
 else
   bad "a failing write exited $code and left a skill directory behind"
 fi
-if h "$state" pack add "$WORK/alpha.hadepack" --yes >/dev/null 2>&1 && \
+if h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1 && \
    [ -f "$state/.hades/skills/alpha/SKILL.md" ]; then
   ok "the same install succeeds once the write limit is gone"
 else
   bad "the install did not recover after the write limit was lifted"
 fi
 
-# 4. A state directory that cannot be written is an error, not a panic, and not a partial skill.
+# 4. A state directory that cannot be written is an error, not a panic, and not a partial skill. A regular
+#    file where the cache directory belongs fails for root as well; `chmod -w` would not, and a test that
+#    passes as a person and silently succeeds as root (inside a container, say) is worse than no test.
 state="$WORK/readonly"
 fresh_state "$state"
-mkdir -p "$state/.hades/packs/archives"
-chmod -w "$state/.hades/packs"
-said=$(h "$state" pack add "$WORK/alpha.hadepack" --yes 2>&1)
+mkdir -p "$state/.hades"
+rm -rf "$state/.hades/packs"
+: >"$state/.hades/packs"
+[ -f "$state/.hades/packs" ] || bad "could not put a file where the cache directory belongs"
+said=$(h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes 2>&1)
 code=$?
-chmod +w "$state/.hades/packs"
+rm -f "$state/.hades/packs"
 if [ $code -ne 0 ] && [ ! -d "$state/.hades/skills/alpha" ] && ! printf '%s' "$said" | grep -q "panicked"; then
-  ok "an unwritable state is refused cleanly (exit $code)"
+  ok "a state that cannot be written is refused cleanly (exit $code)"
 else
-  bad "an unwritable state exited $code: $said"
+  bad "a state that cannot be written exited $code: ${said:0:200}"
+fi
+# The same thing as a person: permission bits only mean something to a non-root caller.
+if [ "$(id -u)" != "0" ]; then
+  state="$WORK/readonly-chmod"
+  fresh_state "$state"
+  mkdir -p "$state/.hades/packs/archives"
+  chmod -w "$state/.hades/packs"
+  said=$(h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes 2>&1)
+  code=$?
+  chmod +w "$state/.hades/packs"
+  if [ $code -ne 0 ] && [ ! -d "$state/.hades/skills/alpha" ]; then
+    ok "a read-only cache directory is refused cleanly (exit $code)"
+  else
+    bad "a read-only cache directory exited $code: ${said:0:200}"
+  fi
+else
+  skip "running as root, so permission bits are not a refusal; the path-type case above covers it"
 fi
 
 # 5. Two installs of the same pack at once. The result must be one skill and a catalog that parses; ordering is
 #    not promised, consistency is.
 state="$WORK/same-twice"
 fresh_state "$state"
-h "$state" pack add "$WORK/alpha.hadepack" --yes >/dev/null 2>&1 &
+h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1 &
 first=$!
-h "$state" pack add "$WORK/alpha.hadepack" --yes >/dev/null 2>&1 &
+h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1 &
 second=$!
 wait "$first"
 wait "$second"
@@ -153,7 +178,39 @@ else
   bad "two simultaneous installs left $lines catalog row(s)"
 fi
 
-# 6. A genuinely full filesystem, when the machine will give us a small one. This is the case `ulimit` only
+# 6. A replace, killed mid-way. The old skill is moved aside before the new one is renamed into place, and that
+#    is the window where an interrupted install could leave nothing at all. After every kill the path must be
+#    either a complete skill or gone (which the next run repairs); it must never be a half-copied directory,
+#    and the final run must land the new version.
+state="$WORK/replace"
+fresh_state "$state"
+h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1
+printf '{"items":[{"kind":"skill","identity":"alpha","action":"replace"}]}\n' >"$WORK/decisions.json"
+torn=0
+gone=0
+for i in $(seq 1 15); do
+  delay=$(awk -v n="$i" 'BEGIN{printf "%.3f", n * 0.0012}')
+  h "$state" pack apply "$WORK/alpha-1.1.0.hadepack" --plan "$WORK/decisions.json" --activate \
+    >/dev/null 2>&1 &
+  pid=$!
+  sleep "$delay"
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  skill="$state/.hades/skills/alpha"
+  if [ -d "$skill" ] && [ ! -f "$skill/SKILL.md" ]; then
+    torn=$((torn + 1))
+  elif [ ! -d "$skill" ]; then
+    gone=$((gone + 1))
+  fi
+done
+final=$(h "$state" pack apply "$WORK/alpha-1.1.0.hadepack" --plan "$WORK/decisions.json" --activate 2>&1)
+if [ -f "$state/.hades/skills/alpha/SKILL.md" ] && grep -q second "$state/.hades/skills/alpha/SKILL.md"; then
+  ok "a replace survives fifteen kills: ${torn} torn directories, ${gone} absent, final run lands 1.1.0"
+else
+  bad "a replace did not land after the kills: ${final:0:200}"
+fi
+
+# 7. A genuinely full filesystem, when the machine will give us a small one. This is the case `ulimit` only
 #    approximates: the tar stage succeeds and the write fails partway through.
 if sudo -n true 2>/dev/null; then
   mkdir -p "$WORK/tiny"
@@ -161,7 +218,7 @@ if sudo -n true 2>/dev/null; then
     state="$WORK/tiny/state"
     mkdir -p "$state"
     h "$state" init --provider ollama-cloud --model qwen3.8-27b --root "$state/work" >/dev/null 2>&1
-    said=$(h "$state" pack add "$WORK/alpha.hadepack" --yes 2>&1)
+    said=$(h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes 2>&1)
     code=$?
     sudo -n umount "$WORK/tiny" 2>/dev/null
     if [ $code -ne 0 ]; then

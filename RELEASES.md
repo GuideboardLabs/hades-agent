@@ -3,6 +3,29 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.12
+
+The rest of the fault-injection gaps, and a machine the artifact has never run on.
+
+- **A replace, killed fifteen times, never leaves a torn skill.** The window between moving the old skill
+  aside and placing the new one is two syscalls; the case is now part of the fault script, and the repair path
+  covers the kill that lands inside it.
+- **A state that cannot be written is refused**, tested with a file where the cache directory belongs so the
+  case means the same thing as root.
+- **A download that stops early is refused.** A server that promises a body and closes halfway is the remote
+  form of a truncated file; the test asserts nothing is installed.
+- **Eleven tests that rewrote the process environment now share one lock.** `PATH`, `HADES_PROXY`,
+  `HADES_FETCH_POOL` and the vision variables could be changed under a neighbouring test; a per-module lock
+  cannot order two modules. This is the most likely mechanism behind the single unreproduced failure noted in
+  the previous release.
+- **`scripts/cross-machine-container.sh`** runs the packaged binary inside a container: installer, daemon,
+  a live shelf install, a second install as a skip, and the fault cases. 6 of 6.
+- **`scripts/fault-injection.sh`** gains the replace case and the path-type state case: 8 passed, 1 skipped.
+
+1072 tests, 12 live browser tests, acceptance 31/31, aarch64 check green, cross-env 7/7, fault cases 8/8 with
+the disk-full case skipped (no privileged mount on this host; `ulimit -f` covers the same code path with
+`EFBIG`), cross-machine 5/5 on the host and 6/6 in a container.
+
 ## 0.1.11
 
 Fault injection on the pack installer, and the same suite run against the packaged binary on a clean home.

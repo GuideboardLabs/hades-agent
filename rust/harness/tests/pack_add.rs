@@ -41,12 +41,24 @@ fn shelf(listener: TcpListener, root: PathBuf) -> std::thread::JoinHandle<()> {
     })
 }
 
+/// Tests in one binary run on threads that share one environment, and `HADES_PACKS_URL` is process-wide.
+/// The shelf tests therefore take this lock; without it they point each other at the wrong server and the
+/// failure looks like a missing pack.
+static SHELF_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn shelf_env() -> std::sync::MutexGuard<'static, ()> {
+    SHELF_ENV
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     mneme::sha256::hex(bytes)
 }
 
 #[test]
 fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
+    let _env = shelf_env();
     let work = std::env::temp_dir().join(format!("hades-pack-add-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     let source = work.join("source");
@@ -204,6 +216,7 @@ fn a_file_that_arrived_is_checked_against_the_digest_you_were_given() {
 /// refused; the failure mode this forbids is installing a different archive and reporting success.
 #[test]
 fn a_pinned_digest_for_a_shelf_pack_is_not_ignored() {
+    let _env = shelf_env();
     let work = std::env::temp_dir().join(format!("hades-pin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     let home = work.join("home");
@@ -469,5 +482,111 @@ fn a_catalog_row_whose_skill_is_gone_is_repaired_by_installing_again() {
     std::fs::remove_dir_all(state.join("skills/mend")).expect("the crash window");
     let repaired = packs_install::add_file(&archive, None, &home, &state, true).expect("a repair");
     assert!(state.join("skills/mend/SKILL.md").is_file(), "{repaired}");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A body that stops early is what a dropped connection looks like from the installer's side. The server
+/// promises the full length and then closes; the fetch must fail, and nothing may be written.
+#[test]
+fn a_download_that_stops_early_is_refused() {
+    let _env = shelf_env();
+    let work = std::env::temp_dir().join(format!("hades-short-body-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("a work dir");
+
+    // A real archive to describe in the index, and half of it to send.
+    let source = work.join("src");
+    std::fs::create_dir_all(source.join("skills/short")).expect("a source");
+    std::fs::write(
+        source.join("skills/short/SKILL.md"),
+        "---\nname: short\ndescription: Use when the body stops early.\n---\n\n# Short\n",
+    )
+    .expect("a skill");
+    let archive = work.join("short.hadepack");
+    let options = ExportOptions {
+        id: "short".to_string(),
+        version: "1.0.0".to_string(),
+        from: source.clone(),
+        title: "Short".to_string(),
+        summary: "A body that stops early.".to_string(),
+        license: "MIT".to_string(),
+        derivatives: "allowed".to_string(),
+        network: false,
+        writes: Vec::new(),
+        requires_roles: Vec::new(),
+        requires_tools: Vec::new(),
+        skills: vec!["short".to_string()],
+        profiles: Vec::new(),
+        cases: Vec::new(),
+        keywords: Vec::new(),
+        source: None,
+        out: Some(archive.clone()),
+    };
+    harness::pack::export(&options).expect("an archive");
+    let body = std::fs::read(&archive).expect("the archive");
+    let digest = sha256(&body);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+    let url = format!("http://{}/", listener.local_addr().expect("an address"));
+    let index = format!(
+        r#"{{"menu":1,"packs":[{{"id":"short","version":"1.0.0","title":"Short",
+        "summary":"A body that stops early.","license":"MIT","derivatives":"allowed","keywords":[],
+        "kind":["skill"],"items":[{{"kind":"skill","name":"short"}}],
+        "requires_hades":">=0.1.0,<0.2","bytes":{},"sha256":"{digest}",
+        "archive":"dist/short-1.0.0.hadepack"}}]}}"#,
+        body.len()
+    );
+    let served = work.join("shelf");
+    std::fs::create_dir_all(served.join("dist")).expect("a shelf");
+    std::fs::write(served.join("INDEX.json"), &index).expect("an index");
+    let half = body.len() / 2;
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let path = request
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .trim_start_matches('/')
+                .to_string();
+            if path == "INDEX.json" {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{index}",
+                    index.len()
+                );
+            } else {
+                // The length is honest about what was promised, and the connection closes halfway through it.
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body[..half]);
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    // SAFETY: this test binary sets these before any fetch and runs no other fetch concurrently.
+    unsafe {
+        std::env::set_var("HADES_PACKS_URL", &url);
+        std::env::set_var("HADES_PACKS_ALLOW_PRIVATE", "1");
+    }
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+
+    let refused = packs_install::add("short", None, &home, &state, true)
+        .expect_err("a body that stops early");
+    assert!(
+        !state.join("skills/short").exists(),
+        "a short body installed something: {refused}"
+    );
+    drop(handle);
     let _ = std::fs::remove_dir_all(&work);
 }

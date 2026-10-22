@@ -244,6 +244,7 @@ mod tests {
     /// the agent starts from inside the service lands on the small root filesystem.
     #[test]
     fn the_units_carry_the_target_directory_when_one_is_set() {
+        let _env = crate::test_env::hold();
         // SAFETY: this test sets the variable only to read it back through `render`; no other test
         // reads or writes `CARGO_TARGET_DIR`.
         unsafe {

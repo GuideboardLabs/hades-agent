@@ -132,6 +132,7 @@ mod tests {
     /// the scrub is applied one layer below the tool the model's programs actually reach.
     #[test]
     fn the_tool_a_run_wires_runs_without_the_harness_environment() {
+        let _env = crate::test_env::hold();
         // The shell path a governed run builds: no cage, so nothing but the environment can confound this.
         let root = crate::scratch::root().join(format!("tool-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

@@ -699,13 +699,10 @@ mod tests {
     }
 
     // A model-run shell sees only the passlist, even when the harness holds a key.
-    use std::sync::Mutex;
-
-    static ENV: Mutex<()> = Mutex::new(());
 
     #[test]
     fn a_model_shell_cannot_read_a_key_the_harness_holds() {
-        let _guard = ENV.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::test_env::hold();
         // Planted in this process, exactly like a provider key the harness was started with.
         unsafe {
             std::env::set_var("HADES_TEST_SECRET", "sk-do-not-leak");

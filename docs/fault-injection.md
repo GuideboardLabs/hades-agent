@@ -3,11 +3,14 @@
 The fourth audit ended with a recommendation: stop reading the installer and break it while it runs. This is
 that run. Two scripts, both in `rust/scripts/`, both committed so the result is repeatable:
 
-- `fault-injection.sh <hades>` kills installs, truncates archives, fails writes, makes the state read-only,
-  races two installs of one pack, and mounts a 96 KiB filesystem when the machine will allow it.
+- `fault-injection.sh <hades>` kills installs, kills a *replace*, truncates archives, fails writes, makes the
+  state unwritable, races two installs of one pack, and mounts a 96 KiB filesystem when the machine will allow
+  it.
 - `cross-machine.sh <tarball>` extracts the packaged release into an otherwise empty directory, gives it a
   home and a umask it has never seen, and runs the acceptance suite, a real install from the published shelf,
   and the fault cases against that binary instead of the build tree.
+- `cross-machine-container.sh <tarball>` does the same inside a container image, so the root filesystem, the
+  daemon's runtime directory and every host path differ from the machine that built it.
 
 ## What the fault cases found
 
@@ -43,6 +46,16 @@ cause was that it is not a tar. The two failures are now told apart, and the mes
 so a row whose default was `ask` ended in "the plan has an action this build does not know: `ask`". It now names
 the item and the two commands that resolve it.
 
+**7. A replace, killed fifteen times, never leaves a torn directory.** The replace path moves the old skill
+aside before it renames the new one into place, which is the one window where a kill could leave nothing at
+all. Fifteen kills at increasing delays produced zero half-copied directories and zero missing paths, and the
+final run landed the new version. The window is real but two syscalls wide; the repair path from finding 2 is
+what covers it when it is hit.
+
+**8. A state that cannot be written is refused, not skipped.** With a regular file where the cache directory
+belongs, `pack add` exits 2 and writes no skill. This replaced a `chmod -w` case that quietly passed as root,
+where permission bits mean nothing.
+
 ## What the fault cases did not find
 
 - The digest check held under every kill: no truncated or swapped archive was ever installed.
@@ -50,11 +63,12 @@ the item and the two commands that resolve it.
 - An unwritable state was refused with exit 2 and no panic.
 - Two simultaneous installs of one pack end with one catalog row and one skill (after fix 3).
 - A 96 KiB tmpfs was not available here — `sudo -n` is refused — so disk-full is covered by the `ulimit -f`
-  case, which fails the write at the same point with `EFBIG` instead of `ENOSPC`.
+  case, which fails the write at the same point with `EFBIG` instead of `ENOSPC`. That is the one case in this
+  document that is reasoned rather than observed.
 
 ## Cross-machine
 
-`cross-machine.sh` on the packaged `hades-0.1.10-x86_64-unknown-linux-gnu.tar.gz`: 5 of 5.
+`cross-machine.sh` on the packaged release: 5 of 5.
 
 - the extracted binary answers its version;
 - the full clean-home acceptance suite passes from the tarball (31 checks) with a fresh home and umask 022;
@@ -67,13 +81,25 @@ An earlier version of this script ran under `env -i` and failed acceptance at `s
 tool needs a session bus. Isolating the home and the umask is the point. Starving the whole environment tested
 the harness, not the artifact.
 
-## One thing that did not reproduce
+`cross-machine-container.sh` on the same release, inside `archlinux:latest`: 6 of 6 — the binary runs, the
+tarball's installer completes, the installed daemon starts and answers, a pack installs from the published
+shelf, a second install is a skip, and the fault cases pass there too (two of them skip, because the container
+runs as root and its mount namespace differs; the script says which). The acceptance suite stays on the host,
+because it re-packages and therefore needs the build tree.
+
+## One failure that did not reproduce, and the mechanism behind it
 
 A single run of `cargo test --workspace` reported one failing unit test in `-p harness --lib` (545 passed, 1
-failed) and the name was lost to the output filter. Eleven further runs, including eight consecutive
-unfiltered runs of that binary, were clean. It is recorded here rather than dropped, because a flaky test in a
-suite this size is a finding whether or not it repeats on demand; a bisection with `--test-threads=1` is the
-next step if it appears again.
+failed); the name was lost to the output filter. Forty-nine further runs, including thirty consecutive
+unfiltered ones and eight under deliberate CPU contention, were clean. It is recorded rather than dropped,
+because a flaky test is a finding whether or not it repeats on demand.
+
+Chasing it turned up a mechanism that fits exactly: eleven tests in six modules rewrote the *process*
+environment (`PATH`, `HADES_PROXY`, `HADES_FETCH_POOL`, `HADES_VISION_*`, `HADES_HUMANIZE`) with no lock, so
+they could change what a neighbouring test reads halfway through its own run. Only one of the modules
+serialised itself, and a per-module lock cannot order two modules. Every one of them now takes one shared
+lock (`test_env::hold`) for the duration of its test. Whether that was the failure will stay unproven without
+the name, but the class of failure is gone.
 
 ## The shape of what remains
 
