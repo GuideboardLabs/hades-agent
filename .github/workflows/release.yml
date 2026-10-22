@@ -1,0 +1,110 @@
+name: release
+
+# The release used to be a sequence of commands someone remembered on their own machine, which is how the
+# binary came to require the build host's glibc and how the README came to advertise the previous version.
+# Everything here is a script in the repository: this file orders them and refuses to publish if any of them
+# says no. The floor assertion is the part that matters: a build on a newer runner fails the job instead of
+# silently shipping a binary that refuses the previous LTS.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: The version the docs claim is the version in the manifest
+        run: bash rust/scripts/check-claims.sh
+      - name: Formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        working-directory: rust
+        run: cargo test --workspace --no-fail-fast
+
+  artifacts:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Both builds run in the image they target, exactly as they do locally. A container job cannot nest a
+      # second container, and `actions/checkout` has no musl build, so the container is driven from the runner.
+      - name: Build for glibc 2.30
+        run: bash rust/scripts/portable-build.sh --flavour gnu --out dist
+      - name: Build the static musl binary
+        run: bash rust/scripts/portable-build.sh --flavour musl --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            dist/hades-portable
+            dist/hades-musl
+          if-no-files-found: error
+
+  verify:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+      - name: The portable binary on three LTS images
+        run: bash rust/scripts/portability.sh dist/hades-portable
+      - name: The static binary on the same three images
+        run: bash rust/scripts/portability.sh dist/hades-musl
+      - name: Acceptance, portable
+        run: bash rust/acceptance/clean-home.sh --bin dist/hades-portable
+      - name: Acceptance, static
+        run: bash rust/acceptance/clean-home.sh --bin dist/hades-musl
+      - name: Faults, portable
+        run: bash rust/scripts/fault-injection.sh dist/hades-portable
+      - name: Faults, static
+        run: bash rust/scripts/fault-injection.sh dist/hades-musl
+      - name: The static binary on the distribution it was built for
+        run: |
+          docker run --rm --platform linux/amd64 -v "$PWD/dist:/b:ro" alpine:3.20 sh -c '
+            apk add --no-cache curl tar >/dev/null
+            export HOME=/tmp
+            /b/hades-musl init --provider ollama-cloud --model qwen3.8-27b --root /tmp/work >/dev/null
+            /b/hades-musl pack add review-a-diff --yes | tail -1
+            /b/hades-musl doctor | grep -E "libc|compatibility"'
+
+  publish:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+      - name: Package both artifacts
+        run: |
+          bash rust/package.sh --skip-build --bin dist/hades-portable --out dist
+          bash rust/package.sh --skip-build --bin dist/hades-musl \
+            --target x86_64-unknown-linux-musl --out dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          bash rust/scripts/release-notes.sh "${tag#v}" > /tmp/notes.md
+          gh release create "$tag" \
+            --title "hades $tag" \
+            --notes-file /tmp/notes.md \
+            dist/hades-*-x86_64-unknown-linux-*.tar.gz \
+            dist/hades-*-x86_64-unknown-linux-*.tar.gz.sha256

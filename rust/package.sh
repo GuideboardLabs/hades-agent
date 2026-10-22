@@ -8,10 +8,11 @@ set -eu
 
 usage() {
     cat <<'EOF'
-usage: package.sh [--out DIR] [--bin FILE] [--skip-build]
+usage: package.sh [--out DIR] [--bin FILE] [--target TRIPLE] [--skip-build]
 
   --out DIR       where dist/ lives (default: rust/dist)
   --bin FILE      package this binary instead of building
+  --target TRIPLE name the artifact after this triple (default: the host's)
   --skip-build    fail rather than build when there is no binary
 EOF
 }
@@ -24,12 +25,14 @@ die() {
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 OUT="$SCRIPT_DIR/dist"
 BIN=""
+TARGET_LABEL=""
 SKIP=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) [ $# -ge 2 ] || die "--out needs a directory"; OUT=$2; shift 2 ;;
         --bin) [ $# -ge 2 ] || die "--bin needs a file"; BIN=$2; shift 2 ;;
+        --target) [ $# -ge 2 ] || die "--target needs a triple"; TARGET_LABEL=$2; shift 2 ;;
         --skip-build) SKIP=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "unknown option: $1 (try --help)" ;;
@@ -45,6 +48,8 @@ case "$(uname -m)" in
     *) ARCH=$(uname -m) ;;
 esac
 TRIPLE="$ARCH-unknown-linux-gnu"
+# The musl build is the same architecture and a different libc, so the name has to say which one it is.
+[ -n "$TARGET_LABEL" ] && TRIPLE="$TARGET_LABEL"
 NAME="hades-$VERSION-$TRIPLE"
 
 if [ -z "$BIN" ]; then

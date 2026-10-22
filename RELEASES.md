@@ -3,6 +3,30 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.16
+
+The release builds itself, and refuses to publish a binary it cannot vouch for.
+
+- **One workflow, four jobs.** `gate` runs formatting, clippy, the suite, and the claims check; `artifacts`
+  builds both images through the same scripts used locally; `verify` runs portability on three LTS images,
+  acceptance and the fault suite against both binaries, and a real Alpine install; `publish` attaches the
+  tarballs to the tag, but only if everything before it said yes.
+- **The glibc floor is an assertion, not a hope.** `scripts/assert-floor.sh` reads the highest GLIBC symbol the
+  binary asks for and fails the build when it is newer than 2.30. A newer runner can no longer move the floor
+  silently, which is exactly how 2.39 arrived.
+- **The version claim is checked.** `scripts/check-claims.sh` compares the manifest, the README badge, the
+  README table and the newest release section. Two audits found that drift; a grep now fails the build instead.
+- **Release notes are per tag.** `scripts/release-notes.sh` prints one version's section, so a release body is
+  its own notes rather than every release ever written.
+- **`package.sh --target`** names the musl tarball after its triple instead of calling it gnu, which is what the
+  second artifact needed.
+
+Nothing about the binary changed in this release except that it says 0.1.16; the point is that the next one
+cannot claim something the build did not check.
+
+1080 tests, 12 live browser tests, acceptance 31/31 on both artifacts, faults 10 passed and 1 skipped on both,
+portability 3/3 on both, claims check green.
+
 ## 0.1.15
 
 Portability became an artifact instead of a paragraph, and the report learned to read the machine.
