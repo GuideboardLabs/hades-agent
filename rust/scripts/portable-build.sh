@@ -14,7 +14,7 @@
 # second container). This file is the container, the arguments, and the assertion on the result.
 #
 # usage: scripts/portable-build.sh [--flavour gnu|musl] [--out DIR] [--image TAG] [--src DIR]
-set -uo pipefail
+set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -38,27 +38,56 @@ case "$FLAVOUR" in
   *) echo "unknown flavour: $FLAVOUR" >&2; exit 2 ;;
 esac
 
-# Default next to the checkout: a release builder that writes to a path outside the repository only works on
-# the machine it was written on.
+# Docker only accepts absolute bind sources. `--out dist` and `--src .` are the natural things to type in a
+# checkout; a relative one becomes a *named volume*, so the build succeeds somewhere else and the checkout
+# stays empty. Resolve both before they reach `-v`, and refuse a source that is not a directory.
 [ -n "$OUT" ] || OUT=$ROOT/dist
+[ -d "$ROOT" ] || { echo "no source directory: $ROOT" >&2; exit 2; }
+ROOT=$(cd "$ROOT" && pwd -P)
 mkdir -p "$OUT"
-# Docker only accepts absolute bind sources, and `--out dist` is the natural thing to type in a checkout.
 OUT=$(cd "$OUT" && pwd -P)
 echo "building $FLAVOUR in $IMAGE; output in $OUT"
 
-docker run --rm \
+# An output directory outlives a failed build. Remove the artifact this run is about to produce before the
+# build starts, so the check afterwards can only ever see this build's bytes.
+rm -f "$OUT/$NAME"
+
+LOG=$(mktemp)
+trap 'rm -f "$LOG"' EXIT
+status=0
+docker run --rm --platform linux/amd64 \
   -v "$OUT:/out" \
   -v "$ROOT:/src:ro" \
-  "$IMAGE" sh /src/rust/scripts/build-inner.sh "$FLAVOUR" /out /src/rust 2>&1 | tail -6
+  "$IMAGE" sh /src/rust/scripts/build-inner.sh "$FLAVOUR" /out /src/rust >"$LOG" 2>&1 || status=$?
+
+if [ "$status" -ne 0 ]; then
+  # Without this the pipeline's status was `tail`'s, and an old executable at the output path satisfied the
+  # check below. The log is tailed for a reader; the status is Docker's, and the exit is this script's.
+  tail -40 "$LOG" >&2 || true
+  echo "docker build failed with status $status; no artifact was written" >&2
+  exit "$status"
+fi
+tail -6 "$LOG"
 
 # The container runs as root, so the artifact belongs to root. Give it back: the person who ran the build owns
 # the binary they are about to package, chmod and test.
 if [ "$(stat -c %u "$OUT/$NAME" 2>/dev/null || echo 0)" != "$(id -u)" ]; then
-  docker run --rm -v "$OUT:/out" alpine:3.20 chown "$(id -u):$(id -g)" "/out/$NAME" >/dev/null 2>&1 || true
+  docker run --rm --platform linux/amd64 -v "$OUT:/out" alpine:3.20 chown "$(id -u):$(id -g)" "/out/$NAME" >/dev/null 2>&1 || true
 fi
 
 [ -x "$OUT/$NAME" ] || { echo "no binary at $OUT/$NAME"; exit 1; }
-echo "wrote: $OUT/$NAME"
+
+# A file that exists is not a build that happened. The binary must name the version this checkout declares,
+# or the artifact is from another revision and every later check would agree with it.
+expected=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/rust/harness/Cargo.toml" | head -1)
+[ -n "$expected" ] || { echo "no version in $ROOT/rust/harness/Cargo.toml" >&2; exit 1; }
+reported=$("$OUT/$NAME" --version | awk '{print $2}')
+[ "$reported" = "$expected" ] || {
+  echo "built binary reports $reported, manifest says $expected" >&2
+  exit 1
+}
+
+echo "wrote: $OUT/$NAME (version $reported)"
 case "$FLAVOUR" in
   gnu) "$HERE/assert-floor.sh" "$OUT/$NAME" --max-glibc 2.30 || exit 1 ;;
   musl) "$HERE/assert-floor.sh" "$OUT/$NAME" --static || exit 1 ;;
