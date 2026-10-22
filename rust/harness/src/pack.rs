@@ -1307,8 +1307,15 @@ fn ensure_gnu_tar() -> Result<(), String> {
     if version.contains("GNU tar") {
         Ok(())
     } else {
-        Err("pack export needs GNU tar for a deterministic archive; `rust/package.sh` already requires it"
-            .to_string())
+        Err(if cfg!(target_env = "musl") {
+            "pack install and export need GNU tar for a deterministic archive; this build does not bundle one, and \
+             busybox tar does not produce the same bytes. Install it (`apk add tar`) and run the command \
+             again. Nothing was installed."
+                .to_string()
+        } else {
+            "pack install and export need GNU tar for a deterministic archive; `rust/package.sh` already requires it"
+                .to_string()
+        })
     }
 }
 

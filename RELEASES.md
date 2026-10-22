@@ -3,6 +3,29 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.15
+
+Portability became an artifact instead of a paragraph, and the report learned to read the machine.
+
+- **`hades doctor` describes the host.** It now prints the platform line first (system, machine, kernel), the C
+  library and version this binary carries, the Landlock ABI with whether a run can be caged, the bundled SQLite
+  version, and a final `compatibility: full` or `reduced: <names>` verdict. A support table is a promise about a
+  distribution; this is a reading of the machine in front of you.
+- **A static musl binary exists.** `scripts/portable-build.sh --flavour musl` builds in Alpine and produces a
+  static-pie binary that asks the host for nothing: it runs on Alpine, NixOS and every glibc system the portable
+  build covers. Its one cost is measured: a static process cannot `dlopen` libcurl, so fetches use the `curl`
+  executable, 231 ms against 256 ms for two small fetches in `docs/performance.md`.
+- **A missing `curl` on a static build says what happened.** The error names the static build, the transport it
+  cannot use, and the command that fixes it, instead of "could not run curl".
+- **GNU tar is a named capability.** Alpine's busybox tar is a different program with a different archive, so
+  pack install and export need `apk add tar` there. `hades doctor` reports `tar` alongside libc and Landlock,
+  the failure names the package, and `docs/portability.md` says why it cannot be worked around.
+- **Portability claims are files, not footnotes:** `docs/portability.md` is the matrix, `docs/performance.md`
+  is the transport measurement, and `scripts/portability.sh` checks a binary against 20.04, 22.04 and 24.04.
+
+1080 tests, 12 live browser tests, acceptance 31/31 on both artifacts, fault cases 10 passed and 1 skipped,
+cross-machine 5/5 and 6/6, portability 3/3 on each binary, musl verified on Alpine with and without curl.
+
 ## 0.1.14
 
 The sixth audit. Three consistency holes, and the glibc floor the reviewer challenged.

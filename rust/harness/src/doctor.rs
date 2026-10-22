@@ -83,7 +83,7 @@ pub fn socket_findings(candidates: &[PathBuf]) -> Vec<Finding> {
 /// The checks, in the order a person would debug them. `home` is the Hades home, `config` the path the CLI
 /// would read, and `binary` the executable that is running.
 pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<Finding> {
-    let mut found = Vec::new();
+    let mut found = platform_findings();
 
     if home.is_dir() {
         let probe = home.join(".doctor-write-probe");
@@ -359,7 +359,150 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
         )
     });
 
+    found.push(compatibility(&found));
     found
+}
+
+/// What this machine is, and which of the parts Hades needs it can actually provide.
+///
+/// A support table is a promise about a distribution; this is a reading of the machine in front of you. It is
+/// the first thing `doctor` prints, because "supported" and "works here" are different questions and only the
+/// second one matters at the moment something is wrong.
+pub fn platform_findings() -> Vec<Finding> {
+    let mut found = Vec::new();
+    let system = uname();
+    found.push(Finding::ok("platform", system));
+    found.push(Finding::ok("libc", libc_report()));
+    let abi = crate::cage::abi();
+    found.push(if abi >= 1 {
+        Finding::ok(
+            "landlock",
+            format!("ABI {abi}: a run can be confined to its workspace"),
+        )
+    } else {
+        Finding::warn(
+            "landlock",
+            format!(
+                "ABI {abi}: no Landlock on this kernel, so a governed run cannot be caged here"
+            ),
+        )
+    });
+    found.push(Finding::ok(
+        "sqlite",
+        format!("bundled {}", rusqlite::version()),
+    ));
+    // Pack export shells out to GNU tar for a byte-identical archive. Busybox tar is present on Alpine and is
+    // not the same program, so "tar exists" is not the question.
+    found.push(match gnu_tar() {
+        Ok(version) => Finding::ok("tar", format!("GNU tar {}", version)),
+        Err(_) => Finding::warn(
+            "tar",
+            "no GNU tar: packs cannot be exported or installed from an archive here (busybox tar is not \
+             byte-identical); install it (`apk add tar`)",
+        ),
+    });
+    found
+}
+
+/// The first version number GNU tar prints, or nothing when the `tar` on PATH is another program.
+fn gnu_tar() -> Result<String, String> {
+    let output = std::process::Command::new("tar")
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("could not run tar: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    if !text.contains("GNU tar") {
+        return Err("not GNU tar".to_string());
+    }
+    let version = text
+        .split_whitespace()
+        .skip_while(|word| *word != "tar)")
+        .nth(1)
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(version)
+}
+
+/// The verdict, from the findings that describe the host rather than the install: a person with a missing
+/// config still has a capable machine, and a person with a perfect config on an old kernel does not.
+fn compatibility(found: &[Finding]) -> Finding {
+    let capability = [
+        "platform",
+        "libc",
+        "landlock",
+        "sqlite",
+        "tar",
+        "fetch transport",
+        "browser",
+    ];
+    let reduced: Vec<String> = found
+        .iter()
+        .filter(|finding| finding.level != Level::Ok && capability.contains(&finding.name.as_str()))
+        .map(|finding| finding.name.clone())
+        .collect();
+    if reduced.is_empty() {
+        Finding::ok("compatibility", "full")
+    } else {
+        Finding::warn("compatibility", format!("reduced: {}", reduced.join(", ")))
+    }
+}
+
+/// Kernel and machine, from `uname`, without a dependency: the release string is what support questions
+/// actually turn on.
+fn uname() -> String {
+    // SAFETY: `uname` fills a struct it defines; the arrays are NUL-terminated by the kernel.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return "unknown system".to_string();
+    }
+    let field = |raw: &[libc::c_char]| {
+        let bytes: Vec<u8> = raw
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    format!(
+        "{} {}, kernel {}",
+        field(&uts.sysname),
+        field(&uts.machine),
+        field(&uts.release)
+    )
+}
+
+/// Which C library carries this binary, and which version. On musl the answer is the build's own, because a
+/// static binary does not ask the host anything.
+fn libc_report() -> String {
+    #[cfg(target_env = "gnu")]
+    {
+        unsafe extern "C" {
+            fn gnu_get_libc_version() -> *const libc::c_char;
+        }
+        // SAFETY: glibc defines this and returns a NUL-terminated static string.
+        let version = unsafe {
+            std::ffi::CStr::from_ptr(gnu_get_libc_version())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let linkage = if cfg!(target_feature = "crt-static") {
+            "static"
+        } else {
+            "dynamic"
+        };
+        format!("glibc {version} ({linkage})")
+    }
+    #[cfg(not(target_env = "gnu"))]
+    {
+        format!(
+            "musl ({})",
+            if cfg!(target_feature = "crt-static") {
+                "static"
+            } else {
+                "dynamic"
+            }
+        )
+    }
 }
 
 /// One line per finding, and a count at the end. The exit code is the answer: 1 when anything failed.
@@ -391,6 +534,36 @@ pub fn running_binary() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_platform_report_names_this_machine_and_reaches_a_verdict() {
+        let found = platform_findings();
+        let names: Vec<&str> = found.iter().map(|finding| finding.name.as_str()).collect();
+        for name in ["platform", "libc", "landlock", "sqlite"] {
+            assert!(names.contains(&name), "{names:?}");
+        }
+        let platform = found
+            .iter()
+            .find(|f| f.name == "platform")
+            .expect("a platform");
+        assert!(platform.detail.starts_with("Linux "), "{}", platform.detail);
+        let libc = found.iter().find(|f| f.name == "libc").expect("a libc");
+        // One of the two, never neither: a binary knows which C library it was built against.
+        assert!(
+            libc.detail.starts_with("glibc ") || libc.detail.starts_with("musl "),
+            "{}",
+            libc.detail
+        );
+        let mut all = found.clone();
+        all.push(compatibility(&all));
+        let verdict = all.last().expect("a verdict");
+        assert_eq!(verdict.name, "compatibility");
+        assert!(
+            verdict.detail == "full" || verdict.detail.starts_with("reduced: "),
+            "{}",
+            verdict.detail
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = crate::scratch::root().join(format!("doctor-{name}-{}", std::process::id()));

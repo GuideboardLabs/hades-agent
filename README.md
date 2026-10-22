@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.14-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.15-blue">
   <img alt="Tests" src="https://img.shields.io/badge/tests-1079%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
@@ -52,13 +52,13 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.14 |
+| **Version** | 0.1.15 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
 | **Work profiles** | `survey`, `fix`, `sweep`, `verify`, `record` |
 | **Isolation** | Landlock cage plus a deterministic safety floor |
-| **Platform** | Linux x86-64, glibc 2.30 or newer (Ubuntu 20.04+, Debian 11+, RHEL 9+); release binaries are built by `scripts/portable-build.sh` |
+| **Platform** | Linux x86-64. `hades-portable` needs glibc 2.30+ (Ubuntu 20.04+, Debian 11+, RHEL 9+); `hades-musl` is static and runs on any x86-64 Linux, needing `curl` and GNU `tar` installed. Both built by `scripts/portable-build.sh` |
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |

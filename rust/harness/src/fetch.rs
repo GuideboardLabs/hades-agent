@@ -592,9 +592,19 @@ fn call(
     ] {
         command.env_remove(variable);
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("could not run curl: {error}"))?;
+    let output = command.output().map_err(|error| {
+        // A static musl build cannot dlopen libcurl, so this path is not a fallback there: it is the only
+        // transport, and the missing piece has a name and a fix. Say both.
+        if cfg!(target_env = "musl") {
+            format!(
+                "could not run curl: {error} (this is a static build, so the in-process libcurl pool \
+                 cannot be loaded and every fetch runs through the curl executable; install curl, for \
+                 example `apk add curl`)"
+            )
+        } else {
+            format!("could not run curl: {error}")
+        }
+    })?;
     let code = output.status.code().unwrap_or(-1);
     // `-sS` means stderr carries curl's own sentence for a failure. It is kept and quoted rather
     // than discarded: "curl failed with exit 7" alone does not say what went wrong, and the
