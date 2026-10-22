@@ -2087,8 +2087,10 @@ fn argument(args: &Value, key: &str) -> Option<String> {
 /// is not readable. A chat is where a fetched page can talk to the model, so the read boundary is the
 /// thing that keeps a page from asking for a key and getting it.
 ///
-/// The timeout is the `timeout` command rather than a thread that forgets the child, so a hung program dies
-/// with its shell and cannot outlive the message.
+/// The deadline is the command runner's own: it owns the process group and the pipes, so a shell that exits
+/// while a background child holds its output open still ends at the deadline, and everything the program
+/// started dies with it. Wrapping the program in `timeout` looked equivalent and was not: that command
+/// supervises only what it launches, while this process keeps reading the pipes the child inherited.
 fn shell(args: &Value, world: &World) -> String {
     let command = args.get("command").and_then(Value::as_str).unwrap_or("");
     if command.trim().is_empty() {
@@ -2103,12 +2105,23 @@ fn shell(args: &Value, world: &World) -> String {
     if let Err(error) = std::fs::create_dir_all(&scratch) {
         return format!("could not make the scratch directory: {error}");
     }
-    let program = format!("timeout {seconds} sh -c {}", quote(command));
     let cage = crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network());
-    match crate::command::run_clean_in(&program, &world.root, 6000, Some(&cage), Some(&scratch)) {
+    let deadline = Some(std::time::Duration::from_secs(seconds));
+    match crate::command::run_within_in(
+        command,
+        &world.root,
+        6000,
+        Some(&cage),
+        Some(&scratch),
+        deadline,
+    ) {
         Ok(run) => {
             let mut text = run.output;
-            if text.trim().is_empty() {
+            if run.timed_out {
+                // The output is what arrived before the deadline, and saying so is better than passing a
+                // partial run off as a finished one.
+                text.push_str(&format!("\n[timed out after {seconds}s]"));
+            } else if text.trim().is_empty() {
                 text = format!("exit {}\n(no output)", run.status);
             } else if run.status != 0 {
                 text.push_str(&format!("\n[exit {}]", run.status));
@@ -2117,12 +2130,6 @@ fn shell(args: &Value, world: &World) -> String {
         }
         Err(fault) => format!("could not run the command: {fault}"),
     }
-}
-
-/// Quote one argument for `sh`, so the program reaches the shell as one word. A single quote inside is
-/// closed, escaped and reopened; that is the whole of the POSIX rule.
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn read_file(args: &Value, world: &World) -> String {
@@ -3299,6 +3306,31 @@ mod tests {
         schema.sort();
         known.sort();
         assert_eq!(schema, known);
+    }
+
+    /// `timeout` supervises what it launches; the shell can exit while a background child holds the pipes it
+    /// inherited, and that used to make the tool call stall past its own deadline. The deadline is the
+    /// runner's now, so the call ends within it and says that it did.
+    #[test]
+    fn a_shell_command_ends_at_its_deadline_even_with_a_background_child() {
+        let dir = crate::scratch::root().join("agent-shell-deadline");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a workspace");
+        let world = world_at(&dir, Mode::Act, "chat:7");
+
+        let started = std::time::Instant::now();
+        let said = shell(
+            &serde_json::json!({ "command": "sleep 30 &", "timeout_s": 1 }),
+            &world,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "took {elapsed:?}"
+        );
+        assert!(said.contains("timed out after 1s"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn world_at(dir: &Path, mode: Mode, actor: &str) -> World {

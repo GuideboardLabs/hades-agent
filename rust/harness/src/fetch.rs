@@ -491,11 +491,12 @@ fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, St
     let mut current = url.to_string();
     let mut followed = 0usize;
     loop {
-        // The clock is read before the hop, not inside curl: a hop that has no time left is
-        // refused here rather than started with a zero or negative `--max-time`.
-        let max_time = remaining_seconds(deadline)?;
         let target = Target::parse(&current)?;
         let address = resolve(&target, allow_private)?;
+        // Read after the lookup, not before: resolution is part of the fetch and can take the whole budget
+        // on a slow resolver, and a transfer started with the original allowance would double the declared
+        // deadline. A hop with no time left is refused here rather than started with `--max-time 0`.
+        let max_time = remaining_seconds(deadline)?;
         match hop(&target, &current, address, max_time, ca)? {
             Outcome::Page(bytes) => return Ok(String::from_utf8_lossy(&bytes).to_string()),
             Outcome::Oversize => {
@@ -664,6 +665,10 @@ fn curl_args(
     // v6 literal, which curl also cannot parse - but a literal needs no pin, because there is no
     // lookup for a literal to race).
     let mut args: Vec<String> = vec![
+        "-q".to_string(),
+        // `-q` must be the first argument: curl otherwise reads `.curlrc`, which can name a proxy, extra
+        // URLs or a relaxed TLS check, and none of that is visible to the caller that cleared the
+        // environment. The rest of this list assumes the config file had no say.
         "-sS".to_string(),
         "--max-time".to_string(),
         max_time.to_string(),

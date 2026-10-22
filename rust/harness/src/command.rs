@@ -118,6 +118,20 @@ pub fn run_within(
     run_inner(program, root, limit, cage, deadline, false, None)
 }
 
+/// [`run_within`] with a temporary directory, for the same reason [`run_clean_in`] has one: a caged
+/// program that writes `$TMPDIR` needs a directory it may write in, and a deadline needs to be the thing
+/// that ends it, not the pipe.
+pub fn run_within_in(
+    program: &str,
+    root: &Path,
+    limit: usize,
+    cage: Option<&Cage>,
+    tmp: Option<&Path>,
+    deadline: Option<std::time::Duration>,
+) -> Result<Run, Fault> {
+    run_inner(program, root, limit, cage, deadline, true, tmp)
+}
+
 fn run_inner(
     program: &str,
     root: &Path,

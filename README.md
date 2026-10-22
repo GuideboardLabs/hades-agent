@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.3-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1050%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.4-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1053%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.3 |
+| **Version** | 0.1.4 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1050 passing, 13 ignored live tests |
+| **Tests** | 1053 passing, 13 ignored live tests |
 
 ---
 
@@ -154,6 +154,10 @@ a safety-floor category.
 - **A run that died leaves a marker.** `<state>/inflight/<session>.json` is written when a run starts and
   removed when it ends, so `hades status` and `hades doctor` can report `interrupted: N` with the session,
   the run, the start time and the goal. Nothing is replayed automatically.
+- **A model's shell is bounded by the runner, not by `timeout`.** The tool call runs under the same clock and
+  process-group kill as a goal check, so a shell that exits while a background child keeps its output open
+  still ends at the deadline, and the result says it timed out instead of passing partial output off as a
+  finished run.
 - **The process seals itself.** `PR_SET_DUMPABLE` is cleared at startup, so a caged child cannot read the
   runtime's own environment out of `/proc/<parent>/environ`; a cleared child environment is not enough on
   its own. The flag belongs to the process and is reset by `execve`, so the guarantee is about the runtime's
@@ -658,6 +662,11 @@ systemd manager, can point it at any OpenAI-compatible endpoint instead:
 `key_env` names the variable, never the value. `HADES_VISION_URL` and `HADES_VISION_MODEL_NAME` override the
 file for one process. `hades config` prints which of the two is configured.
 
+A local vision server is asked `/props` before it is reused, so a port answered by another model is
+restarted rather than trusted. A server that does not answer `/props` is accepted, because an older build
+would otherwise be refused for no safety gain; `HADES_VISION_STRICT=1` makes that case a refusal instead,
+which is the setting to use when the port is shared with anything else.
+
 ---
 
 ## Security model
@@ -685,7 +694,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1050 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1053 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -729,7 +738,8 @@ These are current limits, not aspirations hidden in a roadmap:
   process per fetch costs 9.2 ms and 67.5 ms. `libcurl.so.4` is optional; without it, or with
   `HADES_FETCH_POOL=off`, the tool falls back to one `curl` process per fetch and behaves identically. Both
   paths disable proxies, including the environment variables libcurl would otherwise read, because a proxy
-  would take the connection somewhere other than the address that was checked. libcurl before 7.85 gets the
+  would take the connection somewhere other than the address that was checked; the `curl` process is also
+  started with `-q` first, so a `~/.curlrc` cannot set one either. libcurl before 7.85 gets the
   legacy protocol bitmask instead of the string option, so Ubuntu 22.04 keeps the pool rather than silently
   dropping to the slow path; `hades doctor` prints which transport is live and which protocol options it
   uses. The numbers and the guarantees both paths keep are in

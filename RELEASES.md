@@ -3,6 +3,29 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.4
+
+A review of 0.1.3 found three places where an existing guarantee stopped short of a path that could escape
+it. Each was reproduced before it was changed.
+
+- **The fallback fetch read `~/.curlrc`.** The `curl` process was started without `-q`, so curl loaded the
+  user's config file, and that file can name a proxy, extra URLs or a relaxed TLS check. Clearing the
+  environment does not clear it, so the slow path could be routed away from the address that was checked
+  while the pooled path could not. `-q` is the first argument now. `tests/fetch_config.rs` writes a
+  `.curlrc` naming a proxy, runs the subprocess path, and asserts the destination answers and the proxy sees
+  nothing; with the argument removed the same test fails, which is how the defect was confirmed.
+- **A model's shell outlived its timeout.** The shell tool wrapped the command in `timeout N sh -c …` and ran
+  it without a wall-clock deadline. `timeout` ends what it launches, but the runner keeps reading the pipes a
+  background child inherited, so a command could stall far past its stated limit. The shell now runs under
+  the runner's own deadline: the process group is killed, the readers are cancelled, and the result says
+  `[timed out after Ns]` rather than returning partial output as a finished run.
+- **DNS came out of no budget.** The remaining time was read before resolution, so a slow lookup could hand
+  the transfer the full allowance again and double the declared deadline. The clock is read after the
+  lookup; a hop with nothing left is refused instead of started.
+- **Strict vision identity.** `HADES_VISION_STRICT=1` refuses a local vision endpoint that answers `/health`
+  but does not say which weights it loaded, instead of accepting it as the configured model. The default is
+  unchanged, because an older server without `/props` would be refused for no safety gain.
+
 ## 0.1.3
 
 A follow-up audit of 0.1.2 found one trust-boundary mismatch between the two fetch paths and three smaller

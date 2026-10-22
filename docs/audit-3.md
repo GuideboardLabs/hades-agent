@@ -88,3 +88,12 @@ a permanent restriction on the tree.
 | The pool vanished on libcurl older than 7.85, where `CURLOPT_PROTOCOLS_STR` does not exist | The legacy `CURLOPT_PROTOCOLS` bitmask carries the same HTTP/HTTPS-only rule; `hades doctor` prints the transport, version and option form | `fetch_pool::tests::the_protocol_option_form_follows_the_reported_version` |
 | Local vision instances shared the unit name `hades-vision` | The unit is named after its port; `/props` verifies which weights a healthy endpoint serves | `vision::tests::a_successful_launch_keeps_waiting_for_the_model` asserts the per-port unit name |
 | Cancelled pipe readers could remain blocked after the deadline | Descriptors are non-blocking and polled with a cancellation flag, so readers end within 50 ms of a timeout | command suite; the background-child test still returns at the deadline |
+
+## Review of 0.1.3
+
+| Finding | What changed | Test |
+|---|---|---|
+| The subprocess `curl` read `.curlrc`, which can name a proxy | `-q` is the first argument; a config file cannot change the fetch policy | `tests/fetch_config.rs` (fails without the argument) |
+| The model's shell relied on `timeout` and could stall past its limit while a background child held the pipes | The shell runs under the runner's deadline; the group is killed, readers are cancelled, the result says so | `agent::tests::a_shell_command_ends_at_its_deadline_even_with_a_background_child` |
+| DNS ran outside the fetch budget | The remaining time is read after resolution | `fetch` suite |
+| Vision identity was best-effort | `HADES_VISION_STRICT=1` refuses an endpoint that will not name its model | `vision::tests::strict_identity_is_asked_for_by_name` |

@@ -467,7 +467,10 @@ A host with no user systemd manager and no model files uses the second path and 
 ### Two fetch paths, one set of rules
 
 A fetch runs through the in-process libcurl pool when the library is present, and through one `curl`
-process per call when it is not. The pool is faster because it keeps connections and TLS sessions, and the
+process per call when it is not. The subprocess is started with `-q` as its first argument, so `curl` does
+not read `~/.curlrc`: a config file can name a proxy, extra URLs or a relaxed TLS check, and none of that is
+visible to the caller that cleared the environment. DNS is charged to the same deadline as the transfer, so
+a slow resolver shortens the hop that follows instead of adding to it. The pool is faster because it keeps connections and TLS sessions, and the
 two paths are otherwise required to behave the same: proxies are disabled in both, including the lowercase
 and uppercase environment variables libcurl reads; redirects are not followed; the body cap is enforced
 while the bytes are read; and the destination is pinned to the address the tool checked. libcurl older than
@@ -481,7 +484,8 @@ The local vision server runs as a transient user unit named after its port (`had
 processes on different ports do not stop each other's server; `HADES_VISION_PORT` chooses the port. Before
 reusing a healthy endpoint the runtime asks `/props` which weights the server loaded and restarts its own
 unit if the answer is a different model. A build that does not answer `/props` is accepted, because
-refusing it would break older servers without protecting anything.
+refusing it would break older servers without protecting anything; `HADES_VISION_STRICT=1` turns that case
+into a refusal, for a port that is shared with something else.
 
 ## Work that runs itself
 

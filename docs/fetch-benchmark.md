@@ -111,11 +111,17 @@ each is covered by a test:
   the same variables from the runtime's own environment. A proxy would take the connection somewhere other
   than the address that was resolved and checked. `fetch::tests::a_proxy_in_the_environment_does_not_take_a_fetch`
   starts a listener, points `http_proxy` and `HTTP_PROXY` at it, and asserts that nothing arrives.
+- **No configuration file.** `curl` is started with `-q` as its first argument. Without it, curl reads
+  `~/.curlrc`, which can name a proxy, extra URLs or a relaxed TLS check; the environment was cleared and the
+  config file was not. `tests/fetch_config.rs` writes a `.curlrc` that points at a listener, runs the
+  subprocess path, and asserts the destination answered and the listener saw nothing.
 - **HTTP and HTTPS only, on every libcurl.** `CURLOPT_PROTOCOLS_STR` arrived in 7.85; before it the same
   restriction is the `CURLOPT_PROTOCOLS` bitmask, which exists on every version this build can meet. Ubuntu
   22.04 ships 7.81, where the string option fails and the transfer would have been abandoned for the slow
   path without anyone noticing.
 - **No redirects, a body cap that runs while reading, and a pinned destination.**
+- **One deadline that includes resolution.** The remaining time is read after DNS, so a slow lookup shortens
+  the transfer that follows instead of adding a second budget to it.
 
 `hades doctor` prints the live transport, the version libcurl reported, and which form of the protocol
 option is in use.

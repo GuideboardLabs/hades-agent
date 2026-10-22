@@ -232,6 +232,16 @@ fn ensure_server() -> Result<(), String> {
     let mut checked_unit = Instant::now();
     loop {
         if healthy() {
+            if strict_identity() && served_model().is_none() {
+                // The server answers but will not say which model it is, and the operator asked for
+                // confirmed identity: stop it rather than reuse an endpoint nobody can name.
+                stop_unit();
+                return Err(format!(
+                    "the server on port {} answers but does not report which model it loaded, and \
+                     HADES_VISION_STRICT is set",
+                    port()
+                ));
+            }
             if let Some(child) = child.take() {
                 *held = Some(child);
             }
@@ -301,7 +311,9 @@ fn stop_unit() {
 /// anything: the check is there for the case where two models share a port by accident.
 fn serving_configured_model() -> bool {
     let Some(reported) = served_model() else {
-        return true;
+        // A server that will not say which weights it loaded is accepted by default; with strict identity
+        // on, it is refused, because an unidentified endpoint on the port is the case this check exists for.
+        return !strict_identity();
     };
     let wanted = env_or("HADES_VISION_MODEL", DEFAULT_MODEL);
     let name = Path::new(&wanted)
@@ -309,6 +321,21 @@ fn serving_configured_model() -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or("");
     name.is_empty() || reported.ends_with(name)
+}
+
+/// Whether identity has to be confirmed rather than assumed. `HADES_VISION_STRICT` wins over the config
+/// file, like the other vision settings.
+fn strict_identity() -> bool {
+    match std::env::var("HADES_VISION_STRICT") {
+        Ok(value) => asked_for_strict_identity(&value),
+        Err(_) => false,
+    }
+}
+
+/// The spellings `HADES_VISION_STRICT` accepts. A value nobody recognises means the setting is wrong, and
+/// the safe reading is the one that keeps the old behaviour rather than the one that changes it silently.
+fn asked_for_strict_identity(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "yes" | "on")
 }
 
 /// The model path the server reports, or `None` when it does not answer `/props`.
@@ -641,6 +668,16 @@ mod tests {
         assert!(body.contains("image_url"), "{body}");
         assert!(body.contains("data:image/png;base64,"), "{body}");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn strict_identity_is_asked_for_by_name() {
+        for yes in ["1", "true", "yes", "on", " on "] {
+            assert!(asked_for_strict_identity(yes), "{yes:?}");
+        }
+        for no in ["0", "false", "no", "", "strict"] {
+            assert!(!asked_for_strict_identity(no), "{no:?}");
+        }
     }
 
     #[test]
