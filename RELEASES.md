@@ -3,6 +3,21 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.6
+
+- **`hades pack add <id>`.** One command from the shelf to a plan: the index is fetched, the archive named by
+  the row is fetched as bytes, its sha256 is compared with the digest the menu published, and a mismatch is
+  refused before the manifest is parsed. Without `--yes` nothing is written past the cache; with it the plan
+  is applied and the pack is active.
+- **A signed-shaped digest is now a check, not a record.** The archive path had no way to compare the digest
+  to anything and the text fetch decoded bodies lossily, which would have corrupted exactly the bytes worth
+  checking. `fetch::bytes` keeps the body intact and the add path compares before reading.
+- **A row may name an absolute archive URL.** That is how a licensed shelf lives somewhere other than the
+  public repository. `HADES_PACKS_URL` points at a mirror and `HADES_PACKS_ALLOW_PRIVATE=1` allows that
+  mirror to be a local address; the default refuses both a plain-http base and a private address.
+- **A pack's licence is its own.** The runtime is MIT and that does not reach installed content; a commercial
+  pack declares `license` and `derivatives: forbidden`, and its bytes belong on a non-public shelf.
+
 ## 0.1.5
 
 The base install carries a shelf, not a pack library.

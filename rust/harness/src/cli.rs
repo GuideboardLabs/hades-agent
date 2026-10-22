@@ -2488,6 +2488,7 @@ fn pack_cmd(args: &[String]) -> Result<(String, i32), String> {
         "merge" => pack_merge(rest),
         "menu" => pack_menu(rest),
         "find" => pack_find(rest),
+        "add" => pack_add(rest),
         "help" | "--help" => Ok((pack_help(), 0)),
         other => Err(format!(
             "`pack {other}`: say export, inspect, plan, apply, uninstall, list, adapt, merge or help"
@@ -2625,6 +2626,7 @@ fn pack_plan(args: &[String]) -> Result<(String, i32), String> {
 fn pack_help() -> String {
     "pack menu [--json]                      the shelf this build ships\n\
      pack find <words> [--json]              narrow it by id, title, summary or keywords\n\
+     pack add <id> [--yes] [--state <dir>]   fetch, check the digest, and show or apply the plan\n\
      pack export <id> --from <state> [selectors] [--out <file>]\n\
      pack inspect <file> [--json]\n\
      pack plan <file> [--state <dir>] [--json]\n\
@@ -2710,6 +2712,21 @@ fn pack_find(args: &[String]) -> Result<(String, i32), String> {
     }
     let listed: Vec<crate::packs_menu::Row> = found.into_iter().cloned().collect();
     Ok((crate::packs_menu::render(&listed), 0))
+}
+
+/// `hades pack add <id>`: one command from the shelf to a plan, and `--yes` from the plan to a write.
+///
+/// The digest is checked against the menu before the archive is read, so a pack that changed under the same
+/// URL is refused rather than inspected. Without `--yes` nothing is written beyond the cache.
+fn pack_add(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state"], &["yes"])?;
+    let id = flags.positional.first().ok_or_else(|| {
+        "`pack add` needs a pack id; `hades pack find <words>` lists ids".to_string()
+    })?;
+    let state = state_of(&flags)?;
+    let home = hades_home()?;
+    let text = crate::packs_install::add(id, &home, &state, switched(&flags, "yes"))?;
+    Ok((text, 0))
 }
 
 fn pack_item(text: &str) -> Result<(crate::pack::Kind, String), String> {

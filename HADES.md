@@ -468,9 +468,13 @@ A host with no user systemd manager and no model files uses the second path and 
 
 Skills, tool profiles and test cases are not built into the runtime; a catalog of packs is. `hades pack menu`
 reads it and `hades pack find` searches it, both from an index embedded at build time, so a machine with no
-network still knows what the shelf holds. Installation is not part of that tool: a pack is fetched by a
-person, checked against the digest in the menu, and applied through the same reviewed plan as any other
-pack, because the thing that decides what runs is not the thing that proposes it.
+network still knows what the shelf holds. Installation is `pack add`: the archive is fetched, the bytes are hashed, and a digest that does not match
+the menu is refused before the manifest is read. Without `--yes` the plan is printed and nothing is written,
+because the thing that decides what runs is not the thing that proposes it.
+
+A pack's licence is its own. The runtime is MIT; a pack installed into it may be commercial, and a shelf of
+licensed packs is exactly the same format served from a URL the operator controls. A row may name an absolute
+archive URL, so the public menu can stay public and a licensed shelf can stay somewhere else.
 
 A manifest may declare what a pack provides, what it needs and what it may touch. It may not declare roles,
 a floor, a cage or a policy: those are the runtime's, and a download that could set them could disable its

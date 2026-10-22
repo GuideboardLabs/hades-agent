@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.5-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1057%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.6-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1060%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.5 |
+| **Version** | 0.1.6 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1057 passing, 13 ignored live tests |
+| **Tests** | 1060 passing, 13 ignored live tests |
 
 ---
 
@@ -584,7 +584,7 @@ is refused when the config is read, not silently ignored. Precedence is `--model
 | `hades research <question>` | One evidence-first run: plan, search, fetch, extract, verify; `--offline` reads only the local library |
 | `hades library add\|list\|search\|show\|verify\|remove` | The local shelf of documents, with FTS5 search and a hash check |
 | `hades mneme import\|export\|upgrade` | Move a vault in or out of the record; `upgrade` writes the new tree and can retire `40 Topics` |
-| `hades pack menu\|find` | Read the shipped shelf of skill, tool and test packs, and search it before writing a skill by hand |
+| `hades pack menu\|find\|add` | Read the shipped shelf of skill, tool and test packs, search it before writing a skill by hand, and add one with a digest check before anything is read |
 | `hades pack export\|inspect\|plan\|apply\|uninstall\|list` | Move skills, a harness and cases between installs as a signed-shaped archive with a decision file |
 | `hades mcp list\|tools\|call` | The MCP servers the config names, what each offers, and a call to one allowed tool |
 | `hades context <goal>` / `hades map <goal>` | Build the context for a goal, or rank the tree for one and say what the map cache did |
@@ -682,9 +682,19 @@ its manifest, licence and declared capabilities, and may not declare a guardrail
 because a download that could set those would be a download that could disable its own limits. Installing is
 a person's command with a printed plan, not something a model does on its own.
 
+`hades pack add <id>` fetches the archive named by the menu, hashes the bytes that arrived, and refuses when
+the digest is not the one the menu published, before the manifest is parsed. Without `--yes` it prints the
+plan and writes nothing; with it, the plan is applied and the pack is active. `HADES_PACKS_URL` points the
+shelf at a mirror, and `HADES_PACKS_ALLOW_PRIVATE=1` is what lets that mirror be a local address.
+
 The catalog is generated from a packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`
 from the pack directories) and copied into `docs/packs/` at release. This repository publishes three skills
 to start with.
+
+A pack's licence is its own: this runtime is MIT, and that does not reach a pack installed into it. A
+commercial pack is a pack whose manifest says so (`license` and `derivatives: forbidden`), and its bytes
+belong on a shelf that is not public. A row may name an absolute `https://` archive URL, so a licensed shelf
+can live anywhere; a public menu stays public content.
 
 ## Security model
 
@@ -711,7 +721,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1057 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1060 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

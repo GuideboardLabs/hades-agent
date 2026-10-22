@@ -72,6 +72,7 @@ pub mod mode;
 pub mod model;
 pub mod pack;
 pub mod pack_fit;
+pub mod packs_install;
 pub mod packs_menu;
 pub mod patch;
 pub mod path;

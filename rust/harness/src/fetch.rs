@@ -487,6 +487,23 @@ fn run_with_ca(url: &str, limit: usize, allow_private: bool, ca: &Path) -> Strin
 /// from the header file, resolved against the URL that produced it, and pushed through the same
 /// parse, classify and pin the first URL went through.
 fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, String> {
+    chase_bytes(url, allow_private, ca).map(|body| String::from_utf8_lossy(&body).to_string())
+}
+
+/// A fetch for something that is not text. Same parse, pin, deadline and cap as [`run`]; the difference is
+/// that an archive is bytes, and lossily decoding it would corrupt the one thing worth checking, its digest.
+pub fn bytes(url: &str, limit: usize, allow_private: bool) -> Result<Vec<u8>, String> {
+    let body = chase_bytes(url, allow_private, None)?;
+    if body.len() > limit {
+        return Err(format!(
+            "refused: the body is {} bytes, over the {limit} ceiling",
+            body.len()
+        ));
+    }
+    Ok(body)
+}
+
+fn chase_bytes(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + FETCH_DEADLINE;
     let mut current = url.to_string();
     let mut followed = 0usize;
@@ -498,7 +515,7 @@ fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, St
         // deadline. A hop with no time left is refused here rather than started with `--max-time 0`.
         let max_time = remaining_seconds(deadline)?;
         match hop(&target, &current, address, max_time, ca)? {
-            Outcome::Page(bytes) => return Ok(String::from_utf8_lossy(&bytes).to_string()),
+            Outcome::Page(bytes) => return Ok(bytes),
             Outcome::Oversize => {
                 return Err(
                     "refused: the body passed the cap, and a body this tool would not be able to \
