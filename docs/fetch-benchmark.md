@@ -100,3 +100,22 @@ Shipped. The four guarantees are tests in `harness/src/fetch.rs`, each run throu
 
 Both paths print the same failure sentence, in the same shape, so a message never depends on which one
 served the fetch.
+
+## What the two paths must agree on
+
+The pool is an optimisation, so the rules it enforces are the ones the process path already enforced, and
+each is covered by a test:
+
+- **No proxy.** The process path removes every spelling of the proxy variables from the child's environment;
+  the pool sets `CURLOPT_PROXY` to an empty string after every reset, because libcurl would otherwise read
+  the same variables from the runtime's own environment. A proxy would take the connection somewhere other
+  than the address that was resolved and checked. `fetch::tests::a_proxy_in_the_environment_does_not_take_a_fetch`
+  starts a listener, points `http_proxy` and `HTTP_PROXY` at it, and asserts that nothing arrives.
+- **HTTP and HTTPS only, on every libcurl.** `CURLOPT_PROTOCOLS_STR` arrived in 7.85; before it the same
+  restriction is the `CURLOPT_PROTOCOLS` bitmask, which exists on every version this build can meet. Ubuntu
+  22.04 ships 7.81, where the string option fails and the transfer would have been abandoned for the slow
+  path without anyone noticing.
+- **No redirects, a body cap that runs while reading, and a pinned destination.**
+
+`hades doctor` prints the live transport, the version libcurl reported, and which form of the protocol
+option is in use.

@@ -255,6 +255,12 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
     ));
     // A browser the tool cannot find is a live screenshot that fails at the moment it is needed. Naming the
     // binary here, before the run, turns that into a warning at the top.
+    // Two fetch paths with different performance and different platform requirements: which one is live
+    // belongs in the report, not in a benchmark's footnote.
+    found.push(Finding::ok(
+        "fetch transport",
+        crate::fetch_pool::transport(),
+    ));
     found.push(match crate::browser::browser_path() {
         Ok(path) => Finding::ok(
             "browser",

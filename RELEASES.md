@@ -3,6 +3,29 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.3
+
+A follow-up audit of 0.1.2 found one trust-boundary mismatch between the two fetch paths and three smaller
+edges. Each was reproduced before it was changed.
+
+- **The pooled fetch inherited proxy settings that the process path blocks.** The subprocess path clears
+  every spelling of `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` before it runs, because a proxy would take
+  the connection away from the address that was resolved and checked. libcurl reads the same variables from
+  the runtime's environment, so the fast path could be re-routed while the slow path could not. Every pooled
+  transfer now sets `CURLOPT_PROXY` to an empty string after its reset. The regression test points the
+  variables at a listener and asserts that nothing arrives.
+- **The pool disappeared on libcurl older than 7.85.** `CURLOPT_PROTOCOLS_STR` does not exist there, the
+  configuration call failed, and the transfer fell back to the process path silently. The pool now uses the
+  `CURLOPT_PROTOCOLS` bitmask on older libraries, which is the same HTTP/HTTPS-only restriction, and
+  `hades doctor` prints the transport, the version and which form is in use.
+- **Two local vision instances shared one unit name.** The unit is named after its port
+  (`hades-vision-8123`), so a second process on another port cannot stop the first one's server. Before
+  reusing a healthy endpoint the runtime asks `/props` which weights are loaded and restarts its own unit if
+  the answer is another model.
+- **Cancelled readers left threads behind.** The pipe readers blocked in `read`, so a process that escaped
+  the group could keep them alive after the deadline. The descriptors are non-blocking and polled with a
+  cancellation flag, so a timed-out run's readers end within one poll interval.
+
 ## 0.1.2
 
 A re-audit of 0.1.1 found one regression and five smaller edges. Each was reproduced before it was changed.

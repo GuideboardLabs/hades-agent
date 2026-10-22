@@ -30,6 +30,9 @@ const OPT_WRITEFUNCTION: c_int = 20011;
 const OPT_WRITEDATA: c_int = 10001;
 const OPT_HEADERFUNCTION: c_int = 20079;
 const OPT_HEADERDATA: c_int = 10029;
+const OPT_PROXY: c_int = 10004;
+const OPT_PROTOCOLS: c_int = 19;
+const OPT_REDIR_PROTOCOLS: c_int = 182;
 const OPT_PROTOCOLS_STR: c_int = 10318;
 const OPT_REDIR_PROTOCOLS_STR: c_int = 10319;
 const OPT_MAXREDIRS: c_int = 68;
@@ -63,6 +66,10 @@ struct Api {
     easy_strerror: unsafe extern "C" fn(c_int) -> *const c_char,
     slist_append: unsafe extern "C" fn(Slist, *const c_char) -> Slist,
     slist_free_all: unsafe extern "C" fn(Slist),
+    /// Whether `CURLOPT_PROTOCOLS_STR` exists, which is libcurl 7.85 and later.
+    protocols_str: bool,
+    /// The version string libcurl reported, for `hades doctor`.
+    reported: String,
 }
 
 // The function table is immutable once resolved; the handles it returns are guarded by `FREE`.
@@ -91,6 +98,15 @@ fn api() -> Option<&'static Api> {
                     std::mem::transmute::<*mut c_void, $kind>(found)
                 }};
             }
+            let version = symbol!("curl_version", unsafe extern "C" fn() -> *const c_char);
+            let reported = {
+                let text = version();
+                if text.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(text).to_string_lossy().into_owned()
+                }
+            };
             let api = Api {
                 global_init: symbol!("curl_global_init", unsafe extern "C" fn(c_long) -> c_int),
                 easy_init: symbol!("curl_easy_init", unsafe extern "C" fn() -> Curl),
@@ -114,6 +130,8 @@ fn api() -> Option<&'static Api> {
                     unsafe extern "C" fn(Slist, *const c_char) -> Slist
                 ),
                 slist_free_all: symbol!("curl_slist_free_all", unsafe extern "C" fn(Slist)),
+                protocols_str: protocols_str_supported(&reported),
+                reported,
             };
             // libcurl's own documentation says implicit initialisation is not safe on every platform, and
             // the thread-safety of the explicit call only arrived in 7.84. `OnceLock::get_or_init` makes
@@ -215,7 +233,44 @@ unsafe extern "C" fn on_header(
     length
 }
 
-/// What one transfer returns: the status, the body and the headers, or the sentence libcurl gave.
+/// Whether the loaded libcurl understands `CURLOPT_PROTOCOLS_STR`.
+///
+/// The string options arrived in 7.85. The version string libcurl reports is `libcurl/8.5.0 OpenSSL/...`;
+/// an unreadable one is treated as old, because the bitmask form exists on every version this build could
+/// meet and is therefore the safe branch.
+fn protocols_str_supported(reported: &str) -> bool {
+    let version = reported
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("libcurl/"))
+        .unwrap_or("");
+    let mut parts = version.split('.');
+    let major: u32 = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    (major, minor) >= (7, 85)
+}
+
+/// Which transport a fetch will use, and why, for `hades doctor`. A machine where the pool is unavailable
+/// falls back to the process path, and that difference should be visible before a benchmark rather than
+/// inferred from one.
+pub fn transport() -> String {
+    if std::env::var("HADES_FETCH_POOL").as_deref() == Ok("off") {
+        return "curl subprocess (HADES_FETCH_POOL=off)".to_string();
+    }
+    match api() {
+        Some(api) => format!(
+            "in-process {}, protocol options: {}",
+            api.reported.split_whitespace().next().unwrap_or("libcurl"),
+            if api.protocols_str {
+                "string form (7.85+)"
+            } else {
+                "legacy bitmask (pre-7.85)"
+            }
+        ),
+        None => "curl subprocess (libcurl could not be loaded)".to_string(),
+    }
+}
+
+/// Whether the loaded libcurl understands `CURLOPT_PROTOCOLS_STR`.
 type Answer = Result<(u16, Vec<u8>, Vec<u8>), String>;
 
 /// One transfer through the shared handle. `Ok(None)` is "the pool is not usable", never a verdict on the
@@ -283,8 +338,23 @@ pub fn get(
         (api.easy_reset)(handle);
         let mut ok = true;
         ok &= (api.easy_setopt)(handle, OPT_URL, url.as_ptr()) == CURLE_OK;
-        ok &= (api.easy_setopt)(handle, OPT_PROTOCOLS_STR, protocols.as_ptr()) == CURLE_OK;
-        ok &= (api.easy_setopt)(handle, OPT_REDIR_PROTOCOLS_STR, protocols.as_ptr()) == CURLE_OK;
+        // A proxy from the environment would take the connection somewhere other than the address this
+        // module pinned, which is the same reason the process path clears every spelling of the variable.
+        // An empty string disables proxy use for this transfer, and it is set after every reset.
+        let no_proxy = CString::new("").ok()?;
+        ok &= (api.easy_setopt)(handle, OPT_PROXY, no_proxy.as_ptr()) == CURLE_OK;
+        if api.protocols_str {
+            ok &= (api.easy_setopt)(handle, OPT_PROTOCOLS_STR, protocols.as_ptr()) == CURLE_OK;
+            ok &=
+                (api.easy_setopt)(handle, OPT_REDIR_PROTOCOLS_STR, protocols.as_ptr()) == CURLE_OK;
+        } else {
+            // 7.85 introduced the string form; before it the bitmask is the same restriction, and it has
+            // existed since 7.19. Ubuntu 22.04 ships 7.81, where the string options fail and the whole
+            // transfer would have been abandoned for the slower path.
+            let allowed = (1 as c_long) | (2 as c_long);
+            ok &= (api.easy_setopt)(handle, OPT_PROTOCOLS, allowed) == CURLE_OK;
+            ok &= (api.easy_setopt)(handle, OPT_REDIR_PROTOCOLS, allowed) == CURLE_OK;
+        }
         ok &= (api.easy_setopt)(handle, OPT_FOLLOWLOCATION, 0 as c_long) == CURLE_OK;
         ok &= (api.easy_setopt)(handle, OPT_MAXREDIRS, 0 as c_long) == CURLE_OK;
         ok &= (api.easy_setopt)(handle, OPT_TIMEOUT, max_time as c_long) == CURLE_OK;
@@ -361,5 +431,26 @@ pub fn get(
         _ => Some(Err(format!(
             "curl failed with exit {code}: curl: ({code}) {sentence}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ubuntu 22.04 ships 7.81, where the string protocol options do not exist and the whole transfer would
+    /// be abandoned for the slow path. The parser decides which branch every transfer takes.
+    #[test]
+    fn the_protocol_option_form_follows_the_reported_version() {
+        assert!(!protocols_str_supported("libcurl/7.81.0 OpenSSL/3.0.2"));
+        assert!(!protocols_str_supported("libcurl/7.84.0"));
+        assert!(protocols_str_supported("libcurl/7.85.0"));
+        assert!(protocols_str_supported(
+            "libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3"
+        ));
+        // Anything unreadable takes the branch that exists on every version.
+        assert!(!protocols_str_supported(""));
+        assert!(!protocols_str_supported("something else"));
+        assert!(!protocols_str_supported("libcurl/"));
     }
 }

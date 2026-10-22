@@ -79,3 +79,12 @@ were reproduced or read directly in the source before being changed.
 The guarantee around `PR_SET_DUMPABLE` was also narrowed in `README.md` and `HADES.md`: the attribute is per
 process and reset by `execve`, so the seal protects the runtime's own entry, which holds the keys, and is not
 a permanent restriction on the tree.
+
+## Follow-up audit of 0.1.2
+
+| Finding | What changed | Test |
+|---|---|---|
+| The pooled fetch inherited `HTTP_PROXY` and friends, which the process path blocks | `CURLOPT_PROXY` is set to an empty string after every `curl_easy_reset` | `fetch::tests::a_proxy_in_the_environment_does_not_take_a_fetch` |
+| The pool vanished on libcurl older than 7.85, where `CURLOPT_PROTOCOLS_STR` does not exist | The legacy `CURLOPT_PROTOCOLS` bitmask carries the same HTTP/HTTPS-only rule; `hades doctor` prints the transport, version and option form | `fetch_pool::tests::the_protocol_option_form_follows_the_reported_version` |
+| Local vision instances shared the unit name `hades-vision` | The unit is named after its port; `/props` verifies which weights a healthy endpoint serves | `vision::tests::a_successful_launch_keeps_waiting_for_the_model` asserts the per-port unit name |
+| Cancelled pipe readers could remain blocked after the deadline | Descriptors are non-blocking and polled with a cancellation flag, so readers end within 50 ms of a timeout | command suite; the background-child test still returns at the deadline |

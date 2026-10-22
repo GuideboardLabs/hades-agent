@@ -464,6 +464,25 @@ Vision follows the same rule as the chat model. The image tool starts a local Qw
 `vision.url`, `vision.model` and `vision.key_env` in the config, where the key is named rather than stored.
 A host with no user systemd manager and no model files uses the second path and never touches the first.
 
+### Two fetch paths, one set of rules
+
+A fetch runs through the in-process libcurl pool when the library is present, and through one `curl`
+process per call when it is not. The pool is faster because it keeps connections and TLS sessions, and the
+two paths are otherwise required to behave the same: proxies are disabled in both, including the lowercase
+and uppercase environment variables libcurl reads; redirects are not followed; the body cap is enforced
+while the bytes are read; and the destination is pinned to the address the tool checked. libcurl older than
+7.85 has no string protocol option, so the pool uses the older bitmask rather than abandoning the transfer
+for the slow path. `hades doctor` prints which transport is live and which form of the option it uses, so a
+machine where the pool is unavailable is visible rather than inferred from a benchmark.
+
+### One vision server per port
+
+The local vision server runs as a transient user unit named after its port (`hades-vision-8123`), so two
+processes on different ports do not stop each other's server; `HADES_VISION_PORT` chooses the port. Before
+reusing a healthy endpoint the runtime asks `/props` which weights the server loaded and restarts its own
+unit if the answer is a different model. A build that does not answer `/props` is accepted, because
+refusing it would break older servers without protecting anything.
+
 ## Work that runs itself
 
 A job is a standing goal file under `<state>/jobs`, one file per job, and the file is the record. The body

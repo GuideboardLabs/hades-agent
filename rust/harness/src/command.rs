@@ -177,13 +177,28 @@ fn run_inner(
     // Each reader reports on a channel rather than through `join`, because `join` has no timeout: a
     // background child that inherited a pipe keeps it open after the shell exits, and a blocking join
     // would wait past the deadline the caller asked for.
+    use std::os::unix::io::IntoRawFd as _;
+    let out_fd = out_pipe.map(std::process::ChildStdout::into_raw_fd);
+    let err_fd = err_pipe.map(std::process::ChildStderr::into_raw_fd);
+    for descriptor in [out_fd, err_fd].into_iter().flatten() {
+        set_nonblocking(descriptor);
+    }
+
     let (sender, reader) = std::sync::mpsc::channel();
+    // A reader that is blocked on a pipe cannot be cancelled, and a process that escaped the group can hold
+    // that pipe open for as long as it likes. The descriptors are non-blocking and polled, so a cancellation
+    // ends the thread within one poll interval instead of leaving it behind in a long-lived process.
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let out_sender = sender.clone();
+    let out_cancel = std::sync::Arc::clone(&cancelled);
     let out_reader = std::thread::spawn(move || {
-        let _ = out_sender.send((false, read_pipe(out_pipe, budget)));
+        let captured = read_fd(out_fd, budget, out_cancel);
+        let _ = out_sender.send((false, captured));
     });
+    let err_cancel = std::sync::Arc::clone(&cancelled);
     let err_reader = std::thread::spawn(move || {
-        let _ = sender.send((true, read_pipe(err_pipe, budget)));
+        let captured = read_fd(err_fd, budget, err_cancel);
+        let _ = sender.send((true, captured));
     });
 
     let started = std::time::Instant::now();
@@ -201,6 +216,7 @@ fn run_inner(
         }
         if deadline.is_some_and(|limit| started.elapsed() >= limit) {
             timed_out = true;
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             end_group(&mut child, child_pid);
             break -1;
         }
@@ -239,6 +255,7 @@ fn run_inner(
                     // `Run` claim success and a deadline at the same time.
                     timed_out = true;
                     status = -1;
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
                     end_group(&mut child, child_pid);
                     break;
                 }
@@ -323,16 +340,51 @@ struct Captured {
 }
 
 /// Everything a child wrote to one pipe, bounded by `limit` while it is read.
-fn read_pipe<R: std::io::Read>(pipe: Option<R>, limit: usize) -> Captured {
+/// Poll rather than block, so a cancellation is noticed even when no byte ever arrives.
+fn set_nonblocking(descriptor: i32) {
+    // SAFETY: `fcntl` on a descriptor this call owns the number of, with the flags it just reported.
+    unsafe {
+        let flags = libc::fcntl(descriptor, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+fn read_fd(
+    descriptor: Option<i32>,
+    limit: usize,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Captured {
+    use std::os::unix::io::FromRawFd as _;
     let mut captured = Captured::default();
-    let Some(mut pipe) = pipe else {
+    let Some(descriptor) = descriptor else {
         return captured;
     };
+    // Own the descriptor, so it closes when this reader ends and a cancelled read cannot leak it.
+    // SAFETY: the descriptor came from the child's pipe and is transferred to this `File` once.
+    let mut pipe = unsafe { std::fs::File::from_raw_fd(descriptor) };
     let head_limit = limit / 2;
     let tail_limit = limit - head_limit;
     let mut chunk = [0u8; 8192];
-    loop {
-        match pipe.read(&mut chunk) {
+    while !cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut polled = libc::pollfd {
+            fd: descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one descriptor, no timeout pointer, a positive count.
+        let ready = unsafe { libc::poll(&mut polled, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            continue;
+        }
+        match std::io::Read::read(&mut pipe, &mut chunk) {
             Ok(0) => break,
             Ok(read) => {
                 let mut bytes = &chunk[..read];
@@ -353,7 +405,14 @@ fn read_pipe<R: std::io::Read>(pipe: Option<R>, limit: usize) -> Captured {
                     }
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(_) => break,
         }
     }

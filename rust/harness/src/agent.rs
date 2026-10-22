@@ -5093,7 +5093,9 @@ mod tests {
             .set_nonblocking(true)
             .expect("a nonblocking listener");
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // A bound for the stub thread, not a performance assertion: under a loaded test binary the
+            // third request can take seconds to arrive, and five was tight enough to fail a suite run.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while counted.load(std::sync::atomic::Ordering::SeqCst) < 3
                 && std::time::Instant::now() < deadline
             {

@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.2-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1048%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.3-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1050%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.2 |
+| **Version** | 0.1.3 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1048 passing, 13 ignored live tests |
+| **Tests** | 1050 passing, 13 ignored live tests |
 
 ---
 
@@ -685,7 +685,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1048 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1050 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -724,11 +724,16 @@ These are current limits, not aspirations hidden in a roadmap:
 - The floor reads text. `--policy strict` is a deny list over the same text, so an obfuscated command
   (`r''m -rf`, `$(printf rm)`) is not caught by either. The cage is the bound the kernel enforces.
 - Crash recovery reports an interrupted run and does not replay it. The marker is in `<state>/inflight/`.
-- Fetches share one libcurl handle, loaded at run time, so a run keeps its connections and TLS sessions:
-  0.53 ms per fetch on a loopback fixture and 19.5 ms against a page on the internet, where a process per
-  fetch costs 9.2 ms and 67.5 ms. `libcurl.so.4` is optional; without it, or with `HADES_FETCH_POOL=off`,
-  the tool falls back to one `curl` process per fetch and behaves identically. The numbers and the
-  guarantees both paths keep are in [`docs/fetch-benchmark.md`](docs/fetch-benchmark.md).
+- Fetches share a pool of libcurl handles, loaded at run time, so a run keeps its connections and TLS
+  sessions: 0.53 ms per fetch on a loopback fixture and 19.5 ms against a page on the internet, where a
+  process per fetch costs 9.2 ms and 67.5 ms. `libcurl.so.4` is optional; without it, or with
+  `HADES_FETCH_POOL=off`, the tool falls back to one `curl` process per fetch and behaves identically. Both
+  paths disable proxies, including the environment variables libcurl would otherwise read, because a proxy
+  would take the connection somewhere other than the address that was checked. libcurl before 7.85 gets the
+  legacy protocol bitmask instead of the string option, so Ubuntu 22.04 keeps the pool rather than silently
+  dropping to the slow path; `hades doctor` prints which transport is live and which protocol options it
+  uses. The numbers and the guarantees both paths keep are in
+  [`docs/fetch-benchmark.md`](docs/fetch-benchmark.md).
 - Unix-socket connects are refused by Landlock only on ABI 9 (Linux 7.1). This is a property of the
   kernel, not of the cage: on an ABI 8 kernel the same protection is `--cage strict`, which narrows the
   paths a caged program may reach. `hades doctor` prints the ABI and names the flag.

@@ -18,6 +18,12 @@ const DEFAULT_MODEL: &str = "models/Qwen3VL-8B-Instruct-Q4_K_M.gguf";
 const DEFAULT_PROJECTOR: &str = "models/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf";
 const PORT: u16 = 8123;
 
+/// The transient unit that runs the local server. It is named after the port, so two processes using
+/// different ports do not stop each other's server: one unit per endpoint, not one per user.
+fn unit() -> String {
+    format!("hades-vision-{}", port())
+}
+
 /// The port the local server listens on. A host that already has something on 8123, or that wants two
 /// models at once, sets `HADES_VISION_PORT`; the default stays where every earlier install expects it.
 fn port() -> u16 {
@@ -162,7 +168,13 @@ fn ensure_server() -> Result<(), String> {
         Err(poisoned) => poisoned.into_inner(),
     };
     if healthy() {
-        return Ok(());
+        if serving_configured_model() {
+            return Ok(());
+        }
+        // Something answers on this port, but it is not the model this process was told to use. Stop the
+        // unit this process owns and start the configured one: a health endpoint says the process is up,
+        // not which weights it has.
+        stop_unit();
     }
     if let Some(mut child) = held.take() {
         let _ = child.kill();
@@ -176,7 +188,7 @@ fn ensure_server() -> Result<(), String> {
         ));
     }
     let _ = Command::new("systemctl")
-        .args(["--user", "stop", "hades-vision"])
+        .args(["--user", "stop", &unit()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -184,7 +196,7 @@ fn ensure_server() -> Result<(), String> {
         .args([
             "--user",
             "--unit",
-            "hades-vision",
+            &unit(),
             "--collect",
             "-q",
             "-p",
@@ -276,16 +288,54 @@ fn ensure_server() -> Result<(), String> {
 /// function started is only the launcher, and killing it would leave the server running.
 fn stop_unit() {
     let _ = Command::new("systemctl")
-        .args(["--user", "stop", "hades-vision"])
+        .args(["--user", "stop", &unit()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
 }
 
+/// Whether the server on the port is the model this process configured, as far as it says.
+///
+/// `/health` reports that something is listening; `/props` reports which weights it loaded. A build that
+/// does not answer `/props` is accepted, because refusing it would break older servers without protecting
+/// anything: the check is there for the case where two models share a port by accident.
+fn serving_configured_model() -> bool {
+    let Some(reported) = served_model() else {
+        return true;
+    };
+    let wanted = env_or("HADES_VISION_MODEL", DEFAULT_MODEL);
+    let name = Path::new(&wanted)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    name.is_empty() || reported.ends_with(name)
+}
+
+/// The model path the server reports, or `None` when it does not answer `/props`.
+fn served_model() -> Option<String> {
+    let probe = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "2",
+            &format!("http://127.0.0.1:{}/props", port()),
+        ])
+        .output()
+        .ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&probe.stdout).ok()?;
+    value
+        .get("model_path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// Why the vision unit is not running, in systemd's own words, or `None` while it is starting or up.
 fn unit_failure() -> Option<String> {
     let failed = Command::new("systemctl")
-        .args(["--user", "is-failed", "hades-vision"])
+        .args(["--user", "is-failed", &unit()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -297,7 +347,7 @@ fn unit_failure() -> Option<String> {
         .args([
             "--user",
             "-u",
-            "hades-vision",
+            &unit(),
             "-n",
             "5",
             "--no-pager",
@@ -480,6 +530,9 @@ mod tests {
             std::env::set_var("HADES_VISION_MODEL", &model);
             std::env::set_var("HADES_VISION_PROJECTOR", &projector);
         }
+
+        // One unit per port: two processes on different ports must not stop each other's server.
+        assert_eq!(unit(), format!("hades-vision-{port}"));
 
         let started = Instant::now();
         let result = ensure_server();
