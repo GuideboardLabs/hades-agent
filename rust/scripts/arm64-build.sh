@@ -146,20 +146,54 @@ build_musl() {
   rustup target list --installed | grep -qx aarch64-unknown-linux-musl ||
     rustup target add aarch64-unknown-linux-musl
   local musl=$PREFIX/musl
-  if [ ! -x "$musl/bin/aarch64-linux-musl-gcc" ]; then
+  local cc ar flags name=hades-arm64-musl
+  if [ -x "$musl/bin/aarch64-linux-musl-gcc" ]; then
+    cc=$musl/bin/aarch64-linux-musl-gcc
+    ar=$musl/bin/aarch64-linux-musl-ar
+    flags="-C target-feature=+crt-static"
+  elif python3 -m ziglang version >/dev/null 2>&1; then
+    # GitHub-hosted runners cannot reach musl.cc (the connection times out), and the release must not depend
+    # on one CDN being reachable from one network. Zig ships a C compiler and a musl libc for this target and
+    # is installable from PyPI, which the runners can reach. Rust's own self-contained crt objects collide
+    # with Zig's, so that arm is turned off for this link.
+    mkdir -p "$PREFIX/zig"
+    cat >"$PREFIX/zig/cc" <<'WRAPPER'
+#!/usr/bin/env bash
+# cc-rs passes `--target=<triple>` and rustc passes the Cortex-A53 erratum workaround; Zig spells the target
+# `-target` and its linker rejects that workaround, so both are filtered here.
+args=()
+for a in "$@"; do
+  case "$a" in
+    --target=*|-Wl,--fix-cortex-a53-843419) continue ;;
+  esac
+  args+=("$a")
+done
+exec python3 -m ziglang cc -target aarch64-linux-musl "${args[@]}"
+WRAPPER
+    chmod +x "$PREFIX/zig/cc"
+    cc=$PREFIX/zig/cc
+    ar=ar
+    flags="-C target-feature=+crt-static -C link-self-contained=no"
+  else
     mkdir -p "$PREFIX"
-    echo "staging the aarch64 musl toolchain under $PREFIX"
-    curl -sSL https://musl.cc/aarch64-linux-musl-cross.tgz |
-      tar xz -C "$PREFIX"
-    rm -rf "$musl"
-    mv "$PREFIX/aarch64-linux-musl-cross" "$musl"
+    echo "staging the aarch64 musl toolchain from musl.cc"
+    if curl -sSL --max-time 90 https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C "$PREFIX"; then
+      rm -rf "$musl"
+      mv "$PREFIX/aarch64-linux-musl-cross" "$musl"
+      cc=$musl/bin/aarch64-linux-musl-gcc
+      ar=$musl/bin/aarch64-linux-musl-ar
+      flags="-C target-feature=+crt-static"
+    else
+      echo "no aarch64 musl C compiler: musl.cc is unreachable and ziglang is not installed" >&2
+      echo "install one with 'pip install ziglang', or stage the toolchain under $musl" >&2
+      exit 1
+    fi
   fi
-  local name=hades-arm64-musl
   rm -f "$OUT/$name"
-  CC_aarch64_unknown_linux_musl=$musl/bin/aarch64-linux-musl-gcc \
-    AR_aarch64_unknown_linux_musl=$musl/bin/aarch64-linux-musl-ar \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$musl/bin/aarch64-linux-musl-gcc \
-    RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
+  CC_aarch64_unknown_linux_musl=$cc \
+    AR_aarch64_unknown_linux_musl=$ar \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$cc \
+    RUSTFLAGS="${RUSTFLAGS:-} $flags" \
     "$CARGO" build --release --locked --manifest-path "$MANIFEST" -p harness --target aarch64-unknown-linux-musl
   cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/hades" "$OUT/$name"
   chmod 755 "$OUT/$name"

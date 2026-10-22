@@ -55,6 +55,12 @@ jobs:
       # `apt-get download` and `dpkg-deb -x`, because registering binfmt needs root the runner does not give us.
       # The artifacts are *run* here, not only compiled: version, doctor, init, pack add and audit under
       # qemu-aarch64, with `--require` so a missing emulator fails the job instead of skipping it.
+      # musl.cc is not reachable from GitHub-hosted runners (the connection times out). Zig ships an
+      # aarch64-linux-musl C compiler and libc, installs from PyPI, and is the fallback `arm64-build.sh`
+      # uses when no staged musl toolchain is present. It is a fallback, not a requirement: a machine with
+      # the musl.cc toolchain already staged does not download it.
+      - name: Provide a reachable musl C compiler
+        run: python3 -m pip install --quiet --disable-pip-version-check ziglang
       - name: Build and run ARM64 artifacts
         run: |
           set +e

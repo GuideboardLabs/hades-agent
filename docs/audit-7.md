@@ -130,6 +130,14 @@ step only became visible after the previous one was fixed:
   `lib/aarch64-linux-gnu`, so `-lpthread` was silently dropped under `--as-needed`. The bullseye multiarch
   directories are added explicitly.
 
+The musl half then failed on the CI runner for a different reason: `musl.cc` does not answer from GitHub's
+network (the connection times out after two minutes). A release that depends on one CDN is a release that
+fails when that CDN does. When no staged musl toolchain is present, the build now uses Zig's
+`aarch64-linux-musl` compiler from PyPI, installed in the release job; the wrapper drops the two arguments
+Zig spells differently (`--target=`, and the Cortex-A53 erratum flag its linker rejects) and disables Rust's
+self-contained crt objects so they do not collide with Zig's. A machine that already has the musl.cc
+toolchain staged still uses it, so the fallback adds no cost locally.
+
 With those four, the GNU artifact links, `assert-floor.sh` reports **GLIBC_2.30** against a 2.31 ceiling, and
 `arm64-check.sh --require` runs it through version, doctor, init, an offline pack export/add, a second add and
 audit under qemu.
