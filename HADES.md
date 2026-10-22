@@ -286,8 +286,11 @@ refusing /home/someone/notes: it is a notes vault (the directory carries an .obs
 its own home and its own state, and pointing it here is the one thing that separation exists to prevent
 ```
 
-Exit code 2, and no fallback. Paths are compared by parts after `.` and `..` are resolved, so a directory that
-merely shares the name is not refused; a symlink or a relative path does not walk around the rule.
+Exit code 2, and no fallback. Paths are compared by parts after `.` and `..` are resolved and after the deepest
+existing ancestor is resolved through symlinks, so a directory that merely shares the name is not refused and
+an alias that points into a vault is. The marker is looked for at every parent, not the first twelve, and a
+path that does not exist yet is judged by where its existing parent really lives. `HADES_HOME` goes through
+the same guard once, because the default state, config, vault, keys and skills are all derived from it.
 
 The model does not name a program for an MCP server. `mcp.json` lists servers and, optionally, an allowlist
 of runtimes (`npx`, `bunx`, `uvx`, `python3`, `node`, `deno` by default). A server's program is matched by

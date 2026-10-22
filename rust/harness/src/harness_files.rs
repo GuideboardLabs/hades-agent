@@ -260,8 +260,8 @@ fn short(digest: &str) -> &str {
 
 /// `$HADES_HOME/harness/<profile>` when the directory exists, else `~/.hades/harness/<profile>`.
 fn default_dir(profile: &str) -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HADES_HOME") {
-        let dir = PathBuf::from(home).join("harness").join(profile);
+    if let Ok(home) = crate::boundary::hades_home() {
+        let dir = home.join("harness").join(profile);
         if dir.is_dir() {
             return Some(dir);
         }

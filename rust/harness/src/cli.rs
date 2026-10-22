@@ -1484,19 +1484,14 @@ fn config_path(flags: &Flags) -> Result<PathBuf, String> {
     }
 }
 
-/// Where Hades keeps its own things, and never inside another agent's install.
+/// Where Hades keeps its own things, validated like every other path it is handed.
 ///
-/// `HADES_HOME` exists for two callers: an installer that is staging a home before it moves it, and a
-/// test that must not see the home of the machine it is running on. An empty value is not a home.
+/// `HADES_HOME` exists for an installer that names the home explicitly and for a test that must not see the
+/// home of the machine it is running on. It is *not* an exemption: the default state, config, vault, keys and
+/// skills all derive from this value, so a home inside a notes vault or another agent's install would carry
+/// every derived path past the guard. Validate here, once, and let every caller inherit the answer.
 fn hades_home() -> Result<PathBuf, String> {
-    match std::env::var("HADES_HOME") {
-        Ok(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-        _ => {
-            let home = std::env::var("HOME")
-                .map_err(|_| "no HOME and no HADES_HOME, so pass an explicit path".to_string())?;
-            Ok(PathBuf::from(home).join(".hades"))
-        }
-    }
+    boundary::hades_home()
 }
 
 /// Every directory a command is about to touch goes through here first.
@@ -1504,13 +1499,7 @@ fn hades_home() -> Result<PathBuf, String> {
 /// One function rather than a check per command: a guard that has to be remembered at each call site is a
 /// guard that will be forgotten at the newest one.
 fn guarded(path: &Path) -> Result<PathBuf, String> {
-    let home =
-        std::env::var("HOME").map_err(|_| "no HOME, so pass an explicit path".to_string())?;
-    let home = PathBuf::from(home);
-    if let Some(reason) = boundary::foreign(path, &home) {
-        return Err(boundary::refusal(path, reason));
-    }
-    Ok(path.to_path_buf())
+    boundary::guard(path)
 }
 
 /// The state directory, which is Hades' own by default and never inside another agent's install.
@@ -5288,7 +5277,11 @@ fn open_memory(flags: &Flags) -> Result<Option<MnemeMemory>, String> {
         }
         return MnemeMemory::open(&vault, state.join("mneme.db")).map(Some);
     }
-    MnemeMemory::open(&config.vault, db_path(flags)?).map(Some)
+    // A config is data, and older or hand-edited data can name a vault the flags never would. The record is
+    // opened through the same guard as every explicit path, or `run` writes into a notes vault that `audit`
+    // refuses one command later.
+    let vault = guarded(&config.vault)?;
+    MnemeMemory::open(&vault, db_path(flags)?).map(Some)
 }
 
 /// What a goal recalls, and the memory object a caller needs to record afterwards.

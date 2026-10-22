@@ -68,10 +68,7 @@ impl Options {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or("HOME is not set")?;
-        let hades = std::env::var_os("HADES_HOME")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".hades"));
+        let hades = crate::boundary::hades_home()?;
         let state = flags
             .get("--state")
             .map(PathBuf::from)

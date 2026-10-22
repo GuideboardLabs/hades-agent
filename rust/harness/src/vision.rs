@@ -70,13 +70,7 @@ fn remote() -> Result<Option<Remote>, String> {
             }));
         }
     }
-    let home = match std::env::var("HADES_HOME") {
-        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => match std::env::var("HOME") {
-            Ok(home) => std::path::PathBuf::from(home).join(".hades"),
-            Err(_) => return Ok(None),
-        },
-    };
+    let home = crate::boundary::hades_home()?;
     let path = home.join(crate::config::NAME);
     let config = crate::config::load(&path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;

@@ -3454,3 +3454,113 @@ fn research_file_writes_the_report_body_and_the_run_link() {
         "{body}"
     );
 }
+
+// `HADES_HOME` is not an exemption from the boundary. Every default path (state, config, vault, keys,
+// skills) is derived from it, so the guard has to run here once rather than only on explicit flags.
+#[test]
+fn a_hades_home_inside_a_vault_is_refused_before_init_writes() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let vault = scratch("home-vault");
+    std::fs::create_dir_all(vault.join(".obsidian")).expect("a marker");
+    let root = scratch("home-vault-root");
+    let home = scratch("home-vault-home");
+    let output = std::process::Command::new(exe)
+        .args([
+            "init",
+            "--non-interactive",
+            "--root",
+            root.to_str().expect("utf8"),
+        ])
+        .env("HOME", &home)
+        .env("HADES_HOME", &vault)
+        .output()
+        .expect("init runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("notes vault"), "{text}");
+    assert!(
+        !vault.join("config.json").exists(),
+        "the refusal happened before a write: {text}"
+    );
+}
+
+#[test]
+fn a_hades_home_inside_another_agents_home_is_refused() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let home = scratch("home-agent");
+    let hades = home.join(".hermes/hades");
+    std::fs::create_dir_all(&hades).expect("a foreign home");
+    let root = scratch("home-agent-root");
+    let output = std::process::Command::new(exe)
+        .args([
+            "init",
+            "--non-interactive",
+            "--root",
+            root.to_str().expect("utf8"),
+        ])
+        .env("HOME", &home)
+        .env("HADES_HOME", &hades)
+        .output()
+        .expect("init runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("another agent's home"), "{text}");
+}
+
+#[test]
+fn a_clean_hades_home_still_initialises() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let home = scratch("home-clean");
+    let root = scratch("home-clean-root");
+    let output = std::process::Command::new(exe)
+        .args([
+            "init",
+            "--non-interactive",
+            "--root",
+            root.to_str().expect("utf8"),
+        ])
+        .env("HOME", &home)
+        .env("HADES_HOME", home.join("hades"))
+        .output()
+        .expect("init runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert!(home.join("hades/config.json").is_file(), "{text}");
+}
+
+// A state directory that is a symlink into a vault is judged by its destination.
+#[test]
+fn a_state_symlink_into_a_vault_is_refused() {
+    let exe = env!("CARGO_BIN_EXE_hades");
+    let home = scratch("state-symlink-home");
+    let vault = scratch("state-symlink-vault");
+    std::fs::create_dir_all(vault.join(".obsidian")).expect("a marker");
+    std::fs::create_dir_all(vault.join("state")).expect("a state");
+    let alias = scratch("state-symlink-alias").join("state");
+    std::os::unix::fs::symlink(vault.join("state"), &alias).expect("an alias");
+    let output = std::process::Command::new(exe)
+        .args(["status", "--state", alias.to_str().expect("utf8")])
+        .env("HOME", &home)
+        .env("HADES_HOME", home.join("hades"))
+        .output()
+        .expect("status runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("notes vault"), "{text}");
+}
