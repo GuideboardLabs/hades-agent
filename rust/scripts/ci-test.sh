@@ -15,6 +15,15 @@ trap 'rm -f "$OUT"' EXIT
 cargo test --workspace --no-fail-fast "$@" 2>&1 | tee "$OUT"
 status=${PIPESTATUS[0]}
 
+# The count is a claim in four places (badge, table, prose, release notes), so the run that proves it should
+# produce the number rather than leaving a person to add up forty test-result lines by hand. A failed run
+# writes nothing: a partial total is worse than no number.
+if [ "$status" -eq 0 ]; then
+  passed=$(grep -E '^test result: ' "$OUT" | sed -nE 's/^test result: [A-Za-z]+\. ([0-9]+) passed.*/\1/p' | awk '{ total += $1 } END { print total + 0 }')
+  printf '%s\n' "$passed" > .test-count
+  echo "test count: $passed"
+fi
+
 if [ "$status" -ne 0 ]; then
   {
     echo

@@ -19,5 +19,6 @@ mneme.db
 
 # Scratch and coverage
 /scratch/
+/rust/.test-count
 coverage/
 *.profraw
