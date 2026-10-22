@@ -138,6 +138,9 @@ pub struct Manifest {
     pub requires: Requires,
     pub provides: Provides,
     pub capabilities: Capabilities,
+    /// Words a person would search for. Optional, because most packs are found by their `id` and summary;
+    /// it exists so a menu can be generated without a second file to keep in step with the manifest.
+    pub keywords: Vec<String>,
 }
 
 impl Manifest {
@@ -158,6 +161,7 @@ impl Manifest {
                 "requires",
                 "provides",
                 "capabilities",
+                "keywords",
             ],
             "pack.json",
         )?;
@@ -198,6 +202,10 @@ impl Manifest {
             root.get("capabilities")
                 .ok_or_else(|| "pack.json is missing `capabilities`".to_string())?,
         )?;
+        let keywords = match root.get("keywords") {
+            None => Vec::new(),
+            Some(_) => strings(root, "keywords", "pack.json")?,
+        };
         Ok(Manifest {
             format,
             id,
@@ -209,6 +217,7 @@ impl Manifest {
             requires,
             provides,
             capabilities,
+            keywords,
         })
     }
 
@@ -236,6 +245,7 @@ impl Manifest {
                 "writes": self.capabilities.writes,
                 "code": self.capabilities.code,
             },
+            "keywords": self.keywords,
         })
     }
 
@@ -1021,6 +1031,7 @@ pub struct ExportOptions {
     pub skills: Vec<String>,
     pub profiles: Vec<String>,
     pub cases: Vec<String>,
+    pub keywords: Vec<String>,
     pub out: Option<PathBuf>,
 }
 
@@ -1193,6 +1204,7 @@ pub fn export(options: &ExportOptions) -> Result<PathBuf, String> {
             writes: unique(&options.writes),
             code: false,
         },
+        keywords: unique(&options.keywords),
     };
     fs::write(stage.join("pack.json"), manifest.to_bytes()?)
         .map_err(|error| format!("could not write pack.json: {error}"))?;
@@ -1873,6 +1885,30 @@ mod tests {
         assert!(!shared.is_empty());
         let (low, _) = similarity(&a, "a recipe for bread with flour water and salt");
         assert!(low < 0.60, "{low}");
+    }
+
+    #[test]
+    fn keywords_are_optional_and_survive_a_round_trip() {
+        let bare = r#"{"format":1,"id":"demo","version":"1.0.0","title":"Demo","summary":"s",
+            "license":"MIT","derivatives":"allowed",
+            "requires":{"hades":">=0.1.0","roles":[],"tools":[]},
+            "provides":{"skills":[],"harnesses":[],"cases":[]},
+            "capabilities":{"network":false,"writes":[],"code":false}}"#;
+        assert!(
+            Manifest::parse(bare)
+                .expect("a pack without keywords")
+                .keywords
+                .is_empty()
+        );
+
+        let tagged = bare.replace(
+            r#""capabilities""#,
+            r#""keywords":["git","review"],"capabilities""#,
+        );
+        let manifest = Manifest::parse(&tagged).expect("a pack with keywords");
+        assert_eq!(manifest.keywords, vec!["git", "review"]);
+        let again = Manifest::parse(&manifest.to_value().to_string()).expect("its own output");
+        assert_eq!(again.keywords, vec!["git", "review"]);
     }
 
     #[test]

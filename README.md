@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.4-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1053%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.5-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1057%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.4 |
+| **Version** | 0.1.5 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1053 passing, 13 ignored live tests |
+| **Tests** | 1057 passing, 13 ignored live tests |
 
 ---
 
@@ -584,6 +584,7 @@ is refused when the config is read, not silently ignored. Precedence is `--model
 | `hades research <question>` | One evidence-first run: plan, search, fetch, extract, verify; `--offline` reads only the local library |
 | `hades library add\|list\|search\|show\|verify\|remove` | The local shelf of documents, with FTS5 search and a hash check |
 | `hades mneme import\|export\|upgrade` | Move a vault in or out of the record; `upgrade` writes the new tree and can retire `40 Topics` |
+| `hades pack menu\|find` | Read the shipped shelf of skill, tool and test packs, and search it before writing a skill by hand |
 | `hades pack export\|inspect\|plan\|apply\|uninstall\|list` | Move skills, a harness and cases between installs as a signed-shaped archive with a decision file |
 | `hades mcp list\|tools\|call` | The MCP servers the config names, what each offers, and a call to one allowed tool |
 | `hades context <goal>` / `hades map <goal>` | Build the context for a goal, or rank the tree for one and say what the map cache did |
@@ -669,6 +670,22 @@ which is the setting to use when the port is shared with anything else.
 
 ---
 
+## Packs
+
+The base install carries a shelf, not the packs. `hades pack menu` prints what exists, `hades pack find
+<words>` narrows it by id, title, summary or keyword, and an archive is installed with the same inspect →
+plan → apply path a pack exported from another home uses. The index ships inside the binary, so the shelf is
+readable offline and without a network call.
+
+The point is the order of operations: check what exists before writing a skill of your own. A pack carries
+its manifest, licence and declared capabilities, and may not declare a guardrail, a role or a cage rule,
+because a download that could set those would be a download that could disable its own limits. Installing is
+a person's command with a printed plan, not something a model does on its own.
+
+The catalog is generated from a packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`
+from the pack directories) and copied into `docs/packs/` at release. This repository publishes three skills
+to start with.
+
 ## Security model
 
 - **Least authority by profile.** A read job has no mutating tool at all.
@@ -694,7 +711,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1053 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1057 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

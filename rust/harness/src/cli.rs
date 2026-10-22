@@ -2486,6 +2486,8 @@ fn pack_cmd(args: &[String]) -> Result<(String, i32), String> {
         "list" => pack_list(rest),
         "adapt" => pack_adapt(rest),
         "merge" => pack_merge(rest),
+        "menu" => pack_menu(rest),
+        "find" => pack_find(rest),
         "help" | "--help" => Ok((pack_help(), 0)),
         other => Err(format!(
             "`pack {other}`: say export, inspect, plan, apply, uninstall, list, adapt, merge or help"
@@ -2509,6 +2511,7 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
             "writes",
             "requires-role",
             "requires-tool",
+            "keyword",
             "out",
         ],
         &["network"],
@@ -2549,6 +2552,7 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
         skills: repeated("skill"),
         profiles: repeated("profile"),
         cases: repeated("case"),
+        keywords: repeated("keyword"),
         out: flags.named.get("out").map(PathBuf::from),
     };
     let path = crate::pack::export(&options)?;
@@ -2619,7 +2623,9 @@ fn pack_plan(args: &[String]) -> Result<(String, i32), String> {
 }
 
 fn pack_help() -> String {
-    "pack export <id> --from <state> [selectors] [--out <file>]\n\
+    "pack menu [--json]                      the shelf this build ships\n\
+     pack find <words> [--json]              narrow it by id, title, summary or keywords\n\
+     pack export <id> --from <state> [selectors] [--out <file>]\n\
      pack inspect <file> [--json]\n\
      pack plan <file> [--state <dir>] [--json]\n\
      pack apply <file> --plan <decisions.json> [--state <dir>] [--activate]\n\
@@ -2628,6 +2634,82 @@ fn pack_help() -> String {
      pack adapt <file> --item <kind>:<identity> [--accept] [model flags]\n\
      pack merge <file> --item skill:<identity> --into <skill> [--name <n>] [--accept]\n"
         .to_string()
+}
+
+/// `hades pack menu`: the catalog this build carries, so a person can see what exists before writing a
+/// skill by hand. Read-only: it reads the embedded index and prints it.
+fn pack_menu(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &[], &["json"])?;
+    let rows = crate::packs_menu::shipped()?;
+    if switched(&flags, "json") {
+        let listed: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "version": row.version,
+                    "title": row.title,
+                    "summary": row.summary,
+                    "keywords": row.keywords,
+                    "kind": row.kinds,
+                    "items": row.items,
+                    "requires_hades": row.requires_hades,
+                    "bytes": row.bytes,
+                    "sha256": row.sha256,
+                    "archive": row.archive,
+                })
+            })
+            .collect();
+        return Ok((
+            serde_json::to_string_pretty(&listed)
+                .map_err(|error| format!("could not print the menu: {error}"))?,
+            0,
+        ));
+    }
+    Ok((crate::packs_menu::render(&rows), 0))
+}
+
+/// `hades pack find <words>`: the same shelf, filtered. Empty is an answer too: it means there is nothing to
+/// install, which is the one case where writing a new skill is the right move.
+fn pack_find(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &[], &["json"])?;
+    let query = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack find` needs words to look for".to_string())?;
+    let rows = crate::packs_menu::shipped()?;
+    let found = crate::packs_menu::find(&rows, query);
+    if switched(&flags, "json") {
+        let listed: Vec<serde_json::Value> = found
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.id,
+                    "version": row.version,
+                    "summary": row.summary,
+                    "sha256": row.sha256,
+                    "archive": row.archive,
+                })
+            })
+            .collect();
+        return Ok((
+            serde_json::to_string_pretty(&listed)
+                .map_err(|error| format!("could not print the result: {error}"))?,
+            0,
+        ));
+    }
+    if found.is_empty() {
+        return Ok((
+            format!(
+                "nothing on the shelf matches `{query}`.\n\
+                 Writing a skill is the right move when nothing here covers the task; check `hades pack menu` \
+                 for what does exist.\n"
+            ),
+            0,
+        ));
+    }
+    let listed: Vec<crate::packs_menu::Row> = found.into_iter().cloned().collect();
+    Ok((crate::packs_menu::render(&listed), 0))
 }
 
 fn pack_item(text: &str) -> Result<(crate::pack::Kind, String), String> {

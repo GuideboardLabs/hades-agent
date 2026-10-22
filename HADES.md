@@ -464,6 +464,18 @@ Vision follows the same rule as the chat model. The image tool starts a local Qw
 `vision.url`, `vision.model` and `vision.key_env` in the config, where the key is named rather than stored.
 A host with no user systemd manager and no model files uses the second path and never touches the first.
 
+### The shelf
+
+Skills, tool profiles and test cases are not built into the runtime; a catalog of packs is. `hades pack menu`
+reads it and `hades pack find` searches it, both from an index embedded at build time, so a machine with no
+network still knows what the shelf holds. Installation is not part of that tool: a pack is fetched by a
+person, checked against the digest in the menu, and applied through the same reviewed plan as any other
+pack, because the thing that decides what runs is not the thing that proposes it.
+
+A manifest may declare what a pack provides, what it needs and what it may touch. It may not declare roles,
+a floor, a cage or a policy: those are the runtime's, and a download that could set them could disable its
+own limits.
+
 ### Two fetch paths, one set of rules
 
 A fetch runs through the in-process libcurl pool when the library is present, and through one `curl`

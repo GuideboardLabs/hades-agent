@@ -92,6 +92,7 @@ fn options(from: &Path, out: &Path) -> ExportOptions {
         skills: vec!["pack-skill".to_string()],
         profiles: vec!["research".to_string()],
         cases: vec!["research-f3e86460f834".to_string()],
+        keywords: vec!["fixture".to_string()],
         out: Some(out.to_path_buf()),
     }
 }

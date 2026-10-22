@@ -3,6 +3,20 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.5
+
+The base install carries a shelf, not a pack library.
+
+- **`hades pack menu` and `hades pack find <words>`.** The catalog of skill, tool and test packs is embedded
+  in the binary at build time, so a machine with no network can still answer "does a pack already do this?".
+  `find` matches the id, title, summary and keywords, and every word of the query has to land. An empty
+  result says so in words instead of printing nothing, because that is the case where writing a skill is the
+  right move.
+- **`pack.json` may carry `keywords`.** Optional, additive to format 1, so an older manifest still parses.
+  It exists so the menu is generated from one file instead of a second list that drifts.
+- **The shelf is data about packs, not permission to run one.** The menu only reads what exists; installing
+  is still `pack inspect` → `plan` → `apply` with a reviewed decision file.
+
 ## 0.1.4
 
 A review of 0.1.3 found three places where an existing guarantee stopped short of a path that could escape
