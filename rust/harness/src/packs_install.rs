@@ -10,6 +10,7 @@
 //! because "fetch this and run it" is not a sentence to point at a laptop.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 
 use crate::packs_menu::{self, Row};
@@ -21,6 +22,9 @@ pub const DEFAULT_BASE: &str =
 /// A pack is a skill and a manifest. Four MiB is the fetch path's own body cap; a pack over it is not a pack.
 const MAX_ARCHIVE: usize = 4 * 1024 * 1024;
 const MAX_INDEX: usize = 256 * 1024;
+
+/// Distinguishes two installations in the same process, where the clock alone could collide.
+static STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn base() -> Result<String, String> {
     let base = match std::env::var("HADES_PACKS_URL") {
@@ -100,11 +104,29 @@ pub fn rows(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
 ///
 /// `yes` is the difference between a plan and a write, and it is the only thing `yes` does: the digest is
 /// checked, the plan is built and every preflight runs on both paths.
-pub fn add(id: &str, home: &Path, state: &Path, yes: bool) -> Result<String, String> {
+pub fn add(
+    id: &str,
+    expect: Option<&str>,
+    home: &Path,
+    state: &Path,
+    yes: bool,
+) -> Result<String, String> {
     let rows = rows(state, true)?;
     let row = rows.iter().find(|row| row.id == id).ok_or_else(|| {
         format!("`{id}` is not on the shelf. `hades pack find <words>` lists what is.")
     })?;
+    // A digest the operator names is a pin on exact bytes, not a hint. If the shelf has moved on, the
+    // installation is refused before anything is fetched, because the alternative is installing something
+    // other than what was asked for and calling it a success.
+    if let Some(expect) = expect
+        && !expect.eq_ignore_ascii_case(&row.sha256)
+    {
+        return Err(format!(
+            "refused: you asked for {expect}, and the shelf now names {} for `{id}` {}. Nothing was \
+             fetched and nothing was written.",
+            row.sha256, row.version
+        ));
+    }
     // A row may name an absolute URL: that is how a pack whose bytes are not in the public repository is
     // published. The digest is the same commitment either way, so the check does not care where it came from.
     let url = if row.archive.starts_with("https://") || row.archive.starts_with("http://") {
@@ -129,8 +151,31 @@ pub fn add_file(
     state: &Path,
     yes: bool,
 ) -> Result<String, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    // Size first, then a bounded read: `fs::read` would allocate whatever the file happens to be, which is
+    // the one thing a limit is for. The extra byte is what tells a file that grew after the check.
+    let on_disk = fs::metadata(path)
+        .map_err(|error| format!("could not stat {}: {error}", path.display()))?
+        .len();
+    if on_disk > MAX_ARCHIVE as u64 {
+        return Err(format!(
+            "refused: {} is {on_disk} bytes, over the {MAX_ARCHIVE}-byte ceiling for a pack. Nothing was \
+             read.",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    let file = fs::File::open(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    file.take(MAX_ARCHIVE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if bytes.len() > MAX_ARCHIVE {
+        return Err(format!(
+            "refused: {} grew past the {MAX_ARCHIVE}-byte ceiling while it was being read. Nothing was \
+             installed.",
+            path.display()
+        ));
+    }
     let digest = mneme::sha256::hex(&bytes);
     if let Some(expect) = expect
         && !expect.eq_ignore_ascii_case(&digest)
@@ -164,16 +209,57 @@ fn install(
     let dir = cache_dir(state).join("archives");
     fs::create_dir_all(&dir)
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
-    // Read it from a copy in the cache: `Pack::open` takes a file, and the cache is where a pack lives
-    // between being checked and being installed.
-    let incoming = dir.join("incoming.hadepack");
-    fs::write(&incoming, bytes)
-        .map_err(|error| format!("could not write {}: {error}", incoming.display()))?;
-    let pack = crate::pack::Pack::open(&incoming)?;
+    // A staging file of this installation's own: `create_new` means two processes cannot write the same
+    // path, and a name built from the process, the clock and a counter means they do not try.
+    let staging = dir.join(format!(
+        "incoming-{}-{}-{}.hadepack",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+        STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, bytes)?;
+            file.sync_all()
+        });
+    if let Err(error) = written {
+        let _ = fs::remove_file(&staging);
+        return Err(format!("could not write {}: {error}", staging.display()));
+    }
+    let opened = crate::pack::Pack::open(&staging);
+    // The file the parser read must still be the file that was verified. A truncated write, a full disk or
+    // another process that found the name would all show up here rather than as a pack nobody approved.
+    let intact = opened.is_ok()
+        && fs::read(&staging)
+            .map(|again| mneme::sha256::hex(&again) == digest)
+            .unwrap_or(false);
+    if !intact {
+        let _ = fs::remove_file(&staging);
+        return Err(format!(
+            "refused: the archive staged at {} is not the bytes that were verified ({digest}). Nothing was \
+             installed.",
+            staging.display()
+        ));
+    }
+    let pack = match opened {
+        Ok(pack) => pack,
+        Err(error) => {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+    };
     let id = pack.manifest.id.clone();
     let version = pack.manifest.version.clone();
-    let file = dir.join(format!("{id}-{version}.hadepack"));
-    fs::rename(&incoming, &file)
+    // The cache name is the digest, not the id: an id may be namespaced (`author/tool`), which is not a
+    // filename, and two versions of one pack are two different archives.
+    let file = dir.join(format!("{digest}.hadepack"));
+    fs::rename(&staging, &file)
         .map_err(|error| format!("could not keep {}: {error}", file.display()))?;
 
     let planned = crate::pack::plan(&pack, state)?;

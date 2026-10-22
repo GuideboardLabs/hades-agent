@@ -427,16 +427,28 @@ pub fn read_catalog(state: &Path) -> Result<Vec<Installed>, String> {
     Ok(rows)
 }
 
+/// Distinguishes two catalog writes in the same process without relying on the clock.
+static CATALOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_catalog(state: &Path, rows: &[Installed]) -> Result<(), String> {
     let path = catalog_path(state);
     if let Some(parent) = path.parent() {
         scratch::state_dir(parent)
             .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
     }
-    let temporary = path.with_file_name(format!(".catalog-{}.tmp", std::process::id()));
+    // A name of its own per write. `catalog-<pid>.tmp` collided between two installs in one process, which is
+    // exactly the case a concurrent install creates: one thread renamed the other thread's file away.
+    let temporary = path.with_file_name(format!(
+        ".catalog-{}-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+        CATALOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .open(&temporary)
         .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;

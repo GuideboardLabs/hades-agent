@@ -623,7 +623,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-const TOOLS: [&str; 24] = [
+pub const TOOLS: [&str; 24] = [
     "shell",
     "read_file",
     "write_file",

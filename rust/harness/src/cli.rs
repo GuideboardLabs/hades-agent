@@ -2815,10 +2815,26 @@ fn pack_find(args: &[String]) -> Result<(String, i32), String> {
     // The same shelf `menu` reads: the cached one when there is one, the live one with --refresh. A search
     // that answers from a different catalog than the listing is a search that misses what it just showed.
     let state = state_of(&flags)?;
-    let rows = if switched(&flags, "refresh") {
-        crate::packs_install::rows(&state, true).or_else(|_| crate::packs_menu::shipped())?
+    // A failed refresh is said out loud. Falling back to the shipped catalog and printing "no match" would
+    // report the absence of a pack in a catalog nobody could read, which is the opposite of what a search is
+    // for. Machine output gets the error instead, because there is nowhere in a list to put the caveat.
+    let (rows, note) = if switched(&flags, "refresh") {
+        match crate::packs_install::rows(&state, true) {
+            Ok(rows) => (rows, String::new()),
+            Err(error) if switched(&flags, "json") => return Err(error),
+            Err(error) => (
+                crate::packs_menu::shipped()?,
+                format!(
+                    "\n(the live shelf could not be read, so this search used the copy the build ships: \
+                     {error})\n"
+                ),
+            ),
+        }
     } else {
-        crate::packs_install::cached(&state).unwrap_or(crate::packs_menu::shipped()?)
+        (
+            crate::packs_install::cached(&state).unwrap_or(crate::packs_menu::shipped()?),
+            String::new(),
+        )
     };
     let found = crate::packs_menu::find(&rows, query);
     if switched(&flags, "json") {
@@ -2845,13 +2861,13 @@ fn pack_find(args: &[String]) -> Result<(String, i32), String> {
             format!(
                 "nothing on the shelf matches `{query}`.\n\
                  Writing a skill is the right move when nothing here covers the task; check `hades pack menu` \
-                 for what does exist.\n"
+                 for what does exist.\n{note}"
             ),
             0,
         ));
     }
     let listed: Vec<crate::packs_menu::Row> = found.into_iter().cloned().collect();
-    Ok((crate::packs_menu::render(&listed), 0))
+    Ok((format!("{}{note}", crate::packs_menu::render(&listed)), 0))
 }
 
 /// `hades pack add <id>`: one command from the shelf to a plan, and `--yes` from the plan to a write.
@@ -2877,7 +2893,15 @@ fn pack_add(args: &[String]) -> Result<(String, i32), String> {
             switched(&flags, "yes"),
         )?
     } else {
-        crate::packs_install::add(name, &home, &state, switched(&flags, "yes"))?
+        // The pin is passed to both paths: a digest the operator names is checked against the shelf, and a
+        // shelf that has moved on is refused rather than installed anyway.
+        crate::packs_install::add(
+            name,
+            flags.named.get("digest").map(String::as_str),
+            &home,
+            &state,
+            switched(&flags, "yes"),
+        )?
     };
     Ok((text, 0))
 }

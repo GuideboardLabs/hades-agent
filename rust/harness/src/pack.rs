@@ -31,21 +31,12 @@ pub const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
 pub const MAX_EXTRACT_SECONDS: u64 = 20;
 
 const KNOWN_ROLES: [&str; 5] = ["survey", "patch", "sweep", "verify", "record"];
-const KNOWN_TOOLS: [&str; 13] = [
-    "read_file",
-    "list_dir",
-    "search",
-    "recall",
-    "session_search",
-    "skills",
-    "web_search",
-    "fetch",
-    "image",
-    "remember",
-    crate::SHELL,
-    crate::PATCH,
-    crate::VERIFY,
-];
+/// Whether this build can supply a tool at all. The list lives with the surface that calls tools, so a tool
+/// added there is a tool a pack may require; a second list here is how `browser` came to be rejected by a
+/// runtime that ships it. `verify` is the one name a pack may require that is not a model-facing tool.
+fn known_tool(name: &str) -> bool {
+    crate::agent::TOOLS.contains(&name) || name == crate::VERIFY
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -1051,7 +1042,7 @@ pub fn export(options: &ExportOptions) -> Result<PathBuf, String> {
         }
     }
     for tool in &options.requires_tools {
-        if !KNOWN_TOOLS.contains(&tool.as_str()) {
+        if !known_tool(tool.as_str()) {
             return Err(format!("`{tool}` is not a tool this build ships"));
         }
     }
@@ -1542,7 +1533,7 @@ pub fn plan(pack: &Pack, state: &Path) -> Result<Vec<Row>, String> {
             }
         }
         for tool in &pack.manifest.requires.tools {
-            if !KNOWN_TOOLS.contains(&tool.as_str()) {
+            if !known_tool(tool.as_str()) {
                 incompatibility = Some(format!("requires unknown tool `{tool}`"));
             }
         }
@@ -1849,6 +1840,20 @@ mod tests {
         assert!(validate_listing("files/./escape\n", "-\n").is_err());
         assert!(validate_listing("files/link\n", "l\n").is_err());
         assert!(validate_listing("files/\n", "d\n").is_ok());
+    }
+
+    #[test]
+    fn every_tool_the_runtime_ships_is_a_tool_a_pack_may_require() {
+        // `browser` was rejected by a runtime that ships it, because this list was a second copy of the tool
+        // registry. The copy is gone; this test is what keeps the two from drifting apart again.
+        for tool in crate::agent::TOOLS {
+            assert!(
+                known_tool(tool),
+                "`{tool}` is a tool this build ships and a pack cannot require it"
+            );
+        }
+        assert!(known_tool(crate::VERIFY));
+        assert!(!known_tool("teleport"));
     }
 
     #[test]

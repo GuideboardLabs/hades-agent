@@ -115,14 +115,14 @@ fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
     std::fs::create_dir_all(&home).expect("a home");
     std::fs::create_dir_all(&state).expect("a state");
 
-    let planned = packs_install::add("ledger", &home, &state, false).expect("a plan");
+    let planned = packs_install::add("ledger", None, &home, &state, false).expect("a plan");
     assert!(planned.contains("install"), "{planned}");
     assert!(
         !state.join("skills/proposed/ledger").exists(),
         "a plan wrote a skill"
     );
 
-    let applied = packs_install::add("ledger", &home, &state, true).expect("an install");
+    let applied = packs_install::add("ledger", None, &home, &state, true).expect("an install");
     assert!(applied.contains("applied: 1 item"), "{applied}");
     assert!(
         state.join("skills/ledger/SKILL.md").is_file(),
@@ -132,7 +132,7 @@ fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
     // A digest that does not match is refused before the archive is read, and nothing is written.
     std::fs::write(shelf_root.join("INDEX.json"), index(&"0".repeat(64))).expect("a bad index");
     let refused =
-        packs_install::add("ledger", &home, &state, true).expect_err("a mismatched digest");
+        packs_install::add("ledger", None, &home, &state, true).expect_err("a mismatched digest");
     assert!(refused.contains("hashes to"), "{refused}");
     assert!(refused.contains("nothing was written"), "{refused}");
 
@@ -197,5 +197,183 @@ fn a_file_that_arrived_is_checked_against_the_digest_you_were_given() {
     assert!(applied.contains("applied: 1 item"), "{applied}");
     assert!(state.join("skills/letter/SKILL.md").is_file(), "{applied}");
 
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A digest the operator names is a pin on bytes. If the shelf names something else, the installation is
+/// refused; the failure mode this forbids is installing a different archive and reporting success.
+#[test]
+fn a_pinned_digest_for_a_shelf_pack_is_not_ignored() {
+    let work = std::env::temp_dir().join(format!("hades-pin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+    let served = work.join("shelf");
+    std::fs::create_dir_all(&served).expect("a shelf");
+
+    // A shelf that answers, so the refusal is the pin's and not the network's.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+    let url = format!("http://{}/", listener.local_addr().expect("an address"));
+    let index = r#"{"menu":1,"packs":[{"id":"ledger","version":"1.0.0","title":"Ledger",
+        "summary":"Keep a ledger.","license":"MIT","derivatives":"allowed","keywords":[],
+        "kind":["skill"],"items":[{"kind":"skill","name":"ledger"}],
+        "requires_hades":">=0.1.0,<0.2","bytes":10,"sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+        "archive":"dist/ledger-1.0.0.hadepack"}]}"#;
+    std::fs::write(served.join("INDEX.json"), index).expect("an index");
+    let _server = shelf(listener, served.clone());
+    // SAFETY: this test binary sets these before any fetch and does not run concurrently with the others.
+    unsafe {
+        std::env::set_var("HADES_PACKS_URL", &url);
+        std::env::set_var("HADES_PACKS_ALLOW_PRIVATE", "1");
+    }
+
+    let refused = packs_install::add("ledger", Some(&"0".repeat(64)), &home, &state, true)
+        .expect_err("a pin the shelf disagrees with");
+    assert!(refused.contains("you asked for"), "{refused}");
+    assert!(refused.contains("Nothing was fetched"), "{refused}");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// Two installations into one state at the same time. Each must get its own staging file, and each installed
+/// skill must be the content of its own archive.
+#[test]
+fn two_installs_into_one_state_do_not_share_a_staging_file() {
+    let work = std::env::temp_dir().join(format!("hades-concurrent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+
+    let mut archives = Vec::new();
+    for name in ["alpha", "beta"] {
+        let source = work.join(format!("src-{name}"));
+        std::fs::create_dir_all(source.join("skills").join(name)).expect("a source");
+        std::fs::write(
+            source.join("skills").join(name).join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Use when {name} is the one.\n---\n\n# {name}\n"
+            ),
+        )
+        .expect("a skill");
+        let out = work.join(format!("{name}.hadepack"));
+        let options = ExportOptions {
+            id: name.to_string(),
+            version: "1.0.0".to_string(),
+            from: source.clone(),
+            title: name.to_string(),
+            summary: format!("The {name} pack."),
+            license: "MIT".to_string(),
+            derivatives: "allowed".to_string(),
+            network: false,
+            writes: Vec::new(),
+            requires_roles: Vec::new(),
+            requires_tools: Vec::new(),
+            skills: vec![name.to_string()],
+            profiles: Vec::new(),
+            cases: Vec::new(),
+            keywords: Vec::new(),
+            source: None,
+            out: Some(out.clone()),
+        };
+        harness::pack::export(&options).expect("an archive");
+        archives.push(out);
+    }
+
+    let mut threads = Vec::new();
+    for archive in archives.clone() {
+        let home = home.clone();
+        let state = state.clone();
+        threads.push(std::thread::spawn(move || {
+            packs_install::add_file(&archive, None, &home, &state, true)
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("a worker").expect("an install");
+    }
+
+    assert!(state.join("skills/alpha/SKILL.md").is_file());
+    assert!(state.join("skills/beta/SKILL.md").is_file());
+    let cached: Vec<_> = std::fs::read_dir(state.join("packs/archives"))
+        .expect("a cache")
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "hadepack")
+        })
+        .collect();
+    assert_eq!(cached.len(), 2, "one cache entry per digest: {cached:?}");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The format allows `author/tool`; the cache used to build that id into a path.
+#[test]
+fn a_namespaced_pack_id_installs_and_is_cached_under_its_digest() {
+    let work = std::env::temp_dir().join(format!("hades-namespaced-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let source = work.join("src");
+    std::fs::create_dir_all(source.join("skills/tool")).expect("a source");
+    std::fs::write(
+        source.join("skills/tool/SKILL.md"),
+        "---\nname: tool\ndescription: Use when a namespaced pack is the one.\n---\n\n# Tool\n",
+    )
+    .expect("a skill");
+    let archive = work.join("tool.hadepack");
+    let options = ExportOptions {
+        id: "author/tool".to_string(),
+        version: "1.0.0".to_string(),
+        from: source.clone(),
+        title: "Tool".to_string(),
+        summary: "A namespaced pack.".to_string(),
+        license: "MIT".to_string(),
+        derivatives: "allowed".to_string(),
+        network: false,
+        writes: Vec::new(),
+        requires_roles: Vec::new(),
+        requires_tools: Vec::new(),
+        skills: vec!["tool".to_string()],
+        profiles: Vec::new(),
+        cases: Vec::new(),
+        keywords: Vec::new(),
+        source: None,
+        out: Some(archive.clone()),
+    };
+    harness::pack::export(&options).expect("an archive");
+    let digest = sha256(&std::fs::read(&archive).expect("the archive"));
+
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+    packs_install::add_file(&archive, None, &home, &state, true).expect("a namespaced install");
+    assert!(state.join("skills/tool/SKILL.md").is_file());
+    assert!(
+        state
+            .join("packs/archives")
+            .join(format!("{digest}.hadepack"))
+            .is_file()
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A local import is read through a limit, not after one.
+#[test]
+fn an_oversized_local_archive_is_refused_before_it_is_read() {
+    let work = std::env::temp_dir().join(format!("hades-oversize-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("a work dir");
+    let huge = work.join("huge.hadepack");
+    let file = std::fs::File::create(&huge).expect("a file");
+    file.set_len(64 * 1024 * 1024).expect("a large file");
+    drop(file);
+
+    let refused = packs_install::add_file(&huge, None, &work, &work, true)
+        .expect_err("an archive past the ceiling");
+    assert!(refused.contains("over the"), "{refused}");
+    assert!(refused.contains("Nothing was read"), "{refused}");
     let _ = std::fs::remove_dir_all(&work);
 }

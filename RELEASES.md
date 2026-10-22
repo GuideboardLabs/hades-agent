@@ -3,6 +3,32 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.10
+
+Six findings from the audit of the pack installer, all reproduced before being fixed, plus one the new
+concurrency test found on its own.
+
+- **Concurrent installs could swap archives under each other.** Every install staged to
+  `archives/incoming.hadepack`, so two installs into one state shared one file: the second could replace the
+  first's bytes between verification and parsing. Each install now stages to a name of its own opened with
+  `create_new`, the staged file is hashed again after the parser has read it, and a difference is a refusal.
+- **The catalog write had the same collision.** `.catalog-<pid>.tmp` is shared between installs in one process;
+  one thread renamed the other's file away. It is now per-write and `create_new`. This one was not in the review;
+  the test written for the first finding caught it.
+- **`--digest` is honoured for shelf ids.** It was forwarded only for local files, so a pinned digest could be
+  silently replaced by whatever the refreshed index named. A pin that disagrees with the shelf is refused before
+  anything is fetched.
+- **Namespaced ids install.** `author/tool` was a valid id and an invalid filename. Cache entries are named by
+  digest.
+- **A local import is measured before it is read**, through a bounded read rather than after the allocation.
+- **The tool list comes from the tool registry.** `KNOWN_TOOLS` was a stale second copy that refused `browser`,
+  `write_file`, `ask` and `spawn`; validation now asks the list the act surface and the ledger already use, and a
+  test keeps them equal.
+- **A failed `pack find --refresh` is disclosed**, in text and as an error in `--json`, instead of searching the
+  built-in catalog and reporting no match.
+
+1069 tests, 12 live browser tests, acceptance 31/31, aarch64 check green, cross-env 7/7.
+
 ## 0.1.9
 
 - **The menu says when it was read.** A cached index now records its fetch time, and `pack menu` reports it
