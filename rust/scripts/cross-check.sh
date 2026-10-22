@@ -25,9 +25,23 @@ esac
 
 PREFIX=${CROSS_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/hades-cross}
 TARGET=aarch64-unknown-linux-gnu
-PACKAGES="gcc-aarch64-linux-gnu gcc-13-aarch64-linux-gnu cpp-13-aarch64-linux-gnu \
+# The cross gcc series follows the distribution: 13 on 24.04, 14 or 15 on newer images. `ubuntu-latest` moved
+# under us once already, and a hardcoded 13 made the whole staging step fail on a runner where every other
+# package existed. Ask apt which series is present instead of assuming.
+GCC_SERIES=""
+for series in 13 14 15 16 12; do
+    if apt-cache policy "gcc-$series-aarch64-linux-gnu" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+        GCC_SERIES=$series
+        break
+    fi
+done
+if [ -z "$GCC_SERIES" ]; then
+    echo "no gcc-<series>-aarch64-linux-gnu package is available; install the ARM64 cross toolchain or set CROSS_PREFIX to a staged one" >&2
+    exit 1
+fi
+PACKAGES="gcc-aarch64-linux-gnu gcc-$GCC_SERIES-aarch64-linux-gnu cpp-$GCC_SERIES-aarch64-linux-gnu \
 binutils-aarch64-linux-gnu libc6-dev-arm64-cross libc6-arm64-cross linux-libc-dev-arm64-cross \
-libgcc-13-dev-arm64-cross libgcc-s1-arm64-cross"
+libgcc-$GCC_SERIES-dev-arm64-cross libgcc-s1-arm64-cross"
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo is not on PATH" >&2
@@ -37,11 +51,20 @@ fi
 if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
     echo "staging the cross toolchain under $PREFIX"
     mkdir -p "$PREFIX/debs" "$PREFIX/root" "$PREFIX/bin"
-    # `apt-get download` needs no privileges; `dpkg-deb -x` unpacks to a prefix we own.
-    (cd "$PREFIX/debs" && apt-get download $PACKAGES >/dev/null)
+    # `apt-get download` needs no privileges; `dpkg-deb -x` unpacks to a prefix we own. One package missing on
+    # a newer image should be named and skipped, not take the whole step down before anything is compiled;
+    # the check below is what decides whether the staging is usable.
+    (cd "$PREFIX/debs" && for package in $PACKAGES; do
+        apt-get download "$package" >/dev/null 2>&1 || echo "cross-check: $package is not in this image, skipping"
+    done)
     for deb in "$PREFIX"/debs/*.deb; do
+        [ -f "$deb" ] || continue
         dpkg-deb -x "$deb" "$PREFIX/root"
     done
+fi
+if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
+    echo "the staged tree has no aarch64-linux-gnu-gcc; the cross toolchain could not be staged" >&2
+    exit 1
 fi
 
 cat > "$PREFIX/bin/as" <<WRAPPER
