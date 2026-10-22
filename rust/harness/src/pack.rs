@@ -1555,7 +1555,19 @@ pub fn plan(pack: &Pack, state: &Path) -> Result<Vec<Row>, String> {
             .filter(|known| known.kind == item.kind && known.identity == item.identity)
             .collect();
         if let Some(known) = same.first() {
-            let class = if known.digest == item.digest {
+            // The installed copy of a skill carries the installer's own frontmatter (status, defaults), so its
+            // digest can never equal the archive's. The catalog is the record of what was installed and from
+            // which archive, so "already installed, and still as installed" is asked of it rather than guessed
+            // from the text. Without this, installing the same pack twice was a conflict and `pack add` could
+            // not be re-run.
+            let recorded = crate::pack_fit::read_catalog(state).unwrap_or_default();
+            let from_this_archive = recorded.iter().any(|row| {
+                row.kind == item.kind
+                    && row.identity == item.identity
+                    && row.pack_digest == pack.digest
+                    && row.live_digest == known.digest
+            });
+            let class = if known.digest == item.digest || from_this_archive {
                 "duplicate"
             } else {
                 "conflict"

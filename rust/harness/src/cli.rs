@@ -198,13 +198,15 @@ hades — the harness, one turn or a whole graph
       list the shelf, search it with FTS5, print one document, verify hashes and
       chunk bounds, or remove an entry to trash
 
-  hades pack export <id> --from <state> [--version 1.0.0]
-                    [--skill <name>]... [--profile <p>]... [--case <id>]...
-                    [--title <t>] [--summary <s>] [--license <l>]
+  hades pack export <id> [--dir <folder>] [--skill <name>]... [--profile <p>]...
+                    [--case <id>]... [--from <state>] [--version 1.0.0]
+                    [--title <t>] [--summary <s>] [--license <l>] [--keyword <k>]...
                     [--derivatives allowed|forbidden] [--network] [--writes vault]...
                     [--requires-role <r>]... [--requires-tool <t>]... [--out <file>]
-      write a deterministic .hadepack from installed skills, one current harness per
-      --profile, and named cases. At least one selector is required. The pack records
+      write a deterministic .hadepack from a skill, one current harness per --profile, and
+      named cases. The skill defaults to <id>, found installed, proposed or built in; --dir
+      packs a folder that was never installed. The summary and keywords come from SKILL.md
+      unless they are given, and the id defaults to the folder's name. The pack records
       only what it is given; it never reads the live Hermes home
 
   hades pack inspect <file> [--json]
@@ -2731,7 +2733,7 @@ fn pack_help() -> String {
     "pack menu [--json]                      the shelf this build ships\n\
      pack find <words> [--json]              narrow it by id, title, summary or keywords\n\
      pack add <id|file> [--yes] [--digest <sha>]  fetch or read, check the digest, show or apply the plan\n\
-     pack export <id> --from <state> [selectors] [--out <file>]\n\
+     pack export <id|--dir <folder>> [selectors] [--out <file>]\n\
      pack inspect <file> [--json]\n\
      pack plan <file> [--state <dir>] [--json]\n\
      pack apply <file> --plan <decisions.json> [--state <dir>] [--activate]\n\

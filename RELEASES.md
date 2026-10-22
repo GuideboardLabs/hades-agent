@@ -3,6 +3,28 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.11
+
+Fault injection on the pack installer, and the same suite run against the packaged binary on a clean home.
+
+- **`pack add` is idempotent.** The installed copy of a skill carries the installer's frontmatter, so its
+  digest never equals the archive's and a second install was a conflict. The catalog is now asked instead:
+  same pack digest and unchanged live digest means skip.
+- **A killed replace is repairable.** A kill between moving the old skill aside and putting the new one in
+  place left a catalog row whose path was gone, and the next install refused it as "already installed". The
+  guard checks the disk now, not the memory of the catalog.
+- **A losing race no longer deletes the winner.** Two installs of one pack both try the final rename; the
+  loser's error path removed the directory the winner had just placed. It removes only what it placed.
+- **Interrupted installs no longer leak staging files.** The next install sweeps `incoming-*` whose pid is
+  gone.
+- **A truncated archive says it is not a pack**, instead of being reported as bytes that changed under the
+  parser, and **a plan that needs a person** names the item and the two commands instead of failing on an
+  action the command did not know.
+- **`scripts/fault-injection.sh`** and **`scripts/cross-machine.sh`** are committed, so the run is repeatable.
+
+1071 tests, 12 live browser tests, acceptance 31/31, aarch64 check green, cross-env 7/7, fault cases 6/6,
+cross-machine 5/5.
+
 ## 0.1.10
 
 Six findings from the audit of the pack installer, all reproduced before being fixed, plus one the new

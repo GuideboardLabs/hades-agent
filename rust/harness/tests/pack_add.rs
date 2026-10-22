@@ -377,3 +377,97 @@ fn an_oversized_local_archive_is_refused_before_it_is_read() {
     assert!(refused.contains("Nothing was read"), "{refused}");
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// A pack that is already installed should be a skip. It was a conflict, because the installed skill carries
+/// the installer's own frontmatter and can never hash to the archive.
+#[test]
+fn installing_the_same_pack_twice_is_a_skip() {
+    let work = std::env::temp_dir().join(format!("hades-idempotent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let source = work.join("src");
+    std::fs::create_dir_all(source.join("skills/once")).expect("a source");
+    std::fs::write(
+        source.join("skills/once/SKILL.md"),
+        "---\nname: once\ndescription: Use when once is enough.\n---\n\n# Once\n",
+    )
+    .expect("a skill");
+    let archive = work.join("once.hadepack");
+    let options = ExportOptions {
+        id: "once".to_string(),
+        version: "1.0.0".to_string(),
+        from: source.clone(),
+        title: "Once".to_string(),
+        summary: "Install me twice.".to_string(),
+        license: "MIT".to_string(),
+        derivatives: "allowed".to_string(),
+        network: false,
+        writes: Vec::new(),
+        requires_roles: Vec::new(),
+        requires_tools: Vec::new(),
+        skills: vec!["once".to_string()],
+        profiles: Vec::new(),
+        cases: Vec::new(),
+        keywords: Vec::new(),
+        source: None,
+        out: Some(archive.clone()),
+    };
+    harness::pack::export(&options).expect("an archive");
+
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+    packs_install::add_file(&archive, None, &home, &state, true).expect("a first install");
+    let again =
+        packs_install::add_file(&archive, None, &home, &state, true).expect("a second install");
+    assert!(again.contains("already installed"), "{again}");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// An install killed between moving the old skill aside and putting the new one in place leaves a catalog row
+/// whose path is gone. Installing again is how that is repaired, and it has to be allowed.
+#[test]
+fn a_catalog_row_whose_skill_is_gone_is_repaired_by_installing_again() {
+    let work = std::env::temp_dir().join(format!("hades-repair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let source = work.join("src");
+    std::fs::create_dir_all(source.join("skills/mend")).expect("a source");
+    std::fs::write(
+        source.join("skills/mend/SKILL.md"),
+        "---\nname: mend\ndescription: Use when something has to be put back.\n---\n\n# Mend\n",
+    )
+    .expect("a skill");
+    let archive = work.join("mend.hadepack");
+    let options = ExportOptions {
+        id: "mend".to_string(),
+        version: "1.0.0".to_string(),
+        from: source.clone(),
+        title: "Mend".to_string(),
+        summary: "Put it back.".to_string(),
+        license: "MIT".to_string(),
+        derivatives: "allowed".to_string(),
+        network: false,
+        writes: Vec::new(),
+        requires_roles: Vec::new(),
+        requires_tools: Vec::new(),
+        skills: vec!["mend".to_string()],
+        profiles: Vec::new(),
+        cases: Vec::new(),
+        keywords: Vec::new(),
+        source: None,
+        out: Some(archive.clone()),
+    };
+    harness::pack::export(&options).expect("an archive");
+
+    let home = work.join("home");
+    let state = work.join("state");
+    std::fs::create_dir_all(&home).expect("a home");
+    std::fs::create_dir_all(&state).expect("a state");
+    packs_install::add_file(&archive, None, &home, &state, true).expect("a first install");
+
+    // What a kill between the two renames leaves: the catalog row stays, the live path is gone.
+    std::fs::remove_dir_all(state.join("skills/mend")).expect("the crash window");
+    let repaired = packs_install::add_file(&archive, None, &home, &state, true).expect("a repair");
+    assert!(state.join("skills/mend/SKILL.md").is_file(), "{repaired}");
+    let _ = std::fs::remove_dir_all(&work);
+}

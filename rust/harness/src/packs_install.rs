@@ -211,6 +211,7 @@ fn install(
         .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
     // A staging file of this installation's own: `create_new` means two processes cannot write the same
     // path, and a name built from the process, the clock and a counter means they do not try.
+    sweep_stale(&dir);
     let staging = dir.join(format!(
         "incoming-{}-{}-{}.hadepack",
         std::process::id(),
@@ -232,14 +233,22 @@ fn install(
         let _ = fs::remove_file(&staging);
         return Err(format!("could not write {}: {error}", staging.display()));
     }
-    let opened = crate::pack::Pack::open(&staging);
-    // The file the parser read must still be the file that was verified. A truncated write, a full disk or
-    // another process that found the name would all show up here rather than as a pack nobody approved.
-    let intact = opened.is_ok()
-        && fs::read(&staging)
-            .map(|again| mneme::sha256::hex(&again) == digest)
-            .unwrap_or(false);
-    if !intact {
+    // The parser reads the file, so the two failures are told apart: an archive that is not a pack says so,
+    // and only bytes that changed under the parser are reported as a changed digest. Collapsing them would
+    // have reported a truncated download as a race.
+    let pack = match crate::pack::Pack::open(&staging) {
+        Ok(pack) => pack,
+        Err(error) => {
+            let _ = fs::remove_file(&staging);
+            return Err(format!(
+                "refused: {origin} is not a readable pack: {error}. Nothing was installed."
+            ));
+        }
+    };
+    let again = fs::read(&staging)
+        .map(|bytes| mneme::sha256::hex(&bytes))
+        .unwrap_or_default();
+    if again != digest {
         let _ = fs::remove_file(&staging);
         return Err(format!(
             "refused: the archive staged at {} is not the bytes that were verified ({digest}). Nothing was \
@@ -247,13 +256,6 @@ fn install(
             staging.display()
         ));
     }
-    let pack = match opened {
-        Ok(pack) => pack,
-        Err(error) => {
-            let _ = fs::remove_file(&staging);
-            return Err(error);
-        }
-    };
     let id = pack.manifest.id.clone();
     let version = pack.manifest.version.clone();
     // The cache name is the digest, not the id: an id may be namespaced (`author/tool`), which is not a
@@ -277,6 +279,17 @@ fn install(
             "install" => crate::pack_fit::Action::Install,
             "replace" => crate::pack_fit::Action::Replace,
             "skip" => crate::pack_fit::Action::Skip,
+            // A plan that wants a person means there is no default to apply. Saying so, with the identity
+            // that needs the decision, is the difference between "this needs you" and a crash.
+            "ask" | "review" | "refuse" => {
+                return Err(format!(
+                    "`{id}` needs a decision for {} `{}` ({}). Nothing was installed. Run `hades pack plan \
+                     <file>` and `hades pack apply <file> --plan <decisions.json>` to choose.",
+                    planned_row.kind.name(),
+                    planned_row.identity,
+                    planned_row.reason
+                ));
+            }
             other => {
                 return Err(format!(
                     "the plan has an action this build does not know: `{other}`"
@@ -288,6 +301,17 @@ fn install(
             identity: planned_row.identity.clone(),
             action,
         });
+    }
+    // Nothing to do is a success, not a refusal. `pack apply` says "nothing to apply" because a person asked
+    // it to change something; `pack add` asked for a pack to be present, and it already is.
+    if decisions
+        .iter()
+        .all(|decision| decision.action == crate::pack_fit::Action::Skip)
+    {
+        text.push_str(&format!(
+            "\nalready installed: {id} {version}, every item unchanged\n"
+        ));
+        return Ok(text);
     }
     let receipt = crate::pack_fit::apply(&pack, home, state, &decisions, true)?;
     text.push_str(&format!(
@@ -304,6 +328,32 @@ fn install(
         ));
     }
     Ok(text)
+}
+
+/// Remove staging files whose process is gone. A `kill -9` during a write leaves one behind, and a directory
+/// that grows by a few kilobytes on every interrupted install is a leak with a slow fuse. The pid is in the
+/// name, so the check is whether that process still exists; a live install keeps its own.
+fn sweep_stale(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("incoming-") else {
+            continue;
+        };
+        let Some(pid) = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !Path::new("/proc").join(pid.to_string()).exists() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn render(rows: &[crate::pack::Row]) -> String {

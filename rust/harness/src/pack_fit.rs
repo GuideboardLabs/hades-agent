@@ -834,6 +834,9 @@ fn temp_beside(target: &Path, label: &str) -> Result<PathBuf, String> {
 
 fn install_skill(prepared: &Prepared, activate: bool) -> Result<Installed, String> {
     let temp = temp_beside(&prepared.target, "install")?;
+    // Whether this call put the target in place. The error path must not remove a directory another install
+    // just finished: two installs of one pack race on this rename, and the loser used to delete the winner.
+    let mut placed = false;
     if let (Some(existing), Some(backup)) = (&prepared.existing, &prepared.backup)
         && let Err(error) = fs::rename(existing, backup)
     {
@@ -858,13 +861,16 @@ fn install_skill(prepared: &Prepared, activate: bool) -> Result<Installed, Strin
             .map_err(|error| format!("could not write {}: {error}", skill.display()))?;
         fs::rename(&temp, &prepared.target)
             .map_err(|error| format!("could not install {}: {error}", prepared.target.display()))?;
+        placed = true;
         digest_live(&prepared.target)
     })();
     let _ = fs::remove_dir_all(&temp);
     let live_digest = match result {
         Ok(digest) => digest,
         Err(error) => {
-            let _ = remove_live(&prepared.target);
+            if placed {
+                let _ = remove_live(&prepared.target);
+            }
             if let (Some(backup), Some(existing)) = (&prepared.backup, &prepared.existing) {
                 let _ = fs::rename(backup, existing);
             }
@@ -1019,7 +1025,14 @@ pub fn apply(
     let content = content_root(state, &pack.manifest.id, &pack.manifest.version)?;
     let existing_rows = read_catalog(state)?;
     let content_name = format!("packs/{}/{}", pack.manifest.id, pack.manifest.version);
-    if existing_rows.iter().any(|row| row.content == content_name) {
+    // "Already installed" is about what is on disk, not about what the catalog remembers. An install killed
+    // between moving the old skill aside and putting the new one in place leaves a row whose live path is
+    // gone; refusing that as a duplicate made the state unrepairable by the command that created it.
+    let still_there = existing_rows
+        .iter()
+        .filter(|row| row.content == content_name)
+        .any(|row| state.join(&row.live).exists() || home.join(&row.live).exists());
+    if still_there {
         return Err(format!(
             "{} is already installed; uninstall it before applying again",
             content_name
