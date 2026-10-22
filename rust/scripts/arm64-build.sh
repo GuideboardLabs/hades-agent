@@ -86,6 +86,10 @@ PY
   # name absolute `/usr/aarch64-linux-gnu/...` paths. `--sysroot` does not rewrite the contents of a script,
   # so the linker reads an x86-64 path that does not exist. Write the two scripts against this sysroot.
   lib="$PREFIX/root/usr/aarch64-linux-gnu/lib"
+  # A fresh runner's cross toolchain has the compiler at `usr/bin` but may not have the cross libc package
+  # that creates this directory; the sysroot's own libraries are reached with -L, so the directory only has
+  # to exist for the two scripts below.
+  mkdir -p "$lib"
   mvec=""
   if [ -e "$root/lib/aarch64-linux-gnu/libmvec.so.1" ]; then
     mvec=" AS_NEEDED ( $root/lib/aarch64-linux-gnu/libmvec.so.1 )"
