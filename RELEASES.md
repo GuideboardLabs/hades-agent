@@ -3,6 +3,22 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.19
+
+The gate found a real one behind a test that only ran on the runner.
+
+- **A rustup toolchain under `$HOME` is readable inside a cage.** The cage refused to grant `~/.cargo` and
+  `~/.rustup` because both were assumed to hold credentials. `~/.cargo` does (`credentials.toml`); `~/.rustup`
+  does not, and on a stock rustup install it holds the `settings.toml` the `cargo` shim reads before it will run
+  anything. The result was `cargo` unusable inside a cage on most machines: `could not read settings file:
+  Permission denied`. Home-relative `CARGO_HOME` is still refused and still has `declare_toolchains` as its way
+  in; a whole-home value for either key is still refused.
+
+Reproduced by running the suite with a home-relative `RUSTUP_HOME` and a stand-in shim that needs `settings.toml`,
+which is the shape the runner has.
+
+1079 tests, 12 live browser tests.
+
 ## 0.1.18
 
 Three tests passed on a workstation and failed on the runner. Each assumed something about the machine, and one

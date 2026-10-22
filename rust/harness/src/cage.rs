@@ -653,14 +653,20 @@ fn discover_runtimes() -> Vec<PathBuf> {
 
     // A rustup toolchain is a shim plus two homes: the shim is found on `PATH`, but it reads
     // `<RUSTUP_HOME>/settings.toml` and the registry cache under `CARGO_HOME`, so granting only the bin
-    // directory yields "could not read settings file: Permission denied" inside the cage. Only values
-    // outside `$HOME` are taken: granting `~/.cargo` would hand the cage `credentials.toml`, and a
-    // toolchain that lives under the home is a toolchain this cage does not cover (stated in its docs).
+    // directory yields "could not read settings file: Permission denied" inside the cage.
+    //
+    // The two are not the same risk. `~/.cargo` can hold `credentials.toml`, so a home-relative CARGO_HOME
+    // stays out and is declared with `declare_toolchains` when someone wants it. `~/.rustup` holds toolchains
+    // and a settings file, never a secret, and on a stock rustup install it is exactly where the shim looks:
+    // leaving it out makes `cargo` unusable in a cage on most machines, including a CI runner, while granting
+    // it read-only adds no path a model could not already read through `/usr`. A whole-home value for either
+    // key is still refused by the filter below.
     if let Some(home) = &home {
         for key in ["CARGO_HOME", "RUSTUP_HOME"] {
             if let Some(value) = std::env::var_os(key) {
                 let path = PathBuf::from(value);
-                if !path.starts_with(home) {
+                let under_home = path.starts_with(home);
+                if !under_home || key == "RUSTUP_HOME" {
                     found.push(path);
                 }
             }
