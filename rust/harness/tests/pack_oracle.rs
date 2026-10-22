@@ -93,6 +93,7 @@ fn options(from: &Path, out: &Path) -> ExportOptions {
         profiles: vec!["research".to_string()],
         cases: vec!["research-f3e86460f834".to_string()],
         keywords: vec!["fixture".to_string()],
+        source: None,
         out: Some(out.to_path_buf()),
     }
 }
@@ -660,4 +661,68 @@ fn uninstall_keeps_a_skill_a_person_edited_after_install() {
     assert_eq!(receipt.kept, vec!["skills/proposed/pack-skill"]);
     assert!(path.is_file(), "an edited live copy is not deleted");
     assert!(pack_fit::read_catalog(&target).expect("catalog").is_empty());
+}
+
+/// A built-in skill is the one most likely to be worth sharing, and it was the one export could not see:
+/// the resolver only walked installed skills, so `skills/builtin/<name>` looked like no skill at all.
+#[test]
+fn a_builtin_skill_exports_without_being_installed() {
+    let work = std::env::temp_dir().join(format!("hades-builtin-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let state = work.join("state");
+    let skill = state.join("skills/builtin/keeper");
+    std::fs::create_dir_all(&skill).expect("a builtin skill");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: keeper\ndescription: Use when the memory must stay useful.\ntags: memory, upkeep\n---\n\n# Keeper\n",
+    )
+    .expect("a skill file");
+
+    let out = work.join("keeper.hadepack");
+    let mut options = options(&state, &out);
+    options.skills = vec!["keeper".to_string()];
+    options.profiles = Vec::new();
+    options.cases = Vec::new();
+    options.id = "keeper".to_string();
+    options.title = "Keeper".to_string();
+    options.summary = "Keep memory useful.".to_string();
+    let path = harness::pack::export(&options).expect("a builtin skill export");
+    let pack = harness::pack::Pack::open(&path).expect("the archive");
+    assert_eq!(pack.manifest.provides.skills.len(), 1);
+    assert_eq!(pack.manifest.provides.skills[0].identity, "keeper");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The authoring case: a folder that was never installed anywhere.
+#[test]
+fn a_skill_folder_exports_without_a_state() {
+    let work = std::env::temp_dir().join(format!("hades-folder-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let folder = work.join("my-skill");
+    std::fs::create_dir_all(folder.join("scripts")).expect("a skill folder");
+    std::fs::write(
+        folder.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: Use when a folder is the only copy.\n---\n\n# Mine\n",
+    )
+    .expect("a skill file");
+    std::fs::write(folder.join("scripts/run.sh"), "#!/bin/sh\necho ok\n").expect("a script");
+
+    let out = work.join("my-skill.hadepack");
+    let mut options = options(&work.join("empty-state"), &out);
+    options.skills = vec!["my-skill".to_string()];
+    options.profiles = Vec::new();
+    options.cases = Vec::new();
+    options.id = "my-skill".to_string();
+    options.title = "My skill".to_string();
+    options.summary = "From a folder.".to_string();
+    options.source = Some(folder);
+    let path = harness::pack::export(&options).expect("a folder export");
+    let pack = harness::pack::Pack::open(&path).expect("the archive");
+    assert_eq!(pack.manifest.provides.skills.len(), 1);
+    assert!(
+        pack.root()
+            .join("files/skills/my-skill/scripts/run.sh")
+            .is_file()
+    );
+    let _ = std::fs::remove_dir_all(&work);
 }

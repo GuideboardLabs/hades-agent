@@ -3,6 +3,21 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.7
+
+Export was the part that was not easy, and it is the part that makes a pack worth having.
+
+- **A built-in skill exports.** Export resolved skills through the installed list only, so
+  `skills/builtin/<name>` looked like no skill at all; the one most likely to be worth sharing was the one
+  the command refused. It now resolves installed, proposed and built in, in that order.
+- **A folder exports.** `hades pack export --dir ./my-skill` packs a folder that was never installed, which
+  is the authoring case: a skill written anywhere can be shared without seeding a state directory first.
+- **The flags are inferred.** The id defaults to the skill's name, the summary to its `SKILL.md`
+  description, the keywords to its tags. `hades pack export my-skill` needs no other argument, writes
+  `<id>-<version>.hadepack` in the working directory, and prints a menu row with the digest to paste into a
+  shelf.
+- **One extension.** Export, the shelf builder and the menu all say `.hadepack`.
+
 ## 0.1.6
 
 - **`hades pack add <id>`.** One command from the shelf to a plan: the index is fetched, the archive named by

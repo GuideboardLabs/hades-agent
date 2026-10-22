@@ -1032,6 +1032,9 @@ pub struct ExportOptions {
     pub profiles: Vec<String>,
     pub cases: Vec<String>,
     pub keywords: Vec<String>,
+    /// A skill folder that is not installed in `from`: the authoring case, where a person has a skill in a
+    /// directory and wants to share it without seeding it into a state first.
+    pub source: Option<PathBuf>,
     pub out: Option<PathBuf>,
 }
 
@@ -1060,7 +1063,11 @@ pub fn export(options: &ExportOptions) -> Result<PathBuf, String> {
     if options.skills.is_empty() && options.profiles.is_empty() && options.cases.is_empty() {
         return Err("pack export needs at least one --skill, --profile or --case".to_string());
     }
-    if !options.from.is_dir() {
+    // `--from` is where installed skills, profiles and cases are looked up. A folder export reads none of
+    // them, so it must not need a state directory to exist for a pack that was never installed.
+    let needs_from =
+        options.source.is_none() || !options.profiles.is_empty() || !options.cases.is_empty();
+    if needs_from && !options.from.is_dir() {
         return Err(format!(
             "`--from {}` is not a directory",
             options.from.display()
@@ -1074,30 +1081,43 @@ pub fn export(options: &ExportOptions) -> Result<PathBuf, String> {
     let files_root = stage.join("files");
     make_dir(&files_root)?;
 
-    let installed = skills::installed(&options.from);
     let mut provided_skills = Vec::new();
     let skills_selected = unique(&options.skills);
     for name in &skills_selected {
         valid_id(name).map_err(|_| format!("`{name}` is not a valid skill name"))?;
-        let skill = installed
-            .iter()
-            .find(|skill| &skill.name == name)
-            .ok_or_else(|| {
+        let dest = files_root.join("skills").join(name);
+        make_dir(&dest)?;
+        // A named folder wins, then the state resolver, which knows installed, proposed and built-in: a
+        // built-in skill is the one most likely to be worth sharing and it was the one export could not see.
+        let folder = options
+            .source
+            .clone()
+            .filter(|dir| dir.file_name().and_then(|leaf| leaf.to_str()) == Some(name));
+        if let Some(folder) = folder {
+            if !folder.join("SKILL.md").is_file() {
+                return Err(format!(
+                    "`{}` is not a skill folder: it has no SKILL.md",
+                    folder.display()
+                ));
+            }
+            copy_tree(&folder, &dest)?;
+        } else {
+            let skill = skills::find(&options.from, name).ok_or_else(|| {
                 format!(
-                    "no installed skill called `{name}` under {}",
+                    "no skill called `{name}` under {}, installed, proposed or built in; pass --dir <folder> \
+                     to export a folder that was never installed",
                     options.from.display()
                 )
             })?;
-        let dest = files_root.join("skills").join(name);
-        make_dir(&dest)?;
-        if skill.path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
-            let root = skill
-                .path
-                .parent()
-                .ok_or_else(|| format!("skill `{name}` has no directory"))?;
-            copy_tree(root, &dest)?;
-        } else {
-            copy_file(&skill.path, &dest.join("SKILL.md"))?;
+            if skill.path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+                let root = skill
+                    .path
+                    .parent()
+                    .ok_or_else(|| format!("skill `{name}` has no directory"))?;
+                copy_tree(root, &dest)?;
+            } else {
+                copy_file(&skill.path, &dest.join("SKILL.md"))?;
+            }
         }
         provided_skills.push(Provided {
             kind: Kind::Skill,

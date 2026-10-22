@@ -2501,6 +2501,7 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
         args,
         &[
             "from",
+            "dir",
             "version",
             "skill",
             "profile",
@@ -2517,15 +2518,93 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
         ],
         &["network"],
     )?;
-    let id = flags.positional.first().ok_or_else(|| {
-        "`pack export` needs an id, for example `seth/research-method`".to_string()
-    })?;
-    let from = flags
-        .named
-        .get("from")
-        .ok_or_else(|| "`pack export` needs `--from <state>`".to_string())?;
-    let from = guarded(Path::new(from))?;
+    let from = match flags.named.get("from") {
+        Some(path) => guarded(Path::new(path))?,
+        None => hades_home()?,
+    };
+    let dir = flags.named.get("dir").map(PathBuf::from);
+    let dir_name = dir
+        .as_ref()
+        .and_then(|dir| dir.file_name())
+        .and_then(|leaf| leaf.to_str())
+        .map(str::to_string);
     let repeated = |name: &str| flags.repeated.get(name).cloned().unwrap_or_default();
+
+    // A skill folder stands on its own: `hades pack export --dir ./my-skill` needs no name and no flags.
+    let mut skills = repeated("skill");
+    if skills.is_empty()
+        && let Some(name) = dir_name.clone()
+    {
+        skills.push(name);
+    }
+    let id = match (flags.positional.first(), skills.first()) {
+        (Some(id), _) => id.clone(),
+        (None, Some(name)) => name.clone(),
+        (None, None) => {
+            return Err(
+                "`pack export` needs an id or a skill, for example `hades pack export my-skill` or \
+                 `hades pack export --dir ./my-skill`"
+                    .to_string(),
+            );
+        }
+    };
+
+    // `hades pack export my-skill` means the skill by that name: the id is the name unless the caller says
+    // otherwise, which is the common case and the one that has to work without flags.
+    // A namespaced id (`seth/empty`) is not a skill name; only a plain one is taken as the skill.
+    if skills.is_empty()
+        && dir.is_none()
+        && !id.contains('/')
+        && flags.repeated.get("profile").is_none_or(Vec::is_empty)
+        && flags.repeated.get("case").is_none_or(Vec::is_empty)
+    {
+        skills.push(id.clone());
+    }
+
+    // Everything a good SKILL.md already says, inferred: the summary and the keywords. A flag still wins.
+    let (hinted_summary, hinted_keywords) = match skills.first() {
+        Some(name) => {
+            let path = match dir
+                .as_ref()
+                .filter(|dir| dir.file_name().and_then(|leaf| leaf.to_str()) == Some(name.as_str()))
+            {
+                Some(folder) => folder.join("SKILL.md"),
+                None => crate::skills::find(&from, name)
+                    .map(|skill| skill.path)
+                    .unwrap_or_default(),
+            };
+            if path.is_file() {
+                crate::skills::describe(&crate::skills::Skill {
+                    name: name.clone(),
+                    path,
+                })
+            } else {
+                (String::new(), Vec::new())
+            }
+        }
+        None => (String::new(), Vec::new()),
+    };
+    let title = flags
+        .named
+        .get("title")
+        .cloned()
+        .unwrap_or_else(|| id.clone());
+    let summary = flags
+        .named
+        .get("summary")
+        .cloned()
+        .filter(|summary| !summary.trim().is_empty())
+        .or_else(|| Some(hinted_summary).filter(|summary| !summary.trim().is_empty()))
+        .unwrap_or_else(|| title.clone());
+    let keywords = {
+        let named = repeated("keyword");
+        if named.is_empty() {
+            hinted_keywords
+        } else {
+            named
+        }
+    };
+
     let options = crate::pack::ExportOptions {
         id: id.clone(),
         version: flags
@@ -2534,8 +2613,8 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
             .cloned()
             .unwrap_or_else(|| "1.0.0".to_string()),
         from,
-        title: flags.named.get("title").cloned().unwrap_or_default(),
-        summary: flags.named.get("summary").cloned().unwrap_or_default(),
+        title,
+        summary,
         license: flags
             .named
             .get("license")
@@ -2550,20 +2629,45 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
         writes: repeated("writes"),
         requires_roles: repeated("requires-role"),
         requires_tools: repeated("requires-tool"),
-        skills: repeated("skill"),
+        skills,
         profiles: repeated("profile"),
         cases: repeated("case"),
-        keywords: repeated("keyword"),
+        keywords,
+        source: dir,
         out: flags.named.get("out").map(PathBuf::from),
     };
     let path = crate::pack::export(&options)?;
     let bytes =
         fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let sha = mneme::sha256::hex(&bytes);
+    let pack = crate::pack::Pack::open(&path)?;
+    let manifest = &pack.manifest;
+    let kinds: Vec<&str> = [
+        (!manifest.provides.skills.is_empty()).then_some("skill"),
+        (!manifest.provides.harnesses.is_empty()).then_some("tool"),
+        (!manifest.provides.cases.is_empty()).then_some("test"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     Ok((
         format!(
-            "wrote: {}\nsha256: {}\n",
+            "wrote: {}\nsha256: {}\n\nmenu row (paste into a shelf's MENU.md):\n\
+             | `{}` | {} | {} | {} | {} | {} B | `{}` |\n{}",
             path.display(),
-            mneme::sha256::hex(&bytes)
+            sha,
+            manifest.id,
+            kinds.join(", "),
+            manifest.version,
+            manifest.summary,
+            manifest.keywords.join(", "),
+            bytes.len(),
+            &sha[..12],
+            if manifest.license == "NOASSERTION" {
+                "\nno --license given: the manifest says NOASSERTION. Set one before sharing the pack.\n"
+            } else {
+                ""
+            }
         ),
         0,
     ))

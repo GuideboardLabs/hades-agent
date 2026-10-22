@@ -58,7 +58,7 @@ fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
     )
     .expect("a skill file");
 
-    let archive = work.join("dist").join("ledger-1.0.0.pack");
+    let archive = work.join("dist").join("ledger-1.0.0.hadepack");
     std::fs::create_dir_all(archive.parent().expect("a dist")).expect("a dist directory");
     let options = ExportOptions {
         id: "ledger".to_string(),
@@ -76,6 +76,7 @@ fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
         profiles: Vec::new(),
         cases: Vec::new(),
         keywords: vec!["books".to_string()],
+        source: None,
         out: Some(archive.clone()),
     };
     harness::pack::export(&options).expect("an archive");
@@ -85,14 +86,15 @@ fn a_pack_is_fetched_verified_and_installed_only_when_asked() {
     // The shelf: an index naming the archive and its digest, served from a loopback port.
     let shelf_root = work.join("shelf");
     std::fs::create_dir_all(shelf_root.join("dist")).expect("a shelf");
-    std::fs::copy(&archive, shelf_root.join("dist/ledger-1.0.0.pack")).expect("the archive copy");
+    std::fs::copy(&archive, shelf_root.join("dist/ledger-1.0.0.hadepack"))
+        .expect("the archive copy");
     let index = |digest: &str| {
         format!(
             r#"{{"menu":1,"packs":[{{"id":"ledger","version":"1.0.0","title":"Ledger",
             "summary":"Keep a ledger that balances.","license":"Commercial","derivatives":"forbidden",
             "keywords":["books"],"kind":["skill"],"items":[{{"kind":"skill","name":"ledger"}}],
             "requires_hades":">=0.1.0,<0.2","bytes":{},"sha256":"{digest}",
-            "archive":"dist/ledger-1.0.0.pack"}}]}}"#,
+            "archive":"dist/ledger-1.0.0.hadepack"}}]}}"#,
             bytes.len()
         )
     };

@@ -321,6 +321,22 @@ pub fn evidence(text: &str) -> Evidence {
 
 /// The `key: value` lines between the first two `---` fences. Deliberately not a YAML parser: a proposal is
 /// written by this program, and a parser that accepts more than it writes is a second format to maintain.
+/// What a pack export can infer from a skill without asking: its one-line description and its tags.
+///
+/// A skill that ships with a good frontmatter should be exportable with no flags beyond its name, so the
+/// description is the manifest summary and the tags are the keywords a menu searches.
+pub fn describe(skill: &Skill) -> (String, Vec<String>) {
+    let Ok(text) = std::fs::read_to_string(&skill.path) else {
+        return (String::new(), Vec::new());
+    };
+    let Some(fields) = frontmatter(&text) else {
+        return (String::new(), Vec::new());
+    };
+    let description = fields.get("description").cloned().unwrap_or_default();
+    let tags = list(fields.get("tags").or_else(|| fields.get("keywords")));
+    (description, tags)
+}
+
 fn frontmatter(text: &str) -> Option<std::collections::BTreeMap<String, String>> {
     let text = text.strip_prefix("---\n")?;
     let end = text.find("\n---")?;

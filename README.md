@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.6-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1060%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.7-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1062%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.6 |
+| **Version** | 0.1.7 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1060 passing, 13 ignored live tests |
+| **Tests** | 1062 passing, 13 ignored live tests |
 
 ---
 
@@ -682,6 +682,12 @@ its manifest, licence and declared capabilities, and may not declare a guardrail
 because a download that could set those would be a download that could disable its own limits. Installing is
 a person's command with a printed plan, not something a model does on its own.
 
+Sharing is one command. `hades pack export <skill>` resolves the skill wherever it lives (installed,
+proposed, or built in), takes the summary and the keywords from its `SKILL.md`, writes
+`<id>-<version>.hadepack` in the working directory, and prints a menu row ready to paste into a shelf.
+`hades pack export --dir ./my-skill` does the same for a folder that was never installed, so a skill written
+outside Hades can be shared without seeding a state first.
+
 `hades pack add <id>` fetches the archive named by the menu, hashes the bytes that arrived, and refuses when
 the digest is not the one the menu published, before the manifest is parsed. Without `--yes` it prints the
 plan and writes nothing; with it, the plan is applied and the pack is active. `HADES_PACKS_URL` points the
@@ -721,7 +727,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1060 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1062 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
