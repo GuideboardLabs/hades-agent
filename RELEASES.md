@@ -3,6 +3,26 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.14
+
+The sixth audit. Three consistency holes, and the glibc floor the reviewer challenged.
+
+- **Uninstall reports what it did.** It had the same post-commit bug apply lost: a failed audit event marked a
+  finished uninstall as failed. Worse, it removed files *before* writing the catalog, so a failed commit left
+  rows naming directories that were gone. The order is now decide, commit, remove; a failed commit changes
+  nothing, a failed removal is a named leftover, and the receipt carries `left_behind` and `event_error`.
+- **The home is locked too.** Harness profiles live under `<home>/harness`, outside the state lock. A second
+  lock there is taken whenever a pack carries a harness, always after the state lock.
+- **Audit correlation uses install ids.** Rows and apply events now share an `install` id, so an uninstall and
+  reinstall of one version cannot be vouched for by the earlier event.
+- **The release binary is built for glibc 2.30, not 2.39.** `scripts/portable-build.sh` builds inside Ubuntu
+  20.04; the artifact runs cleanly on 20.04, 22.04, 24.04, Debian 11 and 12, and passes acceptance 31/31 and
+  the fault script. 2.28 was attempted and could not be built here; that is stated rather than claimed.
+- **README version and counts** are taken from the release they ship with.
+
+1079 tests, 12 live browser tests, acceptance 31/31, aarch64 check green, cross-env 7/7, fault cases 10 passed
+and 1 skipped, cross-machine 5/5 on the host and in a container, portability 3/3 on the portable artifact.
+
 ## 0.1.13
 
 The fifth audit: a lost update that reproduced on the first attempt, and two smaller defects around it.

@@ -41,8 +41,15 @@ case "$newest" in
   *) bad "ubuntu:24.04 did not run it: $newest" ;;
 esac
 
-# 3. The previous LTS. It is expected to refuse, and the refusal has to be the loader naming glibc, not a
-#    crash somewhere else: that is the difference between an unsupported floor and a broken binary.
+# 3. The oldest image a release is meant to run on. A portable build passes all three; a host build fails at
+#    22.04 and says why, which is the honest outcome rather than a hidden one.
+oldest=$(run_in ubuntu:20.04)
+case "$oldest" in
+  *GLIBC*) say "note: ubuntu:20.04 is below this binary's floor ($(printf '%s' "$oldest" | head -c 80))" ;;
+  *"hades "[0-9]*) ok "ubuntu:20.04 runs it cleanly" ;;
+  *) bad "ubuntu:20.04 failed for a reason other than glibc: $oldest" ;;
+esac
+
 older=$(run_in ubuntu:22.04)
 # A weak-version warning does not stop the binary printing its version, which is exactly why this checks the
 # warning rather than the exit status: "it launched" and "it is supported here" are different claims.

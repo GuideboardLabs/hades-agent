@@ -200,7 +200,23 @@ else
   bad "two processes installing different packs left ${rows} catalog row(s)"
 fi
 
-# 7. A replace, killed mid-way. The old skill is moved aside before the new one is renamed into place, and that
+# 7. An uninstall whose event cannot be written. The catalog row and the files are already gone by then; the
+#    command must say the uninstall is committed rather than report a failure for work that finished.
+state="$WORK/uninstall-event"
+fresh_state "$state"
+h "$state" pack add "$WORK/alpha-1.0.0.hadepack" --yes >/dev/null 2>&1
+rm -f "$state/.hades/packs/events.jsonl"
+mkdir -p "$state/.hades/packs/events.jsonl"
+said=$(h "$state" pack uninstall alpha 2>&1)
+code=$?
+if [ $code -eq 0 ] && printf '%s' "$said" | grep -q "the uninstall is committed" && \
+   [ ! -d "$state/.hades/skills/alpha" ]; then
+  ok "an uninstall whose event failed is committed and says so"
+else
+  bad "an uninstall whose event failed exited $code: $(printf '%s' "$said" | head -2)"
+fi
+
+# 8. A replace, killed mid-way. The old skill is moved aside before the new one is renamed into place, and that
 #    is the window where an interrupted install could leave nothing at all. After every kill the path must be
 #    either a complete skill or gone (which the next run repairs); it must never be a half-copied directory,
 #    and the final run must land the new version.

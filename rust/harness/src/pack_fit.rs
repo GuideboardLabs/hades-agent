@@ -80,6 +80,9 @@ pub struct Installed {
     pub content: String,
     pub generation: Option<u64>,
     pub at: u64,
+    /// Identifies one installation. Two installs of the same pack and version are two events; without this,
+    /// an apply event from the first makes the second look recorded.
+    pub install: String,
 }
 
 impl Installed {
@@ -96,6 +99,7 @@ impl Installed {
             "content": self.content,
             "generation": self.generation,
             "at": self.at,
+            "install": self.install,
         })
     }
 
@@ -115,6 +119,7 @@ impl Installed {
             "content",
             "generation",
             "at",
+            "install",
         ];
         for key in object.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -156,6 +161,12 @@ impl Installed {
             content: string("content")?,
             generation,
             at,
+            // Catalogs written before this field existed have no id; they are matched by pack and version.
+            install: object
+                .get("install")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         })
     }
 }
@@ -204,6 +215,10 @@ pub struct UninstallReceipt {
     pub kept: Vec<String>,
     pub promoted: Vec<String>,
     pub content_removed: bool,
+    /// Paths the catalog no longer names but the filesystem still holds. Leftovers, not a failed uninstall.
+    pub left_behind: Vec<String>,
+    /// The uninstall is committed; this says whether its audit event was written.
+    pub event_error: Option<String>,
 }
 
 impl UninstallReceipt {
@@ -226,6 +241,17 @@ impl UninstallReceipt {
         }
         if self.content_removed {
             text.push_str("content: removed\n");
+        }
+        if !self.left_behind.is_empty() {
+            text.push_str("warning: the catalog no longer names these, but the filesystem still holds them:\n");
+            for path in &self.left_behind {
+                text.push_str(&format!("  {path}\n"));
+            }
+        }
+        if let Some(error) = &self.event_error {
+            text.push_str(&format!(
+                "\nwarning: the uninstall is committed, but its audit event was not written: {error}\n"
+            ));
         }
         text
     }
@@ -455,16 +481,27 @@ impl Drop for StateLock {
 }
 
 fn lock_state(state: &Path) -> Result<StateLock, String> {
-    let dir = state.join("packs");
-    scratch::state_dir(&dir)
-        .map_err(|error| format!("could not make {}: {error}", dir.display()))?;
-    let path = dir.join(".lock");
+    lock_at(&state.join("packs").join(".lock"))
+}
+
+/// The same lock for the home, because a harness profile lives under `<home>/harness` and not under a state
+/// directory. Two instances with different states but one home can each hold their own state lock and still
+/// install the same profile at once; the ordering is always state first, then home, so the two cannot deadlock.
+fn lock_home(home: &Path) -> Result<StateLock, String> {
+    lock_at(&home.join("harness").join(".lock"))
+}
+
+fn lock_at(path: &Path) -> Result<StateLock, String> {
+    if let Some(parent) = path.parent() {
+        scratch::state_dir(parent)
+            .map_err(|error| format!("could not make {}: {error}", parent.display()))?;
+    }
     let file = fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     // A holder that never finishes should be an error with a name, not a command that hangs forever.
     let mut waited = std::time::Duration::ZERO;
@@ -483,7 +520,7 @@ fn lock_state(state: &Path) -> Result<StateLock, String> {
         }
         if waited >= std::time::Duration::from_secs(30) {
             return Err(format!(
-                "another install has held the pack state at {} for 30 seconds; nothing was changed",
+                "another pack operation has held {} for 30 seconds; nothing was changed",
                 path.display()
             ));
         }
@@ -491,11 +528,10 @@ fn lock_state(state: &Path) -> Result<StateLock, String> {
         waited += std::time::Duration::from_millis(25);
     }
 }
-
-/// Catalog rows whose install has no apply event in the record.
+/// Catalog rows whose install has no apply event naming that install.
 ///
-/// An install that committed and then failed to write its event is consistent on disk and invisible to the
-/// record. This is what `hades doctor` reads to say so, instead of leaving a hole nobody can see.
+/// Correlation is by install id, not by (pack, version): uninstall a pack, reinstall the same version, fail to
+/// write the second event, and a pack/version match would call the new row covered by the old event.
 pub fn rows_without_events(state: &Path) -> Result<Vec<String>, String> {
     let rows = read_catalog(state)?;
     if rows.is_empty() {
@@ -508,6 +544,7 @@ pub fn rows_without_events(state: &Path) -> Result<Vec<String>, String> {
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
     let mut recorded: Vec<(String, String)> = Vec::new();
+    let mut installs: Vec<String> = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -522,19 +559,52 @@ pub fn rows_without_events(state: &Path) -> Result<Vec<String>, String> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             recorded.push((pack.to_string(), version.to_string()));
+            if let Some(ids) = value.get("installs").and_then(Value::as_array) {
+                installs.extend(
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<String>>(),
+                );
+            }
         }
     }
     Ok(rows
         .iter()
-        .filter(|row| !recorded.contains(&(row.pack.clone(), row.version.clone())))
+        .filter(|row| {
+            // A row with an id is covered only by an event naming that id. A catalog written before ids
+            // existed has none, and is matched the old way.
+            if !row.install.is_empty() {
+                return !installs.contains(&row.install);
+            }
+            !recorded.contains(&(row.pack.clone(), row.version.clone()))
+        })
         .map(|row| format!("{} {} {}", row.kind.name(), row.identity, row.version))
         .collect())
+}
+
+/// Distinguishes two installations in the same process, so an event from one cannot vouch for the other.
+static INSTALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn install_id() -> String {
+    format!(
+        "{}-{}-{}",
+        now(),
+        std::process::id(),
+        INSTALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// Distinguishes two catalog writes in the same process without relying on the clock.
 static CATALOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn write_catalog(state: &Path, rows: &[Installed]) -> Result<(), String> {
+    // A test seam, debug builds only: the ordering guarantee ("a failed catalog commit removes nothing") cannot
+    // be exercised without a write that fails on purpose, and there is no unprivileged way to make this one fail.
+    #[cfg(debug_assertions)]
+    if std::env::var("HADES_TEST_FAIL").ok().as_deref() == Some("catalog-write") {
+        return Err("test: the catalog write was made to fail".to_string());
+    }
     let path = catalog_path(state);
     if let Some(parent) = path.parent() {
         scratch::state_dir(parent)
@@ -1010,6 +1080,7 @@ fn install_skill(prepared: &Prepared, activate: bool) -> Result<Installed, Strin
         content: String::new(),
         generation: None,
         at: now(),
+        install: install_id(),
     })
 }
 
@@ -1057,6 +1128,7 @@ fn install_harness(
         content: String::new(),
         generation: generation.map(|generation| generation.id),
         at: now(),
+        install: install_id(),
     })
 }
 
@@ -1131,6 +1203,7 @@ fn install_case(prepared: &Prepared, state: &Path, pack: &Pack) -> Result<Instal
         content: String::new(),
         generation: None,
         at: now(),
+        install: install_id(),
     })
 }
 
@@ -1146,6 +1219,13 @@ pub fn apply(
     let _state = lock_state(state)?;
     let rows = pack::plan(pack, state)?;
     let prepared = preflight(pack, home, state, activate, decisions, &rows)?;
+    // Harness profiles live in the home, not the state. A second state installing into the same home would
+    // otherwise be serialised against a lock it never takes.
+    let _home = prepared
+        .iter()
+        .any(|item| item.decision.kind == Kind::Harness)
+        .then(|| lock_home(home))
+        .transpose()?;
     let content = content_root(state, &pack.manifest.id, &pack.manifest.version)?;
     let existing_rows = read_catalog(state)?;
     let content_name = format!("packs/{}/{}", pack.manifest.id, pack.manifest.version);
@@ -1177,6 +1257,7 @@ pub fn apply(
             Kind::Skill => install_skill(&item, activate)?,
             Kind::Case => install_case(&item, state, pack)?,
         };
+        row.install = install_id();
         row.pack = pack.manifest.id.clone();
         row.version = pack.manifest.version.clone();
         row.pack_digest = pack.digest.clone();
@@ -1216,6 +1297,7 @@ pub fn apply(
             "pack": pack.manifest.id,
             "version": pack.manifest.version,
             "items": installed.len(),
+            "installs": installed.iter().map(|row| row.install.clone()).collect::<Vec<String>>(),
             "at": now(),
         }),
     )
@@ -1278,16 +1360,29 @@ pub fn uninstall(
     if selected.is_empty() {
         return Err(format!("no installed items for pack `{id}`"));
     }
-    let mut removed = Vec::new();
-    let mut removed_contents: Vec<String> = Vec::new();
-    let mut kept = Vec::new();
-    let mut promoted = Vec::new();
+    // Decide first, commit the catalog second, remove third.
+    //
+    // The order matters in one direction only: if the catalog write fails, nothing has been removed and the
+    // state is exactly as it was. Removing first and then failing to write leaves rows naming directories that
+    // are gone, which is uninstall broken for every later command. A removal that fails after the commit is
+    // reported as left behind, because the file is a leftover, not a failed uninstall.
     let keep_rows: Vec<Installed> = rows
         .iter()
         .enumerate()
         .filter(|(index, _)| !selected.contains(index))
         .map(|(_, row)| row.clone())
         .collect();
+    let _home = rows
+        .iter()
+        .enumerate()
+        .any(|(index, row)| selected.contains(&index) && row.kind == Kind::Harness)
+        .then(|| lock_home(home))
+        .transpose()?;
+    let mut keepers = Vec::new();
+    let mut removed = Vec::new();
+    let mut removed_contents: Vec<String> = Vec::new();
+    let mut kept = Vec::new();
+    let mut promoted = Vec::new();
     for index in &selected {
         let row = &rows[*index];
         let path = row_base(row, home, state)?;
@@ -1310,51 +1405,62 @@ pub fn uninstall(
                 continue;
             }
         }
-        match row.kind {
-            Kind::Case => {
-                let profile = case_profile(&row.identity)?;
-                if path.exists() {
-                    cases::forget(state, &profile, &row.identity)?;
-                }
-            }
-            Kind::Harness => {
-                if let Some(generation) = row.generation {
-                    if path.exists() {
-                        tuning::restore_harness(
-                            home,
-                            &row.identity,
-                            &path,
-                            generation,
-                            &tuning::guard_digest(),
-                        )?;
-                    }
-                } else if path.exists() {
-                    remove_live(&path)?;
-                }
-            }
-            Kind::Skill => {
-                if path.exists() {
-                    remove_live(&path)?;
-                }
-            }
-        }
+        keepers.push((row.clone(), path));
         removed.push(row.live.clone());
         removed_contents.push(row.content.clone());
     }
+
     write_catalog(state, &keep_rows)?;
+
+    let mut left_behind: Vec<String> = Vec::new();
     let mut content_removed = false;
-    for content in &removed_contents {
-        if !keep_rows.iter().any(|keep| keep.content == *content) && state.join(content).exists() {
-            fs::remove_dir_all(state.join(content)).map_err(|error| {
-                format!(
-                    "could not remove {}: {error}",
-                    state.join(content).display()
-                )
-            })?;
-            content_removed = true;
+    for (row, path) in &keepers {
+        let outcome = (|| -> Result<(), String> {
+            match row.kind {
+                Kind::Case => {
+                    let profile = case_profile(&row.identity)?;
+                    if path.exists() {
+                        cases::forget(state, &profile, &row.identity)?;
+                    }
+                }
+                Kind::Harness => {
+                    if let Some(generation) = row.generation {
+                        if path.exists() {
+                            tuning::restore_harness(
+                                home,
+                                &row.identity,
+                                path,
+                                generation,
+                                &tuning::guard_digest(),
+                            )?;
+                        }
+                    } else if path.exists() {
+                        remove_live(path)?;
+                    }
+                }
+                Kind::Skill => {
+                    if path.exists() {
+                        remove_live(path)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if outcome.is_err() {
+            // The row is already gone; say which path the filesystem still holds instead of implying the
+            // uninstall did not happen.
+            left_behind.push(row.live.clone());
         }
     }
-    append_event(
+    for content in &removed_contents {
+        if !keep_rows.iter().any(|keep| keep.content == *content) && state.join(content).exists() {
+            match fs::remove_dir_all(state.join(content)) {
+                Ok(()) => content_removed = true,
+                Err(_) => left_behind.push(content.clone()),
+            }
+        }
+    }
+    let event = append_event(
         state,
         json!({
             "event": "uninstall",
@@ -1363,14 +1469,18 @@ pub fn uninstall(
             "removed": removed.len(),
             "kept": kept.len(),
             "promoted": promoted.len(),
+            "installs": keepers.iter().map(|(row, _)| row.install.clone()).collect::<Vec<String>>(),
             "at": now(),
         }),
-    )?;
+    )
+    .err();
     Ok(UninstallReceipt {
         removed,
         kept,
         promoted,
         content_removed,
+        left_behind,
+        event_error: event,
     })
 }
 
@@ -1906,6 +2016,32 @@ fn copy_support(from: &Path, to: &Path, skip: Option<&str>) -> Result<(), String
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_home_lock_is_exclusive_and_released() {
+        // Two states, one home: the state locks do not order them, the home lock does. Held here on one thread
+        // while another waits, which is the whole claim.
+        let base = crate::scratch::unique("home-lock");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("a home");
+        let first = lock_home(&home).expect("a first holder");
+        let started = std::time::Instant::now();
+        let other = home.clone();
+        let waiter = std::thread::spawn(move || {
+            let _second = lock_home(&other)?;
+            Ok::<_, String>(started.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(first);
+        let waited = waiter.join().expect("a waiter").expect("a second holder");
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "the second holder did not wait: {waited:?}"
+        );
+        // Released with the guard, so the next holder takes it immediately.
+        let _third = lock_home(&home).expect("a third holder");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn two_staging_directories_for_one_target_are_not_the_same_path() {
         // The old name was the target, the label and the pid: two threads installing one skill computed the
         // same path and the second deleted the first one's copy.
@@ -1935,16 +2071,30 @@ mod tests {
             content: "packs/alpha/1.0.0".to_string(),
             generation: None,
             at: 0,
+            install: "test-install".to_string(),
         };
-        write_catalog(&state, &[row]).expect("a catalog");
+        write_catalog(&state, std::slice::from_ref(&row)).expect("a catalog");
         let missing = rows_without_events(&state).expect("a check");
         assert_eq!(missing, vec!["skill alpha 1.0.0".to_string()]);
         append_event(
             &state,
-            serde_json::json!({"event": "apply", "pack": "alpha", "version": "1.0.0"}),
+            serde_json::json!({"event": "apply", "pack": "alpha", "version": "1.0.0",
+                "installs": ["test-install"]}),
         )
         .expect("an event");
         assert!(rows_without_events(&state).expect("a check").is_empty());
+
+        // Uninstall, reinstall the same version: the second install is a new row with a new id, and an event
+        // from the first must not vouch for it.
+        let mut again = row.clone();
+        again.install = "second-install".to_string();
+        write_catalog(&state, &[again]).expect("a catalog");
+        let missing = rows_without_events(&state).expect("a check");
+        assert_eq!(
+            missing,
+            vec!["skill alpha 1.0.0".to_string()],
+            "{missing:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1989,6 +2139,7 @@ mod tests {
             content: "packs/demo/1.0.0".to_string(),
             generation: None,
             at: 1,
+            install: "test-install".to_string(),
         };
         assert!(validate_row(&row).is_ok());
 
