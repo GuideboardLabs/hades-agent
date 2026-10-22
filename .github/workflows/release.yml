@@ -70,6 +70,13 @@ jobs:
           name: arm64-build-log
           path: /tmp/arm64-build.log
           if-no-files-found: warn
+      # An artifact needs a download; an annotation is readable through the public API. The last lines of a
+      # failed step are otherwise invisible on a public repository without admin rights.
+      - name: Name the ARM64 failure
+        if: failure()
+        run: |
+          message=$(tail -5 /tmp/arm64-build.log 2>/dev/null | tr '\n' ' ' | cut -c1-900)
+          echo "::error title=ARM64 build failed::${message:-no build log was written}"
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-arm64
