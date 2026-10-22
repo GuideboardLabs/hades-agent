@@ -253,6 +253,15 @@ pub fn check(home: &Path, config: &Path, binary: &Path, services: bool) -> Vec<F
         "recipe",
         crate::recipe::Recipe::describe(&root),
     ));
+    // A browser the tool cannot find is a live screenshot that fails at the moment it is needed. Naming the
+    // binary here, before the run, turns that into a warning at the top.
+    found.push(match crate::browser::browser_path() {
+        Ok(path) => Finding::ok(
+            "browser",
+            format!("{} (set HADES_CHROME to change it)", path.display()),
+        ),
+        Err(said) => Finding::warn("browser", said),
+    });
     // A toolchain the cage cannot see is a runtime that dies inside a run with a message about a missing
     // library. Discovery cannot look under the home, so an install there is named in the config or it is not
     // reachable; this is where a person finds out which of the two it is.

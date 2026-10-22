@@ -3,6 +3,37 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.1
+
+This release answers an external audit of 0.1.0. Five defects were reproduced before they were changed; one
+reported defect did not survive checking and is recorded as such.
+
+- **A caged child could read the runtime's own environment.** Both cage modes grant `/proc`, and a cleared
+  child environment says nothing about the parent's `/proc/<pid>/environ`. The runtime clears
+  `PR_SET_DUMPABLE` at startup, which closes that read for the whole tree; `HADES_ALLOW_PTRACE=1` opts out.
+- **A background child could hold a deadline open.** The shell exiting stopped the clock, then two pipe
+  readers were joined with no timeout: `sh -c 'sleep 300 &'` under a 2 s deadline waited 300 s. Readers report
+  on a channel, the deadline covers the streams, and the group is killed when it passes.
+- **Fetching was serialized again by the pool.** One easy handle behind a mutex held across the transfer
+  turned four research workers into a queue. Handles are a pool, leased and returned, with the transfer
+  outside any lock: four 250 ms fetches finish in 0.26 s.
+- **The vision launch was silent and misspelled.** `GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM` is the variable
+  llama.cpp reads; the build set a near-miss, discarded `systemd-run`'s stderr, and polled for four minutes
+  after a launch that had already failed. It reports the exit and the unit's last lines in seconds now, and
+  the image tool can use a configured OpenAI-compatible endpoint instead of a local model.
+- **A screenshot could be written through a symlink.** The final component is refused when it is a link, a
+  symlinked subdirectory is caught by resolving the parent, and the write uses `O_NOFOLLOW`.
+- **Browser discovery** gained the distribution layouts and a `PATH` search; `hades doctor` names the binary
+  it would launch.
+- **The project recipe reached fewer commands than it should.** `run`, `turn` and `submit` read
+  `.hades-project.json`; `context` and `tune` did not, so a Python tree was prepared for `cargo test`. All
+  five read it now.
+- **The browser's session lock is per state**, so two state directories no longer queue behind each other.
+- `scripts/cross-env.sh` runs the checks a Cargo-shaped tree cannot: a Python project and a Node project
+  through their own recipes, a browser named by `HADES_CHROME`, and a vision endpoint in the config.
+
+The reported "unbounded model response" was already bounded: the body is capped at 8 MiB while it is read.
+
 ## 0.1.0
 
 This release hardens the boundaries the earlier versions drew, and takes the last measured cost out of the

@@ -440,6 +440,27 @@ that read for the whole process tree, and `HADES_ALLOW_PTRACE=1` is the way back
 tool that is needed. On a host whose Yama `ptrace_scope` already refuses a child reading its parent, the seal
 is a second lock rather than the only one.
 
+### What decides the work is done
+
+A profile ships a check, because a runtime that has no default check has no definition of done. The shipped
+coding profiles use `cargo test --quiet`, which is right for this tree and wrong for most others. A repository
+carries `.hades-project.json` at its root naming the command and the files that command reads, as one pair:
+
+```json
+{ "version": 1, "verify": "python3 -m unittest -q", "protect": ["test_app.py"] }
+```
+
+The pair is the point. A file that changed the check without saying what the check reads would let a run
+replace a real test with `true` and still pass as governed. The ruler hashes the protected files before the
+first write and again after the check, so an edit to them is a refused result. `hades context`, `hades tune`
+and a run all read the same recipe, and `hades doctor` prints whether it found one. `--verify` overrides the
+command for one invocation; it cannot drop the protection.
+
+Vision follows the same rule as the chat model. The image tool starts a local Qwen3-VL GGUF through
+`systemd-run` when no endpoint is configured, and posts to any OpenAI-compatible endpoint when one is:
+`vision.url`, `vision.model` and `vision.key_env` in the config, where the key is named rather than stored.
+A host with no user systemd manager and no model files uses the second path and never touches the first.
+
 ## Work that runs itself
 
 A job is a standing goal file under `<state>/jobs`, one file per job, and the file is the record. The body

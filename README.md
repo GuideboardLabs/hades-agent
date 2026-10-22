@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1037%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.1-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1046%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.0 |
+| **Version** | 0.1.1 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1037 passing, 13 ignored live tests |
+| **Tests** | 1046 passing, 13 ignored live tests |
 
 ---
 
@@ -619,6 +619,42 @@ fallback a run uses when the config names no root.
 Keep `~/.hades` out of version control. The repository contains no state, no sessions, no keys and no
 provider configuration.
 
+### A check that is not Cargo
+
+The shipped `fix` and `sweep` profiles run `cargo test --quiet`. A repository that is not Rust says what its
+check is in one file at its root, and the file names the command and the files that command reads as a pair:
+
+```json
+{ "version": 1, "verify": "python3 -m unittest -q", "protect": ["test_app.py"] }
+```
+
+```json
+{ "version": 1, "verify": "node --test", "protect": ["app.test.js", "package.json"] }
+```
+
+`hades init --recipe` writes an example. `hades doctor` prints `recipe: built-in cargo` when a tree carries
+none, and the command it read when it does. The pair is deliberate: a recipe that changed the check without
+saying what the check reads would let a run swap `cargo test` for `true` and still look governed. `--verify`
+overrides the command for one run and cannot remove the protection the recipe declared.
+
+### A vision endpoint that is not this machine
+
+The image tool starts a local Qwen3-VL GGUF by default. A host without those model files, or without a user
+systemd manager, can point it at any OpenAI-compatible endpoint instead:
+
+```json
+{
+  "vision": {
+    "url": "https://vision.example/v1/chat/completions",
+    "model": "qwen3-vl-8b",
+    "key_env": "VISION_API_KEY"
+  }
+}
+```
+
+`key_env` names the variable, never the value. `HADES_VISION_URL` and `HADES_VISION_MODEL_NAME` override the
+file for one process. `hades config` prints which of the two is configured.
+
 ---
 
 ## Security model
@@ -646,7 +682,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1037 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1046 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -655,7 +691,9 @@ browser installed:
 cargo test -p harness --lib browser::tests -- --ignored --test-threads=1
 ```
 
-Acceptance scripts live in `rust/acceptance/`.
+Acceptance scripts live in `rust/acceptance/`. `scripts/cross-env.sh` runs the checks a Cargo-shaped tree
+cannot: a Python project and a Node project through their own recipes, a browser named by `HADES_CHROME`, and a
+vision endpoint in the config.
 
 ---
 

@@ -1741,11 +1741,16 @@ fn tune(args: &[String]) -> Result<(String, i32), String> {
     let config = config_of(&flags)?;
     let root = root_with(&flags, config.as_ref())?;
     let (routed, _) = Rules::shipped().pick(&TaskSpec::new(goal.clone(), root.clone()));
-    let profile = match flags.named.get("profile") {
+    let mut profile = match flags.named.get("profile") {
         Some(id) => profile::named(id).ok_or_else(|| format!("no profile named `{id}`"))?,
         None => profile::named(routed.as_str())
             .ok_or_else(|| format!("the rules picked {routed}, which this build does not ship"))?,
     };
+    // A tune measures candidate harnesses against the check the repository actually uses, not against the
+    // shipped default.
+    if let Some(recipe) = crate::recipe::Recipe::load(&root)? {
+        recipe.apply(&mut profile);
+    }
     let check = flags
         .named
         .get("verify")
@@ -3231,6 +3236,19 @@ fn config_cmd(args: &[String]) -> Result<(String, i32), String> {
                         .unwrap_or_default()
                 ));
             }
+            match &config.vision {
+                Some(vision) => text.push_str(&format!(
+                    "vision: {} ({}){}\n",
+                    vision.model,
+                    vision.url,
+                    vision
+                        .key_env
+                        .as_ref()
+                        .map(|key| format!(", key ${key}"))
+                        .unwrap_or_default()
+                )),
+                None => text.push_str("vision: local model (llama-server on a loopback port)\n"),
+            }
             text.push_str(&format!("mcp servers: {}\n", config.mcp.servers.len()));
             text.push_str("\nkeys and tokens live in .env, never in this file\n");
             Ok((text, 0))
@@ -3792,9 +3810,9 @@ fn context(args: &[String]) -> Result<(String, i32), String> {
     let flags = parse(args, &["root", "profile", "config", "memory"])?;
     let goal = goal(&flags)?;
     let root = root_of(&flags)?;
-    let task = TaskSpec::new(goal.clone(), root);
+    let task = TaskSpec::new(goal.clone(), root.clone());
 
-    let profile = match flags.named.get("profile") {
+    let mut profile = match flags.named.get("profile") {
         Some(id) => profile::named(id).ok_or_else(|| format!("no profile named `{id}`"))?,
         None => {
             let (id, _) = Rules::shipped().pick(&task);
@@ -3802,6 +3820,11 @@ fn context(args: &[String]) -> Result<(String, i32), String> {
                 .ok_or_else(|| format!("the rules picked {id}, which this build does not ship"))?
         }
     };
+    // The context has to name the check the run will actually use, or it prepares the model for the wrong
+    // one: a Python tree told to expect `cargo test --quiet` is a run that starts by misunderstanding.
+    if let Some(recipe) = crate::recipe::Recipe::load(&root)? {
+        recipe.apply(&mut profile);
+    }
 
     let memo = remembered(&flags, &goal, (profile.context_tokens / 10).min(2_000));
     let mut offered = sections(&task, &profile, profile.context_tokens)
@@ -5381,6 +5404,7 @@ fn init(
         endpoints: std::collections::BTreeMap::new(),
         runtime_paths: Vec::new(),
         research: Default::default(),
+        vision: None,
     };
     config::save(&config_path, &config).map_err(|error| {
         format!(
@@ -7405,6 +7429,7 @@ mod profile_model_tests {
             endpoints: Default::default(),
             runtime_paths: Vec::new(),
             research: Default::default(),
+            vision: None,
         }
     }
 

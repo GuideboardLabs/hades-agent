@@ -35,6 +35,40 @@ fn isolate_home() {
     });
 }
 
+/// A repository's `.hades-project.json` sets the check the run will use, and the context command has to
+/// say so: a Python tree told to expect `cargo test --quiet` prepares the model for the wrong check. This
+/// was true of `run` and false of `context` and `tune`, which is the kind of gap a suite catches only when
+/// it looks at every path that reads a profile.
+#[test]
+fn a_project_recipe_reaches_the_context_and_tune_checks() {
+    let root = scratch_base().join(format!("recipe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("a root");
+    std::fs::write(
+        root.join(".hades-project.json"),
+        r#"{"version":1,"verify":"python3 -m pytest -q","protect":["test_app.py"]}"#,
+    )
+    .expect("a recipe");
+    std::fs::write(
+        root.join("test_app.py"),
+        "def test_ok():\n    assert True\n",
+    )
+    .expect("a test");
+
+    let (code, output) = hades(&[
+        "context",
+        "make the test pass",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("python3 -m pytest -q"),
+        "the context did not carry the recipe's check:\n{output}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn log_lines(state: &Path, session: &str) -> Vec<serde_json::Value> {
     let path = state.join("sessions").join(format!("{session}.jsonl"));
     let text = std::fs::read_to_string(&path)

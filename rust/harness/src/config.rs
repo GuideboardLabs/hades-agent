@@ -46,6 +46,17 @@ pub struct Config {
     pub runtime_paths: Vec<PathBuf>,
     /// How research may reach outside the machine.
     pub research: Research,
+    /// An OpenAI-compatible endpoint for the image tool. Absent, the tool starts a local model.
+    pub vision: Option<Vision>,
+}
+
+/// A remote vision endpoint, in the same shape as a named model endpoint: a URL, a model id, and the
+/// *name* of the variable holding the key. A config file is copied and backed up, so it never holds a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vision {
+    pub url: String,
+    pub model: String,
+    pub key_env: Option<String>,
 }
 
 /// The research seam. `external_fallback` is off unless a person turns it on, because the fallback sends the
@@ -270,6 +281,7 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         endpoints,
         runtime_paths: runtime_paths(object.get("runtime_paths"), path)?,
         research: research(object.get("research"), path)?,
+        vision: vision(object.get("vision"), path)?,
     }))
 }
 
@@ -291,6 +303,11 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
         "research": {
             "external_fallback": config.research.external_fallback,
         },
+        "vision": config.vision.as_ref().map(|vision| json!({
+            "url": vision.url,
+            "model": vision.model,
+            "key_env": vision.key_env,
+        })),
         "runtime_paths": config
             .runtime_paths
             .iter()
@@ -419,6 +436,56 @@ fn runtime_paths(value: Option<&Value>, path: &Path) -> Result<Vec<PathBuf>, Str
     Ok(kept)
 }
 
+/// The optional `vision` object: where the image tool sends its question instead of starting a local model.
+///
+/// A URL has to be explicit, and a key is named rather than pasted, for the same reason a named endpoint
+/// does: a config file is backed up and a secret in it is a secret in the backup.
+fn vision(value: Option<&Value>, path: &Path) -> Result<Option<Vision>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{}: `vision` is not an object", path.display()))?;
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .ok_or_else(|| {
+            format!(
+                "{}: `vision.url` must start with http:// or https://",
+                path.display()
+            )
+        })?
+        .to_string();
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| format!("{}: `vision.model` is missing", path.display()))?
+        .to_string();
+    let key_env = match object.get("key_env") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        Some(_) => {
+            return Err(format!(
+                "{}: `vision.key_env` must be a variable name, not a value",
+                path.display()
+            ));
+        }
+    };
+    Ok(Some(Vision {
+        url,
+        model,
+        key_env,
+    }))
+}
+
 /// The optional `profile_models` map. Every key must name a shipped profile and every value a preset
 /// this build knows: a typo that is silently ignored is a setting the owner believes is on.
 fn profile_models(
@@ -518,7 +585,34 @@ mod tests {
             runtime_paths: Vec::new(),
             research: Research::default(),
             endpoints: BTreeMap::new(),
+            vision: None,
         }
+    }
+
+    #[test]
+    fn vision_is_optional_and_a_bad_url_is_refused() {
+        let dir = scratch("vision");
+        let path = path_in(&dir);
+        let base = r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v""#;
+        std::fs::write(
+            &path,
+            format!(
+                "{base},\"vision\":{{\"url\":\"https://example.test/v1/chat/completions\",\"model\":\"vl-8b\",\"key_env\":\"VISION_KEY\"}}}}"
+            ),
+        )
+        .expect("a config");
+        let config = load(&path).expect("load").expect("a config");
+        let vision = config.vision.expect("a vision endpoint");
+        assert_eq!(vision.model, "vl-8b");
+        assert_eq!(vision.key_env.as_deref(), Some("VISION_KEY"));
+
+        std::fs::write(
+            &path,
+            format!("{base},\"vision\":{{\"url\":\"ftp://nope\",\"model\":\"m\"}}}}"),
+        )
+        .expect("a config");
+        let error = load(&path).expect_err("a non-http url is refused");
+        assert!(error.contains("vision.url"), "{error}");
     }
 
     #[test]
@@ -635,6 +729,7 @@ mod tests {
             endpoints: Default::default(),
             runtime_paths: vec![toolchain.clone()],
             research: Research::default(),
+            vision: None,
         };
         save(&path, &config).expect("a save");
         let read = load(&path).expect("a read").expect("a config");
@@ -694,6 +789,7 @@ mod tests {
             endpoints: Default::default(),
             runtime_paths: Vec::new(),
             research: Research::default(),
+            vision: None,
         };
         let mut config = base();
         config.runtime_paths = vec![PathBuf::from("relative/toolchain")];

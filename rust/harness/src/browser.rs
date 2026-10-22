@@ -44,7 +44,11 @@ struct Held {
     last_used: Instant,
 }
 
-static SESSIONS: Mutex<BTreeMap<PathBuf, Held>> = Mutex::new(BTreeMap::new());
+/// One browser per state directory. The map's lock is held only to find, create or drop an entry; the
+/// action itself runs under that entry's own lock, so two states that have nothing to do with each other do
+/// not queue behind one another.
+static SESSIONS: Mutex<BTreeMap<PathBuf, std::sync::Arc<Mutex<Held>>>> =
+    Mutex::new(BTreeMap::new());
 
 /// The key a state directory is held under: the resolved path when it exists, the path as given when it
 /// does not, so two spellings of one directory never become two sessions.
@@ -194,62 +198,96 @@ pub fn tool(args: &Value, state: &Path) -> String {
         return "no action given".to_string();
     }
     let key = session_key(state);
-    let mut held = match SESSIONS.lock() {
-        Ok(held) => held,
-        Err(poisoned) => poisoned.into_inner(),
+    let now = Instant::now();
+
+    // The outer lock is taken for the map only. Everything that touches a browser happens under that
+    // browser's own lock, which is what lets two states work at the same time.
+    let entry = {
+        let mut held = match SESSIONS.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Sweep before use, not on a timer: a session that is closed here is one whose next call has not
+        // come yet, and a call is the only moment this process knows it is still alive. A session another
+        // thread is using is left alone; the next call sweeps it.
+        let idle: Vec<PathBuf> = held
+            .iter()
+            .filter(|(_, session)| {
+                let Ok(session) = session.try_lock() else {
+                    return false;
+                };
+                stale(now, session.last_used)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in idle {
+            if let Some(session) = held.remove(&key)
+                && let Ok(mut session) = session.try_lock()
+            {
+                session.session.close();
+            }
+        }
+
+        if action == "close" {
+            if let Some(session) = held.remove(&key)
+                && let Ok(mut session) = session.try_lock()
+            {
+                session.session.close();
+            }
+            return "browser closed".to_string();
+        }
+
+        if !held.contains_key(&key) {
+            match Session::start(state) {
+                Ok(session) => {
+                    held.insert(
+                        key.clone(),
+                        std::sync::Arc::new(Mutex::new(Held {
+                            session,
+                            last_used: now,
+                        })),
+                    );
+                }
+                Err(said) => return said,
+            }
+        }
+        held.get(&key).cloned()
     };
 
-    // Sweep before use, not on a timer: a session that is closed here is one whose next call has not come
-    // yet, and a call is the only moment this process knows it is still alive.
-    let now = Instant::now();
-    let idle: Vec<PathBuf> = held
-        .iter()
-        .filter(|(_, session)| stale(now, session.last_used))
-        .map(|(key, _)| key.clone())
-        .collect();
-    for key in idle {
-        if let Some(mut session) = held.remove(&key) {
-            session.session.close();
-        }
-    }
-
-    if action == "close" {
-        if let Some(mut session) = held.remove(&key) {
-            session.session.close();
-        }
-        return "browser closed".to_string();
-    }
-
-    if !held.contains_key(&key) {
-        match Session::start(state) {
-            Ok(session) => {
-                held.insert(
-                    key.clone(),
-                    Held {
-                        session,
-                        last_used: now,
-                    },
-                );
+    let result = match entry {
+        Some(entry) => match entry.lock() {
+            Ok(mut held) => {
+                let result = held.session.act(action, args);
+                if result.is_ok() {
+                    held.last_used = Instant::now();
+                }
+                result
             }
-            Err(said) => return said,
-        }
-    }
-    let result = match held.get_mut(&key) {
-        Some(held) => held.session.act(action, args),
+            Err(poisoned) => {
+                let mut held = poisoned.into_inner();
+                let result = held.session.act(action, args);
+                if result.is_ok() {
+                    held.last_used = Instant::now();
+                }
+                result
+            }
+        },
         None => Err("the browser did not start".to_string()),
     };
     match result {
-        Ok(said) => {
-            if let Some(held) = held.get_mut(&key) {
-                held.last_used = Instant::now();
-            }
-            said
-        }
+        Ok(said) => said,
         Err(said) => {
             // The pipe or the page is no longer trustworthy. Drop this state's child only; another state's
             // session has nothing to do with this failure.
-            if let Some(mut held) = held.remove(&key) {
-                held.session.close();
+            let mut held = match SESSIONS.lock() {
+                Ok(held) => held,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(session) = held.remove(&key)
+                && let Ok(mut session) = session.try_lock()
+            {
+                session.session.close();
             }
             format!("the browser failed: {said}")
         }
@@ -3051,6 +3089,35 @@ const PATH_BROWSERS: [&str; 5] = [
     "chrome",
 ];
 
+/// Pick a browser from a list of absolute paths, then from the `PATH` given. Split out from
+/// [`find_chrome`] so the search is testable without a browser installed at a known location.
+fn pick_browser(known: &[&str], path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    for candidate in known {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // Distributions disagree about the name and the layout, and a browser installed by a package manager is
+    // usually on PATH even when it is not in /usr/bin under a name this file guessed. The search is last so
+    // an explicit install still wins.
+    for directory in std::env::split_paths(path_var?) {
+        for name in PATH_BROWSERS {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The browser this build would launch, or why it would not. `hades doctor` reports it so a host where
+/// the browser tool cannot work says so before a run needs it.
+pub fn browser_path() -> Result<PathBuf, String> {
+    find_chrome()
+}
+
 fn find_chrome() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("HADES_CHROME") {
         let path = PathBuf::from(path);
@@ -3077,24 +3144,8 @@ fn find_chrome() -> Result<PathBuf, String> {
             }
         }
     }
-    for candidate in KNOWN_BROWSERS {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    // Distributions disagree about the name and the package layout, and a browser installed by a package
-    // manager is usually on PATH even when it is not in /usr/bin under a name this file guessed. The
-    // search is last so an explicit install still wins.
-    if let Some(paths) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&paths) {
-            for name in PATH_BROWSERS {
-                let candidate = directory.join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
-                }
-            }
-        }
+    if let Some(path) = pick_browser(&KNOWN_BROWSERS, std::env::var_os("PATH").as_deref()) {
+        return Ok(path);
     }
     Err("no Chromium found; set HADES_CHROME to a browser binary".to_string())
 }
@@ -3144,18 +3195,20 @@ mod tests {
             Ok(held) => held,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(session) = held.get_mut(&key) {
-            session.session.policy = BrowserPolicy::permit_local();
-            session.last_used = Instant::now();
+        if let Some(session) = held.get(&key) {
+            if let Ok(mut session) = session.lock() {
+                session.session.policy = BrowserPolicy::permit_local();
+                session.last_used = Instant::now();
+            }
         } else {
             match Session::start_with(state, BrowserPolicy::permit_local()) {
                 Ok(session) => {
                     held.insert(
                         key,
-                        Held {
+                        std::sync::Arc::new(Mutex::new(Held {
                             session,
                             last_used: Instant::now(),
-                        },
+                        })),
                     );
                 }
                 Err(said) => panic!("the fixture browser did not start: {said}"),
@@ -3306,6 +3359,22 @@ mod tests {
         assert!(chromium_path_check(Path::new(&exact)).is_ok());
         let over = format!("/tmp/{}", "x".repeat(room - 4));
         assert!(chromium_path_check(Path::new(&over)).is_err());
+    }
+
+    /// The PATH search is the part a distribution install needs: a browser that is on PATH but not in a
+    /// directory this file knows by name still has to be found, and an explicit known path still wins.
+    #[test]
+    fn a_browser_on_the_path_is_found() {
+        let directory = crate::scratch::root().join("browser-on-path");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let browser = directory.join("chromium");
+        std::fs::write(&browser, b"#!/bin/sh\n").expect("a browser");
+        let path_var = std::env::join_paths([&directory]).expect("a PATH");
+        let found = pick_browser(&[], Some(path_var.as_os_str())).expect("the browser on PATH");
+        assert_eq!(found, browser);
+        assert!(pick_browser(&[], None).is_none());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The list has to name the packages distributions actually ship, not only the one this was built on.

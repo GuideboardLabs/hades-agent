@@ -46,56 +46,15 @@ scheduled with an acceptance test rather than a promise.
 
 The first two are the audit's top two items; the third is the regression its optimisation introduced.
 
-## Next, in order
+## Done in 0.1.1
 
-### 1. A vision endpoint that is not this machine
-
-Today the image tool always starts a local Qwen3-VL GGUF through `systemd-run`. On a container or WSL host
-without a user systemd manager it cannot work at all, and on a host without the model files it refuses.
-
-Design:
-
-- `config.json` gains `vision`: `{ "endpoint": "<name from endpoints>", "model": "<id>" }`, or a
-  `"preset"` naming an entry in the model preset table. Absent means the local path, unchanged.
-- `describe` builds the same OpenAI-shaped body it builds now and posts it through `crate::http::post` to
-  the configured endpoint, with the key resolved by variable name through the existing resolver.
-- The local launcher stays as the fallback and keeps its new early failure.
-- `HADES_VISION_ENDPOINT` / `HADES_VISION_MODEL_NAME` override the config for one process.
-
-Acceptance: a stub endpoint that records the request proves the configured path is used and that no
-`systemd-run` is attempted; the local path keeps its current test; `hades doctor` prints which of the two
-is configured.
-
-### 2. Browser sessions: lock per state, not per process
-
-`SESSIONS` is a `Mutex<BTreeMap<PathBuf, Held>>` held across `Session::act`, so two states that could work
-in parallel queue. Design: the map holds `Arc<Mutex<Held>>` per key; the outer lock is taken only to find or
-create the entry, then dropped before the action. A session that fails is removed by key after the action,
-under the same rule as today.
-
-Acceptance: two states start two browsers and a click in each completes in about the time of one, with a
-test that fails if the outer lock is held during `act`.
-
-### 3. A check any profile can be pointed at
-
-`fix` and `sweep` ship `cargo test --quiet`. That is the right default for this repository and the wrong
-assumption for a Python or Node project. Design: profile defaults gain an optional `check` string, read from
-`config.json` (`profiles.fix.check`), validated as a program that runs; the shipped default stays. The
-`--protect` list follows the same idea: a profile can name its own manifests.
-
-Acceptance: a profile with `check: "pytest -q"` runs that, `hades profiles` shows it, and the protected-file
-set names no Cargo path when the check is not Cargo.
-
-### 4. A small cross-environment suite
-
-Four fixtures, run by `scripts/cross-env.sh`, each one a claim that is currently untested:
-
-- a Python project (no `Cargo.toml`) with the `fix` profile pointed at `pytest`;
-- a Node project with `npm test`;
-- a browser at a non-standard path, found through PATH, with a live screenshot;
-- a remote OpenAI-compatible stub for the main model and for vision.
-
-WSL/container behaviour is covered by the last two: neither depends on systemd or on a model file.
+| Item | What changed | Test |
+|---|---|---|
+| A vision endpoint that is not this machine | `vision: {url, model, key_env}` in the config; `HADES_VISION_URL` and `HADES_VISION_MODEL_NAME` for one process; the local launcher stays as the fallback | `vision::tests::a_configured_endpoint_is_used_instead_of_a_local_server`, `config::tests::vision_is_optional_and_a_bad_url_is_refused` |
+| Browser work per state | The sessions map holds one `Arc<Mutex<Held>>` per state; the outer lock is taken to find or create an entry and released before the action | live browser suite; `browser::tests::a_browser_on_the_path` |
+| A check that is not Cargo | `.hades-project.json` was honoured by `run`, `turn` and `submit` and ignored by `context` and `tune`, so a Python tree was prepared for `cargo test`. All five read it now | `cli_oracle::a_project_recipe_reaches_the_context_and_tune_checks` |
+| Cross-environment suite | `scripts/cross-env.sh`: a Python project, a Node project, a browser named by `HADES_CHROME`, a vision endpoint in the config | the script itself, seven checks |
+| Browser discovery | Distribution layouts and a `PATH` search; `hades doctor` names the binary | `browser::tests::a_browser_on_the_path`, `browser::tests::common_browser_locations_are_known` |
 
 ### 5. Not doing
 

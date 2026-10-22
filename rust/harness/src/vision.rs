@@ -24,6 +24,56 @@ fn env_or(name: &str, fallback: &str) -> String {
 
 static SERVER: Mutex<Option<Child>> = Mutex::new(None);
 
+/// A configured OpenAI-compatible endpoint for the image tool.
+struct Remote {
+    url: String,
+    model: String,
+    key_env: Option<String>,
+}
+
+/// Where the image tool sends its question when it is not starting a local model.
+///
+/// The environment wins over the config so one run can point at another server without editing a file;
+/// the config is the durable form. Nothing here reads a key value: `key_env` names the variable.
+fn remote() -> Result<Option<Remote>, String> {
+    if let Ok(url) = std::env::var("HADES_VISION_URL") {
+        let url = url.trim().to_string();
+        if !url.is_empty() {
+            let model = std::env::var("HADES_VISION_MODEL_NAME").map_err(|_| {
+                "HADES_VISION_URL is set but HADES_VISION_MODEL_NAME is not: an endpoint has to say which \
+                 model to ask for"
+                    .to_string()
+            })?;
+            let key_env = std::env::var("HADES_VISION_KEY_ENV")
+                .ok()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+            return Ok(Some(Remote {
+                url,
+                model,
+                key_env,
+            }));
+        }
+    }
+    let home = match std::env::var("HADES_HOME") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => match std::env::var("HOME") {
+            Ok(home) => std::path::PathBuf::from(home).join(".hades"),
+            Err(_) => return Ok(None),
+        },
+    };
+    let path = home.join(crate::config::NAME);
+    let config = crate::config::load(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Ok(config
+        .and_then(|config| config.vision)
+        .map(|vision| Remote {
+            url: vision.url,
+            model: vision.model,
+            key_env: vision.key_env,
+        }))
+}
+
 /// Look at one image and answer one question about it.
 pub fn describe(path: &Path, question: &str) -> Result<String, String> {
     let bytes = std::fs::read(path)
@@ -31,7 +81,6 @@ pub fn describe(path: &Path, question: &str) -> Result<String, String> {
     if bytes.is_empty() {
         return Err(format!("{} is empty", path.display()));
     }
-    ensure_server()?;
     // A full screenshot costs the encoder seconds per thousand pixels; 768 px wide keeps ordinary interface
     // text legible and stays near four seconds on the card. The original is untouched.
     let (bytes, picture) = shrink(path).unwrap_or((bytes, path.to_path_buf()));
@@ -48,8 +97,22 @@ pub fn describe(path: &Path, question: &str) -> Result<String, String> {
         _ => "image/jpeg",
     };
     let data = base64(&bytes);
+
+    let configured = remote()?;
+    let (url, model, key_env) = match configured {
+        Some(remote) => (remote.url, remote.model, remote.key_env),
+        None => {
+            ensure_server()?;
+            (
+                format!("http://127.0.0.1:{PORT}/v1/chat/completions"),
+                "qwen3vl".to_string(),
+                None,
+            )
+        }
+    };
+
     let body = json!({
-        "model": "qwen3vl",
+        "model": model,
         "messages": [{
             "role": "user",
             "content": [
@@ -60,13 +123,13 @@ pub fn describe(path: &Path, question: &str) -> Result<String, String> {
         "max_tokens": 500,
         "temperature": 0.2
     });
-    let reply = crate::http::post(
-        &format!("http://127.0.0.1:{PORT}/v1/chat/completions"),
-        &body.to_string(),
-        &[("Content-Type", "application/json".to_string())],
-        Duration::from_secs(240),
-    )
-    .map_err(|fault| format!("the vision server did not answer: {fault:?}"))?;
+    let mut headers = vec![("Content-Type", "application/json".to_string())];
+    if let Some(name) = key_env {
+        let key = crate::model::secret(&name)?;
+        headers.push(("Authorization", format!("Bearer {key}")));
+    }
+    let reply = crate::http::post(&url, &body.to_string(), &headers, Duration::from_secs(240))
+        .map_err(|fault| format!("the vision server did not answer: {fault:?}"))?;
     if !reply.ok() {
         return Err(format!(
             "the vision server answered {}: {}",
@@ -309,6 +372,90 @@ pub fn base64_for_test(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configured endpoint is used instead of starting a local model, and the request it receives is
+    /// the OpenAI vision shape. Without this, the image tool is tied to one machine's GGUF files.
+    #[test]
+    fn a_configured_endpoint_is_used_instead_of_a_local_server() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one connection");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let body_at = loop {
+                let read = stream.read(&mut buffer).expect("a request");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                if read == 0 {
+                    panic!("the client closed before finishing its headers");
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..body_at]).to_string();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("a content length");
+            while request.len() < body_at + length {
+                let read = stream.read(&mut buffer).expect("a body");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = String::from_utf8_lossy(&request[body_at..]).to_string();
+            let reply = r#"{"choices":[{"message":{"content":"a stub answer"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                reply.len(),
+                reply
+            )
+            .expect("a reply");
+            body
+        });
+
+        let directory = std::env::temp_dir().join(format!(
+            "hades-vision-stub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let image = directory.join("shot.png");
+        std::fs::write(&image, b"not really a png, which the stub does not mind")
+            .expect("an image");
+
+        // SAFETY: no test in this binary reads these variables concurrently: the only other vision test
+        // checks the encoder, and the image tool's failure test never reaches the endpoint lookup.
+        unsafe {
+            std::env::set_var(
+                "HADES_VISION_URL",
+                format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            );
+            std::env::set_var("HADES_VISION_MODEL_NAME", "stub-vision");
+        }
+        let said = describe(&image, "what is in this picture").expect("an answer");
+        unsafe {
+            std::env::remove_var("HADES_VISION_URL");
+            std::env::remove_var("HADES_VISION_MODEL_NAME");
+        }
+
+        assert_eq!(said, "a stub answer");
+        let body = handle.join().expect("the stub thread");
+        assert!(body.contains("\"model\":\"stub-vision\""), "{body}");
+        assert!(body.contains("image_url"), "{body}");
+        assert!(body.contains("data:image/png;base64,"), "{body}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn the_encoder_matches_the_known_vector() {
