@@ -56,7 +56,20 @@ jobs:
       # The artifacts are *run* here, not only compiled: version, doctor, init, pack add and audit under
       # qemu-aarch64, with `--require` so a missing emulator fails the job instead of skipping it.
       - name: Build and run ARM64 artifacts
-        run: bash rust/scripts/arm64-build.sh --out dist
+        run: |
+          set +e
+          bash rust/scripts/arm64-build.sh --out dist 2>&1 | tee /tmp/arm64-build.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+      # A failed job's log is not readable without admin rights, which makes a red X on a public release
+      # undiagnosable. When the build fails, its own output is attached as an artifact instead.
+      - name: Keep the ARM64 build log when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-build-log
+          path: /tmp/arm64-build.log
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-arm64

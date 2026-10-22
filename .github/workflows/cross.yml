@@ -2,7 +2,8 @@ name: cross
 
 # The cage used raw x86-64 assembly, so the crate did not compile on ARM64 at all. A cross-check is the
 # only thing that keeps that from happening again: this machine has one architecture, and the next one
-# may not. The C dependency (bundled SQLite) needs a cross C compiler, which is why the runner installs it.
+# may not. The C dependency (bundled SQLite) needs a cross C compiler; the repository stages it without
+# root, so this job does not depend on which cross package the runner image happens to ship.
 #
 # Nothing here may name a path on a specific machine. The repository used to carry `.cargo/config.toml`
 # with an absolute `build.target-dir`, which pointed at one host's build directory and turned into
@@ -17,11 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install an aarch64 C toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          aarch64-linux-gnu-gcc --version | head -1
       - name: Add the target
         run: |
           rustup target add aarch64-unknown-linux-gnu
@@ -29,7 +25,4 @@ jobs:
           cargo --version
       - name: Check the workspace for aarch64
         working-directory: rust
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-        run: cargo check --workspace --target aarch64-unknown-linux-gnu
+        run: bash scripts/cross-check.sh
