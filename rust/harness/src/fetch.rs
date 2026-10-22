@@ -442,13 +442,10 @@ fn resolve(target: &Target, allow_private: bool) -> Result<Vec<IpAddr>, String> 
                 ));
             }
         }
-        // All of them are kept: a host that publishes both families may listen on either, and pinning one
-        // answer is a coin flip. IPv4 is tried first because a dual-stack name usually serves v4 too, and a
-        // v4-only listener is the common failure when a resolver answers ::1 first, which most do.
-        let mut ordered = answers;
-        ordered.sort_by_key(|address| !address.is_ipv4());
-        ordered.dedup();
-        return Ok(ordered);
+        // Every answer is kept: a host that publishes both families may listen on either, and pinning one
+        // answer is a coin flip. The list is deduplicated first and then interleaved by family, so a handful
+        // of IPv4 answers cannot push the only IPv6 answer past the attempt cap.
+        return Ok(order_addresses(answers));
     };
     if is_private(literal) && !allow_private {
         return Err(format!(
@@ -456,6 +453,34 @@ fn resolve(target: &Target, allow_private: bool) -> Result<Vec<IpAddr>, String> 
         ));
     }
     Ok(vec![literal])
+}
+
+/// A unique list, interleaved by family: v4, v6, v4, v6, ...
+///
+/// Two defects are closed here. `sort_by_key(|a| !a.is_ipv4())` put every IPv4 answer first, so three
+/// attempts could be spent on three IPv4 addresses while a healthy IPv6 answer was never tried. And `dedup()`
+/// after that sort only removes *adjacent* duplicates, so `[A, B, A]` kept A twice. Uniqueness is decided
+/// before the order, and the order alternates so the first three attempts cover both families whenever a
+/// name publishes both.
+fn order_addresses(answers: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut v4: Vec<IpAddr> = Vec::new();
+    let mut v6: Vec<IpAddr> = Vec::new();
+    for address in answers {
+        let bucket = if address.is_ipv4() { &mut v4 } else { &mut v6 };
+        if !bucket.contains(&address) {
+            bucket.push(address);
+        }
+    }
+    let mut ordered = Vec::with_capacity(v4.len() + v6.len());
+    for index in 0..v4.len().max(v6.len()) {
+        if let Some(address) = v4.get(index) {
+            ordered.push(*address);
+        }
+        if let Some(address) = v6.get(index) {
+            ordered.push(*address);
+        }
+    }
+    ordered
 }
 
 /// How many answers one hop will try before giving up. A name with many addresses is still bounded work: each
@@ -525,39 +550,12 @@ fn chase_bytes(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<Vec<
     loop {
         let target = Target::parse(&current)?;
         let addresses = resolve(&target, allow_private)?;
-        // Read after the lookup, not before: resolution is part of the fetch and can take the whole budget
-        // on a slow resolver, and a transfer started with the original allowance would double the declared
-        // deadline. A hop with no time left is refused here rather than started with `--max-time 0`.
-        let max_time = remaining_seconds(deadline)?;
         // Each attempt stays pinned to one validated address. A refused connect on the first answer is not
         // the host being down, it is the wrong family for this service, so the next validated answer is
         // tried before the fetch is reported as failed.
-        let mut landed = None;
-        let mut failure = None;
-        for (index, address) in addresses.iter().take(MAX_ADDRESSES).enumerate() {
-            match hop(&target, &current, *address, max_time, ca) {
-                Ok(outcome) => {
-                    landed = Some(outcome);
-                    break;
-                }
-                Err(error) => {
-                    let more = index + 1 < addresses.len() && index + 1 < MAX_ADDRESSES;
-                    if more && another_address_may_help(&error) {
-                        failure = Some(error);
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        let Some(outcome) = landed else {
-            return Err(failure.unwrap_or_else(|| {
-                format!(
-                    "there is no address for `{}` to try",
-                    clip_ref(&current, 80)
-                )
-            }));
-        };
+        let outcome = try_addresses(&addresses, deadline, &current, |address, max_time| {
+            hop(&target, &current, address, max_time, ca)
+        })?;
         match outcome {
             Outcome::Page(bytes) => return Ok(bytes),
             Outcome::Oversize => {
@@ -579,6 +577,48 @@ fn chase_bytes(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<Vec<
             }
         }
     }
+}
+
+/// Try the first `MAX_ADDRESSES` answers, asking the clock before **each** attempt.
+///
+/// The deadline is the fetch's, not the URL's. Reading it once outside the loop gave the second address the
+/// allowance the first address had already spent, so a slow failed connect could double the declared budget.
+/// A refusal with no time left ends the fetch here rather than starting an attempt with a stale number.
+///
+/// The hop is a parameter so a test can prove the second attempt receives less time than the first without a
+/// firewall that drops packets.
+fn try_addresses<F>(
+    addresses: &[IpAddr],
+    deadline: Instant,
+    label: &str,
+    mut hop: F,
+) -> Result<Outcome, String>
+where
+    F: FnMut(IpAddr, u64) -> Result<Outcome, String>,
+{
+    let mut failure = None;
+    for (index, address) in addresses.iter().take(MAX_ADDRESSES).enumerate() {
+        // Expiry after a failed attempt must not replace the informative failure with "the deadline passed":
+        // a refused connect is what a person can act on. Only a first attempt with no time left has nothing
+        // better to say.
+        let max_time = match remaining_seconds(deadline) {
+            Ok(seconds) => seconds,
+            Err(expired) => return Err(failure.unwrap_or(expired)),
+        };
+        match hop(*address, max_time) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => {
+                let more = index + 1 < addresses.len() && index + 1 < MAX_ADDRESSES;
+                if more && another_address_may_help(&error) {
+                    failure = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(failure
+        .unwrap_or_else(|| format!("there is no address for `{}` to try", clip_ref(label, 80))))
 }
 
 /// The whole seconds one hop may spend out of the fetch's single deadline. A partial second left
@@ -1039,6 +1079,94 @@ mod tests {
         }
         assert!(addresses[0].is_ipv4(), "{addresses:?}");
         assert!(addresses.len() >= 2, "{addresses:?}");
+    }
+
+    /// Duplicates are removed before the order is chosen. `dedup()` after a family-only sort removed only
+    /// neighbours, so `[A, B, A]` kept A and could spend two attempts on one address.
+    #[test]
+    fn a_repeated_answer_is_kept_once() {
+        let a: IpAddr = "192.0.2.1".parse().expect("v4");
+        let b: IpAddr = "192.0.2.2".parse().expect("v4");
+        assert_eq!(order_addresses(vec![a, b, a]), vec![a, b]);
+        assert_eq!(order_addresses(vec![a, a, a]), vec![a]);
+    }
+
+    /// Four IPv4 answers must not push the only IPv6 answer past `MAX_ADDRESSES`. The first three attempts
+    /// cover both families.
+    #[test]
+    fn one_ipv6_answer_survives_four_ipv4_answers() {
+        let v4: Vec<IpAddr> = (1..=4)
+            .map(|last| format!("192.0.2.{last}").parse().expect("v4"))
+            .collect();
+        let v6: IpAddr = "2001:db8::1".parse().expect("v6");
+        let mut answers = v4.clone();
+        answers.push(v6);
+        let ordered = order_addresses(answers);
+        assert!(
+            ordered.iter().take(MAX_ADDRESSES).any(IpAddr::is_ipv6),
+            "{ordered:?}"
+        );
+        assert_eq!(ordered[0], v4[0]);
+        assert_eq!(ordered[1], v6);
+    }
+
+    /// The deadline is read again before every attempt. A first attempt that spends most of the budget must
+    /// leave the second one the remainder, not a fresh copy of the original allowance.
+    #[test]
+    fn a_second_address_is_handed_what_the_first_did_not_spend() {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let first: IpAddr = "192.0.2.1".parse().expect("v4");
+        let second: IpAddr = "192.0.2.2".parse().expect("v4");
+        let mut seen: Vec<(IpAddr, u64)> = Vec::new();
+        let result = try_addresses(
+            &[first, second],
+            deadline,
+            "http://example.test/",
+            |address, max_time| {
+                seen.push((address, max_time));
+                if address == first {
+                    std::thread::sleep(Duration::from_millis(2_500));
+                    Err("curl failed with exit 7".to_string())
+                } else {
+                    Ok(Outcome::Page(b"ok".to_vec()))
+                }
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "the second attempt did not land: {:?}",
+            result.err()
+        );
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[1].1 < seen[0].1,
+            "the second attempt was handed the first attempt's allowance: {seen:?}"
+        );
+    }
+
+    /// When the clock runs out after a failed attempt, the failure is what gets reported. Replacing it with
+    /// "the deadline passed" hides the one sentence a person can act on.
+    #[test]
+    fn expiry_after_a_failure_keeps_the_failure() {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(1_100);
+        let first: IpAddr = "192.0.2.1".parse().expect("v4");
+        let second: IpAddr = "192.0.2.2".parse().expect("v4");
+        let said = match try_addresses(
+            &[first, second],
+            deadline,
+            "http://example.test/",
+            |_, _| {
+                std::thread::sleep(Duration::from_millis(1_200));
+                Err("curl failed with exit 7: connection refused".to_string())
+            },
+        ) {
+            Ok(_) => panic!("nothing should have landed"),
+            Err(said) => said,
+        };
+        assert!(said.contains("exit 7"), "{said}");
+        assert!(!said.contains("deadline"), "{said}");
     }
 
     /// A loopback target, refused unless the caller's environment allows private targets. The
