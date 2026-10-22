@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "crossterm",
  "governance",

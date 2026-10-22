@@ -3,6 +3,35 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.22
+
+The release that closes the source audit, including the three holes the audit's review found in our own fix.
+
+- **`HADES_HOME` is not an exemption.** The state, config, vault, key, skill and workspace defaults all come
+  from one guarded accessor. `HADES_HOME` inside a vault or inside another agent's home exits 2 before
+  `init` writes anything. The TUI and the vision reader call the same accessor instead of reading the
+  environment themselves, and a config that names a vault is refused when memory is opened.
+- **The boundary agrees with the filesystem.** Symlinks are followed (including dangling ones, whose target
+  `mkdir -p` would have created), `..` is applied to the resolved path rather than the spelling, the marker
+  walk no longer stops after twelve parents, and both sides of the other-agent comparison are resolved so a
+  symlinked `$HOME` cannot invert it. Loops stop at 40 hops, which is what the kernel's `ELOOP` means anyway.
+- **The installer checks everything it writes.** `--home`, `--root` and `--prefix` are resolved and checked
+  before the binary is copied or any directory is created, in POSIX shell, with its own `readlink` walk.
+- **A failed Docker build can no longer pass.** `portable-build.sh` is `set -euo pipefail`, removes the
+  target before building, reads Docker's status without a masking pipe, and rejects a binary whose version
+  is not the manifest's. A relative `--src` is made absolute.
+- **The fetch deadline is per attempt, and DNS order cannot starve IPv6.** Addresses are deduplicated before
+  being interleaved by family; the clock is read before each attempt; an expiry after a failed attempt
+  reports the failure rather than replacing it.
+- **ARM64 ships and runs.** `hades-arm64-gnu` (glibc 2.31 floor) and `hades-arm64-musl` (static) are built
+  against staged sysroots without root, run under staged `qemu-aarch64` through version, doctor, init, an
+  offline pack export/add, a second add, and audit, and are re-verified after download in the release job.
+- **The numbers check themselves.** `ci-test.sh` writes the count only on success; `check-claims.sh` requires
+  the badge, table, prose and newest release section to agree with each other and with that run. The
+  self-test proves each home can fail.
+
+1095 tests, 12 live browser tests.
+
 ## 0.1.21
 
 The guard stopped naming one directory.

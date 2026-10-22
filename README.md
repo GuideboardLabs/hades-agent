@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.21-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1079%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.22-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1095%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,17 +52,17 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.21 |
+| **Version** | 0.1.22 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
 | **Work profiles** | `survey`, `fix`, `sweep`, `verify`, `record` |
 | **Isolation** | Landlock cage plus a deterministic safety floor |
-| **Platform** | Linux x86-64. `hades-portable` needs glibc 2.30+ (Ubuntu 20.04+, Debian 11+, RHEL 9+); `hades-musl` is static and runs on any x86-64 Linux, needing `curl` and GNU `tar` installed. Both built by `scripts/portable-build.sh` |
+| **Platform** | Linux, x86-64 and ARM64. x86-64: `hades-portable` needs glibc 2.30+ (Ubuntu 20.04+, Debian 11+, RHEL 9+); `hades-musl` is static, needing `curl` and GNU `tar`. ARM64: `hades-arm64-gnu` needs glibc 2.31+ (Ubuntu 20.04+, Debian 11+); `hades-arm64-musl` is static with the same curl/tar requirement. All four built by `scripts/portable-build.sh` and `scripts/arm64-build.sh`, and the ARM64 ones are run under qemu before release |
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1079 passing, 13 ignored (12 live browser) |
+| **Tests** | 1095 passing, 13 ignored (12 live browser) |
 
 ---
 
@@ -734,7 +734,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1079 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
+Current state: **1095 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -765,8 +765,10 @@ These are current limits, not aspirations hidden in a roadmap:
   characters of `TMPDIR`, the bind fails inside Chromium and it aborts. `hades` refuses such a state with
   the numbers instead of launching. The browser's own stderr is kept at `<state>/browser/chromium.log`.
 - `scripts/cross-check.sh` checks the workspace for `aarch64-unknown-linux-gnu` without root: it stages the
-  cross gcc under a prefix and points `CC_<target>` at it. CI installs the package instead
-  (`.github/workflows/cross.yml`).
+  cross gcc under a prefix and points `CC_<target>` at it. `scripts/arm64-build.sh` goes further and builds
+  both ARM64 release artifacts against staged sysroots, then runs them under `qemu-aarch64` (also staged
+  without root). The release workflow runs the same checks on the downloaded bytes; a machine that cannot
+  stage qemu reports a skip, and CI passes `--require` so a skip is a failure there.
 - The live browser suite is `cargo test -p harness --lib browser:: -- --ignored` (add `DISPLAY=:0` for the
   headed case). Twelve tests; all twelve pass on this machine.
 - `eval` can act outside the textual safety floor. It is an explicit escape hatch.
