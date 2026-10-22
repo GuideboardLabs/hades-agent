@@ -23,6 +23,12 @@ if [ "$status" -ne 0 ]; then
       echo "  $name"
       printf '::error title=failing test::%s\n' "$name"
     done
+    # The name says which test; the sentence after `panicked at` says why. Both go in the annotation, because
+    # a run whose log needs a signed-in account otherwise reports that something failed and nothing else.
+    grep -A1 "panicked at" "$OUT" | grep -v "panicked at" | grep -v "^--$" | sed 's/^[[:space:]]*//' | head -5 |
+      while IFS= read -r message; do
+        [ -n "$message" ] && printf '::error title=why::%s\n' "$(printf '%s' "$message" | cut -c1-280)"
+      done
     grep -E '^error(\[E[0-9]+\])?:' "$OUT" | head -20 | while read -r line; do
       printf '::error title=build::%s\n' "$line"
     done

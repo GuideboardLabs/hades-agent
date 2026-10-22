@@ -442,7 +442,14 @@ fn resolve(target: &Target, allow_private: bool) -> Result<IpAddr, String> {
                     ));
                 }
             }
-            answers[0]
+            // Pinning takes one address, so a name that answers both families needs an order. IPv4 goes
+            // first: a host that publishes both usually listens on both, and one that listens on v4 only
+            // otherwise turns a working name into "connection refused" on any machine whose resolver
+            // answers ::1 first, which is most of them. Both answers were judged above; this is only
+            // which one is tried.
+            let mut ordered = answers;
+            ordered.sort_by_key(|address| !address.is_ipv4());
+            ordered[0]
         }
     };
     if is_private(answer) && !allow_private {

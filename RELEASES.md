@@ -3,6 +3,24 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.18
+
+Three tests passed on a workstation and failed on the runner. Each assumed something about the machine, and one
+of the assumptions was a real defect.
+
+- **A dual-family name is pinned to IPv4 first.** `localhost` answers both `::1` and `127.0.0.1`, and the pin
+  took whichever the resolver listed first. On a host that listens on v4 only, a v6-first pin turns a working
+  name into "connection refused". Both answers are still validated; only the order changed.
+- **A PDF import without poppler names the tool.** The test now checks the complaint when `pdftotext` is absent
+  and the conversion when it is present, so a bare image checks the half of the behaviour it can.
+- **Confinement is checked only where the kernel can confine.** Without Landlock the cage is inert, which
+  `hades doctor` already reports; the test skips instead of asserting a denial that cannot happen.
+- **The gate says why, not just what.** Failure annotations now carry the panic sentence, the gate prints the
+  host it ran on as notices (platform, libc, Landlock ABI, transport, compatibility verdict), so a
+  runner-only failure is diagnosable without an account that can read the log.
+
+1079 tests, 12 live browser tests.
+
 ## 0.1.17
 
 Two things the first CI run found, both in the gate itself.

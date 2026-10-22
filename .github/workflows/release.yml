@@ -29,6 +29,14 @@ jobs:
       - name: Clippy
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: The host this gate ran on
+        working-directory: rust
+        run: |
+          cargo run -q -p harness --bin hades -- doctor 2>/dev/null \
+            | grep -E "platform|libc|landlock|sqlite|tar |fetch transport|compatibility" \
+            | sed 's/^[[:space:]]*//' | head -8 | while IFS= read -r line; do
+                echo "::notice::$line"
+              done || true
       - name: Tests
         working-directory: rust
         run: bash scripts/ci-test.sh

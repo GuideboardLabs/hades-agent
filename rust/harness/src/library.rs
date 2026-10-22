@@ -2026,6 +2026,37 @@ mod tests {
 
     #[test]
     fn a_pdf_is_converted_with_pdftotext() {
+        // poppler is not part of a base image, and the import path has to say so rather than fail obscurely.
+        // The test asserts the message when it is absent and the conversion when it is present, so a machine
+        // without the tool checks the half of the behaviour that exists there instead of going red.
+        let has_tool = std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_ok();
+        if !has_tool {
+            eprintln!("skipping PDF conversion: pdftotext is not installed");
+            let root = temp("library-pdf-missing");
+            let source = root.join("paper.pdf");
+            fs::write(&source, tiny_pdf("Hello")).expect("a pdf");
+            let library = Library::open(root.join("library")).expect("a library");
+            // Extraction may happen at import or on first read, so the complaint has to be found wherever
+            // this version raises it.
+            let said = match library.add_path(&source, &AddOptions::default()) {
+                Ok(report) => match report.added.first() {
+                    Some(entry) => match library.text(&entry.entry.id) {
+                        Ok(_) => String::new(),
+                        Err(error) => error,
+                    },
+                    None => "the import reported nothing".to_string(),
+                },
+                Err(error) => error,
+            };
+            assert!(
+                said.contains("pdftotext"),
+                "an import without pdftotext must name it: {said}"
+            );
+            return;
+        }
         let root = temp("library-pdf");
         let source = root.join("paper.pdf");
         fs::write(&source, tiny_pdf("Hello from a PDF library")).expect("a pdf");

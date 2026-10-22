@@ -3238,6 +3238,16 @@ mod tests {
             &client,
             &|_, _| {},
         );
+        // Landlock is the mechanism, and a kernel without it cannot be asked to demonstrate this. The
+        // degradation is reported by `hades doctor` and is a property of the host, not of the code, so the
+        // check is skipped there instead of asserting a denial that cannot happen.
+        if crate::cage::abi() == 0 {
+            eprintln!(
+                "skipping the confinement check: this kernel has no Landlock (abi {}), so the cage is inert",
+                crate::cage::abi()
+            );
+            return;
+        }
         assert!(!said.contains("a secret"), "{said}");
         assert!(said.contains("Permission denied"), "{said}");
 
