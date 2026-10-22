@@ -32,8 +32,12 @@ pub struct Run {
 }
 
 impl Run {
+    /// A run passed only if it exited zero *and* was not killed on the deadline. The status alone is not
+    /// enough: a shell can exit 0 while a background child holds the output open, and the command that was
+    /// asked for never finished. `status` is normalised to -1 in that case, but the second half of the test
+    /// is what the contract says.
     pub fn passed(&self) -> bool {
-        self.status == 0
+        self.status == 0 && !self.timed_out
     }
 }
 
@@ -184,7 +188,7 @@ fn run_inner(
 
     let started = std::time::Instant::now();
     let mut timed_out = false;
-    let status = loop {
+    let mut status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {}
@@ -231,7 +235,10 @@ fn run_inner(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // The shell said it was done; the command was not. Recording its zero here would let a
+                    // `Run` claim success and a deadline at the same time.
                     timed_out = true;
+                    status = -1;
                     end_group(&mut child, child_pid);
                     break;
                 }
@@ -454,6 +461,12 @@ mod tests {
         );
         assert!(run.timed_out, "{run:?}");
         assert!(run.output.contains("wall-clock deadline"), "{}", run.output);
+        // The shell exited 0; the command did not finish. A run cannot claim both.
+        assert_eq!(
+            run.status, -1,
+            "a timed-out run kept the shell's exit status"
+        );
+        assert!(!run.passed(), "a timed-out run reported that it passed");
     }
 
     #[test]

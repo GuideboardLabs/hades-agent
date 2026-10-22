@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.1-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1046%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.2-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1048%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.1 |
+| **Version** | 0.1.2 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -61,7 +61,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1046 passing, 13 ignored live tests |
+| **Tests** | 1048 passing, 13 ignored live tests |
 
 ---
 
@@ -156,7 +156,10 @@ a safety-floor category.
   the run, the start time and the goal. Nothing is replayed automatically.
 - **The process seals itself.** `PR_SET_DUMPABLE` is cleared at startup, so a caged child cannot read the
   runtime's own environment out of `/proc/<parent>/environ`; a cleared child environment is not enough on
-  its own. `HADES_ALLOW_PTRACE=1` opts out for a debugger.
+  its own. The flag belongs to the process and is reset by `execve`, so the guarantee is about the runtime's
+  own entry, which is the one holding the keys, not a permanent restriction on everything it starts. A
+  failure to set it stops the process, because a runtime that keeps running unsealed is a runtime that
+  accepted the risk silently; `HADES_ALLOW_PTRACE=1` is the explicit way to accept it.
 - **The boundary** refuses `~/.hermes` and the live knowledge vault by default, so a coding run cannot
   wander into the second brain.
 
@@ -682,7 +685,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1046 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
+Current state: **1048 passing, 0 failing, 13 ignored** across the workspace. The ignored thirteen are the live browser suite; all thirteen pass with a browser and a display.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

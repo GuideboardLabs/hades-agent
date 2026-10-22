@@ -57,6 +57,7 @@ struct Api {
     easy_setopt: unsafe extern "C" fn(Curl, c_int, ...) -> c_int,
     easy_perform: unsafe extern "C" fn(Curl) -> c_int,
     easy_getinfo: unsafe extern "C" fn(Curl, c_int, ...) -> c_int,
+    global_init: unsafe extern "C" fn(c_long) -> c_int,
     easy_reset: unsafe extern "C" fn(Curl),
     easy_cleanup: unsafe extern "C" fn(Curl),
     easy_strerror: unsafe extern "C" fn(c_int) -> *const c_char,
@@ -90,7 +91,8 @@ fn api() -> Option<&'static Api> {
                     std::mem::transmute::<*mut c_void, $kind>(found)
                 }};
             }
-            return Some(Api {
+            let api = Api {
+                global_init: symbol!("curl_global_init", unsafe extern "C" fn(c_long) -> c_int),
                 easy_init: symbol!("curl_easy_init", unsafe extern "C" fn() -> Curl),
                 easy_setopt: symbol!(
                     "curl_easy_setopt",
@@ -112,7 +114,19 @@ fn api() -> Option<&'static Api> {
                     unsafe extern "C" fn(Slist, *const c_char) -> Slist
                 ),
                 slist_free_all: symbol!("curl_slist_free_all", unsafe extern "C" fn(Slist)),
-            });
+            };
+            // libcurl's own documentation says implicit initialisation is not safe on every platform, and
+            // the thread-safety of the explicit call only arrived in 7.84. `OnceLock::get_or_init` makes
+            // the call happen exactly once even when several research workers reach the pool together, so
+            // the first fetch cannot race the second on a distribution that still ships 7.81.
+            static INIT: OnceLock<bool> = OnceLock::new();
+            // CURL_GLOBAL_DEFAULT is 3: SSL plus the platform's own setup. The result is kept, not re-run:
+            // a second call would be harmless in libcurl, but on a failure every fetch should take the
+            // process path rather than try the same broken library again.
+            if !*INIT.get_or_init(|| (api.global_init)(3) == 0) {
+                return None;
+            }
+            return Some(api);
         }
         None
     })
@@ -124,7 +138,9 @@ fn api() -> Option<&'static Api> {
 /// turn four research workers into a queue; this keeps them parallel without an async runtime.
 static FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-/// More than this many concurrent fetches queue for a handle. The workers are bounded well below it.
+/// How many idle handles are kept for reuse. This is not a cap on concurrency: a fetch that finds the
+/// free list empty creates a handle of its own, and one that returns to a full list is closed. Connection
+/// reuse is what the pool is for, and the research workers are bounded well below this number.
 const MAX_HANDLES: usize = 8;
 
 /// A handle borrowed from the pool. Dropping it returns the handle, whatever path the transfer took,
@@ -249,7 +265,13 @@ pub fn get(
     // The pin: per transfer, host spelled as the URL spelled it.
     let mut list: Slist = std::ptr::null_mut();
     if host.parse::<std::net::IpAddr>().is_err() {
-        let entry = CString::new(format!("{host}:{port}:{address}:{port}")).ok()?;
+        // The entry is colon-separated, so an IPv6 address has to be bracketed or its own colons read as
+        // more fields. Without this, a pinned fetch works on IPv4 and fails wherever IPv6 is preferred.
+        let target = match address {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        let entry = CString::new(format!("{host}:{port}:{target}:{port}")).ok()?;
         list = unsafe { (api.slist_append)(list, entry.as_ptr()) };
         if list.is_null() {
             return None;

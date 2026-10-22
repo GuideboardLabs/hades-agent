@@ -435,10 +435,13 @@ boundary needs the cage, or a container around it.
 The cage grants `/proc` in both modes, because ordinary tools read `/proc/cpuinfo` and `/proc/self` and a
 runtime that hides them breaks more than it protects. A cleared environment is therefore not enough on its
 own: `/proc/<parent>/environ` is a file like any other, and a same-user child could read the keys the
-runtime was started with. The runtime makes itself non-dumpable at startup (`PR_SET_DUMPABLE`), which closes
-that read for the whole process tree, and `HADES_ALLOW_PTRACE=1` is the way back in when a debugger is the
-tool that is needed. On a host whose Yama `ptrace_scope` already refuses a child reading its parent, the seal
-is a second lock rather than the only one.
+runtime was started with. The runtime makes *itself* non-dumpable at startup (`PR_SET_DUMPABLE`), which
+closes that read of its own entry; the attribute is per process and is reset across `execve`, so it is not an
+inherited restriction on the programs it starts. That is enough for the risk, because the keys are in the
+runtime's environment and not in a child's. A failure to set it stops the process rather than continuing
+unsealed, and `HADES_ALLOW_PTRACE=1` is the explicit way to accept the trade when a debugger is the tool
+needed. On a host whose Yama `ptrace_scope` already refuses a child reading its parent, the seal is a second
+lock rather than the only one.
 
 ### What decides the work is done
 

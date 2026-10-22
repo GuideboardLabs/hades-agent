@@ -3,6 +3,34 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.2
+
+A re-audit of 0.1.1 found one regression and five smaller edges. Each was reproduced before it was changed.
+
+- **Local vision cold start.** `systemd-run` exits 0 as soon as the unit exists, while the model is still
+  loading. 0.1.1 treated any exit as a failed launch, so a first local vision call failed on a cold start.
+  Exit 0 now moves on to watching the unit and `/health`; only a non-zero exit is an error, and a wait that
+  runs out stops the unit by name. The test starts a launcher that exits 0 at once and a health endpoint that
+  answers only on the third probe.
+- **A timed-out run kept the shell's status.** A shell that exited 0 while a background child held the pipe
+  produced `status: 0` with `timed_out: true`, and `passed()` said true. The status is normalised to -1 and
+  `passed()` requires that the run did not time out.
+- **The fetch pin was malformed for IPv6.** `CURLOPT_CONNECT_TO` entries are colon-separated, so an IPv6
+  address has to be bracketed; without it a pinned fetch fails wherever IPv6 is preferred.
+- **libcurl is initialised explicitly.** `curl_global_init` runs once through a `OnceLock` before any handle
+  exists, which matters on distributions that still ship a libcurl from before 7.84, where the explicit call
+  is what makes first use thread-safe.
+- **A failed seal is fatal.** A runtime that cannot make itself non-dumpable no longer proceeds to accept
+  model-executed commands; `HADES_ALLOW_PTRACE=1` is the explicit way past it. Help and version output still
+  print, with the reason.
+- **The pool comment was wrong.** `MAX_HANDLES` bounds idle retained handles, not concurrent transfers; the
+  comment says so now.
+- **Local vision port override.** `HADES_VISION_PORT` moves the local server off 8123, for a host where that
+  port is taken or two models are wanted.
+
+The `PR_SET_DUMPABLE` guarantee is stated more narrowly in the README and `HADES.md`: per process, reset by
+`execve`.
+
 ## 0.1.1
 
 This release answers an external audit of 0.1.0. Five defects were reproduced before they were changed; one

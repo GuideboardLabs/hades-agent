@@ -18,6 +18,15 @@ const DEFAULT_MODEL: &str = "models/Qwen3VL-8B-Instruct-Q4_K_M.gguf";
 const DEFAULT_PROJECTOR: &str = "models/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf";
 const PORT: u16 = 8123;
 
+/// The port the local server listens on. A host that already has something on 8123, or that wants two
+/// models at once, sets `HADES_VISION_PORT`; the default stays where every earlier install expects it.
+fn port() -> u16 {
+    std::env::var("HADES_VISION_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(PORT)
+}
+
 fn env_or(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
 }
@@ -104,7 +113,7 @@ pub fn describe(path: &Path, question: &str) -> Result<String, String> {
         None => {
             ensure_server()?;
             (
-                format!("http://127.0.0.1:{PORT}/v1/chat/completions"),
+                format!("http://127.0.0.1:{}/v1/chat/completions", port()),
                 "qwen3vl".to_string(),
                 None,
             )
@@ -190,7 +199,7 @@ fn ensure_server() -> Result<(), String> {
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
-        .arg(PORT.to_string())
+        .arg(port().to_string())
         .arg("-c")
         .arg("4096")
         .arg("-ngl")
@@ -203,48 +212,74 @@ fn ensure_server() -> Result<(), String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("could not start {binary}: {error}"))?;
-    let mut child = child;
+    // `systemd-run` returns as soon as the transient unit exists. Exit 0 means the unit is starting, not
+    // that the server has answered, so only a non-zero exit is a failed launch. Once it has exited there
+    // is no child to keep, and the unit is stopped by name if the wait runs out.
+    let mut child = Some(child);
     let started = Instant::now();
     let mut checked_unit = Instant::now();
     loop {
         if healthy() {
-            *held = Some(child);
+            if let Some(child) = child.take() {
+                *held = Some(child);
+            }
             return Ok(());
         }
-        // `systemd-run` exits as soon as the transient unit is started, so a non-zero status here is the
-        // launch itself failing: no user manager, no binary, a rejected property. Waiting four minutes
-        // for a server that was never started is the bug this replaces.
-        if let Ok(Some(status)) = child.try_wait() {
-            let said = child
-                .stderr
-                .take()
-                .and_then(|mut pipe| {
-                    use std::io::Read;
-                    let mut text = String::new();
-                    pipe.read_to_string(&mut text).ok().map(|_| text)
-                })
-                .unwrap_or_default();
-            return Err(format!(
-                "the vision server was not started: systemd-run exited {}: {}",
-                status.code().unwrap_or(-1),
-                clip(said.trim(), 300)
-            ));
+        let exited = match child.as_mut() {
+            Some(running) => match running.try_wait() {
+                Ok(Some(status)) => Some((status, running.stderr.take())),
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some((status, pipe)) = exited {
+            child = None;
+            if !status.success() {
+                let said = pipe
+                    .and_then(|mut pipe| {
+                        use std::io::Read;
+                        let mut text = String::new();
+                        pipe.read_to_string(&mut text).ok().map(|_| text)
+                    })
+                    .unwrap_or_default();
+                return Err(format!(
+                    "the vision server was not started: systemd-run exited {}: {}",
+                    status.code().unwrap_or(-1),
+                    clip(said.trim(), 300)
+                ));
+            }
         }
         // The unit can also fail after `systemd-run` returns; asking systemd is cheaper than waiting out
         // the clock, and its last lines say why.
         if checked_unit.elapsed() >= Duration::from_secs(15) {
             checked_unit = Instant::now();
             if let Some(reason) = unit_failure() {
-                let _ = child.kill();
+                stop_unit();
+                if let Some(mut child) = child.take() {
+                    let _ = child.kill();
+                }
                 return Err(reason);
             }
         }
         if started.elapsed() >= Duration::from_secs(240) {
-            let _ = child.kill();
+            stop_unit();
+            if let Some(mut child) = child.take() {
+                let _ = child.kill();
+            }
             return Err("the vision server did not become healthy in four minutes".to_string());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Stop the transient unit. Used when the wait ran out and `systemd-run` is long gone: the child this
+/// function started is only the launcher, and killing it would leave the server running.
+fn stop_unit() {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "hades-vision"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Why the vision unit is not running, in systemd's own words, or `None` while it is starting or up.
@@ -291,7 +326,7 @@ fn healthy() -> bool {
             "%{http_code}",
             "--max-time",
             "2",
-            "http://127.0.0.1:8123/health",
+            &format!("http://127.0.0.1:{}/health", port()),
         ])
         .output();
     matches!(probe, Ok(out) if out.status.success() && out.stdout == b"200")
@@ -372,6 +407,104 @@ pub fn base64_for_test(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `systemd-run` exits 0 as soon as the unit exists, while the model is still loading. Treating that
+    /// exit as a failed launch made every first local vision call fail; the wait has to continue against
+    /// the health endpoint and the unit.
+    #[test]
+    fn a_successful_launch_keeps_waiting_for_the_model() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        // A port of this test's own: the default is a real service on some hosts, and a test that skips
+        // when it is busy proves nothing about the branch.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                // The first two probes land while the model is loading: close without an answer.
+                if index < 2 {
+                    continue;
+                }
+                let body = r#"{"status":"ok"}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let directory = std::env::temp_dir().join(format!(
+            "hades-vision-cold-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or(0)
+        ));
+        let bin = directory.join("bin");
+        std::fs::create_dir_all(&bin).expect("a bin directory");
+        // A launcher that exits 0 at once, and a systemctl that reports no failed unit.
+        std::fs::write(bin.join("systemd-run"), "#!/bin/sh\nexit 0\n").expect("a systemd-run");
+        std::fs::write(bin.join("systemctl"), "#!/bin/sh\nexit 1\n").expect("a systemctl");
+        std::fs::write(bin.join("journalctl"), "#!/bin/sh\nexit 1\n").expect("a journalctl");
+        for name in ["systemd-run", "systemctl", "journalctl"] {
+            let mut permissions = std::fs::metadata(bin.join(name))
+                .expect("the script")
+                .permissions();
+            use std::os::unix::fs::PermissionsExt as _;
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(bin.join(name), permissions).expect("an executable");
+        }
+        let model = directory.join("model.gguf");
+        let projector = directory.join("mmproj.gguf");
+        std::fs::write(&model, b"stub").expect("a model file");
+        std::fs::write(&projector, b"stub").expect("a projector file");
+
+        let old_path = std::env::var_os("PATH");
+        let joined = std::env::join_paths(std::iter::once(bin.clone()).chain(
+            std::env::split_paths(old_path.as_deref().unwrap_or_default()),
+        ))
+        .expect("a PATH");
+        // SAFETY: no other test reads these variables; the stub endpoint test sets a different pair and does
+        // not reach the local launcher.
+        unsafe {
+            std::env::set_var("PATH", &joined);
+            std::env::set_var("HADES_VISION_PORT", port.to_string());
+            std::env::set_var("HADES_VISION_BIN", "llama-server");
+            std::env::set_var("HADES_VISION_MODEL", &model);
+            std::env::set_var("HADES_VISION_PROJECTOR", &projector);
+        }
+
+        let started = Instant::now();
+        let result = ensure_server();
+        unsafe {
+            std::env::remove_var("HADES_VISION_PORT");
+            std::env::remove_var("HADES_VISION_BIN");
+            std::env::remove_var("HADES_VISION_MODEL");
+            std::env::remove_var("HADES_VISION_PROJECTOR");
+            if let Some(path) = old_path {
+                std::env::set_var("PATH", path);
+            }
+        }
+        let waited = started.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "a launcher that exited 0 was treated as a failure: {result:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(500),
+            "the wait did not survive an unhealthy probe: {waited:?}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+        drop(server);
+    }
 
     /// A configured endpoint is used instead of starting a local model, and the request it receives is
     /// the OpenAI vision shape. Without this, the image tool is tied to one machine's GGUF files.

@@ -1136,6 +1136,53 @@ mod tests {
     /// This is the regression the pool of handles exists to prevent: one easy handle behind a mutex is
     /// held for the whole blocking transfer, so research workers that should run together queue behind
     /// each other. The fallback path also passes, which is the point of asserting on the tool.
+    /// `CURLOPT_CONNECT_TO` is colon-separated, so an IPv6 address has to be bracketed. This exercises the
+    /// pinned path directly against `::1`; without the brackets libcurl reads the address as more fields and
+    /// the transfer fails on any IPv6-capable host.
+    #[test]
+    fn a_pinned_fetch_reaches_an_ipv6_address() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(_) => {
+                eprintln!("skipping: this host has no IPv6 loopback");
+                return;
+            }
+        };
+        let port = listener.local_addr().expect("an address").port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let body = "over v6";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let url = format!("http://v6.test:{port}/");
+        let answer = crate::fetch_pool::get(
+            &url,
+            "v6.test",
+            port,
+            "::1".parse().expect("an address"),
+            5_000,
+            4096,
+            None,
+        )
+        .expect("the pool handles the transfer")
+        .expect("the pinned transfer");
+        assert_eq!(answer.0, 200);
+        assert_eq!(String::from_utf8_lossy(&answer.1), "over v6");
+        handle.join().expect("the fixture");
+    }
+
     #[test]
     fn fetches_in_different_threads_do_not_queue() {
         let site = slow_site(std::time::Duration::from_millis(250), "slow");

@@ -61,3 +61,21 @@ The first two are the audit's top two items; the third is the regression its opt
 No async HTTP framework, no per-domain egress proxy, no automatic replay of uncertain side effects, no
 hardcoded verifier model, no claim that a verified citation proves a conclusion. The audit agrees; the
 reasons are already in the README and `HADES.md`.
+
+## Re-audit of 0.1.1
+
+A second review of 0.1.1 found one regression, one result-contract bug and four portability edges. All six
+were reproduced or read directly in the source before being changed.
+
+| Finding | What changed | Test |
+|---|---|---|
+| A successful `systemd-run` exit was treated as a failed local vision launch | Only a non-zero exit is a failure; exit 0 moves on to watching the unit and `/health`; the unit is stopped by name when the wait runs out | `vision::tests::a_successful_launch_keeps_waiting_for_the_model` (a launcher that exits 0 at once, a health endpoint that answers only on the third probe) |
+| A timed-out run could keep `status: 0` and `passed(): true` | `status` is normalised to -1 when the stream deadline expires, and `passed()` requires `!timed_out` | `command::tests::a_background_child_cannot_hold_the_deadline_open` now asserts both |
+| The `CONNECT_TO` pin was malformed for IPv6 | The address is bracketed for `IpAddr::V6` | `fetch::tests::a_pinned_fetch_reaches_an_ipv6_address` against `::1` |
+| libcurl was initialised implicitly by the first handle | `curl_global_init` is called once, through a `OnceLock`, before any handle is made | the pool tests exercise the initialised path on every run |
+| A failed seal let the runtime continue holding keys | A seal failure stops every invocation that can run a program; help and version still print, with the reason | manual: `HADES_ALLOW_PTRACE=1` is the only way past it |
+| The pool's `MAX_HANDLES` comment claimed a concurrency cap | The comment now states what the code does: idle handles retained, not a limit on parallel transfers | — |
+
+The guarantee around `PR_SET_DUMPABLE` was also narrowed in `README.md` and `HADES.md`: the attribute is per
+process and reset by `execve`, so the seal protects the runtime's own entry, which holds the keys, and is not
+a permanent restriction on the tree.
