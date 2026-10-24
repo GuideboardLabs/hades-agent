@@ -316,8 +316,9 @@ impl OpenAi {
             temperature: 0.2,
             // Room to think and then answer. A thinking model given 1024 tokens spends all of them
             // reasoning and returns nothing at all, which is worse than a wrong program: there is nothing
-            // to read. Unused headroom costs nothing, because the model stops when it is done.
-            max_tokens: 4096,
+            // to read. Unused headroom costs nothing, because the model stops when it is done. Beam
+            // spends a 4096-token cap on a hard turn and never starts the answer.
+            max_tokens: 16_384,
             timeout: Duration::from_secs(180),
             // Conservative by default, because the alternative is asking a model for more than its window
             // and having the server truncate silently, which is the worst outcome of the three: a context
@@ -593,7 +594,7 @@ impl OpenAi {
         };
         let mut content = String::new();
         let mut reasoning = String::new();
-        let mut usage: Option<(u64, u64)> = None;
+        let mut usage: Option<(u64, u64, u64)> = None;
         let mut saw = false;
         let started = Instant::now();
         let body = self.body(task, bundle, budget, true);
@@ -639,7 +640,7 @@ impl OpenAi {
                     .get("completion_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                usage = Some((prompt, generated));
+                usage = Some((prompt, generated, cached_of(found)));
             }
         })?;
         let elapsed = started.elapsed();
@@ -649,7 +650,7 @@ impl OpenAi {
             return self.once(task, bundle, budget);
         }
         let program = extract(&content);
-        let (prompt_tokens, generated_tokens) = usage.unwrap_or((0, 0));
+        let (prompt_tokens, generated_tokens, cached_tokens) = usage.unwrap_or((0, 0, 0));
         if let Some(edit_answer) = crate::patch::edits_from(&program) {
             let answer = match edit_answer {
                 Ok(edits) => ModelAnswer::editing(edits),
@@ -658,6 +659,7 @@ impl OpenAi {
             return Ok(answer
                 .with_usage(Usage {
                     prompt_tokens,
+                    cached_tokens,
                     generated_tokens,
                     millis: elapsed.as_millis(),
                     reasoning_chars: reasoning.chars().count() as u64,
@@ -670,6 +672,7 @@ impl OpenAi {
         let answer = ModelAnswer::new(program)
             .with_usage(Usage {
                 prompt_tokens,
+                cached_tokens,
                 generated_tokens,
                 millis: elapsed.as_millis(),
                 reasoning_chars: reasoning.chars().count() as u64,
@@ -677,6 +680,15 @@ impl OpenAi {
             .with_reasoning(reasoning.clone());
         Ok(answer)
     }
+}
+
+/// Cached prompt tokens, in either shape a provider reports them.
+fn cached_of(usage: &serde_json::Value) -> u64 {
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
 }
 
 impl OpenAi {
@@ -868,6 +880,7 @@ impl OpenAi {
                 .pointer("/usage/prompt_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            cached_tokens: cached_of(parsed.get("usage").unwrap_or(&serde_json::Value::Null)),
             generated_tokens: parsed
                 .pointer("/usage/completion_tokens")
                 .and_then(|v| v.as_u64())
@@ -1200,6 +1213,164 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_error_frame_is_retried_and_not_hidden_as_an_empty_stream() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let answers = [
+                "data: {\"error\":{\"message\":\"429 rate limit reached\"}}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            ];
+            for answer in answers {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(),
+                    answer
+                )
+                .expect("write");
+            }
+        });
+
+        let client = OpenAi::new(
+            format!("http://{}/v1/chat/completions", address),
+            "test-model",
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let reply = client
+            .chat(&messages, None, &mut |_, _| {})
+            .expect("the second attempt answers");
+        assert_eq!(reply.content, "ok");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_reasoning_only_answer_at_the_cap_is_retried_with_a_bigger_cap() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let answers = [
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            ];
+            for answer in answers {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(),
+                    answer
+                )
+                .expect("write");
+            }
+        });
+
+        let client = OpenAi::new(
+            format!("http://{}/v1/chat/completions", address),
+            "test-model",
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let reply = client
+            .chat_with_cap(&messages, None, 4_096, &mut |_, _| {})
+            .expect("the bigger cap answers");
+        assert_eq!(reply.content, "ok");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn an_empty_turn_is_retried_with_one_nudge_and_no_repeat_of_the_same_silence() {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let answers = [
+                "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            ];
+            let mut bodies = Vec::new();
+            for answer in answers {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("header");
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().expect("length");
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).expect("body");
+                bodies.push(String::from_utf8_lossy(&body).to_string());
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(),
+                    answer
+                )
+                .expect("write");
+            }
+            bodies
+        });
+
+        let client = OpenAi::new(
+            format!("http://{}/v1/chat/completions", address),
+            "test-model",
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "shell", "parameters": {"type": "object"}}}
+        ]);
+        let reply = client
+            .chat(&messages, Some(&tools), &mut |_, _| {})
+            .expect("the forced call answers");
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].name, "shell");
+        let bodies = server.join().expect("server");
+        assert!(
+            bodies[1].contains("Continue with the next step."),
+            "the retry must carry a nudge: {}",
+            bodies[1]
+        );
+        assert!(
+            bodies[1].contains("\"tool_choice\":\"required\""),
+            "the first retry must force a call: {}",
+            bodies[1]
+        );
+        assert!(
+            bodies[2].contains("\"tool_choice\":\"required\""),
+            "the last attempt must force a call: {}",
+            bodies[2]
+        );
+    }
+
+    #[test]
     fn a_key_can_be_read_out_of_a_dotenv_file() {
         let text = "OTHER=1\n# a comment\nOLLAMA_API_KEY=abc123\nLATER=z\n";
         assert_eq!(
@@ -1277,119 +1448,215 @@ impl OpenAi {
         cap: u64,
         feed: FeedFn<'_>,
     ) -> Result<Reply, Fault> {
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": cap.min(u32::MAX as u64),
-            "stream": true,
-        });
-        if self.usage_log.is_some() {
-            body["stream_options"] = serde_json::json!({"include_usage": true});
-        }
-        if let Some(tools) = tools {
-            body["tools"] = tools.clone();
-        }
+        let mut cap = cap;
+        // A model can end a turn with nothing at all after a tool result: finish "stop", no
+        // content, no call. Repeating the identical request buys the same silence, so the retry
+        // carries one short user nudge. It is for this request only and never enters the session.
+        let mut nudged: Option<Vec<serde_json::Value>> = None;
         let mut headers: Vec<(&str, String)> =
             vec![("Content-Type", "application/json".to_string())];
         if let Some(key) = &self.key {
             headers.push(("Authorization", format!("Bearer {}", key.resolve()?)));
         }
-        let mut reply = Reply::default();
-        let started = std::time::Instant::now();
-        let mut partial: std::collections::BTreeMap<u64, ToolCall> =
-            std::collections::BTreeMap::new();
-        http::stream(
-            &self.target,
-            &body.to_string(),
-            &headers,
-            self.timeout,
-            &mut |line| {
-                let Some(data) = line.trim().strip_prefix("data:") else {
-                    return;
-                };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    return;
+        let mut last_fault = String::from("the endpoint streamed neither an answer nor a tool call");
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let wait = if attempt == 1 { 1_000 } else { 3_000 };
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+            }
+            let mut body = serde_json::json!({
+                "model": self.model,
+                "messages": nudged.as_deref().unwrap_or(messages),
+                "temperature": self.temperature,
+                "max_tokens": cap.min(u32::MAX as u64),
+                "stream": true,
+            });
+            if self.usage_log.is_some() {
+                body["stream_options"] = serde_json::json!({"include_usage": true});
+            }
+            if let Some(tools) = tools {
+                body["tools"] = tools.clone();
+                // The first retry forces an action. A model that has decided the task is finished
+                // answers an empty turn no matter how it is asked; a required tool call is the one
+                // instruction it cannot satisfy with silence.
+                if attempt >= 1 {
+                    body["tool_choice"] = serde_json::json!("required");
                 }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                    return;
-                };
-                // Usage-only frames have an empty choices array and must be read before delta.
-                if let Some(usage) = value.get("usage").filter(|usage| {
-                    usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
-                        || usage
-                            .get("completion_tokens")
-                            .and_then(Value::as_u64)
-                            .is_some()
-                }) {
-                    reply.usage = Some(Usage {
-                        prompt_tokens: usage
-                            .get("prompt_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        generated_tokens: usage
-                            .get("completion_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        ..Usage::default()
-                    });
-                }
-                let Some(delta) = value.pointer("/choices/0/delta") else {
-                    return;
-                };
-                if let Some(piece) = delta.get("content").and_then(|v| v.as_str())
-                    && !piece.is_empty()
-                {
-                    reply.content.push_str(piece);
-                    feed(Feed::Content, piece);
-                }
-                for field in ["reasoning_content", "reasoning", "thinking"] {
-                    if let Some(piece) = delta.get(field).and_then(|v| v.as_str())
+            }
+            let mut reply = Reply::default();
+            let started = std::time::Instant::now();
+            let mut partial: std::collections::BTreeMap<u64, ToolCall> =
+                std::collections::BTreeMap::new();
+            let mut reasoning_chars = 0usize;
+            let mut provider_error: Option<String> = None;
+            let mut finish_reason = String::new();
+            let streamed = http::stream(
+                &self.target,
+                &body.to_string(),
+                &headers,
+                self.timeout,
+                &mut |line| {
+                    let Some(data) = line.trim().strip_prefix("data:") else {
+                        return;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        return;
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                        return;
+                    };
+                    // A provider-side failure arrives as data, not as an HTTP status. Read it,
+                    // or the turn reports an empty stream and hides the reason.
+                    if let Some(error) = value.get("error") {
+                        provider_error = Some(
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .or_else(|| error.as_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| error.to_string()),
+                        );
+                        return;
+                    }
+                    // Usage-only frames have an empty choices array and must be read before delta.
+                    if let Some(usage) = value.get("usage").filter(|usage| {
+                        usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
+                            || usage
+                                .get("completion_tokens")
+                                .and_then(Value::as_u64)
+                                .is_some()
+                    }) {
+                        reply.usage = Some(Usage {
+                            prompt_tokens: usage
+                                .get("prompt_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            cached_tokens: cached_of(usage),
+                            generated_tokens: usage
+                                .get("completion_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            ..Usage::default()
+                        });
+                    }
+                    if let Some(reason) = value
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(Value::as_str)
+                    {
+                        finish_reason = reason.to_string();
+                    }
+                    let Some(delta) = value.pointer("/choices/0/delta") else {
+                        return;
+                    };
+                    if let Some(piece) = delta.get("content").and_then(|v| v.as_str())
                         && !piece.is_empty()
                     {
-                        feed(Feed::Reasoning, piece);
+                        reply.content.push_str(piece);
+                        feed(Feed::Content, piece);
                     }
-                }
-                if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                    for call in calls {
-                        let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let slot = partial.entry(index).or_default();
-                        if let Some(id) = call.get("id").and_then(|v| v.as_str())
-                            && !id.is_empty()
+                    for field in ["reasoning_content", "reasoning", "thinking"] {
+                        if let Some(piece) = delta.get(field).and_then(|v| v.as_str())
+                            && !piece.is_empty()
                         {
-                            slot.id = id.to_string();
+                            reasoning_chars += piece.chars().count();
+                            feed(Feed::Reasoning, piece);
                         }
-                        if let Some(function) = call.get("function") {
-                            if let Some(name) = function.get("name").and_then(|v| v.as_str())
-                                && !name.is_empty()
+                    }
+                    if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for call in calls {
+                            let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let slot = partial.entry(index).or_default();
+                            if let Some(id) = call.get("id").and_then(|v| v.as_str())
+                                && !id.is_empty()
                             {
-                                slot.name = name.to_string();
+                                slot.id = id.to_string();
                             }
-                            if let Some(arguments) =
-                                function.get("arguments").and_then(|v| v.as_str())
-                            {
-                                slot.arguments.push_str(arguments);
+                            if let Some(function) = call.get("function") {
+                                if let Some(name) = function.get("name").and_then(|v| v.as_str())
+                                    && !name.is_empty()
+                                {
+                                    slot.name = name.to_string();
+                                }
+                                if let Some(arguments) =
+                                    function.get("arguments").and_then(|v| v.as_str())
+                                {
+                                    slot.arguments.push_str(arguments);
+                                }
                             }
                         }
                     }
+                },
+            );
+            if let Err(fault) = streamed {
+                last_fault = fault.detail().to_string();
+                if attempt < 2 {
+                    continue;
                 }
-            },
-        )?;
-        reply.calls = partial.into_values().collect();
-        if let Some(usage) = &mut reply.usage {
-            usage.millis = started.elapsed().as_millis();
-            if let Some(log) = &self.usage_log
-                && let Ok(mut log) = log.lock()
-            {
-                log.push(*usage);
+                return Err(Fault::model(last_fault));
             }
+            if let Some(message) = provider_error {
+                last_fault = format!("the endpoint reported: {message}");
+                let transient = {
+                    let text = last_fault.to_lowercase();
+                    [
+                        "429", "500", "502", "503", "504", "overload", "rate limit", "timeout",
+                        "temporar", "try again",
+                    ]
+                    .iter()
+                    .any(|needle| text.contains(needle))
+                };
+                if transient && attempt < 2 {
+                    continue;
+                }
+                return Err(Fault::model(last_fault));
+            }
+            reply.calls = partial.into_values().collect();
+            if let Some(usage) = &mut reply.usage {
+                usage.millis = started.elapsed().as_millis();
+                if let Some(log) = &self.usage_log
+                    && let Ok(mut log) = log.lock()
+                {
+                    log.push(*usage);
+                }
+            }
+            if reply.content.trim().is_empty() && reply.calls.is_empty() {
+                // A thinking model that spent the whole cap gets one bigger cap. Anything else,
+                // including a turn that reasoned for a few characters and then stopped, is a
+                // stochastic empty answer: the same request can answer on the next try, and one
+                // nudge makes the retry a different request rather than a repeat.
+                if finish_reason == "length" && cap < 16_384 {
+                    cap = (cap * 2).min(16_384);
+                    continue;
+                }
+                last_fault = if reasoning_chars > 0 {
+                    format!(
+                        "the model reasoned {reasoning_chars} characters and produced no answer \
+                         or tool call (finish: {})",
+                        if finish_reason.is_empty() {
+                            "none"
+                        } else {
+                            finish_reason.as_str()
+                        }
+                    )
+                } else {
+                    "the endpoint streamed neither an answer nor a tool call".to_string()
+                };
+                if attempt < 2 {
+                    if nudged.is_none() {
+                        let mut wire = messages.to_vec();
+                        wire.push(serde_json::json!({
+                            "role": "user",
+                            "content": "Continue with the next step."
+                        }));
+                        nudged = Some(wire);
+                    }
+                    continue;
+                }
+                return Err(Fault::model(last_fault));
+            }
+            return Ok(reply);
         }
-        if reply.content.trim().is_empty() && reply.calls.is_empty() {
-            return Err(Fault::model(
-                "the endpoint streamed neither an answer nor a tool call".to_string(),
-            ));
-        }
-        Ok(reply)
+        Err(Fault::model(last_fault))
     }
 }

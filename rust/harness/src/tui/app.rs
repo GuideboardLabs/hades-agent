@@ -145,6 +145,7 @@ pub struct App {
     pub closing: bool,
     pub usage: Arc<Mutex<Vec<crate::task::Usage>>>,
     pub saved_input_tokens: u64,
+    pub saved_cached_tokens: u64,
     pub saved_output_tokens: u64,
     pub tabs_area: Rect,
     pub content_area: Rect,
@@ -207,6 +208,7 @@ impl App {
             closing: false,
             usage: Arc::new(Mutex::new(Vec::new())),
             saved_input_tokens: 0,
+            saved_cached_tokens: 0,
             saved_output_tokens: 0,
             tabs_area: Rect::default(),
             content_area: Rect::default(),
@@ -306,6 +308,11 @@ impl App {
             self.saved_output_tokens + log.iter().map(|u| u.generated_tokens).sum::<u64>(),
             log.len(),
         )
+    }
+    /// Prompt tokens the provider served from its prefix cache, across the session.
+    pub fn cached_tokens(&self) -> u64 {
+        let log = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        self.saved_cached_tokens + log.iter().map(|u| u.cached_tokens).sum::<u64>()
     }
     pub fn refresh(&mut self) {
         if self.options.demo {
@@ -645,7 +652,7 @@ impl App {
         backend::save_session(
             &self.options.state,
             &self.id,
-            &json!({"version":1,"id":self.id,"root":self.options.root,"model":self.options.model,"title":self.title,"messages":self.messages.iter().map(Message::json).collect::<Vec<_>>(),"transcript":self.transcript,"input_tokens":input,"output_tokens":output,"in_progress":self.busy,"draft":self.input.text}),
+            &json!({"version":1,"id":self.id,"root":self.options.root,"model":self.options.model,"title":self.title,"messages":self.messages.iter().map(Message::json).collect::<Vec<_>>(),"transcript":self.transcript,"input_tokens":input,"cached_tokens":self.cached_tokens(),"output_tokens":output,"in_progress":self.busy,"draft":self.input.text}),
         )
     }
     pub fn resume(&mut self, id: &str) -> Result<(), String> {
@@ -690,6 +697,7 @@ impl App {
             self.messages.push(Message::new("system", "The previous process ended during a turn. Partial output is preserved. Inspect the activity ledger before retrying; an action may have completed."));
         }
         self.saved_input_tokens = value["input_tokens"].as_u64().unwrap_or(0);
+        self.saved_cached_tokens = value["cached_tokens"].as_u64().unwrap_or(0);
         self.saved_output_tokens = value["output_tokens"].as_u64().unwrap_or(0);
         self.usage = Arc::new(Mutex::new(Vec::new()));
         self.switch(View::Chat);
@@ -809,6 +817,7 @@ impl App {
                 self.chat_cache = None;
                 self.title = "Ready for your next task".into();
                 self.saved_input_tokens = 0;
+                self.saved_cached_tokens = 0;
                 self.saved_output_tokens = 0;
                 self.usage = Arc::new(Mutex::new(Vec::new()));
                 self.governed = None;
@@ -836,6 +845,13 @@ impl App {
                     self.options.model = argument.into();
                     self.options.endpoint = None;
                     self.options.key = None;
+                    self.quota = Quota::pending(self.options.provider());
+                    self.quota_checked = None;
+                    self.refresh();
+                    self.status = format!("Model changed to {argument} for this session");
+                } else if self.options.endpoint.is_some() {
+                    // A model id on the endpoint in use (an account model, not a bundled preset).
+                    self.options.model = argument.into();
                     self.quota = Quota::pending(self.options.provider());
                     self.quota_checked = None;
                     self.refresh();
@@ -948,9 +964,37 @@ impl App {
         self.selected = 0;
         self.overlay_scroll = 0;
     }
+    /// Model ids the current account serves, written by the installer or `hades models --refresh`.
+    /// Missing or malformed means "no extra models", never an error at paint time.
+    fn account_models() -> Vec<String> {
+        let home = std::env::var_os("HADES_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".hades"))
+            });
+        let Some(home) = home else {
+            return Vec::new();
+        };
+        std::fs::read_to_string(home.join("models.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+            .unwrap_or_default()
+    }
+
     pub fn palette_items(&self) -> Vec<(String, String)> {
         let query = self.query.text.to_lowercase();
         if matches!(self.overlay, Some(Overlay::Models)) {
+            // When the account's model list exists, that is the list: the bundled presets are a
+            // fallback for a build with no provider catalog, not a substitute for the account.
+            let account = Self::account_models();
+            if !account.is_empty() {
+                return account
+                    .into_iter()
+                    .filter(|id| id.to_lowercase().contains(&query))
+                    .map(|id| (id, String::new()))
+                    .collect();
+            }
             crate::model::presets()
                 .into_iter()
                 .filter(|p| p.id.to_lowercase().contains(&query))
@@ -974,7 +1018,10 @@ impl App {
                 ) {
                     self.query.insert(&text.replace('\n', " "));
                 } else if self.overlay.is_none() {
-                    self.input.insert(&text);
+                    // A pasted multi-line prompt must keep its word boundaries: the field is one
+                    // line, and dropping the newline without a space welds "ReleaseGate" to the
+                    // next word.
+                    self.input.insert(&text.replace('\n', " "));
                 }
             }
             InputEvent::Mouse(mouse) if self.overlay.is_none() => match mouse.kind {

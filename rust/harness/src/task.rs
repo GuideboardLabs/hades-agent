@@ -55,6 +55,11 @@ impl Budget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
+    /// Of `prompt_tokens`, how many the provider served from its prefix cache. A long agent loop
+    /// re-sends the whole transcript every step, so this is the difference between "60M tokens of
+    /// work" and "60M tokens, almost all of them re-reads". Zero means the provider said nothing,
+    /// not that nothing was cached.
+    pub cached_tokens: u64,
     pub generated_tokens: u64,
     pub millis: u128,
     /// Characters of reasoning the model produced before its answer, when the endpoint reported any. The

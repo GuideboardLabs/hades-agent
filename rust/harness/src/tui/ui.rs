@@ -1198,7 +1198,7 @@ fn overlay(f: &mut Frame, app: &App) {
     let title = match overlay {
         Overlay::Help => "HELP",
         Overlay::Palette => "COMMAND PALETTE",
-        Overlay::Models => "MODEL PRESETS",
+        Overlay::Models => "MODELS",
         Overlay::Find => "FIND IN CONVERSATION",
         Overlay::Detail(title, _) => title,
         Overlay::Approval(_) => "REVIEW APPROVAL",

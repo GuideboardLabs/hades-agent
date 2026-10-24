@@ -245,9 +245,14 @@ fn cancellation_repairs_tool_protocol_and_compaction_drops_whole_turns() {
     backend::repair_tool_history(&mut messages);
     assert_eq!(messages[4]["tool_call_id"], "b");
     assert_eq!(messages[5]["role"], "user");
-    backend::compact_context(&mut messages, 100);
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[1]["content"], "new");
+    crate::agent::compact_context(&mut messages, 100);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "system");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("trimmed from context"));
+    assert_eq!(messages[2]["content"], "new");
 }
 
 #[test]

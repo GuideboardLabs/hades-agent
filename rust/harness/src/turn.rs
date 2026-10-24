@@ -811,6 +811,7 @@ fn total(
             let right = right.unwrap_or_default();
             Some(crate::task::Usage {
                 prompt_tokens: left.prompt_tokens + right.prompt_tokens,
+                cached_tokens: left.cached_tokens + right.cached_tokens,
                 generated_tokens: left.generated_tokens + right.generated_tokens,
                 millis: left.millis + right.millis,
                 reasoning_chars: left.reasoning_chars + right.reasoning_chars,

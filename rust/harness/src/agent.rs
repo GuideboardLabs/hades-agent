@@ -722,9 +722,23 @@ pub fn answer_stoppable(
     // model gets a refusal instead of a fourth result, and the ledger says why. Keyed on the exact name and
     // arguments, so two similar reads are not conflated.
     let mut repeats: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    // Meta tools are easy to graze on: a turn that calls recall or session_search a hundred times
+    // is exploring its own machinery instead of doing the task. Cap them per turn; the model gets a
+    // refusal and carries on with the tools that do the work.
+    let mut used: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    const TOOL_BUDGETS: &[(&str, u32)] = &[("session_search", 2), ("recall", 2), ("goal", 4), ("skills", 8), ("remember", 2), ("library", 2), ("web_search", 25), ("fetch", 60)];
     for _ in 0..steps {
         if stopped() {
             return Ok(None);
+        }
+        // A turn can run for hundreds of steps, and one user message means the old turn-boundary
+        // compactor never fired. Trim with hysteresis: cut at 1.5x the working set back to 0.75x,
+        // so a transcript hovering at the limit does not drop one message on every single step.
+        let cap = client.context().min(WORKING_SET);
+        if estimate_tokens(messages) > cap + cap / 2 {
+            compact_context(messages, cap - cap / 4);
+            // The read results the model just lost are not a loop; let it fetch them again.
+            repeats.clear();
         }
         // A message from the parent is read at a step boundary, before the model is asked. It cannot
         // interrupt the call already in flight, and it does not count as the model's own turn: the
@@ -766,6 +780,16 @@ pub fn answer_stoppable(
             if text.is_empty() {
                 return Err(Fault::model("the model answered with nothing".to_string()));
             }
+            // A model can leak its tool-call syntax as plain text. That is not an answer: no tool
+            // ran, and returning it ends the turn on a malformed line. Nudge it back to the tool
+            // interface and take another step instead.
+            if leaked_tool_call(&text) {
+                messages.push(json!({
+                    "role": "user",
+                    "content": "That was a malformed tool call printed as text; no tool ran. Use the tool interface and continue the task."
+                }));
+                continue;
+            }
             return Ok(Some(text));
         }
         let calls: Vec<Value> = reply
@@ -792,19 +816,38 @@ pub fn answer_stoppable(
             }
             let label = label(&call.name, &call.arguments);
             activity(Activity::Start, &label);
+            if let Some((_, cap)) = TOOL_BUDGETS.iter().find(|(name, _)| *name == call.name) {
+                let n = used.entry(call.name.clone()).and_modify(|n| *n += 1).or_insert(1);
+                if *n > *cap {
+                    let said = format!(
+                        "Refused: this turn has used its {} call(s) to `{}`. Continue the task with the tools that do the work.",
+                        cap, call.name
+                    );
+                    messages.push(json!({"role": "tool", "tool_call_id": call.id, "content": said}));
+                    activity(Activity::End, &label);
+                    continue;
+                }
+            }
             let key = format!("{}:{}", call.name, call.arguments);
-            let count = repeats.entry(key).and_modify(|n| *n += 1).or_insert(1);
-            if repeats_refuse(*count) {
+            // Read-only tools are not loops. After a trim the model may legitimately need the same
+            // file again, and refusing the read leaves it no way to rebuild its working set.
+            let guarded = repeat_guarded(&call.name);
+            let count = if guarded {
+                *repeats.entry(key).and_modify(|n| *n += 1).or_insert(1)
+            } else {
+                1
+            };
+            if guarded && repeats_refuse(count) {
                 let said = format!(
                     "Refused: `{}` with exactly these arguments has run {} times in this answer. Say what you learned, or change the call.",
-                    call.name, *count
+                    call.name, count
                 );
                 decided(
                     world,
                     "repeat",
                     &label,
                     "refuse",
-                    "the same call repeated three times",
+                    "the same call repeated twice",
                     "",
                 );
                 messages.push(json!({
@@ -817,17 +860,46 @@ pub fn answer_stoppable(
             }
             let result =
                 execute_with_stop(&call.name, &call.arguments, world, client, activity, stop);
+            let result = cap_tool_output(result);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": result
             }));
+            // A write makes a repeat a fresh check, so the guard forgets the earlier call.
+            if matches!(call.name.as_str(), "write_file" | "patch") {
+                repeats.clear();
+            }
             activity(Activity::End, &label);
+        }
+    }
+    // The bound was reached while the model was still calling tools. That is a turn that ran out of
+    // steps, not a failed model: ask once for a status with no tools, so the person gets a report and
+    // the loop ends cleanly. The synthetic request is a copy and never enters the session.
+    let mut closing = messages.clone();
+    closing.push(json!({
+        "role": "user",
+        "content": format!(
+            "You have reached this turn's limit of {steps} tool steps. Do not call tools. Reply with a short status: what is done, what remains, and the next command to run."
+        )
+    }));
+    if let Ok(reply) = client.chat(&closing, None, feed) {
+        let text = reply.content.trim().to_string();
+        if !text.is_empty() {
+            return Ok(Some(text));
         }
     }
     Err(Fault::model(format!(
         "stopped after {steps} steps without an answer"
     )))
+}
+
+fn leaked_tool_call(text: &str) -> bool {
+    if text.contains("</rfl") || text.contains("<|tool") || text.contains("<function=") {
+        return true;
+    }
+    let first = text.lines().next().unwrap_or("").trim_start();
+    first.split_whitespace().next().is_some_and(|word| word.ends_with("to="))
 }
 
 pub(crate) fn label(name: &str, arguments: &str) -> String {
@@ -889,11 +961,50 @@ pub(crate) fn label(name: &str, arguments: &str) -> String {
     }
 }
 
-/// The same exact call is refused on its third occurrence in one answer.
+/// The same exact call is refused on its third occurrence in one answer, unless a file was
+/// written since it last ran: a write makes the repeat a new check rather than a loop.
 const REPEATS: u32 = 3;
+
+/// The working set for a long turn. Quality first: 400k keeps the whole plan and its evidence in
+/// view, which is what the 90.5 run had. A trim at 1.5x is only a guard against a runaway transcript.
+pub const WORKING_SET: usize = 400_000;
 
 fn repeats_refuse(count: u32) -> bool {
     count >= REPEATS
+}
+
+/// Only mutating or expensive calls are loop-guarded. A repeat read after a context trim is how the
+/// model rebuilds what it lost; refusing it turns a trim into an infinite exploration loop.
+fn repeat_guarded(name: &str) -> bool {
+    !matches!(
+        name,
+        "read_file" | "list_dir" | "search" | "grep" | "skills" | "recall" | "remember"
+            | "session_search" | "goal"
+    )
+}
+
+/// A tool result is data, not an invitation to dump a whole file into the next prompt. Keep the
+/// head and the tail, where the exit code lives, and say how much was dropped. 16k keeps a full
+/// source file in view while still bounding a runaway dump.
+const TOOL_OUTPUT_LIMIT: usize = 16_000;
+
+fn cap_tool_output(text: String) -> String {
+    if text.len() <= TOOL_OUTPUT_LIMIT {
+        return text;
+    }
+    let head: String = text.chars().take(12_000).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(2_000)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n\n[harness] output truncated: {} bytes total. Read the file in ranges or grep for the part you need.\n\n{tail}",
+        text.len()
+    )
 }
 
 /// The person's pre-tool hooks, from `<state>/hooks.json`: `{"pre_tool": ["test -f .hades-allow"]}`.
@@ -2105,7 +2216,14 @@ fn shell(args: &Value, world: &World) -> String {
     if let Err(error) = std::fs::create_dir_all(&scratch) {
         return format!("could not make the scratch directory: {error}");
     }
-    let cage = crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network());
+    let skills = world.state.join("skills");
+    if let Err(error) = std::fs::create_dir_all(&skills) {
+        return format!("could not make the skills directory: {error}");
+    }
+    let cage = crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network())
+        // The skills directory is the agent's own state. A skill that cannot be installed there
+        // cannot be found by the skills tool, so the install step has to be able to write it.
+        .also_writable(skills);
     let deadline = Some(std::time::Duration::from_secs(seconds));
     match crate::command::run_within_in(
         command,
@@ -2851,6 +2969,61 @@ pub fn estimate_tokens(messages: &[Value]) -> usize {
                 + 8
         })
         .sum()
+}
+
+/// Keep the system preamble and the current task, then as many of the newest messages as fit.
+/// The old compactor only dropped whole user turns, so a single long turn (one user message,
+/// hundreds of tool steps) never shrank. This trims the middle instead, never the task, and
+/// starts the kept tail on a complete group so no tool result is orphaned.
+pub fn compact_context(messages: &mut Vec<Value>, limit: usize) {
+    if estimate_tokens(messages) <= limit {
+        return;
+    }
+    let system = messages
+        .first()
+        .filter(|message| message["role"] == "system")
+        .cloned();
+    let Some(start) = messages.iter().rposition(|message| message["role"] == "user") else {
+        return;
+    };
+    let mut used = estimate_tokens(&messages[start..start + 1]);
+    if let Some(system) = &system {
+        used += estimate_tokens(std::slice::from_ref(system));
+    }
+    let mut keep_from = messages.len();
+    while keep_from > start + 1 {
+        let index = keep_from - 1;
+        let cost = estimate_tokens(&messages[index..index + 1]);
+        if used + cost > limit && keep_from < messages.len() {
+            break;
+        }
+        used += cost;
+        keep_from = index;
+    }
+    // Back up over tool results so the tail does not begin with a result whose call was dropped.
+    while keep_from > start + 1 && messages[keep_from]["role"] == "tool" {
+        keep_from -= 1;
+    }
+    let head = usize::from(system.is_some());
+    let dropped_before = start.saturating_sub(head);
+    let dropped_after = keep_from.saturating_sub(start + 1);
+    let dropped = dropped_before + dropped_after;
+    if dropped == 0 {
+        return;
+    }
+    let mut trimmed = Vec::with_capacity(messages.len() - dropped + 1);
+    if let Some(system) = system {
+        trimmed.push(system);
+    }
+    trimmed.push(json!({
+        "role": "user",
+        "content": format!(
+            "[harness] {dropped} earlier messages were trimmed from context to stay inside the working set. The current task follows. Continue from the state on disk; do not redo completed checks."
+        )
+    }));
+    trimmed.push(messages[start].clone());
+    trimmed.extend_from_slice(&messages[keep_from..]);
+    *messages = trimmed;
 }
 
 /// Where a compression may cut, and where it may not.
@@ -3756,6 +3929,71 @@ mod tests {
         assert!(!repeats_refuse(2));
         assert!(repeats_refuse(3));
         assert!(repeats_refuse(4));
+    }
+
+    #[test]
+    fn reads_are_not_loop_guarded_but_shell_and_writes_are() {
+        assert!(!repeat_guarded("read_file"));
+        assert!(!repeat_guarded("list_dir"));
+        assert!(!repeat_guarded("skills"));
+        assert!(repeat_guarded("shell"));
+        assert!(repeat_guarded("write_file"));
+        assert!(repeat_guarded("patch"));
+    }
+
+    #[test]
+    fn a_large_tool_result_keeps_its_head_and_tail_and_says_what_it_dropped() {
+        let text = format!("{}{}", "a".repeat(10_000), "z".repeat(10_000));
+        let capped = cap_tool_output(text);
+        assert!(capped.len() < 16_000, "capped length {}", capped.len());
+        assert!(capped.contains("output truncated: 20000 bytes"));
+        assert!(capped.starts_with("aaa"));
+        assert!(capped.ends_with("zzz"));
+    }
+
+    #[test]
+    fn a_single_long_turn_is_trimmed_around_its_task() {
+        let mut messages = vec![
+            json!({"role":"system","content":"preamble"}),
+            json!({"role":"user","content":"build the thing"}),
+        ];
+        for i in 0..300 {
+            let id = format!("c{i}");
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":id,"type":"function","function":{"name":"shell","arguments":"{\"command\":\"echo x\"}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":"x".repeat(1_000)}));
+        }
+        assert!(estimate_tokens(&messages) > 64_000);
+        compact_context(&mut messages, 64_000);
+        assert!(
+            estimate_tokens(&messages) <= 66_000,
+            "still {} tokens",
+            estimate_tokens(&messages)
+        );
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[2]["content"].as_str().unwrap().contains("build the thing"));
+        assert_ne!(messages[3]["role"], "tool", "the tail orphaned a tool result");
+        assert_eq!(messages.last().unwrap()["role"], "tool");
+        assert!(messages
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|c| c.contains("trimmed from context"))));
+    }
+
+    #[test]
+    fn compaction_keeps_the_newest_task_not_the_first() {
+        let mut messages = vec![json!({"role":"system","content":"preamble"})];
+        for task in 0..4 {
+            messages.push(json!({"role":"user","content":format!("task {task}")}));
+            let id = format!("c{task}");
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":id,"type":"function","function":{"name":"shell","arguments":"{\"command\":\"echo x\"}"}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":id,"content":"y".repeat(200_000)}));
+        }
+        compact_context(&mut messages, 64_000);
+        assert!(messages
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|c| c == "task 3")));
+        assert!(!messages
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|c| c == "task 0")));
     }
 
     #[test]
