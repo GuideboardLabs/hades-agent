@@ -726,7 +726,7 @@ pub fn answer_stoppable(
     // is exploring its own machinery instead of doing the task. Cap them per turn; the model gets a
     // refusal and carries on with the tools that do the work.
     let mut used: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    const TOOL_BUDGETS: &[(&str, u32)] = &[("session_search", 2), ("recall", 2), ("goal", 4), ("skills", 8), ("remember", 2), ("library", 2), ("web_search", 25), ("fetch", 60)];
+    const TOOL_BUDGETS: &[(&str, u32)] = &[("session_search", 2), ("recall", 2), ("goal", 4), ("skills", 8), ("remember", 2), ("library", 2), ("web_search", 25), ("fetch", 60), ("shell", 120)];
     for _ in 0..steps {
         if stopped() {
             return Ok(None);
@@ -808,7 +808,16 @@ pub fn answer_stoppable(
             "content": reply.content,
             "tool_calls": calls
         }));
-        for call in &reply.calls {
+        // A model that answers with hundreds of calls in one batch is not thinking in steps; it is
+        // writing a script and hoping. Cap the batch so a runaway answer costs one turn, not a run.
+        const MAX_CALLS_PER_ANSWER: usize = 40;
+        if reply.calls.len() > MAX_CALLS_PER_ANSWER {
+            for call in &reply.calls[MAX_CALLS_PER_ANSWER..] {
+                messages.push(json!({"role": "tool", "tool_call_id": call.id,
+                    "content": format!("Refused: this answer proposed {} calls; only the first {} ran. Continue in the next step with the calls that matter.", reply.calls.len(), MAX_CALLS_PER_ANSWER)}));
+            }
+        }
+        for call in reply.calls.iter().take(MAX_CALLS_PER_ANSWER) {
             // The side effect boundary. A stop that arrived while the model was writing this call means the
             // call is not made: the person asked for the work to end, not for one more step of it.
             if stopped() {
