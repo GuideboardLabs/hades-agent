@@ -373,7 +373,7 @@ pub fn check_until(text: &str) -> Result<String, String> {
 
 /// The start of a local calendar day, from a strict `YYYY-MM-DD`. `date` knows the zone; this crate
 /// still does not carry a calendar library.
-fn day_start(text: &str) -> Option<i64> {
+pub(crate) fn day_start(text: &str) -> Option<i64> {
     let text = text.trim();
     let mut parts = text.split('-');
     let (year, month, day) = (parts.next()?, parts.next()?, parts.next()?);
@@ -399,7 +399,7 @@ fn day_start(text: &str) -> Option<i64> {
 
 /// Whether the job's last day is behind us. The last day itself is included: `until: 2026-11-01` means
 /// the 1st may still run, and the 2nd may not.
-fn expired(job: &Job, now: i64) -> bool {
+pub(crate) fn expired(job: &Job, now: i64) -> bool {
     if job.until.is_empty() {
         return false;
     }

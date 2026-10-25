@@ -76,6 +76,12 @@ pub fn step(job: &Job, pending: Option<&Pending>, now: i64) -> Option<Step> {
             previous: String::new(),
         });
     }
+    // A pending try does not outlive the job's `until` date. `due` already refuses an expired job, but a
+    // retry reaches this function on the other path, and running one after the cutoff would be a model
+    // call the schedule promised not to make.
+    if crate::cron::expired(job, now) {
+        return None;
+    }
     let pending = pending?;
     if pending.at > now || pending.attempt >= ATTEMPTS {
         return None;
@@ -262,6 +268,67 @@ mod tests {
         assert_eq!(next.attempt, 2);
         assert_eq!(next.window, "2@1000", "the same occurrence");
         assert_eq!(next.previous, "endpoint refused");
+    }
+
+    fn job_until(last: i64, until: &str) -> Job {
+        Job {
+            until: until.to_string(),
+            ..job(last)
+        }
+    }
+
+    #[test]
+    fn a_pending_retry_does_not_outlive_the_until_date() {
+        // A try was saved before midnight; the process restarts after it. The scheduler must not resume
+        // the retry, even though its time has come.
+        let start = crate::cron::day_start("2026-10-24").expect("a date");
+        let now = start + 86_400 + 60;
+        let pending = Pending {
+            window: "2@1".to_string(),
+            attempt: 1,
+            at: 0,
+            error: "endpoint refused".to_string(),
+        };
+        assert_eq!(step(&job_until(now - 60, "2026-10-24"), Some(&pending), now), None);
+    }
+
+    #[test]
+    fn a_pending_retry_still_runs_before_the_until_date() {
+        // The same pending try, an hour before midnight: the retry is allowed, and it keeps its occurrence.
+        let start = crate::cron::day_start("2026-10-24").expect("a date");
+        let now = start + 3_600;
+        let pending = Pending {
+            window: "2@1".to_string(),
+            attempt: 1,
+            at: 0,
+            error: "endpoint refused".to_string(),
+        };
+        let next = step(&job_until(now - 60, "2026-10-24"), Some(&pending), now).expect("the retry");
+        assert_eq!(next.attempt, 2);
+        assert_eq!(next.window, "2@1");
+    }
+
+    #[test]
+    fn a_persisted_retry_is_refused_after_a_restart_past_until() {
+        // The recovery case: the pending try is on disk before the cutoff, the process restarts after
+        // midnight, and the scheduler must make no model call.
+        let state = scratch("until-restart");
+        let start = crate::cron::day_start("2026-10-24").expect("a date");
+        again(
+            &state,
+            2,
+            &Step {
+                window: "2@1".to_string(),
+                attempt: 1,
+                previous: String::new(),
+            },
+            0,
+            "endpoint refused",
+        )
+        .expect("the pending try");
+        let reread = read(&state, 2).expect("persisted across the restart");
+        let now = start + 86_400 + 60;
+        assert_eq!(step(&job_until(now - 60, "2026-10-24"), Some(&reread), now), None);
     }
 
     #[test]

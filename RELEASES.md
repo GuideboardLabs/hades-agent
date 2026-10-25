@@ -3,6 +3,14 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## Unreleased
+
+- **A pending retry cannot outlive `until`.** `cron::due` already refused an expired job, but `retry::step`
+  reached a pending retry on the other path, so a try saved before the cutoff resumed after it and made a
+  model call the schedule had promised not to make. The expiry check now runs before the pending branch,
+  and a recovery test persists a try, re-reads it as a restart would, and asserts no step is returned.
+  Reported by [@ownlocus](https://x.com/ownlocus) on X.
+
 ## 0.1.22
 
 The release that closes the source audit, including the three holes the audit's review found in our own fix.
