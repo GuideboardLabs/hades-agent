@@ -1,6 +1,6 @@
 //! Fetch one URL N times through the tool and report the per-fetch time.
 //!
-//! The comparison in `docs/fetch-benchmark.md` needs a number for the path the tool actually takes, not
+//! The fetch comparison needs a number for the path the tool actually takes, not
 //! for a shell loop around curl. This runs the real policy, resolve, pin and read.
 //!
 //! `cargo run --release --example bench_fetch -- http://127.0.0.1:8000/ 50`

@@ -443,8 +443,8 @@ for reproducible visual checks. Fifteen `tui::tests` cover responsive views, ani
 response formats, streamed usage, a real local HTTP/SSE tool-call exchange, private session storage,
 and resume, and run as part of `cargo test --workspace`. The PTY check exercises the command palette,
 paste, view switching, resizing, clean exit, terminal restoration, and the absence of demo writes.
-See [TUI-VALIDATION.txt](TUI-VALIDATION.txt) for the original branch validation, the merge
-revalidation, and the kernel limitation.
+The original branch validation, the merge revalidation, and the kernel limitation are recorded in
+the release notes.
 To reimport the artwork from its original HTML, run
 `python3 harness/tests/import_tui_skull.py /path/to/index.html` from `rust/` with Pillow installed.
 This development helper extracts the embedded PNG without executing the HTML's JavaScript.
@@ -784,8 +784,8 @@ These are current limits, not aspirations hidden in a roadmap:
   started with `-q` first, so a `~/.curlrc` cannot set one either. libcurl before 7.85 gets the
   legacy protocol bitmask instead of the string option, so Ubuntu 22.04 keeps the pool rather than silently
   dropping to the slow path; `hades doctor` prints which transport is live and which protocol options it
-  uses. The numbers and the guarantees both paths keep are in
-  [`docs/fetch-benchmark.md`](docs/fetch-benchmark.md).
+  uses. The numbers and the guarantees both paths keep are recorded in the 0.1.x
+  release notes.
 - Unix-socket connects are refused by Landlock only on ABI 9 (Linux 7.1). This is a property of the
   kernel, not of the cage: on an ABI 8 kernel the same protection is `--cage strict`, which narrows the
   paths a caged program may reach. `hades doctor` prints the ABI and names the flag.

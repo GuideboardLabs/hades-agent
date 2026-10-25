@@ -22,3 +22,19 @@ mneme.db
 /rust/.test-count
 coverage/
 *.profraw
+
+# Internal working notes (never published)
+/docs/plans/
+/docs/audit-*.md
+/docs/*-plan.md
+/notes/
+
+# OS and editor junk
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+__pycache__/
+*.pyc
+.venv/
+node_modules/
