@@ -21,6 +21,7 @@
 
 pub mod children;
 pub mod goal;
+pub mod lease;
 pub mod session;
 pub mod telegram;
 
@@ -1679,200 +1680,260 @@ fn stop_gateway(children: &children::Registry) -> usize {
     drained
 }
 
+/// The gateway's long-lived half: one recovery pass, one lease, one scheduler and one heartbeat. A
+/// surface builds it once and may call [`Runtime::run`] again after a transport failure without starting a
+/// second set of background threads or replaying recovery against a live process.
+pub struct Runtime {
+    socket: PathBuf,
+    state: PathBuf,
+    settings: Settings,
+    children: children::Registry,
+    signals: Arc<Signals>,
+    mcp: Arc<crate::mcp::Mcp>,
+    /// Held for the life of the runtime. Dropping it releases the state directory for the next process.
+    _lease: lease::Lease,
+}
+
+impl Runtime {
+    /// Take the state directory and, when `background` is given, start the scheduler and the heartbeat
+    /// against that transport. The transport is a clone of the surface's own handle: background work posts
+    /// into the same chats, so it has to outlive a reconnect. A surface that reconnects keeps one handle and
+    /// reconnects inside it, rather than handing the runtime a fresh one.
+    pub fn new<T: Transport + Clone + Send + 'static>(
+        surface: &str,
+        socket: PathBuf,
+        state: PathBuf,
+        settings: Settings,
+        background: Option<T>,
+    ) -> Result<Runtime, String> {
+        let lease = lease::Lease::take(&state, surface)?;
+        // A child is a thread in this process, so records a dead process left behind name work that ended
+        // with it. Recovery marks them lost before the gateway admits anything new; nothing is resumed.
+        let children = children::Registry::new(&state);
+        match children.recover() {
+            Ok(report) if report.files == 0 => {}
+            Ok(report) => {
+                if report.marked > 0 {
+                    eprintln!(
+                        "children: {} live child(ren) from a previous gateway are marked lost",
+                        report.marked
+                    );
+                }
+                for path in &report.unreadable {
+                    eprintln!("children: {path}: the record would not parse; left in place");
+                }
+                for said in &report.failed {
+                    eprintln!("children: could not mark a lost child: {said}");
+                }
+                debug_assert_eq!(report.accounted(), report.files);
+            }
+            Err(said) => eprintln!("children: could not recover the registry: {said}"),
+        }
+        // The old single-list shape becomes one file per job before anything schedules it.
+        match crate::cron::migrate(&state) {
+            Ok(0) => {}
+            Ok(count) => eprintln!(
+                "cron: imported {count} job(s) into {}",
+                crate::cron::dir(&state).display()
+            ),
+            Err(said) => eprintln!("cron: could not import the old job list: {said}"),
+        }
+        // One registry for the life of the gateway: a server started for one message is the server the next
+        // message reaches, which is what makes an MCP server with state worth configuring.
+        let mcp = Arc::new(crate::mcp::Mcp::new(
+            settings.mcp.clone(),
+            Some(PathBuf::from(&settings.root)),
+        ));
+        let signals = Arc::new(Signals::default());
+        if let Some(transport) = background {
+            {
+                let worker = transport.clone();
+                let settings = settings.clone();
+                let state = state.clone();
+                let mcp = Arc::clone(&mcp);
+                std::thread::spawn(move || scheduler(worker, settings, state, mcp));
+            }
+            {
+                // The heartbeat is a second thread beside the scheduler, not a cron schedule: it continues
+                // a conversation that already exists, and cron's shape is a new run that reports into a chat.
+                let worker = transport.clone();
+                let settings = settings.clone();
+                let state = state.clone();
+                let socket = socket.clone();
+                let mcp = Arc::clone(&mcp);
+                let signals = Arc::clone(&signals);
+                std::thread::spawn(move || heartbeat(worker, settings, state, socket, mcp, signals));
+            }
+        }
+        Ok(Runtime {
+            socket,
+            state,
+            settings,
+            children,
+            signals,
+            mcp,
+            _lease: lease,
+        })
+    }
+
+    /// Poll one transport until it fails, `/shutdown` ends the surface, or `--once` has drained its batch.
+    /// A transport error is returned to the caller; calling `run` again on the same runtime resumes without
+    /// duplicating background work.
+    pub fn run<T: Transport + Clone + Send + 'static>(
+        &mut self,
+        mut transport: T,
+        once: bool,
+    ) -> Result<(), String> {
+        let socket = self.socket.clone();
+        let state = self.state.clone();
+        let settings = self.settings.clone();
+        let signals = Arc::clone(&self.signals);
+        let mcp = Arc::clone(&self.mcp);
+        let mut offset = load_offset(&state);
+        let mut pending: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        loop {
+            if signals.stopped() {
+                // `/shutdown` is the end of this gateway's ownership. Join the children it admitted and
+                // say how many, instead of returning while their threads are still attached to a process
+                // that is about to exit. `drain` waits for them; it does not kill a model call.
+                stop_gateway(&self.children);
+                return Ok(());
+            }
+            let updates = transport.updates(offset, 50)?;
+            for update in &updates {
+                offset = Some(offset.map_or(update.id + 1, |held| held.max(update.id + 1)));
+                if !settings.allowed.contains(&update.from) {
+                    continue;
+                }
+                let (name, goal) = command(&update.text);
+                if update.callback.is_none() && name == "/run" && !goal.is_empty() {
+                    let mut worker = transport.clone();
+                    let socket = socket.clone();
+                    let state = state.clone();
+                    let settings = settings.clone();
+                    let update = update.clone();
+                    let signals = Arc::clone(&signals);
+                    let mcp = Arc::clone(&mcp);
+                    let handle = std::thread::spawn(move || {
+                        if let Err(said) = handle_with(
+                            &update,
+                            &settings,
+                            &socket,
+                            &state,
+                            &mut worker,
+                            &signals,
+                            &mcp,
+                        ) {
+                            let _ = worker.send(
+                                update.chat,
+                                &clip(&format!("the run failed: {said}"), worker.limit()),
+                                &[],
+                            );
+                        }
+                    });
+                    if once {
+                        pending.push(handle);
+                    }
+                } else if update.callback.is_some() {
+                    let mut worker = transport.clone();
+                    let socket = socket.clone();
+                    let state = state.clone();
+                    let settings = settings.clone();
+                    let update = update.clone();
+                    let signals = Arc::clone(&signals);
+                    let mcp = Arc::clone(&mcp);
+                    let handle = std::thread::spawn(move || {
+                        if let Err(said) = handle_with(
+                            &update,
+                            &settings,
+                            &socket,
+                            &state,
+                            &mut worker,
+                            &signals,
+                            &mcp,
+                        ) {
+                            eprintln!("gateway: {said}");
+                        }
+                    });
+                    if once {
+                        pending.push(handle);
+                    }
+                } else if update.callback.is_none() && !update.text.trim().starts_with('/') {
+                    // A conversation is work: it can stream for a minute, and a poller parked inside it
+                    // cannot receive the `/stop` that would end it. One thread per chat, serialized by the
+                    // chat's lock so two messages do not interleave their history.
+                    let mut worker = transport.clone();
+                    let socket = socket.clone();
+                    let state = state.clone();
+                    let settings = settings.clone();
+                    let update = update.clone();
+                    let signals = Arc::clone(&signals);
+                    let mcp = Arc::clone(&mcp);
+                    let handle = std::thread::spawn(move || {
+                        let lock = signals.lock(update.chat);
+                        let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let flag = signals.begin(update.chat);
+                        if let Err(said) = handle_with(
+                            &update,
+                            &settings,
+                            &socket,
+                            &state,
+                            &mut worker,
+                            &signals,
+                            &mcp,
+                        ) {
+                            let _ = worker.send(
+                                update.chat,
+                                &clip(&format!("the answer failed: {said}"), worker.limit()),
+                                &[],
+                            );
+                        }
+                        signals.leave(update.chat, &flag);
+                    });
+                    if once {
+                        pending.push(handle);
+                    }
+                } else if let Err(said) = handle_with(
+                    update,
+                    &settings,
+                    &socket,
+                    &state,
+                    &mut transport,
+                    &signals,
+                    &mcp,
+                ) {
+                    eprintln!("gateway: {said}");
+                }
+            }
+            if let Some(id) = offset {
+                save_offset(&state, id)?;
+            }
+            if once {
+                // `--once` means the batch is handled to the end, not merely accepted. The workers hold
+                // their own transport clones, so joining them here is what makes a scripted test
+                // deterministic.
+                for handle in pending.drain(..) {
+                    let _ = handle.join();
+                }
+                return Ok(());
+            }
+            if updates.is_empty() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// Telegram, served the way it always was: one runtime, one transport, one loop.
 pub fn serve<T: Transport + Clone + Send + 'static>(
-    mut transport: T,
+    transport: T,
     socket: PathBuf,
     state: PathBuf,
     settings: Settings,
     once: bool,
 ) -> Result<(), String> {
-    let mut offset = load_offset(&state);
-    // A child is a thread in this process, so records a dead process left behind name work that ended
-    // with it. Recovery marks them lost before the gateway admits anything new; nothing is resumed.
-    let children = children::Registry::new(&state);
-    match children.recover() {
-        Ok(report) if report.files == 0 => {}
-        Ok(report) => {
-            if report.marked > 0 {
-                eprintln!(
-                    "children: {} live child(ren) from a previous gateway are marked lost",
-                    report.marked
-                );
-            }
-            for path in &report.unreadable {
-                eprintln!("children: {path}: the record would not parse; left in place");
-            }
-            for said in &report.failed {
-                eprintln!("children: could not mark a lost child: {said}");
-            }
-            debug_assert_eq!(report.accounted(), report.files);
-        }
-        Err(said) => eprintln!("children: could not recover the registry: {said}"),
-    }
-    // The old single-list shape becomes one file per job before anything schedules it.
-    match crate::cron::migrate(&state) {
-        Ok(0) => {}
-        Ok(count) => eprintln!(
-            "cron: imported {count} job(s) into {}",
-            crate::cron::dir(&state).display()
-        ),
-        Err(said) => eprintln!("cron: could not import the old job list: {said}"),
-    }
-    // One registry for the life of the gateway: a server started for one message is the server the next
-    // message reaches, which is what makes an MCP server with state worth configuring.
-    let mcp = Arc::new(crate::mcp::Mcp::new(
-        settings.mcp.clone(),
-        Some(PathBuf::from(&settings.root)),
-    ));
-    {
-        let worker = transport.clone();
-        let settings = settings.clone();
-        let state = state.clone();
-        let mcp = Arc::clone(&mcp);
-        std::thread::spawn(move || scheduler(worker, settings, state, mcp));
-    }
-    let signals = Arc::new(Signals::default());
-    {
-        // The heartbeat is a second thread beside the scheduler, not a cron schedule: it continues a
-        // conversation that already exists, and cron's shape is a new run that reports into a chat.
-        let worker = transport.clone();
-        let settings = settings.clone();
-        let state = state.clone();
-        let socket = socket.clone();
-        let mcp = Arc::clone(&mcp);
-        let signals = Arc::clone(&signals);
-        std::thread::spawn(move || heartbeat(worker, settings, state, socket, mcp, signals));
-    }
-    let mut pending: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    loop {
-        if signals.stopped() {
-            // `/shutdown` is the end of this gateway's ownership. Join the children it admitted and
-            // say how many, instead of returning while their threads are still attached to a process
-            // that is about to exit. `drain` waits for them; it does not kill a model call.
-            stop_gateway(&children);
-            return Ok(());
-        }
-        let updates = transport.updates(offset, 50)?;
-        for update in &updates {
-            offset = Some(offset.map_or(update.id + 1, |held| held.max(update.id + 1)));
-            if !settings.allowed.contains(&update.from) {
-                continue;
-            }
-            let (name, goal) = command(&update.text);
-            if update.callback.is_none() && name == "/run" && !goal.is_empty() {
-                let mut worker = transport.clone();
-                let socket = socket.clone();
-                let state = state.clone();
-                let settings = settings.clone();
-                let update = update.clone();
-                let signals = Arc::clone(&signals);
-                let mcp = Arc::clone(&mcp);
-                let handle = std::thread::spawn(move || {
-                    if let Err(said) = handle_with(
-                        &update,
-                        &settings,
-                        &socket,
-                        &state,
-                        &mut worker,
-                        &signals,
-                        &mcp,
-                    ) {
-                        let _ = worker.send(
-                            update.chat,
-                            &clip(&format!("the run failed: {said}"), worker.limit()),
-                            &[],
-                        );
-                    }
-                });
-                if once {
-                    pending.push(handle);
-                }
-            } else if update.callback.is_some() {
-                let mut worker = transport.clone();
-                let socket = socket.clone();
-                let state = state.clone();
-                let settings = settings.clone();
-                let update = update.clone();
-                let signals = Arc::clone(&signals);
-                let mcp = Arc::clone(&mcp);
-                let handle = std::thread::spawn(move || {
-                    if let Err(said) = handle_with(
-                        &update,
-                        &settings,
-                        &socket,
-                        &state,
-                        &mut worker,
-                        &signals,
-                        &mcp,
-                    ) {
-                        eprintln!("gateway: {said}");
-                    }
-                });
-                if once {
-                    pending.push(handle);
-                }
-            } else if update.callback.is_none() && !update.text.trim().starts_with('/') {
-                // A conversation is work: it can stream for a minute, and a poller parked inside it cannot
-                // receive the `/stop` that would end it. One thread per chat, serialized by the chat's lock
-                // so two messages do not interleave their history.
-                let mut worker = transport.clone();
-                let socket = socket.clone();
-                let state = state.clone();
-                let settings = settings.clone();
-                let update = update.clone();
-                let signals = Arc::clone(&signals);
-                let mcp = Arc::clone(&mcp);
-                let handle = std::thread::spawn(move || {
-                    let lock = signals.lock(update.chat);
-                    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let flag = signals.begin(update.chat);
-                    if let Err(said) = handle_with(
-                        &update,
-                        &settings,
-                        &socket,
-                        &state,
-                        &mut worker,
-                        &signals,
-                        &mcp,
-                    ) {
-                        let _ = worker.send(
-                            update.chat,
-                            &clip(&format!("the answer failed: {said}"), worker.limit()),
-                            &[],
-                        );
-                    }
-                    signals.leave(update.chat, &flag);
-                });
-                if once {
-                    pending.push(handle);
-                }
-            } else if let Err(said) = handle_with(
-                update,
-                &settings,
-                &socket,
-                &state,
-                &mut transport,
-                &signals,
-                &mcp,
-            ) {
-                eprintln!("gateway: {said}");
-            }
-        }
-        if let Some(id) = offset {
-            save_offset(&state, id)?;
-        }
-        if once {
-            // `--once` means the batch is handled to the end, not merely accepted. The workers hold their own
-            // transport clones, so joining them here is what makes a scripted test deterministic.
-            for handle in pending.drain(..) {
-                let _ = handle.join();
-            }
-            return Ok(());
-        }
-        if updates.is_empty() {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
+    let mut runtime = Runtime::new("telegram", socket, state, settings, Some(transport.clone()))?;
+    runtime.run(transport, once)
 }
 
 #[cfg(test)]
