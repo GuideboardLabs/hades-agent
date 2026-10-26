@@ -10,6 +10,9 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
+    /// A conversation: read, search the web, recall memory and answer. No tool that changes anything, and
+    /// no delegation or standing goal either, because both are how work starts.
+    Chat,
     /// Read, search, fetch and answer. No tool that changes anything.
     #[default]
     Read,
@@ -22,6 +25,7 @@ pub enum Mode {
 impl Mode {
     pub fn name(self) -> &'static str {
         match self {
+            Mode::Chat => "chat",
             Mode::Read => "read",
             Mode::Plan => "plan",
             Mode::Act => "act",
@@ -30,6 +34,7 @@ impl Mode {
 
     pub fn parse(text: &str) -> Option<Mode> {
         Some(match text.trim().to_ascii_lowercase().as_str() {
+            "chat" | "talk" => Mode::Chat,
             "read" => Mode::Read,
             "plan" => Mode::Plan,
             "act" => Mode::Act,

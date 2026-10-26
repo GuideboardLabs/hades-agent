@@ -253,7 +253,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             };
         };
         let mode = match word.trim().to_ascii_lowercase().as_str() {
-            "chat" => crate::mode::Mode::Read,
+            "chat" => crate::mode::Mode::Chat,
             "work" => crate::mode::Mode::Act,
             other => crate::mode::Mode::parse(other)
                 .ok_or_else(|| format!("{owner}: `mode` is {other:?}; say chat, work, read, plan or act"))?,
@@ -1040,7 +1040,10 @@ fn chat<T: Transport + Clone + Send + 'static>(
         &format!("chat:{}", update.chat),
         mcp,
     );
-    let mut messages = vec![json!({"role": "system", "content": system_prompt(&workspace)})];
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": system_prompt_for(effective.mode, &workspace)
+    })];
     messages.append(&mut history);
     let mut asked = update.text.trim().to_string();
     if let Some(file_id) = &update.photo {
@@ -1207,6 +1210,24 @@ fn chat<T: Transport + Clone + Send + 'static>(
 }
 
 fn system_prompt(workspace: &Path) -> String {
+    system_prompt_for(crate::mode::Mode::Act, workspace)
+}
+
+/// A conversation is answered under different rules than a workspace. The difference is stated once, here,
+/// because a small model reads this and nothing else.
+fn system_prompt_for(mode: crate::mode::Mode, workspace: &Path) -> String {
+    if mode == crate::mode::Mode::Chat {
+        return format!(
+            "You are Hades, a single-user agent in a chat channel. Answer in prose that reads like a \
+message: short unless the question needs depth, no tables, no headers. You may read files, search the \
+web and recall memory, and you should search when the answer depends on something you do not know. In \
+this channel you cannot create or edit files, run commands, delegate, or start a project; when someone \
+wants work done, say it belongs in a work channel. Keep internal projects out of the reply unless they \
+are asked about directly: answer the question in front of you rather than describing the system around \
+it. Your tools run in {}. Never mention checks, sessions, attempts or routing.",
+            workspace.display()
+        );
+    }
     format!(
         "You are Hades, a single-user agent in a chat. Answer in prose that reads like a message: \
 short unless the question needs depth, no tables, no headers. Your tools run in {}. Use them when the \
@@ -1324,7 +1345,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             let mode = match effective.mode {
                 crate::mode::Mode::Act => "work",
                 crate::mode::Mode::Plan => "plan",
-                crate::mode::Mode::Read => "chat",
+                crate::mode::Mode::Read => "read",
+                crate::mode::Mode::Chat => "chat",
             };
             transport.send(
                 &update.chat,
@@ -1793,6 +1815,9 @@ fn scheduled(
 /// model, and because this is the only place the occurrence key reaches the model.
 fn job_messages(job: &crate::cron::Job, workspace: &Path, step: &crate::retry::Step) -> Vec<Value> {
     let mode_line = match job.mode {
+        crate::mode::Mode::Chat => {
+            "This job is a conversation: it can read, search and recall, and nothing it does changes a file. Answer with what you found."
+        }
         crate::mode::Mode::Read => {
             "This job is read-only: it has no shell, no file writes, no browser and no scheduling. Read and answer with what you found."
         }
@@ -2143,7 +2168,7 @@ mod tests {
         )
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
-        assert_eq!(settings.effective(&Chat::new("discord", "1")).mode, crate::mode::Mode::Read);
+        assert_eq!(settings.effective(&Chat::new("discord", "1")).mode, crate::mode::Mode::Chat);
         let work = settings.effective(&Chat::new("discord", "99"));
         assert_eq!(work.mode, crate::mode::Mode::Act);
         assert_eq!(work.verify, "cargo test --quiet");

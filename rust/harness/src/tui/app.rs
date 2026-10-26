@@ -1110,6 +1110,7 @@ impl App {
             return;
         }
         self.mode = match self.mode {
+            crate::mode::Mode::Chat => crate::mode::Mode::Read,
             crate::mode::Mode::Read => crate::mode::Mode::Plan,
             crate::mode::Mode::Plan => crate::mode::Mode::Act,
             crate::mode::Mode::Act => crate::mode::Mode::Read,
@@ -1118,6 +1119,7 @@ impl App {
             "Tool mode: {} · {}",
             self.mode.name(),
             match self.mode {
+                crate::mode::Mode::Chat => "conversation, no writes",
                 crate::mode::Mode::Read => "read-only",
                 crate::mode::Mode::Plan => "investigate, ask, then plan",
                 crate::mode::Mode::Act => "act under the floor",

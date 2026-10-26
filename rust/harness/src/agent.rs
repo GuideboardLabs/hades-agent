@@ -600,6 +600,13 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
                 .is_some_and(|name| !mutating(name))
         });
     }
+    if mode == crate::mode::Mode::Chat {
+        list.as_array_mut().unwrap().retain(|tool| {
+            tool.pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(chat_allows)
+        });
+    }
     list.as_array_mut().unwrap().retain(|tool| {
         tool.pointer("/function/name")
             .and_then(Value::as_str)
@@ -676,6 +683,25 @@ fn epoch() -> i64 {
 
 /// The tools that change something on this machine or in the world. One list, because a schema that
 /// omits a name and a check that refuses it must never disagree.
+/// The tools a conversation keeps. Everything here reads or searches; nothing writes, spawns or schedules,
+/// which is what makes a chat channel safe to hand a small model.
+pub fn chat_allows(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "list_dir"
+            | "search"
+            | "image"
+            | "fetch"
+            | "library"
+            | "recall"
+            | "session_search"
+            | "skills"
+            | "web_search"
+            | "ask"
+    )
+}
+
 fn mutating(name: &str) -> bool {
     matches!(
         name,
@@ -1085,6 +1111,9 @@ fn execute_with_stop(
     let artifact = crate::activity::artifact(&args);
     // A read surface has no mutating tool in its schema; this is the second half of the same rule, for a
     // call that arrives anyway (a stale transcript, or a worker built before the mode was set).
+    if world.mode == crate::mode::Mode::Chat && !chat_allows(name) {
+        return format!("`{name}` is not available in a chat channel");
+    }
     if !world.mode.acts() && mutating(name) {
         decided(
             world,
@@ -2086,6 +2115,7 @@ fn cron(args: &Value, world: &World) -> String {
                     "job {id} is now {} · runs {schedule} · {}. Edit that file to correct it.",
                     crate::cron::relative(state, &path),
                     match mode {
+                        crate::mode::Mode::Chat => "a conversation; nothing that changes anything",
                         crate::mode::Mode::Read => "read-only",
                         crate::mode::Mode::Plan => "read-only, then a plan",
                         crate::mode::Mode::Act => "may act, under the hard floor",
@@ -3285,6 +3315,26 @@ mod tests {
         assert!(top.contains(&"delegate".to_string()));
         assert!(!worker.contains(&"delegate".to_string()));
         assert!(worker.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn a_conversation_keeps_the_tools_that_answer_and_loses_the_tools_that_start_work() {
+        let chat = names(&schemas(0, Mode::Chat));
+        for kept in ["read_file", "search", "web_search", "fetch", "recall", "library"] {
+            assert!(
+                chat.contains(&kept.to_string()),
+                "a conversation lost {kept}: {chat:?}"
+            );
+        }
+        for gone in ["shell", "write_file", "patch", "cron", "delegate", "goal", "remember"] {
+            assert!(
+                !chat.contains(&gone.to_string()),
+                "a conversation still has {gone}: {chat:?}"
+            );
+        }
+        // A chat is narrower than a read job, not wider.
+        let read = names(&schemas(0, Mode::Read));
+        assert!(read.len() >= chat.len(), "{read:?} vs {chat:?}");
     }
 
     #[test]

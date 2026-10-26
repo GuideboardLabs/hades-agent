@@ -439,6 +439,7 @@ pub fn start_chat(
                 match mode {
                     crate::mode::Mode::Plan => preamble.push_str("\n\nYou are in PLAN MODE. You have read-only tools and `ask`. Investigate first. Before proposing a plan, use `ask` for every genuine fork: the goal or scope, the architecture, and how the person wants a step done when more than one way is valid. Ask at most six questions, one at a time, with 2 to 4 options and one recommendation. Then answer with a numbered plan, the files it would touch, and the checks you would run. Do not modify anything."),
                     crate::mode::Mode::Act => preamble.push_str("\n\nWhen a real fork appears (an engineering choice, a goal or scope change, or a preference where more than one way is valid), use `ask` instead of guessing. Give 2 to 4 options with one recommendation. Do not ask about reversible details."),
+                    crate::mode::Mode::Chat => preamble.push_str("\n\nThis is a conversation. You may read, search and recall; you cannot write, run a command, delegate or schedule. Answer with what you found."),
                     crate::mode::Mode::Read => preamble.push_str("\n\nThis is a read-only turn. Answer with what you found."),
                 }
                 transcript.push(json!({"role":"system","content":preamble}));
