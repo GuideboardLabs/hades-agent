@@ -86,7 +86,15 @@ pub struct World {
     /// The question surface, when a person can answer one. `None` on a surface with nobody to ask, which
     /// is what makes a headless job refuse at the floor instead of waiting forever.
     pub questions: Option<std::sync::Arc<crate::question::Desk>>,
+    /// How this surface takes a reaction, when it can. The gateway installs one per message, already
+    /// bound to that message's id; a surface with no reactions leaves it None and the tool says so
+    /// rather than pretending to have reacted.
+    pub react: Option<React>,
 }
+
+/// Put an emoji on the message this turn is answering. Bound at construction, so the model supplies
+/// the face and nothing else: it cannot name a different message or a different chat.
+pub type React = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// A mailbox a caller can hand a running loop. The loop owns the type because the loop is what decides
 /// when a message can be seen: at a step boundary, never inside a call already sent to the model. A
@@ -176,6 +184,12 @@ pub enum Activity {
 ///
 /// `mode` is the gate a scheduled job stands behind. A read surface is built without the tools that
 /// change anything, so "do not write" is a missing tool rather than an instruction.
+/// The faces this surface will send. A short list on purpose: every entry is a real Discord
+/// reaction, and a model choosing from a list cannot invent one that comes back 400.
+pub const REACTIONS: [&str; 13] = [
+    "✅", "❌", "👀", "🙃", "😂", "🔥", "💀", "🤝", "👌", "🙏", "👋", "🤔", "👍",
+];
+
 pub fn schemas(depth: u8, mode: crate::mode::Mode) -> Value {
     schemas_for(depth, mode, crate::profile::Role::Patch)
 }
@@ -423,6 +437,20 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
                     "required": ["query"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "react",
+                "description": "Put one emoji on the message you are answering, instead of writing a reply. Use it when a reply would be noise: an acknowledgement, a thanks, a chain that has clearly ended, or a joke that only needs a face. Say nothing else unless there is more to say.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "emoji": {"type": "string", "enum": REACTIONS}
+                    },
+                    "required": ["emoji"]
+                }
+            }
         }
     ]);
     if mode.acts() {
@@ -638,7 +666,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-pub const TOOLS: [&str; 24] = [
+pub const TOOLS: [&str; 25] = [
     "shell",
     "read_file",
     "write_file",
@@ -654,6 +682,7 @@ pub const TOOLS: [&str; 24] = [
     "session_search",
     "skills",
     "web_search",
+    "react",
     "cron",
     "goal",
     "mcp",
@@ -707,6 +736,7 @@ pub fn chat_allows(name: &str) -> bool {
             | "skills"
             | "web_search"
             | "ask"
+            | "react"
     )
 }
 
@@ -760,7 +790,7 @@ pub fn answer_stoppable(
     // is exploring its own machinery instead of doing the task. Cap them per turn; the model gets a
     // refusal and carries on with the tools that do the work.
     let mut used: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    const TOOL_BUDGETS: &[(&str, u32)] = &[("session_search", 2), ("recall", 2), ("goal", 4), ("skills", 8), ("remember", 2), ("library", 2), ("web_search", 25), ("fetch", 60), ("shell", 120)];
+    const TOOL_BUDGETS: &[(&str, u32)] = &[("session_search", 2), ("recall", 2), ("goal", 4), ("skills", 8), ("remember", 2), ("library", 2), ("web_search", 25), ("react", 6), ("fetch", 60), ("shell", 120)];
     for _ in 0..steps {
         if stopped() {
             return Ok(None);
@@ -1263,6 +1293,7 @@ fn execute_with_stop(
         "image" => image(&args, world),
         "fetch" => fetch(&args),
         "web_search" => web_search(&args),
+        "react" => react_tool(&args, world),
         "library" => library_tool(&args, world),
         "delegate" => delegate(&args, world, client, activity),
         "spawn" => spawn(&args, world, client, activity),
@@ -1659,6 +1690,7 @@ fn delegate(
             mcp: std::sync::Arc::clone(&world.mcp),
             allowance: std::sync::Arc::clone(&world.allowance),
             questions: world.questions.clone(),
+            react: None,
         };
         let client = client.clone();
         activity(
@@ -1796,6 +1828,7 @@ fn spawn(
         mcp: std::sync::Arc::clone(&world.mcp),
         allowance: std::sync::Arc::clone(&world.allowance),
         questions: world.questions.clone(),
+        react: None,
     };
     activity(Activity::Start, &format!("spawn: {}", clip(&goal, 60)));
 
@@ -2437,6 +2470,29 @@ fn fetch(args: &Value) -> String {
     }
     let allow_private = std::env::var("HADES_FETCH_ALLOW_PRIVATE").as_deref() == Ok("1");
     crate::fetch::run(url, 12_000, allow_private)
+}
+
+/// A reaction is an answer. It is the one tool that leaves the reply empty on purpose, so the
+/// gateway needs to know whether it happened: that is why the surface records it as well as sending.
+fn react_tool(args: &Value, world: &World) -> String {
+    let Some(react) = &world.react else {
+        return "This surface cannot react to a message. Write a reply instead.".to_string();
+    };
+    let emoji = args
+        .get("emoji")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !REACTIONS.contains(&emoji) {
+        return format!(
+            "`{emoji}` is not a reaction this surface sends. Use one of: {}.",
+            REACTIONS.join(" ")
+        );
+    }
+    match react(emoji) {
+        Ok(()) => format!("Reacted {emoji}. If that was the whole answer, say nothing else."),
+        Err(said) => format!("The reaction did not land: {said}"),
+    }
 }
 
 fn web_search(args: &Value) -> String {
@@ -3406,6 +3462,7 @@ mod tests {
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         };
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -3601,7 +3658,33 @@ mod tests {
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         }
+    }
+
+    /// A reaction is a reply, so a conversation must be handed the tool. A surface with nowhere to
+    /// put the emoji gets a refusal instead of a fake success.
+    #[test]
+    fn a_conversation_is_offered_the_reaction_and_a_surface_without_one_refuses() {
+        let offered = names(&schemas(0, Mode::Chat));
+        assert!(offered.contains(&"react".to_string()), "a chat can react: {offered:?}");
+
+        let dir = crate::scratch::root().join("agent-react");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a workspace");
+        let mut world = world_at(&dir, Mode::Chat, "chat:7");
+        assert!(react_tool(&serde_json::json!({"emoji": "✅"}), &world).contains("cannot react"));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        world.react = Some(std::sync::Arc::new(move |emoji: &str| {
+            sink.lock().expect("the sink").push(emoji.to_string());
+            Ok(())
+        }));
+        assert!(react_tool(&serde_json::json!({"emoji": "not-a-face"}), &world).contains("not a reaction"));
+        assert!(seen.lock().expect("the sink").is_empty(), "a refused face never reaches the surface");
+        react_tool(&serde_json::json!({"emoji": "✅"}), &world);
+        assert_eq!(seen.lock().expect("the sink").as_slice(), ["✅"]);
     }
 
     #[test]
@@ -3717,6 +3800,7 @@ mod tests {
             mcp: mcp_with(&dir, &["echo"]),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         };
         let client = crate::model::OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -3758,6 +3842,7 @@ mod tests {
             mcp: mcp_with(&dir, &["echo"]),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         };
         let client = crate::model::OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(
@@ -3793,6 +3878,7 @@ mod tests {
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         };
         let first = remember(
             &json!({"text": "the port is 8101", "title": "Port"}),
@@ -3860,6 +3946,7 @@ mod tests {
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         };
         let said = cron(
             &json!({
@@ -3989,6 +4076,7 @@ mod tests {
             mcp: std::sync::Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(64),
             questions: None,
+            react: None,
         };
         let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
         let said = execute(

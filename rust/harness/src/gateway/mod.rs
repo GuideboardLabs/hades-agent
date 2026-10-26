@@ -187,36 +187,60 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             path.display()
         ));
     }
-    let model = value
+    // The section is the surface's own say over the file's defaults. A connector that names `model`
+    // means it: reading only the top-level key made a Discord bot that said `heem-9b` answer on the
+    // cloud preset, which looks like the model being ignored because it is.
+    let model = section
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .filter(|named| !named.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
     if model.is_empty() {
         return Err(format!(
-            "{}: no top-level `model`; a chat needs a preset to answer with",
+            "{}: no `model` in {name} and no top-level default; a chat needs a preset to answer with",
             path.display()
         ));
     }
-    let root = value
+    let root = section
         .get("root")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .filter(|named| !named.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("root")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
     if root.is_empty() {
         return Err(format!(
             "{}: no top-level `root`; a chat's tools need a workspace",
             path.display()
         ));
     }
-    let vault = value
+    let vault = section
         .get("vault")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .filter(|named| !named.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("vault")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
     if vault.is_empty() {
         return Err(format!(
-            "{}: no top-level `vault`; a chat's memory needs a vault",
+            "{}: no `vault` in {name} and no top-level default; a chat's memory needs a vault",
             path.display()
         ));
     }
@@ -373,6 +397,16 @@ pub trait Transport {
     /// Fetch a file the platform holds, by its file id. Surfaces without files keep the default.
     fn file(&self, _file_id: &str) -> Result<Vec<u8>, String> {
         Err("this surface cannot fetch files".to_string())
+    }
+    /// Put an emoji on a message. A surface that cannot react says so, so the model is told the
+    /// reaction did not land instead of believing it answered.
+    fn react(&mut self, _chat: &Chat, _message: i64, _emoji: &str) -> Result<(), String> {
+        Err("this surface cannot react to a message".to_string())
+    }
+    /// Remove a message this surface posted. An answer that was a reaction leaves the "…" placeholder
+    /// behind, and a placeholder that stays up reads as an answer that never came.
+    fn remove(&mut self, _chat: &Chat, _message: i64) -> Result<(), String> {
+        Err("this surface cannot remove a message".to_string())
     }
 }
 
@@ -1039,7 +1073,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
     let client = crate::model::from_preset(&preset);
     let mut history = load_chat(state, &update.chat);
     let workspace = PathBuf::from(&effective.root);
-    let world = world_for(
+    let mut world = world_for(
         settings,
         state,
         update.chat.clone(),
@@ -1047,6 +1081,26 @@ fn chat<T: Transport + Clone + Send + 'static>(
         &format!("chat:{}", update.chat),
         mcp,
     );
+    // A reaction is a reply. The hook is bound to this message before the model sees it, so the
+    // model chooses the face and nothing else: not the chat, not the message.
+    let reacted: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let surface = Arc::new(Mutex::new(transport.clone()));
+        let chat = update.chat.clone();
+        let message = update.id;
+        let seen = Arc::clone(&reacted);
+        world.react = Some(Arc::new(move |emoji: &str| {
+            let mut surface = surface
+                .lock()
+                .map_err(|_| "the surface is unavailable".to_string())?;
+            surface.react(&chat, message, emoji)?;
+            if let Ok(mut held) = seen.lock() {
+                *held = Some(emoji.to_string());
+            }
+            Ok(())
+        }));
+    }
+
     let mut messages = vec![json!({
         "role": "system",
         "content": system_prompt_for(effective.mode, &workspace)
@@ -1189,6 +1243,19 @@ fn chat<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         Ok(None) => {
+            // A reaction is an answer with no words. Take the placeholder down, because "…" that
+            // never resolves is the same silence the emoji just filled.
+            let reaction = reacted.lock().ok().and_then(|held| held.clone());
+            if let Some(emoji) = reaction {
+                if let Some(message) = id {
+                    let _ = transport.remove(&update.chat, message);
+                }
+                let mut history = load_chat(state, &update.chat);
+                history.push(json!({"role": "user", "content": asked}));
+                history.push(json!({"role": "assistant", "content": format!("[reacted {emoji}]")}));
+                save_chat(state, &update.chat, &history);
+                return Ok(());
+            }
             // A stopped answer is not the assistant's turn: storing it would make the next prompt believe a
             // refusal was something it said. The person's message stays out too, for the same reason.
             if let Some(message) = id {
@@ -1231,7 +1298,7 @@ web and recall memory, and you should search when the answer depends on somethin
 this channel you cannot create or edit files, run commands, delegate, or start a project; when someone \
 wants work done, say it belongs in a work channel. Keep internal projects out of the reply unless they \
 are asked about directly: answer the question in front of you rather than describing the system around \
-it. Your tools run in {}. Never mention checks, sessions, attempts or routing.",
+it. When a reply would be noise (a thanks, an acknowledgement, a chain that has clearly ended, a joke that only needs a face), call react with one emoji and write nothing. Your tools run in {}. Never mention checks, sessions, attempts or routing.",
             workspace.display()
         );
     }
@@ -1789,6 +1856,7 @@ fn world_for(
         allowance: crate::agent::Allowance::new(64),
         // A gateway chat has a person behind it, but no ask bar yet: the floor refuses rather than waits.
         questions: None,
+        react: None,
     }
 }
 
@@ -2183,6 +2251,38 @@ mod tests {
         // A channel that names nothing keeps the surface's own model and policy.
         assert_eq!(work.model, settings.model);
         assert_eq!(work.policy, settings.policy);
+    }
+
+    /// A connector that names a model means it. This is the difference between a bot that says it
+    /// runs the local 9B and one that quietly answers on the cloud preset at the top of the file.
+    #[test]
+    fn a_connector_model_wins_over_the_top_level_default() {
+        let dir = scratch("connmodel");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp","gateway":{"connectors":{
+                "discord":{"allowed_users":["7"],"verify":"true","model":"heem-9b",
+                "channels":{"99":{"mode":"chat"}}}}}}"#,
+        )
+        .expect("config");
+        let settings = settings_for(&path, "discord").expect("settings");
+        assert_eq!(settings.model, "heem-9b");
+        assert_eq!(
+            settings.effective(&Chat::new("discord", "99")).model,
+            "heem-9b"
+        );
+        // A channel that names its own model still wins, and a connector that names none keeps the default.
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp","gateway":{"connectors":{
+                "discord":{"allowed_users":["7"],"verify":"true"}}}}"#,
+        )
+        .expect("config");
+        assert_eq!(
+            settings_for(&path, "discord").expect("settings").model,
+            "deepseek-v4.1-flash"
+        );
     }
 
     #[test]

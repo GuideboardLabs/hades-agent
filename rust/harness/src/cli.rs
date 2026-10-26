@@ -2530,10 +2530,11 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 crate::mode::Mode::Chat => "chat",
             };
             let mut text = format!(
-                "{id}: every channel not listed below is {} (policy {}, root {})\n",
+                "{id}: every channel not listed below is {} (policy {}, root {}, model {})\n",
                 word(settings.mode),
                 settings.policy,
-                settings.root
+                settings.root,
+                settings.model
             );
             let mut ids: Vec<&String> = settings.channels.keys().collect();
             ids.sort();

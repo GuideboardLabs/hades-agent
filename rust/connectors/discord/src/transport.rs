@@ -24,6 +24,21 @@ const LIMIT: usize = 1_900;
 const INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
 const API: &str = "https://discord.com/api/v10";
 
+/// Percent-encode the emoji in a reaction path. Discord wants the code points escaped, and an
+/// unescaped surrogate or a stray space comes back 400 rather than reacting.
+fn quote(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 struct Inner {
     token: String,
     agent: ureq::Agent,
@@ -232,6 +247,30 @@ impl Transport for Discord {
         Ok(())
     }
 
+    fn react(&mut self, chat: &Chat, message: i64, emoji: &str) -> Result<(), String> {
+        // PUT is idempotent: reacting twice with the same face is one face, so a retry is safe.
+        self.rest(
+            "PUT",
+            &format!(
+                "/channels/{}/messages/{}/reactions/{}/@me",
+                chat.id(),
+                message,
+                quote(emoji)
+            ),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    fn remove(&mut self, chat: &Chat, message: i64) -> Result<(), String> {
+        self.rest(
+            "DELETE",
+            &format!("/channels/{}/messages/{}", chat.id(), message),
+            None,
+        )
+        .map(|_| ())
+    }
+
     fn limit(&self) -> usize {
         LIMIT
     }
@@ -430,12 +469,22 @@ fn message_update(inner: &Arc<Inner>, message: &Value) -> Option<Update> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if guild.is_some() && inner.require_mention {
-        let me = inner
-            .me
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-            .clone()?;
+    let me = inner
+        .me
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+        .clone();
+    // Answering a message of ours is addressing us. A reply is how a person continues a thread
+    // without typing the name again, and it is the only mention-free way in a guild.
+    let answering_us = message
+        .pointer("/message_reference/message_id")
+        .is_some()
+        && message
+            .pointer("/referenced_message/author/id")
+            .and_then(Value::as_str)
+            .is_some_and(|author| me.as_deref() == Some(author));
+    if guild.is_some() && inner.require_mention && !answering_us {
+        let me = me?;
         let plain = format!("<@{me}>");
         let nick = format!("<@!{me}>");
         if !text.contains(&plain) && !text.contains(&nick) {
@@ -534,6 +583,28 @@ mod tests {
             .expect("a mention reaches the chat");
         assert_eq!(update.text, "hello");
         assert_eq!(update.chat, Chat::new(SURFACE, "1300000000000000002"));
+    }
+
+    #[test]
+    fn a_reply_to_the_bot_is_answered_without_a_mention() {
+        let inner = inner();
+        let mut reply = message("7", "and then what", Some("9"));
+        reply["message_reference"] = json!({"message_id": "1300000000000000009"});
+        reply["referenced_message"] = json!({"id": "1300000000000000009", "author": {"id": "42", "bot": true}});
+        let update = message_update(&inner, &reply).expect("a reply to us reaches the chat");
+        assert_eq!(update.text, "and then what");
+
+        // replying to somebody else is still not addressing us
+        let mut other = message("7", "and then what", Some("9"));
+        other["message_reference"] = json!({"message_id": "1300000000000000008"});
+        other["referenced_message"] = json!({"id": "1300000000000000008", "author": {"id": "8", "bot": false}});
+        assert!(message_update(&inner, &other).is_none());
+    }
+
+    #[test]
+    fn an_emoji_is_escaped_for_the_reaction_path() {
+        assert_eq!(quote("✅"), "%E2%9C%85");
+        assert_eq!(quote("👀"), "%F0%9F%91%80");
     }
 
     #[test]
