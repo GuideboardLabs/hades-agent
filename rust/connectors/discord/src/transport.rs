@@ -67,8 +67,14 @@ impl Discord {
         let (sender, receiver) = channel();
         let inner = Arc::new(Inner {
             token,
+            // Discord's edge closes idle keep-alive sockets without telling anyone. A pooled
+            // connection that sat through a quiet afternoon is dead, and the next POST writes
+            // into it and waits out the whole timeout, which is exactly how a working bot goes
+            // silent for hours. One fresh connection per call costs a handshake and removes it.
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(20))
+                .max_idle_connections(0)
+                .max_idle_connections_per_host(0)
                 .build(),
             incoming: Mutex::new(receiver),
             guilds,
@@ -106,9 +112,16 @@ impl Discord {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("no message in the answer");
+                eprintln!("discord: {method} {path}: HTTP {code}: {why}");
                 Err(format!("discord {method} {path}: HTTP {code}: {why}"))
             }
-            Err(error) => Err(format!("discord {method} {path}: {error}")),
+            Err(error) => {
+                // A timed out POST is not retried: it may have landed, and a second one would
+                // post the same reply twice. It is logged, because silence in a chat surface is
+                // the symptom and the journal is the only place the cause can show up.
+                eprintln!("discord: {method} {path} failed: {error}");
+                Err(format!("discord {method} {path}: {error}"))
+            }
         }
     }
 }
