@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["session-tree", "mneme", "governance", "harness"]
+members = ["session-tree", "mneme", "governance", "harness", "connectors/discord"]
 
 # Which Python file each crate ports, and the suite that decides when it is done, lives in that
 # crate's own `[package.metadata.hades]`.

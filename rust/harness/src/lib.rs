@@ -47,6 +47,7 @@ pub mod cli;
 pub mod command;
 pub mod compact;
 pub mod config;
+pub mod connector_pack;
 pub mod context;
 pub mod cron;
 pub mod daemon;

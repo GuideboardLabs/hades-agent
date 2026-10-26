@@ -504,6 +504,7 @@ fn dispatch(
         "status" => status(rest),
         "submit" => submit(rest),
         "pack" => pack_cmd(rest),
+        "connector" => connector_cmd(rest),
         "attach" => attach(rest),
         "models" => models(),
         "tools" => tools(rest),
@@ -2466,6 +2467,131 @@ fn case_cmd(args: &[String]) -> Result<(String, i32), String> {
     Ok((text, 0))
 }
 
+
+/// Connectors are installed packs, not built-ins: this resolves one through the catalog, checks that
+/// the binary still hashes to what was approved, and hands the process the same state and config the
+/// gateway uses. The connector itself owns auth and its event loop; core owns install and trust.
+fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let rest = &args[1..];
+    match action {
+        "list" => {
+            let flags = parse_with(rest, &["state"], &[])?;
+            let state = state_of(&flags)?;
+            let rows = crate::connector_pack::rows(&state);
+            if rows.is_empty() {
+                return Ok(("no connectors are installed\n".to_string(), 0));
+            }
+            let mut text = String::new();
+            for row in rows {
+                text.push_str(&format!(
+                    "{} {} · {} · {} · {}\n",
+                    row.id, row.version, row.title, row.platform, row.live_digest
+                ));
+            }
+            Ok((text, 0))
+        }
+        "check" => {
+            let flags = parse_with(rest, &["state"], &[])?;
+            let state = state_of(&flags)?;
+            let id = flags
+                .positional
+                .first()
+                .ok_or_else(|| "`connector check` needs an id".to_string())?;
+            let (manifest, binary) = crate::connector_pack::resolve(&state, id)?;
+            Ok((
+                format!(
+                    "{} {} is installed and its entrypoint matches the approved digest\n  {}\n  protocol {}-{}, built for {}\n",
+                    manifest.id,
+                    manifest.version,
+                    binary.display(),
+                    manifest.protocol_min,
+                    manifest.protocol_max,
+                    manifest.platform
+                ),
+                0,
+            ))
+        }
+        "service" => {
+            let flags = parse_with(rest, &["state", "config", "out"], &["dry-run"])?;
+            let state = state_of(&flags)?;
+            let config = config_path(&flags)?;
+            let id = flags
+                .positional
+                .first()
+                .ok_or_else(|| "`connector service` needs an id".to_string())?;
+            let (manifest, binary) = crate::connector_pack::resolve(&state, id)?;
+            let home = hades_home()?;
+            let text = crate::service::connector_unit(
+                &manifest.id,
+                &binary,
+                &config,
+                &state,
+                &home,
+            );
+            let name = format!("hades-connector-{}.service", manifest.id);
+            if switched(&flags, "dry-run") {
+                return Ok((text, 0));
+            }
+            let out = match flags.named.get("out") {
+                Some(dir) => PathBuf::from(dir),
+                None => home.join(".config/systemd/user"),
+            };
+            std::fs::create_dir_all(&out)
+                .map_err(|error| format!("{}: {error}", out.display()))?;
+            let path = out.join(&name);
+            std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok((
+                format!(
+                    "wrote {}\n  systemctl --user daemon-reload && systemctl --user enable --now {}\n",
+                    path.display(),
+                    name
+                ),
+                0,
+            ))
+        }
+        "remove" => {
+            let flags = parse_with(rest, &["state"], &[])?;
+            let state = state_of(&flags)?;
+            let id = flags
+                .positional
+                .first()
+                .ok_or_else(|| "`connector remove` needs an id".to_string())?;
+            let removed = crate::connector_pack::remove(&state, id)?;
+            Ok((format!("removed {id} ({removed} tree(s))\n"), 0))
+        }
+        "run" => {
+            let flags = parse_with(rest, &["state", "config"], &["once"])?;
+            let state = state_of(&flags)?;
+            let config = config_path(&flags)?;
+            let id = flags
+                .positional
+                .first()
+                .ok_or_else(|| "`connector run` needs an id".to_string())?;
+            let (_, binary) = crate::connector_pack::resolve(&state, id)?;
+            let mut command = std::process::Command::new(&binary);
+            command.arg("--state").arg(&state);
+            command.arg("--config").arg(&config);
+            if switched(&flags, "once") {
+                command.arg("--once");
+            }
+            let status = command
+                .status()
+                .map_err(|error| format!("could not start {}: {error}", binary.display()))?;
+            Ok(("".to_string(), status.code().unwrap_or(1)))
+        }
+        "help" | "--help" => Ok((
+            "hades connector list [--state <dir>]\n\
+             hades connector check <id> [--state <dir>]\n\
+             hades connector run <id> --config <file> [--state <dir>] [--once]\n\
+             hades connector remove <id> [--state <dir>]\n"
+                .to_string(),
+            0,
+        )),
+        other => Err(format!("`connector {other}`: say list, check, run, remove or help")),
+    }
+}
+
 fn pack_cmd(args: &[String]) -> Result<(String, i32), String> {
     let action = args.first().map(String::as_str).unwrap_or("help");
     let rest = &args[1..];
@@ -2720,7 +2846,8 @@ fn pack_plan(args: &[String]) -> Result<(String, i32), String> {
 }
 
 fn pack_help() -> String {
-    "pack menu [--json]                      the shelf this build ships\n\
+    "connector list|run|check|remove         surfaces installed outside the base\n\
+     pack menu [--json]                      the shelf this build ships\n\
      pack find <words> [--json]              narrow it by id, title, summary or keywords\n\
      pack add <id|file> [--yes] [--digest <sha>]  fetch or read, check the digest, show or apply the plan\n\
      pack export <id|--dir <folder>> [selectors] [--out <file>]\n\
@@ -2876,6 +3003,30 @@ fn pack_add(args: &[String]) -> Result<(String, i32), String> {
     let home = hades_home()?;
     // A path that exists is a file somebody sent. Anything else is an id to look up on the shelf.
     let file = Path::new(name);
+    // A connector archive is a different artifact with a different trust story: whole-tree digests,
+    // an entrypoint, and install under the state directory. It arrives through the same verb.
+    if file.is_file() && crate::connector_pack::looks_like_connector(file) {
+        let (target, manifest) = crate::connector_pack::install_tar(&state, file)?;
+        if let Some(want) = flags.named.get("digest") {
+            let (_, binary) = crate::connector_pack::resolve(&state, &manifest.id)?;
+            let got = crate::connector_pack::digest_for(&binary)?;
+            if !got.eq_ignore_ascii_case(want) {
+                let _ = crate::connector_pack::remove(&state, &manifest.id);
+                return Err(format!(
+                    "the connector's entrypoint hashes to {got}, not the {want} you pinned; removed it"
+                ));
+            }
+        }
+        return Ok((
+            format!(
+                "installed connector {} {}\n  {}\n",
+                manifest.id,
+                manifest.version,
+                target.display()
+            ),
+            0,
+        ));
+    }
     let text = if file.is_file() {
         crate::packs_install::add_file(
             file,
@@ -3469,7 +3620,33 @@ fn doctor(args: &[String]) -> Result<(String, i32), String> {
         &crate::doctor::running_binary(),
         switched(&flags, "services"),
     );
-    Ok(crate::doctor::render(&found))
+    let (mut text, mut code) = crate::doctor::render(&found);
+    // Connectors are read, never started: doctor must stay safe to run on a machine whose units are down.
+    for row in crate::connector_pack::rows(&home) {
+        let path = home
+            .join("connectors")
+            .join(&row.id)
+            .join(&row.version)
+            .join("bin")
+            .join(format!("hades-connector-{}", row.id));
+        match crate::connector_pack::digest_for(&path) {
+            Ok(got) if got.eq_ignore_ascii_case(&row.live_digest) => {
+                text.push_str(&format!("ok  connector    {} {} ({})\n", row.id, row.version, row.platform));
+            }
+            Ok(got) => {
+                text.push_str(&format!(
+                    "FAIL connector  {} {} hashes to {got}, not {}\n",
+                    row.id, row.version, row.live_digest
+                ));
+                code = 1;
+            }
+            Err(said) => {
+                text.push_str(&format!("FAIL connector  {} {}: {said}\n", row.id, row.version));
+                code = 1;
+            }
+        }
+    }
+    Ok((text, code))
 }
 
 /// The config a headless process would read, printed field by field. It holds no secrets by construction;

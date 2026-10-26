@@ -1,0 +1,16 @@
+[package]
+name = "hades-connector-discord"
+version = "0.1.0"
+edition = "2024"
+description = "Discord, as a surface Hades can be installed on."
+license = "MIT"
+
+[[bin]]
+name = "hades-connector-discord"
+path = "src/main.rs"
+
+[dependencies]
+harness = { path = "../../harness" }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

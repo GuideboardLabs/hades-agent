@@ -72,24 +72,48 @@ pub struct Settings {
     pub mcp: crate::mcp::McpConfig,
 }
 
-/// Read `gateway.telegram` from a config file. A missing section, an empty allowlist or an empty check is
-/// a refusal with the key named: an absent allowlist must never mean everyone, and a run with no check
-/// can only end in `could_not_run`.
+/// The environment variable a surface's token is read from. A connector never chooses its own name: a
+/// pack that could name `OPENAI_API_KEY` would be handed the model key as its "token".
+pub fn token_env(surface: &str) -> String {
+    if surface == "tg" {
+        return "HADES_TELEGRAM_TOKEN".to_string();
+    }
+    format!(
+        "HADES_CONNECTOR_{}_TOKEN",
+        surface.to_uppercase().replace('-', "_")
+    )
+}
+
+/// Read one surface's settings from a config file. Telegram keeps `gateway.telegram`; every connector
+/// lives under `gateway.connectors.<id>`, so two surfaces cannot read each other's policy. A missing
+/// section, an empty allowlist or an empty check is a refusal with the key named: an absent allowlist
+/// must never mean everyone, and a run with no check can only end in `could_not_run`.
 pub fn settings(path: &Path) -> Result<Settings, String> {
+    settings_for(path, "tg")
+}
+
+pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let value: Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let telegram = value
-        .get("gateway")
-        .and_then(|gateway| gateway.get("telegram"))
-        .ok_or_else(|| {
-            format!(
-                "{}: there is no `gateway.telegram` section; the gateway will not start without one",
-                path.display()
-            )
-        })?;
-    let allowed: Vec<String> = telegram
+    let (section, name) = if surface == "tg" {
+        (value.pointer("/gateway/telegram").cloned(), "gateway.telegram".to_string())
+    } else {
+        (
+            value
+                .pointer(&format!("/gateway/connectors/{surface}"))
+                .cloned(),
+            format!("gateway.connectors.{surface}"),
+        )
+    };
+    let section = section.ok_or_else(|| {
+        format!(
+            "{}: there is no `{name}` section; the gateway will not start without one",
+            path.display()
+        )
+    })?;
+    let allowed: Vec<String> = section
         .get("allowed_users")
         .and_then(Value::as_array)
         .map(|ids| {
@@ -104,18 +128,18 @@ pub fn settings(path: &Path) -> Result<Settings, String> {
         .unwrap_or_default();
     if allowed.is_empty() {
         return Err(format!(
-            "{}: `gateway.telegram.allowed_users` is empty; an empty list is not everyone",
+            "{}: `{name}.allowed_users` is empty; an empty list is not everyone",
             path.display()
         ));
     }
-    let verify = telegram
+    let verify = section
         .get("verify")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
     if verify.trim().is_empty() {
         return Err(format!(
-            "{}: `gateway.telegram.verify` is empty; a chat run needs a check to be judged by",
+            "{}: `{name}.verify` is empty; a chat run needs a check to be judged by",
             path.display()
         ));
     }
@@ -152,14 +176,14 @@ pub fn settings(path: &Path) -> Result<Settings, String> {
             path.display()
         ));
     }
-    let policy = telegram
+    let policy = section
         .get("policy")
         .and_then(Value::as_str)
         .unwrap_or("guarded")
         .to_string();
     if policy != "guarded" && policy != "open" {
         return Err(format!(
-            "{}: `gateway.telegram.policy` is {policy:?}; say guarded or open",
+            "{}: `{name}.policy` is {policy:?}; say guarded or open",
             path.display()
         ));
     }
@@ -1082,7 +1106,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
 
 fn system_prompt(workspace: &Path) -> String {
     format!(
-        "You are Hades, a single-user agent in a Telegram chat. Answer in prose that reads like a message: \
+        "You are Hades, a single-user agent in a chat. Answer in prose that reads like a message: \
 short unless the question needs depth, no tables, no headers. Your tools run in {}. Use them when the \
 answer depends on the machine, a file or the web, and then report what matters rather than the tool \
 traffic. For work that has to happen again later, use the cron tool and never the shell's crontab: a job \
@@ -1127,7 +1151,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
         return Ok(());
     }
     if let Some(callback) = &update.callback {
-        let by = format!("telegram:{}", update.from);
+        let by = format!("{}:{}", update.chat.surface(), update.from);
         let parts: Vec<&str> = callback.data.split(':').collect();
         let (id, allow) = match parts.as_slice() {
             ["a", id, allow] if *allow == "1" || *allow == "0" => match id.parse::<u64>() {
@@ -1209,7 +1233,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         ("/stop", what) => {
-            let by = format!("telegram:{}", update.from);
+            let by = format!("{}:{}", update.chat.surface(), update.from);
             let all = what.trim() == "all";
             let request = if all {
                 json!({"op": "stop", "by": by})
@@ -1289,7 +1313,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                     return Ok(());
                 }
             };
-            let by = format!("telegram:{}", update.from);
+            let by = format!("{}:{}", update.chat.surface(), update.from);
             match crate::cron::cancel(state, id, &by) {
                 Ok(path) => transport.send(&update.chat,
                     &format!(
@@ -1307,7 +1331,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         ("/shutdown", _) => {
-            let by = format!("telegram:{}", update.from);
+            let by = format!("{}:{}", update.chat.surface(), update.from);
             let response = match ask(socket, &json!({"op": "shutdown", "by": by})) {
                 Ok(response) => response,
                 Err(said) => {

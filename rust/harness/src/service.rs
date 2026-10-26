@@ -121,6 +121,42 @@ pub fn render(prefix: &Path, home: &Path) -> Result<Units, String> {
     Ok(Units { daemon, gateway })
 }
 
+/// One unit for one installed connector. It is written next to the daemon's units rather than shipped
+/// inside the pack: a pack brings a binary, the install decides how it is supervised.
+pub fn connector_unit(
+    id: &str,
+    binary: &Path,
+    config: &Path,
+    state: &Path,
+    home: &Path,
+) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Hades connector: {id}\n\
+         After=hades-daemon.service\n\
+         Requires=hades-daemon.service\n\
+         StartLimitIntervalSec=60\n\
+         StartLimitBurst=5\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         WorkingDirectory={home}\n\
+         ExecStart={binary} --state {state} --config {config}\n\
+         Restart=on-failure\n\
+         RestartSec=10\n\
+         NoNewPrivileges=yes\n\
+         PrivateTmp=yes\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        id = id,
+        binary = binary.display(),
+        config = config.display(),
+        state = state.display(),
+        home = home.display(),
+    )
+}
+
 /// Write both units into `out`, in daemon-then-gateway order.
 ///
 /// An existing file is rewritten when it carries the marker, and refused when it does not. The refusal

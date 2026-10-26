@@ -839,7 +839,7 @@ fn validate_listing(names: &str, types: &str) -> Result<(), String> {
 }
 
 /// The SHA-256 of a file, read in chunks. The archive cap bounds the size; this bounds the memory.
-fn file_digest(file: &Path) -> Result<String, String> {
+pub fn file_digest(file: &Path) -> Result<String, String> {
     use std::io::Read;
     let mut handle = fs::File::open(file)
         .map_err(|error| format!("could not read {}: {error}", file.display()))?;
