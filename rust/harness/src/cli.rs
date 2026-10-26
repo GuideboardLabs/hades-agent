@@ -2512,6 +2512,61 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 0,
             ))
         }
+        "channels" => {
+            // The rule a person is about to rely on: what an unlisted channel gets, and what each listed
+            // one changes. Reading it from the same parse the gateway uses, so the answer cannot drift.
+            let flags = parse_with(rest, &["state", "config"], &[])?;
+            let _state = state_of(&flags)?;
+            let config = config_path(&flags)?;
+            let id = flags
+                .positional
+                .first()
+                .ok_or_else(|| "`connector channels` needs an id".to_string())?;
+            let settings = crate::gateway::settings_for(&config, id)?;
+            let word = |mode: crate::mode::Mode| match mode {
+                crate::mode::Mode::Act => "work",
+                crate::mode::Mode::Plan => "plan",
+                crate::mode::Mode::Read => "read",
+                crate::mode::Mode::Chat => "chat",
+            };
+            let mut text = format!(
+                "{id}: every channel not listed below is {} (policy {}, root {})\n",
+                word(settings.mode),
+                settings.policy,
+                settings.root
+            );
+            let mut ids: Vec<&String> = settings.channels.keys().collect();
+            ids.sort();
+            for channel in ids {
+                let entry = &settings.channels[channel];
+                let effective = settings.effective(&crate::gateway::Chat::new(id, channel.as_str()));
+                let mut changed = Vec::new();
+                if entry.mode.is_some() {
+                    changed.push(format!("mode {}", word(effective.mode)));
+                }
+                if entry.policy.is_some() {
+                    changed.push(format!("policy {}", effective.policy));
+                }
+                if entry.verify.is_some() {
+                    changed.push(format!("verify {:?}", effective.verify));
+                }
+                if entry.root.is_some() {
+                    changed.push(format!("root {}", effective.root));
+                }
+                if entry.model.is_some() {
+                    changed.push(format!("model {}", effective.model));
+                }
+                text.push_str(&format!(
+                    "  {channel}: {}\n",
+                    if changed.is_empty() {
+                        "nothing changed".to_string()
+                    } else {
+                        changed.join(" · ")
+                    }
+                ));
+            }
+            Ok((text, 0))
+        }
         "service" => {
             let flags = parse_with(rest, &["state", "config", "out"], &["dry-run"])?;
             let state = state_of(&flags)?;

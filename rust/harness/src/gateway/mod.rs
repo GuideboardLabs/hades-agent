@@ -260,8 +260,15 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         };
         Ok(Some(mode))
     };
+    // A surface with no `mode` is a conversation unless it is the built-in one, whose behaviour predates
+    // the key. A connector added later starts read-only by default: work has to be asked for by id.
+    let default_mode = if surface == "tg" || surface == "telegram" {
+        crate::mode::Mode::Act
+    } else {
+        crate::mode::Mode::Chat
+    };
     let mode = parse_mode(section.get("mode").unwrap_or(&Value::Null), &format!("{name}.mode"))?
-        .unwrap_or(crate::mode::Mode::Act);
+        .unwrap_or(default_mode);
     let mut channels = std::collections::HashMap::new();
     if let Some(map) = section.get("channels") {
         let Some(map) = map.as_object() else {
@@ -2176,6 +2183,27 @@ mod tests {
         // A channel that names nothing keeps the surface's own model and policy.
         assert_eq!(work.model, settings.model);
         assert_eq!(work.policy, settings.policy);
+    }
+
+    #[test]
+    fn a_connector_without_a_mode_is_a_conversation_and_telegram_is_not() {
+        let dir = scratch("modedefault");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp","gateway":{
+                "telegram":{"allowed_users":["7"],"verify":"true"},
+                "connectors":{"discord":{"allowed_users":["7"],"verify":"true"}}}}"#,
+        )
+        .expect("config");
+        assert_eq!(
+            settings_for(&path, "discord").expect("discord").mode,
+            crate::mode::Mode::Chat
+        );
+        assert_eq!(
+            settings_for(&path, "tg").expect("telegram").mode,
+            crate::mode::Mode::Act
+        );
     }
 
     #[test]
