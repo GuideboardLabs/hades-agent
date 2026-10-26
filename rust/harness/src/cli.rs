@@ -2521,7 +2521,11 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 .first()
                 .ok_or_else(|| "`connector service` needs an id".to_string())?;
             let (manifest, binary) = crate::connector_pack::resolve(&state, id)?;
-            let home = hades_home()?;
+            // The unit belongs in the user's systemd directory, not in the state directory; the working
+            // directory is the person's home, the same one the daemon's units use.
+            let home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."));
             let text = crate::service::connector_unit(
                 &manifest.id,
                 &binary,
