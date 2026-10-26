@@ -19,8 +19,10 @@ use crate::packs_menu::{self, Row};
 pub const DEFAULT_BASE: &str =
     "https://raw.githubusercontent.com/GuideboardLabs/hades-agent-packs/main/";
 
-/// A pack is a skill and a manifest. Four MiB is the fetch path's own body cap; a pack over it is not a pack.
-const MAX_ARCHIVE: usize = 4 * 1024 * 1024;
+/// A data pack is a skill and a manifest, and four MiB was already generous for one. A connector is a compiled
+/// binary with its own manifest, so the cap is sixteen: still small enough that a fetch is bounded, large
+/// enough that a statically linked connector fits without the ceiling becoming the reason it cannot ship.
+const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
 const MAX_INDEX: usize = 256 * 1024;
 
 /// Distinguishes two installations in the same process, where the clock alone could collide.
@@ -232,6 +234,34 @@ fn install(
     if let Err(error) = written {
         let _ = fs::remove_file(&staging);
         return Err(format!("could not write {}: {error}", staging.display()));
+    }
+    // A connector archive is not a data pack: it carries a binary, an entrypoint and a digest per file. It
+    // takes the stricter installer, and it is the only path where a shelf row results in something that can
+    // run, so it is also the only one that asks for `--yes` before touching the state directory.
+    if crate::connector_pack::looks_like_connector(&staging) {
+        if !yes {
+            let _ = fs::remove_file(&staging);
+            return Ok(format!(
+                "{origin} is a connector, not a data pack. `hades pack add <id> --yes` installs it; nothing \
+                 was written.\n"
+            ));
+        }
+        let (target, manifest) = match crate::connector_pack::install_tar(state, &staging) {
+            Ok(found) => found,
+            Err(error) => {
+                let _ = fs::remove_file(&staging);
+                return Err(error);
+            }
+        };
+        let _ = fs::remove_file(&staging);
+        return Ok(format!(
+            "installed connector {} {} ({})\n  {}\n  then `hades connector service {}` and start the unit\n",
+            manifest.id,
+            manifest.version,
+            manifest.platform,
+            target.display(),
+            manifest.id
+        ));
     }
     // The parser reads the file, so the two failures are told apart: an archive that is not a pack says so,
     // and only bytes that changed under the parser are reported as a changed digest. Collapsing them would

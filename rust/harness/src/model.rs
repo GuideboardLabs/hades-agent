@@ -1404,13 +1404,14 @@ mod tests {
     #[test]
     fn every_preset_says_where_it_goes_and_two_of_them_are_the_cloud() {
         let all = presets();
-        assert_eq!(all.len(), 4, "two local, two cloud");
+        assert_eq!(all.len(), 5, "three local, two cloud");
         assert_eq!(all.iter().filter(|p| p.key.is_some()).count(), 2);
         for preset in &all {
             assert!(preset.endpoint.starts_with("http"), "{}", preset.id);
             assert!(parses(preset.endpoint), "{}", preset.id);
         }
         assert!(preset("nanbeige-3b").is_some());
+        assert!(preset("heem-9b").is_some());
         assert!(preset("nope").is_none());
     }
 

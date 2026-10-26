@@ -24,6 +24,8 @@ pub struct Row {
     pub bytes: u64,
     pub sha256: String,
     pub archive: String,
+    /// The triple a connector archive was built for. Absent on a data pack, which runs anywhere Hades runs.
+    pub platform: Option<String>,
 }
 
 impl Row {
@@ -52,10 +54,14 @@ impl Row {
     }
 
     fn line(&self) -> String {
+        let kind = match &self.platform {
+            Some(triple) => format!("{}/{}", self.kinds.join(","), triple),
+            None => self.kinds.join(","),
+        };
         format!(
-            "{:<26} {:<10} {:<14} {}",
+            "{:<26} {:<22} {:<10} {}",
             self.id,
-            self.kinds.join(","),
+            kind,
             self.version,
             self.summary
         )
@@ -127,6 +133,10 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
             bytes: object.get("bytes").and_then(Value::as_u64).unwrap_or(0),
             sha256: text("sha256")?,
             archive: text("archive")?,
+            platform: object
+                .get("platform")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         });
     }
     Ok(rows)

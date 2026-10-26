@@ -701,8 +701,10 @@ it again. `HADES_PACKS_URL` points the
 shelf at a mirror, and `HADES_PACKS_ALLOW_PRIVATE=1` is what lets that mirror be a local address.
 
 The catalog is generated from a packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`
-from the pack directories) and copied into `docs/packs/` at release. This repository publishes three skills
-to start with.
+from the pack directories) and copied into `docs/packs/` at release. That shelf publishes three skills and
+the Discord connector. A connector row is the one kind that ships code: it names its platform triple, installs
+through the connector path with a digest per file, and `pack add` requires `--yes` for it where a skill is
+planned and applied.
 
 A pack's licence is its own: this runtime is MIT, and that does not reach a pack installed into it. A
 commercial pack is a pack whose manifest says so (`license` and `derivatives: forbidden`), and its bytes
