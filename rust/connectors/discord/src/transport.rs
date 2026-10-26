@@ -289,6 +289,12 @@ fn read_gateway(inner: &Arc<Inner>, sender: &Sender<Update>) -> Result<(), Strin
             _ => {}
         }
         match socket.read() {
+            Ok(Message::Close(frame)) => {
+                let (code, reason) = frame
+                    .map(|frame| (frame.code.to_string(), frame.reason.to_string()))
+                    .unwrap_or_else(|| ("no code".to_string(), String::new()));
+                return Err(format!("gateway closed the connection: {code} {reason}"));
+            }
             Ok(message) => {
                 let text = text_of(Ok::<Message, tungstenite::Error>(message))?;
                 if let Some(value) = dispatch(inner, sender, &text)? {
@@ -363,6 +369,16 @@ fn dispatch(
             if let Some(id) = value.pointer("/d/user/id").and_then(Value::as_str) {
                 *inner.me.lock().unwrap_or_else(|held| held.into_inner()) = Some(id.to_string());
             }
+            let name = value
+                .pointer("/d/user/username")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let guilds = value
+                .pointer("/d/guilds")
+                .and_then(Value::as_array)
+                .map(|list| list.len())
+                .unwrap_or(0);
+            eprintln!("discord: connected as {name} in {guilds} guild(s)");
         }
         "MESSAGE_CREATE" => {
             if let Some(update) = message_update(inner, value.get("d").unwrap_or(&Value::Null)) {
