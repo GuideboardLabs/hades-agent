@@ -56,6 +56,11 @@ impl Fake {
 }
 
 impl Transport for Fake {
+    // The oracle stands in for a surface that can ask for approval, as Telegram does.
+    fn buttons(&self) -> bool {
+        true
+    }
+
     fn updates(&mut self, _offset: Option<i64>, _timeout: u64) -> Result<Vec<Update>, String> {
         let mut state = self.state.lock().unwrap();
         if state.taken >= state.batches.len() {

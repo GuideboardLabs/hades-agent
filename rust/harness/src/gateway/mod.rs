@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// The most characters one chat message may carry. Telegram refuses more, so the gateway cuts first and
-/// says it cut rather than letting the API fail the whole delivery.
-const MESSAGE_LIMIT: usize = 3_800;
+/// The default per-message character budget, used by a surface that does not declare its own. Telegram
+/// accepts 4096; the gateway keeps a margin for the tags it adds.
+const DEFAULT_LIMIT: usize = 3_800;
 /// How often the status message may be rewritten. An edit per entry turns a long attempt into a flood;
 /// a second between edits keeps the stream readable and stays well inside Telegram's limit.
 const EDIT_EVERY: Duration = Duration::from_millis(1_100);
@@ -215,6 +215,17 @@ pub trait Transport {
     ) -> Result<(), String>;
     fn typing(&mut self, chat: i64) -> Result<(), String>;
     fn ack(&mut self, callback: &str, text: &str) -> Result<(), String>;
+    /// The most characters this surface accepts in one message. The gateway chunks an answer to fit
+    /// rather than cutting it, because a surface with a smaller budget than Telegram's would otherwise
+    /// lose the end of every long answer without saying so.
+    fn limit(&self) -> usize {
+        DEFAULT_LIMIT
+    }
+    /// Whether this surface can render inline buttons. An approval that arrives at a surface without them
+    /// would park a run nobody can unblock, so a guarded policy needs this to be true.
+    fn buttons(&self) -> bool {
+        false
+    }
     /// Fetch a file the platform holds, by its file id. Surfaces without files keep the default.
     fn file(&self, _file_id: &str) -> Result<Vec<u8>, String> {
         Err("this surface cannot fetch files".to_string())
@@ -516,7 +527,7 @@ impl Status {
         }
     }
 
-    fn text(&self) -> String {
+    fn text(&self, limit: usize) -> String {
         let mut parts: Vec<String> = Vec::new();
         if !self.reasoning.trim().is_empty() {
             parts.push(format!(
@@ -531,7 +542,7 @@ impl Status {
             ));
         }
         parts.extend(self.lines.iter().cloned());
-        clip(&parts.join("\n"))
+        clip(&parts.join("\n"), limit)
     }
 
     fn draw(&mut self, transport: &mut dyn Transport, force: bool) -> Result<(), String> {
@@ -542,7 +553,8 @@ impl Status {
             return Ok(());
         }
         self.last = Instant::now();
-        match transport.edit(self.chat, id, &self.text(), &[]) {
+        let text = self.text(transport.limit());
+        match transport.edit(self.chat, id, &text, &[]) {
             // Telegram refuses an edit that changes nothing; that is not a failure to report.
             Err(said) if said.contains("message is not modified") => Ok(()),
             other => other,
@@ -642,7 +654,23 @@ fn follow<T: Transport + Clone + Send + 'static>(
                             "<b>Permission needed</b>\n{}\n<i>{}</i>",
                             pre(action),
                             esc(reason)
-                        ));
+                        ), transport.limit());
+                        if !transport.buttons() {
+                            // A surface with no buttons cannot answer this question. Saying so and stopping
+                            // is better than parking a run behind a prompt that can never be pressed; the
+                            // question stays in the record, and another surface that can render it still can.
+                            transport.send(chat, &text, &[])?;
+                            transport.send(
+                                chat,
+                                &clip(
+                                    "This surface cannot render Allow/Deny buttons, so this run is waiting for a decision it cannot ask for. Set `gateway.<id>.policy` to `open` or run it from a surface with buttons.",
+                                    transport.limit(),
+                                ),
+                                &[],
+                            )?;
+                            stop.store(true, Ordering::SeqCst);
+                            continue;
+                        }
                         let buttons = [
                             Button {
                                 label: "Allow".to_string(),
@@ -662,7 +690,7 @@ fn follow<T: Transport + Clone + Send + 'static>(
                             chat,
                             &clip(&format!(
                                 "this run wants to {action} but I could not remember the question ({said}), so Allow could not continue it. The question stays open in the record."
-                            )),
+                            ), transport.limit()),
                             &[],
                         );
                     }
@@ -712,12 +740,54 @@ fn follow<T: Transport + Clone + Send + 'static>(
     status.draw(transport, true)
 }
 
-fn clip(text: &str) -> String {
-    if text.chars().count() <= MESSAGE_LIMIT {
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
         return text.to_string();
     }
-    let kept: String = text.chars().take(MESSAGE_LIMIT).collect();
-    format!("{kept}\n[cut: the message was longer than {MESSAGE_LIMIT} characters]")
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}\n[cut: the message was longer than {limit} characters]")
+}
+
+/// Split an answer into parts a surface will accept, without cutting a word in half when a boundary is
+/// available. Paragraph first, then line, then space; a hard cut only when the text has no boundary at all
+/// (a base64 blob, a long URL). The caller joins nothing back: each part is a message a person reads.
+fn split(text: &str, limit: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() {
+        if rest.chars().count() <= limit {
+            parts.push(rest.to_string());
+            break;
+        }
+        let window: &str = &rest[..byte_at(rest, limit)];
+        // Prefer the last blank line, then the last newline, then the last space, all inside the window and
+        // past halfway so a part is never needlessly short.
+        let floor = byte_at(window, limit / 2);
+        let cut = window[floor..]
+            .rfind("\n\n")
+            .map(|at| floor + at + 2)
+            .or_else(|| window[floor..].rfind('\n').map(|at| floor + at + 1))
+            .or_else(|| window[floor..].rfind(' ').map(|at| floor + at + 1))
+            .unwrap_or(window.len());
+        let (head, tail) = rest.split_at(cut);
+        let head = head.trim_end();
+        if !head.is_empty() {
+            parts.push(head.to_string());
+        }
+        rest = tail.trim_start();
+    }
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
+}
+
+/// The byte index of the `chars`-th character, or the length when the string is shorter.
+fn byte_at(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map(|(at, _)| at)
+        .unwrap_or(text.len())
 }
 
 fn command(text: &str) -> (&str, &str) {
@@ -770,10 +840,11 @@ fn save_chat(state: &Path, chat: i64, messages: &[Value]) {
 }
 
 /// A chat card is prose, not a run card: the answer as it is written, and the thinking only until there is
-/// an answer to read.
-fn render_chat(reasoning: &str, content: &str, activity: &[String]) -> String {
+/// an answer to read. The live view shows the tail of a long answer, because the newest words are the ones
+/// a person is waiting for; the finished answer is split into messages instead of being cut.
+fn render_chat(reasoning: &str, content: &str, activity: &[String], limit: usize) -> String {
     if !content.trim().is_empty() {
-        return esc(content.trim());
+        return esc(&tail(content.trim(), limit));
     }
     let mut parts = Vec::new();
     if !activity.is_empty() {
@@ -792,7 +863,7 @@ fn render_chat(reasoning: &str, content: &str, activity: &[String]) -> String {
     if parts.is_empty() {
         "<i>…</i>".to_string()
     } else {
-        parts.join("\n\n")
+        clip(&parts.join("\n\n"), limit)
     }
 }
 
@@ -875,6 +946,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
         eprintln!("compression: not written, {fault}");
     }
     let id = transport.send(update.chat, "<i>…</i>", &[])?;
+    let limit = transport.limit();
     let shared = Arc::new(Mutex::new((
         String::new(),
         String::new(),
@@ -897,7 +969,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
                 {
                     let text = {
                         let held = shared.lock().expect("the chat buffer");
-                        render_chat(&held.0, &held.1, &held.2)
+                        render_chat(&held.0, &held.1, &held.2, limit)
                     };
                     let _ = beat.edit(chat_id, message, &text, &[]);
                     last = Instant::now();
@@ -931,10 +1003,21 @@ fn chat<T: Transport + Clone + Send + 'static>(
 
     match answer {
         Ok(Some(text)) => {
-            if let Some(message) = id {
-                transport.edit(update.chat, message, &esc(&text), &[])?;
-            } else {
-                transport.send(update.chat, &esc(&text), &[])?;
+            // An answer longer than the surface accepts becomes several messages instead of a cut. The
+            // placeholder is the first part when the surface gave us an id to edit.
+            let parts = split(&esc(&text), transport.limit());
+            match id {
+                Some(message) => {
+                    transport.edit(update.chat, message, &parts[0], &[])?;
+                    for part in &parts[1..] {
+                        transport.send(update.chat, part, &[])?;
+                    }
+                }
+                None => {
+                    for part in &parts {
+                        transport.send(update.chat, part, &[])?;
+                    }
+                }
             }
             // The record is the conversation, not the tool traffic: the next message needs the exchange.
             let kept = vec![
@@ -1696,7 +1779,7 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
                     ) {
                         let _ = worker.send(
                             update.chat,
-                            &clip(&format!("the run failed: {said}")),
+                            &clip(&format!("the run failed: {said}"), worker.limit()),
                             &[],
                         );
                     }
@@ -1754,7 +1837,7 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
                     ) {
                         let _ = worker.send(
                             update.chat,
-                            &clip(&format!("the answer failed: {said}")),
+                            &clip(&format!("the answer failed: {said}"), worker.limit()),
                             &[],
                         );
                     }
@@ -1990,5 +2073,35 @@ mod tests {
         let refused = super::settings(&path).expect_err("zero is refused");
         assert!(refused.contains("heartbeat"), "{refused}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answer_is_split_on_boundaries_not_mid_word() {
+        let text = "alpha beta gamma\n\ndelta epsilon zeta";
+        let parts = super::split(text, 24);
+        assert!(parts.iter().all(|p| p.chars().count() <= 24), "{parts:?}");
+        let before: Vec<&str> = text.split_whitespace().collect();
+        let after: Vec<&str> = parts.iter().flat_map(|p| p.split_whitespace()).collect();
+        assert_eq!(before, after, "{parts:?}");
+    }
+
+    #[test]
+    fn a_wall_of_text_still_splits_at_the_limit() {
+        let wall = "x".repeat(50);
+        let parts = super::split(&wall, 10);
+        assert_eq!(parts.len(), 5);
+        assert!(parts.iter().all(|p| p.chars().count() <= 10));
+    }
+
+    #[test]
+    fn a_split_never_cuts_a_character_in_half() {
+        let text = "é".repeat(30);
+        let parts = super::split(&text, 7);
+        assert!(parts.iter().all(|p| p.chars().count() <= 7), "{parts:?}");
+        assert_eq!(
+            parts.iter().map(|p| p.chars().count()).sum::<usize>(),
+            30,
+            "{parts:?}"
+        );
     }
 }

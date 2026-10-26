@@ -62,6 +62,16 @@ impl Telegram {
 }
 
 impl Transport for Telegram {
+    /// Telegram accepts 4096 characters per message. The margin covers the tags the gateway adds.
+    fn limit(&self) -> usize {
+        super::DEFAULT_LIMIT
+    }
+
+    /// Telegram renders inline keyboards, which is what the approval flow needs.
+    fn buttons(&self) -> bool {
+        true
+    }
+
     fn updates(&mut self, offset: Option<i64>, timeout: u64) -> Result<Vec<Update>, String> {
         let body = json!({
             "offset": offset,
