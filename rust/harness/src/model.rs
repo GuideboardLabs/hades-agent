@@ -1018,6 +1018,16 @@ pub fn presets() -> Vec<Preset> {
             note: "the other 24/24, a 27B ternary at 10.9 t/s. Needs the Prism fork; port 8111.",
         },
         Preset {
+            id: "heem-9b",
+            thinking: Some(false),
+            endpoint: "http://127.0.0.1:8100/v1/chat/completions",
+            model: "heem-9b",
+            key: None,
+            context: 32768,
+            note: "the abliterated 9B (Qwen3.5-9B-Uncensored-HauhauCS-Aggressive Q4_K_M), fully \
+                   VRAM-resident on the 5700 XT. Start local-llm-heem9b.service on 8100 first",
+        },
+        Preset {
             id: "deepseek-v4.1-flash",
             thinking: None,
             endpoint: "https://ollama.com/v1/chat/completions",
