@@ -191,6 +191,8 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
             vault: dir.join("mneme").display().to_string(),
             heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
             mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
         }
     );
 }
@@ -207,6 +209,8 @@ fn an_unauthorized_sender_gets_nothing() {
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
     };
     let mut fake = Fake::default();
     // The socket does not exist: any attempt to reach the daemon would fail, which is the proof that
@@ -220,6 +224,38 @@ fn an_unauthorized_sender_gets_nothing() {
     )
     .expect("ignored");
     assert!(fake.sent().is_empty());
+}
+
+#[test]
+fn a_channel_set_to_chat_cannot_start_work() {
+    let dir = scratch("readonly");
+    let mut settings = Settings {
+        allowed: vec!["1".to_string()],
+        policy: "open".to_string(),
+        verify: "true".to_string(),
+        model: "nanbeige-3b".to_string(),
+        root: "/tmp".to_string(),
+        vault: "/tmp/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
+        mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
+    };
+    settings.mode = harness::mode::Mode::Read;
+    let mut fake = Fake::default();
+    // No daemon: if the gate let this through, the submit would fail instead of answering.
+    handle(
+        &message(1, 1, "/run make a file"),
+        &settings,
+        &socket_under(&dir),
+        &dir,
+        &mut fake,
+    )
+    .expect("refused");
+    let sent = fake.sent();
+    let text = &sent[0].1;
+    assert!(text.contains("read-only"), "{text:?}");
+    assert!(text.contains("work"), "{text:?}");
 }
 
 #[test]
@@ -272,6 +308,8 @@ fn a_submit_is_relayed_from_started_to_the_end() {
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
     };
     let mut fake = Fake::default();
     handle(
@@ -384,6 +422,8 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
     };
     let fake = Fake::default();
     let mut worker = fake.clone();
@@ -453,6 +493,8 @@ fn the_offset_advances_after_a_batch() {
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
     };
     // One batch with one update, then nothing. `--once` handles the batch and returns.
     let fake = Fake::with(vec![vec![Update {
@@ -504,6 +546,8 @@ fn settings_for(chat: i64) -> Settings {
         vault: "/work/mneme".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
         mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
     }
 }
 

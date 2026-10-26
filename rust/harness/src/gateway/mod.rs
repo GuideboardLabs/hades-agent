@@ -70,6 +70,50 @@ pub struct Settings {
     pub heartbeat: i64,
     /// The MCP servers a chat may reach, parsed from the same file.
     pub mcp: crate::mcp::McpConfig,
+    /// What a message may do when its channel says nothing. `Read` is a conversation; `Act` is work.
+    pub mode: crate::mode::Mode,
+    /// Per-channel overrides, keyed by the channel id the surface reports. A channel can change what a
+    /// message may do (a talk channel that cannot touch the filesystem) without a second surface.
+    pub channels: std::collections::HashMap<String, Channel>,
+}
+
+/// What one channel changes about the surface it belongs to. Every field is optional: a channel that
+/// names nothing behaves exactly like its surface.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Channel {
+    pub mode: Option<crate::mode::Mode>,
+    pub policy: Option<String>,
+    pub verify: Option<String>,
+    pub root: Option<String>,
+    pub model: Option<String>,
+}
+
+/// The settings one message is answered under, after its channel has had its say.
+#[derive(Debug, Clone)]
+pub struct Effective {
+    pub mode: crate::mode::Mode,
+    pub policy: String,
+    pub verify: String,
+    pub root: String,
+    pub model: String,
+}
+
+impl Settings {
+    pub fn effective(&self, chat: &Chat) -> Effective {
+        let channel = self.channels.get(chat.id());
+        let pick = |field: fn(&Channel) -> Option<String>, base: &str| {
+            channel
+                .and_then(field)
+                .unwrap_or_else(|| base.to_string())
+        };
+        Effective {
+            mode: channel.and_then(|c| c.mode).unwrap_or(self.mode),
+            policy: pick(|c| c.policy.clone(), &self.policy),
+            verify: pick(|c| c.verify.clone(), &self.verify),
+            root: pick(|c| c.root.clone(), &self.root),
+            model: pick(|c| c.model.clone(), &self.model),
+        }
+    }
 }
 
 /// The environment variable a surface's token is read from. A connector never chooses its own name: a
@@ -198,6 +242,61 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             )
         })?,
     };
+    // `chat` and `work` are the words a person uses; read/plan/act are what the harness calls them. A
+    // channel that says `chat` may read and answer and cannot change a file.
+    let parse_mode = |value: &Value, owner: &str| -> Result<Option<crate::mode::Mode>, String> {
+        let Some(word) = value.as_str() else {
+            return if value.is_null() {
+                Ok(None)
+            } else {
+                Err(format!("{owner}: `mode` must be a string"))
+            };
+        };
+        let mode = match word.trim().to_ascii_lowercase().as_str() {
+            "chat" => crate::mode::Mode::Read,
+            "work" => crate::mode::Mode::Act,
+            other => crate::mode::Mode::parse(other)
+                .ok_or_else(|| format!("{owner}: `mode` is {other:?}; say chat, work, read, plan or act"))?,
+        };
+        Ok(Some(mode))
+    };
+    let mode = parse_mode(section.get("mode").unwrap_or(&Value::Null), &format!("{name}.mode"))?
+        .unwrap_or(crate::mode::Mode::Act);
+    let mut channels = std::collections::HashMap::new();
+    if let Some(map) = section.get("channels") {
+        let Some(map) = map.as_object() else {
+            return Err(format!("{name}.channels must be an object of channel id -> settings"));
+        };
+        for (id, entry) in map {
+            let owner = format!("{name}.channels.{id}");
+            let body = entry
+                .as_object()
+                .ok_or_else(|| format!("{owner} must be an object"))?;
+            for key in body.keys() {
+                if !["mode", "policy", "verify", "root", "model"].contains(&key.as_str()) {
+                    return Err(format!("{owner}: unknown key {key:?}"));
+                }
+            }
+            let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+            let policy = text("policy");
+            if let Some(policy) = &policy
+                && policy != "guarded"
+                && policy != "open"
+            {
+                return Err(format!("{owner}.policy is {policy:?}; say guarded or open"));
+            }
+            channels.insert(
+                id.clone(),
+                Channel {
+                    mode: parse_mode(body.get("mode").unwrap_or(&Value::Null), &format!("{owner}.mode"))?,
+                    policy,
+                    verify: text("verify"),
+                    root: text("root"),
+                    model: text("model"),
+                },
+            );
+        }
+    }
     Ok(Settings {
         allowed,
         policy,
@@ -207,6 +306,8 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         vault,
         heartbeat,
         mcp: crate::mcp::McpConfig::from_value(value.get("mcp"), path)?,
+        mode,
+        channels,
     })
 }
 
@@ -919,22 +1020,23 @@ fn render_chat(reasoning: &str, content: &str, activity: &[String], limit: usize
 fn chat<T: Transport + Clone + Send + 'static>(
     update: &Update,
     settings: &Settings,
+    effective: &Effective,
     state: &Path,
     transport: &mut T,
     halt: Option<&AtomicBool>,
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<(), String> {
     let _ = state;
-    let preset = crate::model::preset(&settings.model)
-        .ok_or_else(|| format!("no model preset named `{}`", settings.model))?;
+    let preset = crate::model::preset(&effective.model)
+        .ok_or_else(|| format!("no model preset named `{}`", effective.model))?;
     let client = crate::model::from_preset(&preset);
     let mut history = load_chat(state, &update.chat);
-    let workspace = PathBuf::from(&settings.root);
+    let workspace = PathBuf::from(&effective.root);
     let world = world_for(
         settings,
         state,
         update.chat.clone(),
-        crate::mode::Mode::Act,
+        effective.mode,
         &format!("chat:{}", update.chat),
         mcp,
     );
@@ -1150,6 +1252,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     if !settings.allowed.contains(&update.from) {
         return Ok(());
     }
+    // One channel can be a conversation and another a workspace, on the same surface.
+    let effective = settings.effective(&update.chat);
     if let Some(callback) = &update.callback {
         let by = format!("{}:{}", update.chat.surface_name(), update.from);
         let parts: Vec<&str> = callback.data.split(':').collect();
@@ -1195,8 +1299,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             "state": state.display().to_string(),
             "goal": held.goal,
             "session": held.session,
-            "policy": settings.policy,
-            "verify": settings.verify,
+            "policy": effective.policy,
+            "verify": effective.verify,
         });
         return follow(socket, &request, transport, update.chat.clone(), state);
     }
@@ -1204,12 +1308,36 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     let text = update.text.trim();
     if !text.starts_with('/') {
         let halt = signals.flag(&update.chat);
-        return chat(update, settings, state, transport, halt.as_deref(), mcp);
+        return chat(update, settings, &effective, state, transport, halt.as_deref(), mcp);
     }
     match command(text) {
         ("/help", _) => {
             transport.send(&update.chat,
                 "Send a message to talk to Hades.\n<code>/run &lt;goal&gt;</code> starts work on the machine, with a check and an approval when the policy asks.\n<code>/status</code> shows the sessions.\n<code>/stop</code> stops this chat's work; <code>/stop all</code> stops every run.\n<code>/cancel &lt;job&gt;</code> removes a scheduled job and its pending retry.\n<code>/shutdown</code> stops everything and ends the daemon.",
+                &[],
+            )?;
+            Ok(())
+        }
+        ("/mode", _) => {
+            // Which rules this channel is answered under. A person testing a surface should not have to
+            // read the config file to find out what the bot is allowed to do here.
+            let mode = match effective.mode {
+                crate::mode::Mode::Act => "work",
+                crate::mode::Mode::Plan => "plan",
+                crate::mode::Mode::Read => "chat",
+            };
+            transport.send(
+                &update.chat,
+                &format!(
+                    "<b>{mode}</b> in this channel: policy <b>{}</b>, root <code>{}</code>{}",
+                    esc(&effective.policy),
+                    esc(&effective.root),
+                    if effective.mode == crate::mode::Mode::Act {
+                        ""
+                    } else {
+                        "; `/run` needs a channel set to work"
+                    }
+                ),
                 &[],
             )?;
             Ok(())
@@ -1368,13 +1496,22 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         ("/run", goal) if !goal.is_empty() => {
+            // Work is a decision the channel makes, not a word a message can choose.
+            if effective.mode != crate::mode::Mode::Act {
+                transport.send(
+                    &update.chat,
+                    "This channel is read-only. `/run` needs a channel whose settings say `work`.",
+                    &[],
+                )?;
+                return Ok(());
+            }
             let request = json!({
                 "op": "submit",
                 "state": state.display().to_string(),
                 "goal": goal,
                 "session": update.chat.key(),
-                "policy": settings.policy,
-                "verify": settings.verify,
+                "policy": effective.policy,
+                "verify": effective.verify,
             });
             follow(socket, &request, transport, update.chat.clone(), state)
         }
@@ -1987,7 +2124,51 @@ mod tests {
             vault: "/work/mneme".to_string(),
             heartbeat: goal::DEFAULT_HEARTBEAT_SECS,
             mcp: crate::mcp::McpConfig::default(),
+            mode: crate::mode::Mode::Act,
+            channels: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn a_channel_can_be_a_conversation_while_its_surface_is_a_workspace() {
+        let dir = scratch("modes");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp",
+                "gateway":{"connectors":{"discord":{
+                "allowed_users":["7"],"verify":"true","mode":"chat",
+                "channels":{"99":{"mode":"work","verify":"cargo test --quiet","root":"/tmp/w"}}
+            }}}}"#,
+        )
+        .expect("config");
+        let settings = settings_for(&path, "discord").expect("settings");
+        assert_eq!(settings.effective(&Chat::new("discord", "1")).mode, crate::mode::Mode::Read);
+        let work = settings.effective(&Chat::new("discord", "99"));
+        assert_eq!(work.mode, crate::mode::Mode::Act);
+        assert_eq!(work.verify, "cargo test --quiet");
+        assert_eq!(work.root, "/tmp/w");
+        // A channel that names nothing keeps the surface's own model and policy.
+        assert_eq!(work.model, settings.model);
+        assert_eq!(work.policy, settings.policy);
+    }
+
+    #[test]
+    fn a_channel_with_a_word_that_is_not_a_mode_is_refused() {
+        let dir = scratch("badmode");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"model": "deepseek-v4.1-flash", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "channels": {"99": {"mode": "party"}}}}}}"#).expect("config");
+        let said = settings_for(&path, "discord").expect_err("a made-up mode");
+        assert!(said.contains("party"), "{said}");
+    }
+
+    #[test]
+    fn a_channel_key_that_is_not_a_setting_is_refused() {
+        let dir = scratch("badkey");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"model": "deepseek-v4.1-flash", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "channels": {"99": {"policy": "open", "shel": "yes"}}}}}}"#).expect("config");
+        let said = settings_for(&path, "discord").expect_err("a typo");
+        assert!(said.contains("shel"), "{said}");
     }
 
     #[test]

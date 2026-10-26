@@ -1026,6 +1026,8 @@ mod tests {
             vault: root.join("mneme").display().to_string(),
             heartbeat: DEFAULT_HEARTBEAT_SECS,
             mcp: crate::mcp::McpConfig::default(),
+            mode: crate::mode::Mode::Act,
+            channels: std::collections::HashMap::new(),
         }
     }
 
