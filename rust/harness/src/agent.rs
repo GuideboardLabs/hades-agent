@@ -140,6 +140,14 @@ impl World {
     /// did not choose for screenshots.
     pub fn policy(&self) -> crate::path::PathPolicy {
         let mut policy = crate::path::PathPolicy::for_root(&self.root);
+        // A conversation answers from what it knows, so its memory is readable. The vault is added to the
+        // read roots only: no write root grows, and `chat_allows` has already removed every tool that
+        // could write even there.
+        if self.mode == crate::mode::Mode::Chat
+            && let Ok(vault) = std::fs::canonicalize(&self.vault)
+        {
+            policy.read_roots.push(vault);
+        }
         let shots = self.state.join("shots");
         if std::fs::create_dir_all(&shots).is_ok()
             && let Ok(metadata) = std::fs::symlink_metadata(&shots)
@@ -3594,6 +3602,30 @@ mod tests {
             allowance: crate::agent::Allowance::new(64),
             questions: None,
         }
+    }
+
+    #[test]
+    fn a_conversation_may_read_its_vault_and_a_read_job_may_not() {
+        let dir = crate::scratch::root().join("agent-vault-read");
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(dir.join("vault")).expect("vault");
+        std::fs::write(dir.join("vault/note.md"), "a finding").expect("note");
+        let note = dir.join("vault/note.md");
+
+        let mut chat = world_at(&root, Mode::Chat, "chat:7");
+        chat.vault = dir.join("vault");
+        assert!(
+            chat.policy().read(&note).is_ok(),
+            "a conversation could not read its own vault"
+        );
+        // The vault is a read root, never a write root: a chat still cannot change it.
+        assert!(chat.policy().write(&note).is_err());
+
+        let mut read = world_at(&root, Mode::Read, "job:7");
+        read.vault = dir.join("vault");
+        assert!(read.policy().read(&note).is_err(), "a read job lost a boundary it had");
     }
 
     #[test]
