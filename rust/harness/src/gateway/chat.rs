@@ -42,6 +42,12 @@ impl Chat {
         &self.surface
     }
 
+    /// The name a person reads in the ledger: the built-in surface keeps its old name so the record stays
+    /// continuous, and a connector reports its own id.
+    pub fn surface_name(&self) -> &str {
+        if self.surface == "tg" { "telegram" } else { &self.surface }
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }

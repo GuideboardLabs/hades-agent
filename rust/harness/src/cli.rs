@@ -2551,12 +2551,25 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
             ))
         }
         "remove" => {
-            let flags = parse_with(rest, &["state"], &[])?;
+            let flags = parse_with(rest, &["state"], &["force"])?;
             let state = state_of(&flags)?;
             let id = flags
                 .positional
                 .first()
                 .ok_or_else(|| "`connector remove` needs an id".to_string())?;
+            // A running unit would keep a deleted binary mapped and then fail in a way that reads like a
+            // pack bug. Refuse while the unit is active; stopping it is the person's call.
+            let unit = format!("hades-connector-{id}.service");
+            let active = std::process::Command::new("systemctl")
+                .args(["--user", "is-active", &unit])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "active")
+                .unwrap_or(false);
+            if active && !switched(&flags, "force") {
+                return Err(format!(
+                    "{unit} is running; stop it first (`systemctl --user stop {unit}`) or pass --force"
+                ));
+            }
             let removed = crate::connector_pack::remove(&state, id)?;
             Ok((format!("removed {id} ({removed} tree(s))\n"), 0))
         }

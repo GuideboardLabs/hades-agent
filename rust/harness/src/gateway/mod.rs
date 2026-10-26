@@ -1151,7 +1151,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
         return Ok(());
     }
     if let Some(callback) = &update.callback {
-        let by = format!("{}:{}", update.chat.surface(), update.from);
+        let by = format!("{}:{}", update.chat.surface_name(), update.from);
         let parts: Vec<&str> = callback.data.split(':').collect();
         let (id, allow) = match parts.as_slice() {
             ["a", id, allow] if *allow == "1" || *allow == "0" => match id.parse::<u64>() {
@@ -1233,7 +1233,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         ("/stop", what) => {
-            let by = format!("{}:{}", update.chat.surface(), update.from);
+            let by = format!("{}:{}", update.chat.surface_name(), update.from);
             let all = what.trim() == "all";
             let request = if all {
                 json!({"op": "stop", "by": by})
@@ -1313,7 +1313,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                     return Ok(());
                 }
             };
-            let by = format!("{}:{}", update.chat.surface(), update.from);
+            let by = format!("{}:{}", update.chat.surface_name(), update.from);
             match crate::cron::cancel(state, id, &by) {
                 Ok(path) => transport.send(&update.chat,
                     &format!(
@@ -1331,7 +1331,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         ("/shutdown", _) => {
-            let by = format!("{}:{}", update.chat.surface(), update.from);
+            let by = format!("{}:{}", update.chat.surface_name(), update.from);
             let response = match ask(socket, &json!({"op": "shutdown", "by": by})) {
                 Ok(response) => response,
                 Err(said) => {
