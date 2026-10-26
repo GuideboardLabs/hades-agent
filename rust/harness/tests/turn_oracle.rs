@@ -1189,6 +1189,7 @@ impl Evaluator for Costly {
     fn judge(&self, _report: &Report<'_>) -> Judgement {
         Judgement::new(Verdict::Met, "the script says so").with_usage(harness::Usage {
             prompt_tokens: 40,
+            cached_tokens: 0,
             generated_tokens: 2,
             millis: 1,
             reasoning_chars: 0,
@@ -1205,6 +1206,7 @@ fn a_judged_turn_carries_the_judge_call_in_its_usage() {
     let model =
         ScriptedModel::answers([ModelAnswer::new("echo hello").with_usage(harness::Usage {
             prompt_tokens: 100,
+            cached_tokens: 0,
             generated_tokens: 10,
             millis: 4,
             reasoning_chars: 0,
@@ -1239,6 +1241,7 @@ fn an_unwritten_turn_carries_the_call_it_paid_for() {
     let model = ScriptedModel::answers([ModelAnswer::refused("not a program").with_usage(
         harness::Usage {
             prompt_tokens: 250,
+            cached_tokens: 0,
             generated_tokens: 5,
             millis: 3,
             reasoning_chars: 0,

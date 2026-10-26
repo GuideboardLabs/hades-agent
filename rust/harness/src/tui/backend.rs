@@ -428,7 +428,7 @@ pub fn start_chat(
             let world = crate::agent::World {
                 root: options.root.clone(), vault: options.config.as_ref().map(|c| c.vault.clone()).unwrap_or_else(|| options.state.join("mneme")),
                 db: options.state.join("mneme.db"), skills: vec![options.state.join("skills")],
-                sessions: vec![options.state.join("sessions")], state: options.state.clone(), chat: 0, depth: 0, mode,
+                sessions: vec![options.state.join("sessions")], state: options.state.clone(), chat: crate::gateway::Chat::telegram(0), depth: 0, mode,
                 role: crate::profile::Role::Patch, actor: id.clone(), session: id.clone(), inbox: None, mcp, allowance: crate::agent::Allowance::new(4096),
                 questions: crate::approval::OnDisk::open(options.state.join("approvals.jsonl"))
                     .ok()

@@ -225,7 +225,7 @@ mod tests {
     fn job(last: i64) -> Job {
         Job {
             id: 2,
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             schedule: "every 6h".to_string(),
             mode: Mode::Read,
             goal: "report".to_string(),

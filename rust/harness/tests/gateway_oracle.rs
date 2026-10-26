@@ -5,7 +5,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use harness::gateway::{
+use harness::gateway::{Chat, 
     Button, Callback, Settings, Signals, Transport, Update, handle, handle_with, load_offset,
     serve, settings,
 };
@@ -13,9 +13,9 @@ use serde_json::json;
 
 #[derive(Default)]
 struct Recorded {
-    sent: Vec<(i64, String, Vec<Button>)>,
-    edits: Vec<(i64, i64, String)>,
-    typings: Vec<i64>,
+    sent: Vec<(Chat, String, Vec<Button>)>,
+    edits: Vec<(Chat, i64, String)>,
+    typings: Vec<Chat>,
     acks: Vec<(String, String)>,
     batches: Vec<Vec<Update>>,
     taken: usize,
@@ -33,7 +33,7 @@ impl Fake {
         fake
     }
 
-    fn sent(&self) -> Vec<(i64, String, Vec<Button>)> {
+    fn sent(&self) -> Vec<(Chat, String, Vec<Button>)> {
         self.state.lock().unwrap().sent.clone()
     }
 
@@ -71,18 +71,18 @@ impl Transport for Fake {
         Ok(batch)
     }
 
-    fn send(&mut self, chat: i64, text: &str, buttons: &[Button]) -> Result<Option<i64>, String> {
+    fn send(&mut self, chat: &Chat, text: &str, buttons: &[Button]) -> Result<Option<i64>, String> {
         self.state
             .lock()
             .unwrap()
             .sent
-            .push((chat, text.to_string(), buttons.to_vec()));
+            .push((chat.clone(), text.to_string(), buttons.to_vec()));
         Ok(Some(1))
     }
 
     fn edit(
         &mut self,
-        chat: i64,
+        chat: &Chat,
         message: i64,
         text: &str,
         _buttons: &[Button],
@@ -91,12 +91,12 @@ impl Transport for Fake {
             .lock()
             .unwrap()
             .edits
-            .push((chat, message, text.to_string()));
+            .push((chat.clone(), message, text.to_string()));
         Ok(())
     }
 
-    fn typing(&mut self, chat: i64) -> Result<(), String> {
-        self.state.lock().unwrap().typings.push(chat);
+    fn typing(&mut self, chat: &Chat) -> Result<(), String> {
+        self.state.lock().unwrap().typings.push(chat.clone());
         Ok(())
     }
 
@@ -124,8 +124,8 @@ fn socket_under(dir: &Path) -> PathBuf {
 fn message(from: i64, chat: i64, text: &str) -> Update {
     Update {
         id: 1,
-        from,
-        chat,
+        from: from.to_string(),
+        chat: Chat::telegram(chat),
         text: text.to_string(),
         callback: None,
         photo: None,
@@ -183,7 +183,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
     assert_eq!(
         read,
         Settings {
-            allowed: vec![7],
+            allowed: vec!["7".to_string()],
             policy: "open".to_string(),
             verify: "test -f out.txt".to_string(),
             model: "nanbeige-3b".to_string(),
@@ -199,7 +199,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
 fn an_unauthorized_sender_gets_nothing() {
     let dir = scratch("auth");
     let settings = Settings {
-        allowed: vec![1],
+        allowed: vec!["1".to_string()],
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "nanbeige-3b".to_string(),
@@ -264,7 +264,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
     });
 
     let settings = Settings {
-        allowed: vec![1],
+        allowed: vec!["1".to_string()],
         policy: "open".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "nanbeige-3b".to_string(),
@@ -376,7 +376,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
     });
 
     let settings = Settings {
-        allowed: vec![1],
+        allowed: vec!["1".to_string()],
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "nanbeige-3b".to_string(),
@@ -413,8 +413,8 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
     handle(
         &Update {
             id: 2,
-            from: 1,
-            chat: 1,
+            from: 1.to_string(),
+            chat: Chat::telegram(1),
             text: String::new(),
             callback: Some(Callback {
                 id: "cb-1".to_string(),
@@ -445,7 +445,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
 fn the_offset_advances_after_a_batch() {
     let dir = scratch("offset");
     let settings = Settings {
-        allowed: vec![1],
+        allowed: vec!["1".to_string()],
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "nanbeige-3b".to_string(),
@@ -457,8 +457,8 @@ fn the_offset_advances_after_a_batch() {
     // One batch with one update, then nothing. `--once` handles the batch and returns.
     let fake = Fake::with(vec![vec![Update {
         id: 41,
-        from: 1,
-        chat: 1,
+        from: 1.to_string(),
+        chat: Chat::telegram(1),
         text: "/help".to_string(),
         callback: None,
         photo: None,
@@ -496,7 +496,7 @@ fn the_offset_advances_after_a_batch() {
 /// is the one that also ends the poller.
 fn settings_for(chat: i64) -> Settings {
     Settings {
-        allowed: vec![chat],
+        allowed: vec![chat.to_string()],
         policy: "guarded".to_string(),
         verify: "true".to_string(),
         model: "none".to_string(),

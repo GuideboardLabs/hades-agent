@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use super::Chat;
 use session_tree::{FileStore, Kind, Session, SystemClock};
 
 use crate::agent::{Activity, Inbox, World, child_prompt, fits, parse_json_answer};
@@ -49,7 +51,7 @@ pub struct Record {
     pub id: String,
     pub parent: String,
     pub session: String,
-    pub chat: i64,
+    pub chat: Chat,
     pub state: String,
     pub result_path: String,
     pub started: i64,
@@ -88,7 +90,7 @@ impl Record {
             id: value.get("id")?.as_str()?.to_string(),
             parent: value.get("parent")?.as_str()?.to_string(),
             session: value.get("session")?.as_str()?.to_string(),
-            chat: value.get("chat")?.as_i64()?,
+            chat: serde_json::from_value(value.get("chat")?.clone()).ok()?,
             state: value.get("state")?.as_str()?.to_string(),
             result_path: value.get("result_path")?.as_str()?.to_string(),
             started: value.get("started")?.as_i64()?,
@@ -124,7 +126,7 @@ pub struct Admission {
     /// The parent session, so the child's Meta events can say where they came from.
     pub parent: String,
     pub session: String,
-    pub chat: i64,
+    pub chat: Chat,
     pub goal: String,
     pub schema: Value,
     pub steps: usize,
@@ -269,7 +271,7 @@ pub enum Event {
         child_id: String,
         parent_session: String,
         session: String,
-        chat: i64,
+        chat: Chat,
         goal: String,
     },
     /// A message delivered to a running child. A3's `tell` writes this; the registry defines it now so
@@ -349,7 +351,7 @@ impl Event {
                 child_id: payload.get("child_id")?.as_str()?.to_string(),
                 parent_session: payload.get("parent_session")?.as_str()?.to_string(),
                 session: payload.get("session")?.as_str()?.to_string(),
-                chat: payload.get("chat")?.as_i64()?,
+                chat: serde_json::from_value(payload.get("chat")?.clone()).ok()?,
                 goal: payload.get("goal")?.as_str()?.to_string(),
             }),
             CHILD_MESSAGE => Some(Event::Message {
@@ -668,7 +670,7 @@ impl Registry {
             id: admission.id.clone(),
             parent: admission.parent.clone(),
             session: admission.session.clone(),
-            chat: admission.chat,
+            chat: admission.chat.clone(),
             state: STATE_ADMITTED.to_string(),
             result_path: result_path.display().to_string(),
             started,
@@ -681,7 +683,7 @@ impl Registry {
             child_id: admission.id.clone(),
             parent_session: admission.parent.clone(),
             session: admission.session.clone(),
-            chat: admission.chat,
+            chat: admission.chat.clone(),
             goal: admission.goal.clone(),
         };
 
@@ -1165,7 +1167,7 @@ mod tests {
             skills: Vec::new(),
             sessions: vec![state.join("sessions")],
             state: state.to_path_buf(),
-            chat: 7,
+            chat: Chat::telegram(7),
             depth: 1,
             mode: crate::mode::Mode::Read,
             role: crate::profile::Role::Patch,
@@ -1183,7 +1185,7 @@ mod tests {
             id: id.to_string(),
             parent: "parent-session".to_string(),
             session: id.to_string(),
-            chat: 7,
+            chat: Chat::telegram(7),
             goal: "say done".to_string(),
             schema: Admission::report_schema(),
             steps: 4,
@@ -1195,7 +1197,7 @@ mod tests {
             id: id.to_string(),
             parent: "parent-session".to_string(),
             session: id.to_string(),
-            chat: 7,
+            chat: Chat::telegram(7),
             state: state.to_string(),
             result_path: format!("/nonexistent/{id}/result.json"),
             started: 10,
@@ -1675,7 +1677,7 @@ mod tests {
             child_id: "c1".to_string(),
             parent_session: "parent-session".to_string(),
             session: "spawn-meta".to_string(),
-            chat: 7,
+            chat: Chat::telegram(7),
             goal: "say done".to_string(),
         };
         log.append(Kind::Meta, admitted.payload())
@@ -1707,7 +1709,7 @@ mod tests {
                 child_id: "c1".to_string(),
                 parent_session: "p".to_string(),
                 session: "c1".to_string(),
-                chat: 7,
+                chat: Chat::telegram(7),
                 goal: "g".to_string(),
             },
             Event::Message {

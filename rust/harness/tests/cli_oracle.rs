@@ -3214,7 +3214,7 @@ fn a_goal_is_set_then_paused_and_graph_is_refused() {
         "--state", &state_arg,
     ]);
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains("goal 1 is open for chat 7"), "{text}");
+    assert!(text.contains("goal 1 is open for chat 7 on tg"), "{text}");
     assert!(text.contains("last heartbeat: never"), "{text}");
     assert!(state.join("goals/1-write-the-report.json").exists());
 

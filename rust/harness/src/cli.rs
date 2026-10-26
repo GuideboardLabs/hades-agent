@@ -960,7 +960,7 @@ fn goal_cmd(args: &[String]) -> Result<(String, i32), String> {
             let new = crate::gateway::goal::NewGoal {
                 text,
                 session,
-                chat,
+                chat: crate::gateway::Chat::telegram(chat),
                 model: flags.named.get("model").cloned().unwrap_or_default(),
                 check: flags.named.get("check").cloned().unwrap_or_default(),
                 budget,
@@ -973,9 +973,10 @@ fn goal_cmd(args: &[String]) -> Result<(String, i32), String> {
             match crate::gateway::goal::set(&state, new, now) {
                 Ok(goal) => Ok((
                     format!(
-                        "goal {} is open for chat {} (session {}); last heartbeat: {}\n",
+                        "goal {} is open for chat {} on {} (session {}); last heartbeat: {}\n",
                         goal.id,
-                        goal.chat,
+                        goal.chat.id(),
+                        goal.chat.surface(),
                         goal.session,
                         crate::gateway::goal::heartbeat_text(goal.heartbeat)
                     ),

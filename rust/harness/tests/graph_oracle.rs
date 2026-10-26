@@ -327,6 +327,7 @@ fn a_run_that_spends_its_token_budget_stops_after_the_call_that_spent_it() {
         ScriptedModel::answers([
             ModelAnswer::new("true").with_usage(Usage {
                 prompt_tokens: 1000,
+            cached_tokens: 0,
                 generated_tokens: 500,
                 millis: 5,
                 reasoning_chars: 0,
@@ -945,6 +946,7 @@ impl harness::judge::Evaluator for CostlyJudge {
         harness::judge::Judgement::new(harness::judge::Verdict::NotYet, "not the file yet")
             .with_usage(Usage {
                 prompt_tokens: 400,
+            cached_tokens: 0,
                 generated_tokens: 0,
                 millis: 2,
                 reasoning_chars: 0,
@@ -962,6 +964,7 @@ fn a_judged_run_counts_the_judge_call_against_the_token_budget() {
         open(),
         ScriptedModel::answers([ModelAnswer::new("true").with_usage(Usage {
             prompt_tokens: 800,
+            cached_tokens: 0,
             generated_tokens: 0,
             millis: 3,
             reasoning_chars: 0,
@@ -998,12 +1001,14 @@ fn a_run_that_writes_nothing_still_pays_for_every_call() {
         ScriptedModel::answers([
             ModelAnswer::refused("not a program").with_usage(Usage {
                 prompt_tokens: 600,
+            cached_tokens: 0,
                 generated_tokens: 0,
                 millis: 1,
                 reasoning_chars: 0,
             }),
             ModelAnswer::refused("still not a program").with_usage(Usage {
                 prompt_tokens: 600,
+            cached_tokens: 0,
                 generated_tokens: 0,
                 millis: 1,
                 reasoning_chars: 0,

@@ -22,7 +22,7 @@ use std::process::Command;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub id: u64,
-    pub chat: i64,
+    pub chat: crate::gateway::Chat,
     pub schedule: String,
     /// Read or act. A job file written before this field existed reads as `read`, which is the safe
     /// direction: an old job loses tools it may have used, and never gains one it was not given.
@@ -86,9 +86,8 @@ fn read_file(path: &Path) -> Result<Job, String> {
     let id = scalar(&header, "id")
         .parse::<u64>()
         .map_err(|_| "no numeric `id`".to_string())?;
-    let chat = scalar(&header, "chat")
-        .parse::<i64>()
-        .map_err(|_| "no numeric `chat`".to_string())?;
+    let chat = crate::gateway::Chat::parse(&scalar(&header, "chat"))
+        .ok_or_else(|| "no `chat` (a key like tg-123, or an old number)".to_string())?;
     let schedule = scalar(&header, "schedule");
     if schedule.is_empty() {
         return Err("no `schedule`".to_string());
@@ -269,7 +268,7 @@ pub fn migrate(state: &Path) -> Result<usize, String> {
 fn legacy_item(item: &Value) -> Option<Job> {
     Some(Job {
         id: item.get("id")?.as_u64()?,
-        chat: item.get("chat")?.as_i64()?,
+        chat: serde_json::from_value(item.get("chat")?.clone()).ok()?,
         schedule: item.get("when")?.as_str()?.to_string(),
         mode: item
             .get("mode")
@@ -438,7 +437,7 @@ mod tests {
     fn job(schedule: &str, last: i64) -> Job {
         Job {
             id: 1,
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             schedule: schedule.to_string(),
             mode: Mode::Read,
             goal: "report".to_string(),
@@ -495,7 +494,7 @@ mod tests {
         let state = scratch("round-trip");
         let job = Job {
             id: 2,
-            chat: 9,
+            chat: crate::gateway::Chat::telegram(9),
             schedule: "every 6h".to_string(),
             mode: Mode::Act,
             goal: "Summarise the inbox".to_string(),

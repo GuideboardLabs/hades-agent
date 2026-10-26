@@ -57,7 +57,7 @@ pub struct World {
     /// The state directory: the browser profile and screenshots live under it.
     pub state: PathBuf,
     /// The chat a scheduled job reports to. Zero when there is no chat, as in a command-line probe.
-    pub chat: i64,
+    pub chat: crate::gateway::Chat,
     /// 0 for the person's conversation, 1 for a worker it delegated to. A worker cannot delegate again,
     /// which keeps one message from becoming an unbounded tree of model calls.
     pub depth: u8,
@@ -1612,7 +1612,7 @@ fn delegate(
             skills: world.skills.clone(),
             sessions: world.sessions.clone(),
             state: world.state.clone(),
-            chat: world.chat,
+            chat: world.chat.clone(),
             depth: world.depth + 1,
             mode: world.mode,
             role: world.role,
@@ -1638,7 +1638,7 @@ fn delegate(
                 child_id: child.clone(),
                 parent_session: parent.clone(),
                 session: child.clone(),
-                chat: world.chat,
+                chat: world.chat.clone(),
                 goal: started.clone(),
             },
         );
@@ -1747,7 +1747,7 @@ fn spawn(
         skills: world.skills.clone(),
         sessions: world.sessions.clone(),
         state: world.state.clone(),
-        chat: world.chat,
+        chat: world.chat.clone(),
         depth: world.depth + 1,
         mode: world.mode,
         role: world.role,
@@ -1773,7 +1773,7 @@ fn spawn(
             id: name.clone(),
             parent: world.session.clone(),
             session: name,
-            chat: world.chat,
+            chat: world.chat.clone(),
             goal,
             schema,
             steps,
@@ -1797,7 +1797,7 @@ fn spawn(
             child_id: name.clone(),
             parent_session: world.session.clone(),
             session: name.clone(),
-            chat: world.chat,
+            chat: world.chat.clone(),
             goal: goal.clone(),
         },
     );
@@ -2052,7 +2052,7 @@ fn cron(args: &Value, world: &World) -> String {
             if goal.is_empty() {
                 return "a job needs a goal: what should it do?".to_string();
             }
-            if world.chat == 0 {
+            if world.chat.id().is_empty() {
                 return "there is no chat to report to, so a job would run silently".to_string();
             }
             let mode = match args.get("mode").and_then(Value::as_str) {
@@ -2064,7 +2064,7 @@ fn cron(args: &Value, world: &World) -> String {
             };
             let job = crate::cron::Job {
                 id: crate::cron::next_id(&jobs),
-                chat: world.chat,
+                chat: world.chat.clone(),
                 schedule: schedule.clone(),
                 mode,
                 goal,
@@ -2142,7 +2142,7 @@ fn cron(args: &Value, world: &World) -> String {
 /// work going after a model says it has finished.
 fn goal_tool(args: &Value, world: &World) -> String {
     let state = &world.state;
-    let Some(goal) = crate::gateway::goal::active(state, world.chat) else {
+    let Some(goal) = crate::gateway::goal::active(state, world.chat.clone()) else {
         return "there is no open or paused goal in this chat".to_string();
     };
     let action = args
@@ -3338,7 +3338,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             depth: 0,
             mode: Mode::Read,
             role: crate::profile::Role::Patch,
@@ -3533,7 +3533,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             depth: 0,
             mode,
             role: crate::profile::Role::Patch,
@@ -3625,7 +3625,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             depth: 0,
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
@@ -3666,7 +3666,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             depth: 0,
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
@@ -3701,7 +3701,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 0,
+            chat: crate::gateway::Chat::telegram(0),
             depth: 0,
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
@@ -3768,7 +3768,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             depth: 0,
             mode: Mode::Act,
             role: crate::profile::Role::Patch,
@@ -3897,7 +3897,7 @@ mod tests {
             skills: Vec::new(),
             sessions: Vec::new(),
             state: dir.join("state"),
-            chat: 0,
+            chat: crate::gateway::Chat::telegram(0),
             depth: 0,
             mode: crate::mode::Mode::Act,
             role: crate::profile::Role::Patch,
@@ -4867,7 +4867,7 @@ mod tests {
                         id: id.clone(),
                         parent: "parent-session".to_string(),
                         session: id,
-                        chat: 7,
+                        chat: crate::gateway::Chat::telegram(7),
                         goal: "hold".to_string(),
                         schema: Admission::report_schema(),
                         steps: 2,
@@ -5262,7 +5262,7 @@ mod tests {
                         id: id.clone(),
                         parent: "parent-session".to_string(),
                         session: id.clone(),
-                        chat: 7,
+                        chat: crate::gateway::Chat::telegram(7),
                         goal: "say done".to_string(),
                         schema: Admission::report_schema(),
                         steps: 2,
@@ -5326,7 +5326,7 @@ mod tests {
         let new = crate::gateway::goal::NewGoal {
             text: "make the report".to_string(),
             session: String::new(),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             model: String::new(),
             check: "false".to_string(),
             budget: 4,
@@ -5355,7 +5355,7 @@ mod tests {
         crate::gateway::goal::NewGoal {
             text: "make the report".to_string(),
             session: String::new(),
-            chat: 7,
+            chat: crate::gateway::Chat::telegram(7),
             model: String::new(),
             check: check.to_string(),
             budget: 4,

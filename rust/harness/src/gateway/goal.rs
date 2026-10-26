@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
-use crate::gateway::{Settings, chat_path, load_chat, save_chat, system_prompt, world_for};
+use crate::gateway::{Chat, Settings, chat_path, load_chat, save_chat, system_prompt, world_for};
 use crate::model::{OpenAi, from_preset, preset};
 use crate::task::TaskSpec;
 use crate::verify::{CommandVerifier, Verifier};
@@ -193,7 +193,7 @@ pub struct Goal {
     pub text: String,
     pub state: State,
     pub session: String,
-    pub chat: i64,
+    pub chat: Chat,
     pub model: String,
     pub check: String,
     pub budget: u32,
@@ -218,7 +218,7 @@ pub struct Goal {
 pub struct NewGoal {
     pub text: String,
     pub session: String,
-    pub chat: i64,
+    pub chat: Chat,
     pub model: String,
     pub check: String,
     pub budget: u32,
@@ -257,7 +257,7 @@ impl Goal {
             text: value.get("text")?.as_str()?.to_string(),
             state: State::parse(value.get("state")?.as_str()?)?,
             session: value.get("session")?.as_str()?.to_string(),
-            chat: value.get("chat")?.as_i64()?,
+            chat: serde_json::from_value(value.get("chat")?.clone()).ok()?,
             model: value
                 .get("model")
                 .and_then(Value::as_str)
@@ -366,7 +366,7 @@ pub fn load_one(state: &Path, id: u64) -> Option<Goal> {
 
 /// The goal a chat is currently keeping: the newest one that is still open or paused. A done or cleared
 /// goal is history and does not answer a `done` claim.
-pub fn active(state: &Path, chat: i64) -> Option<Goal> {
+pub fn active(state: &Path, chat: Chat) -> Option<Goal> {
     load(state)
         .0
         .into_iter()
@@ -461,7 +461,7 @@ pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
     if text.is_empty() {
         return Err(Refusal::Empty);
     }
-    if new.chat <= 0 {
+    if new.chat.id().is_empty() {
         return Err(Refusal::NoChat);
     }
     if new.budget == 0 {
@@ -469,7 +469,7 @@ pub fn set(state: &Path, new: NewGoal, now: i64) -> Result<Goal, Refusal> {
     }
     let executor = Executor::parse(&new.executor)?;
     let session = if new.session.trim().is_empty() {
-        format!("tg-{}", new.chat)
+        new.chat.key()
     } else {
         new.session.trim().to_string()
     };
@@ -644,14 +644,14 @@ pub fn complete_within(
 /// continuation, which is what makes "one per interval" true even when a continuation fails.
 pub fn due(goal: &Goal, now: i64, interval: i64, last_entry: i64) -> bool {
     goal.state == State::Open
-        && goal.chat > 0
+        && !goal.chat.id().is_empty()
         && now.saturating_sub(goal.heartbeat.max(last_entry)) >= interval
 }
 
 /// The epoch second of the chat's most recent conversation entry. The chat history is the session's
 /// last entry on this surface; its mtime is when that entry was written, and there is no timestamp in
 /// the stored message to read instead. A chat that has never spoken is zero, so its first goal is due.
-pub fn last_entry(state: &Path, chat: i64) -> i64 {
+pub fn last_entry(state: &Path, chat: &Chat) -> i64 {
     std::fs::metadata(chat_path(state, chat))
         .and_then(|meta| meta.modified())
         .ok()
@@ -674,7 +674,7 @@ where
     let (goals, _) = load(state);
     let mut due_now = Vec::new();
     for stale in goals {
-        if !due(&stale, now, interval, last_entry(state, stale.chat)) {
+        if !due(&stale, now, interval, last_entry(state, &stale.chat)) {
             continue;
         }
         if busy(&stale) {
@@ -752,7 +752,7 @@ pub fn continuation_with<T: crate::gateway::Transport>(
     let mut world = world_for(
         settings,
         state,
-        goal.chat,
+        goal.chat.clone(),
         crate::mode::Mode::Act,
         &format!("goal:{}", goal.id),
         mcp,
@@ -760,14 +760,14 @@ pub fn continuation_with<T: crate::gateway::Transport>(
     // The continuation runs in the chat's child-lifecycle session, which is the key the chat's own
     // surface uses. A child it spawns is therefore one the chat can see with `children` and collect
     // with `result`; the goal record keeps `tg-<chat>` as its session key for lease and busy checks.
-    world.session = crate::gateway::child_session(goal.chat);
+    world.session = crate::gateway::child_session(&goal.chat);
     world.allowance = crate::agent::Allowance::new(remaining);
 
     let mut messages = vec![json!({
         "role": "system",
         "content": system_prompt(&root)
     })];
-    messages.extend(load_chat(state, goal.chat));
+    messages.extend(load_chat(state, &goal.chat));
     let prompt = continuation_prompt(goal);
     messages.push(json!({"role": "user", "content": prompt}));
 
@@ -781,22 +781,21 @@ pub fn continuation_with<T: crate::gateway::Transport>(
 
     match answer {
         Ok(Some(text)) => {
-            transport.send(goal.chat, &crate::gateway::esc(&text), &[])?;
+            transport.send(&goal.chat, &crate::gateway::esc(&text), &[])?;
             // The stored exchange is the continuation and the reply, not the whole prompt: the prompt is
             // rebuilt from the goal next time, and storing it would teach the chat history to talk to
             // itself. The reply is kept so a person's next message sees what the heartbeat said.
-            let mut history = load_chat(state, goal.chat);
+            let mut history = load_chat(state, &goal.chat);
             history.push(json!({
                 "role": "user",
                 "content": format!("[heartbeat] continue goal {}", goal.id)
             }));
             history.push(json!({"role": "assistant", "content": text}));
-            save_chat(state, goal.chat, &history);
+            save_chat(state, &goal.chat, &history);
             refresh(state, goal);
             charge(state, goal, spent, now)?;
             if goal.state == State::Paused {
-                transport.send(
-                    goal.chat,
+                transport.send(&goal.chat,
                     &format!(
                         "<b>Goal {} paused: budget.</b> The goal has spent all {} of its model \
                          calls, so no continuation will run until a person resumes it.",
@@ -810,8 +809,7 @@ pub fn continuation_with<T: crate::gateway::Transport>(
         Ok(None) => {
             // A person stopped it. The interval was already stamped, and a stopped turn is not the
             // assistant's turn, so neither the prompt nor a refusal is stored.
-            transport.send(
-                goal.chat,
+            transport.send(&goal.chat,
                 "<b>Goal continuation stopped.</b> What already ran is not undone.",
                 &[],
             )?;
@@ -841,8 +839,7 @@ pub fn continuation_with<T: crate::gateway::Transport>(
             goal.reason = format!("continuation failed: {}", fault.detail());
             save(state, goal)?;
             record(state, goal, "failed");
-            transport.send(
-                goal.chat,
+            transport.send(&goal.chat,
                 &format!(
                     "<b>Goal {} continuation failed.</b> {}",
                     goal.id,
@@ -892,7 +889,7 @@ fn pause_for_budget<T: crate::gateway::Transport>(
         record(state, goal, "paused");
     }
     transport.send(
-        goal.chat,
+        &goal.chat,
         &format!(
             "<b>Goal {} paused: budget.</b> A continuation spent all {} of the goal's model call(s) \
              without finishing. It will not be retried until a person resumes it.",
@@ -979,12 +976,12 @@ pub fn heartbeat_text(at: i64) -> String {
 /// same entry id and leave a log the store refuses to load. `goal.session` stays the chat's session key
 /// for lease and busy checks — it is not the append target.
 fn record(state: &Path, goal: &Goal, action: &str) {
-    record_on(state, &log_of(goal.chat), goal, action);
+    record_on(state, &log_of(&goal.chat), goal, action);
 }
 
 /// The goal log a chat owns. One function so the writer and a reader cannot disagree about the name.
-pub fn log_of(chat: i64) -> String {
-    format!("tg-{chat}-goals")
+pub fn log_of(chat: &Chat) -> String {
+    format!("{chat}-goals")
 }
 
 /// [`record`] with the log named, for a caller (or a test) that is proving two writers share one lock.
@@ -1021,7 +1018,7 @@ mod tests {
 
     fn settings(root: &Path) -> Settings {
         Settings {
-            allowed: vec![7],
+            allowed: vec!["7".to_string()],
             policy: "guarded".to_string(),
             verify: "true".to_string(),
             model: "nanbeige-3b".to_string(),
@@ -1036,7 +1033,7 @@ mod tests {
         NewGoal {
             text: "ship the report".to_string(),
             session: String::new(),
-            chat,
+            chat: Chat::telegram(chat),
             model: String::new(),
             check: check.to_string(),
             budget,
@@ -1050,7 +1047,7 @@ mod tests {
             text: "ship the report".to_string(),
             state: State::Open,
             session: "tg-7".to_string(),
-            chat: 7,
+            chat: Chat::telegram(7),
             model: String::new(),
             check: "true".to_string(),
             budget: 3,
@@ -1098,7 +1095,7 @@ mod tests {
             })
             .expect("the goal event");
         assert_eq!(event["payload"]["goal"]["state"], "open");
-        assert_eq!(event["payload"]["goal"]["chat"], 7);
+        assert_eq!(event["payload"]["goal"]["chat"], "tg-7");
         assert_eq!(
             session_tree::SCHEMA_VERSION,
             1,
@@ -1338,7 +1335,7 @@ mod tests {
 
     #[derive(Default)]
     struct Fake {
-        sent: Vec<(i64, String)>,
+        sent: Vec<(String, String)>,
     }
 
     impl Transport for Fake {
@@ -1348,17 +1345,17 @@ mod tests {
 
         fn send(
             &mut self,
-            chat: i64,
+            chat: &Chat,
             text: &str,
             _buttons: &[Button],
         ) -> Result<Option<i64>, String> {
-            self.sent.push((chat, text.to_string()));
+            self.sent.push((chat.key(), text.to_string()));
             Ok(Some(1))
         }
 
         fn edit(
             &mut self,
-            _chat: i64,
+            _chat: &Chat,
             _message: i64,
             _text: &str,
             _buttons: &[Button],
@@ -1366,7 +1363,7 @@ mod tests {
             Ok(())
         }
 
-        fn typing(&mut self, _chat: i64) -> Result<(), String> {
+        fn typing(&mut self, _chat: &Chat) -> Result<(), String> {
             Ok(())
         }
 
@@ -1398,9 +1395,9 @@ mod tests {
         .expect("a continuation");
 
         assert_eq!(fake.sent.len(), 1);
-        assert_eq!(fake.sent[0].0, 7, "the recorded chat, not another one");
+        assert_eq!(fake.sent[0].0, "tg-7", "the recorded chat, not another one");
         assert!(fake.sent[0].1.contains("still working"));
-        let history = load_chat(&state, 7);
+        let history = load_chat(&state, &Chat::telegram(7));
         let last = history.last().expect("the reply in the history");
         assert_eq!(last["role"], "assistant");
         assert_eq!(last["content"], "still working");
@@ -1568,7 +1565,7 @@ mod tests {
         .expect("the goal log");
         // Five goals, each with its `open` event, plus the log's own create header.
         assert_eq!(goals.entries().len(), 6);
-        assert_eq!(log_of(7), "tg-7-goals");
+        assert_eq!(log_of(&Chat::telegram(7)), "tg-7-goals");
         let _ = std::fs::remove_dir_all(&state);
     }
 
@@ -1722,12 +1719,12 @@ mod tests {
             skills: Vec::new(),
             sessions: vec![state.join("sessions")],
             state: state.to_path_buf(),
-            chat: 7,
+            chat: Chat::telegram(7),
             depth: 0,
             mode: crate::mode::Mode::Act,
             role: crate::profile::Role::Patch,
             actor: "chat:7".to_string(),
-            session: crate::gateway::child_session(7),
+            session: crate::gateway::child_session(&Chat::telegram(7)),
             inbox: None,
             mcp: Arc::new(crate::mcp::Mcp::empty()),
             allowance: crate::agent::Allowance::new(8),
@@ -1764,7 +1761,7 @@ mod tests {
         let records = registry.records().expect("the records");
         let child = records
             .iter()
-            .find(|record| record.parent == crate::gateway::child_session(7))
+            .find(|record| record.parent == crate::gateway::child_session(&Chat::telegram(7)))
             .unwrap_or_else(|| {
                 panic!(
                     "the continuation's child is not on the chat's session: {:?}",

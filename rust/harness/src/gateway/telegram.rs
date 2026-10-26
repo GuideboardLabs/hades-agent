@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::http;
 
-use super::{Button, Callback, Transport, Update};
+use super::{Button, Callback, Chat, Transport, Update};
 
 #[derive(Clone)]
 pub struct Telegram {
@@ -88,8 +88,11 @@ impl Transport for Telegram {
         Ok(result.iter().filter_map(parse_update).collect())
     }
 
-    fn send(&mut self, chat: i64, text: &str, buttons: &[Button]) -> Result<Option<i64>, String> {
-        let mut body = json!({"chat_id": chat, "text": text, "parse_mode": "HTML"});
+    fn send(&mut self, chat: &Chat, text: &str, buttons: &[Button]) -> Result<Option<i64>, String> {
+        let id = chat
+            .telegram_id()
+            .ok_or_else(|| format!("{chat} is not a Telegram chat"))?;
+        let mut body = json!({"chat_id": id, "text": text, "parse_mode": "HTML"});
         if !buttons.is_empty() {
             body["reply_markup"] = keyboard(buttons);
         }
@@ -99,12 +102,15 @@ impl Transport for Telegram {
 
     fn edit(
         &mut self,
-        chat: i64,
+        chat: &Chat,
         message: i64,
         text: &str,
         buttons: &[Button],
     ) -> Result<(), String> {
-        let mut body = json!({"chat_id": chat, "message_id": message, "text": text,
+        let id = chat
+            .telegram_id()
+            .ok_or_else(|| format!("{chat} is not a Telegram chat"))?;
+        let mut body = json!({"chat_id": id, "message_id": message, "text": text,
                               "parse_mode": "HTML"});
         if !buttons.is_empty() {
             body["reply_markup"] = keyboard(buttons);
@@ -112,10 +118,10 @@ impl Transport for Telegram {
         self.call("editMessageText", &body, 20).map(|_| ())
     }
 
-    fn typing(&mut self, chat: i64) -> Result<(), String> {
+    fn typing(&mut self, chat: &Chat) -> Result<(), String> {
         self.call(
             "sendChatAction",
-            &json!({"chat_id": chat, "action": "typing"}),
+            &json!({"chat_id": chat.telegram_id(), "action": "typing"}),
             15,
         )
         .map(|_| ())
@@ -202,8 +208,8 @@ fn parse_update(value: &Value) -> Option<Update> {
         }
         return Some(Update {
             id,
-            from: message.pointer("/from/id")?.as_i64()?,
-            chat: message.pointer("/chat/id")?.as_i64()?,
+            from: message.pointer("/from/id")?.as_i64()?.to_string(),
+            chat: Chat::telegram(message.pointer("/chat/id")?.as_i64()?),
             text,
             callback: None,
             photo,
@@ -212,8 +218,8 @@ fn parse_update(value: &Value) -> Option<Update> {
     let query = value.get("callback_query")?;
     Some(Update {
         id,
-        from: query.pointer("/from/id")?.as_i64()?,
-        chat: query.pointer("/message/chat/id")?.as_i64()?,
+        from: query.pointer("/from/id")?.as_i64()?.to_string(),
+        chat: Chat::telegram(query.pointer("/message/chat/id")?.as_i64()?),
         text: String::new(),
         callback: Some(Callback {
             id: query.get("id")?.as_str()?.to_string(),
@@ -269,7 +275,7 @@ mod tests {
         });
         let parsed = parse_update(&message).expect("a message");
         assert_eq!(parsed.id, 7);
-        assert_eq!(parsed.from, 11);
+        assert_eq!(parsed.from, "11");
         assert_eq!(parsed.text, "hello");
 
         let press = serde_json::json!({
