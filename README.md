@@ -311,7 +311,9 @@ Proposals are reviewed before promotion.
 - **HTTP.** A local read-and-control surface for status, sessions and approvals.
 - **Telegram.** Long polling with a numeric user allowlist and an approval flow. The gateway is opt-in.
 
-There is no Discord transport.
+Discord is not built in. It is a connector pack installed from the shelf: it answers on the
+gateway's model and provider unless its own config routes it elsewhere, and it carries its own
+opening prompt and working animation, both editable without rebuilding anything.
 
 ---
 

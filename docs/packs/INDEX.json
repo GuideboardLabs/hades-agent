@@ -4,7 +4,7 @@
   "packs": [
     {
       "archive": "dist/hades-connector-discord-0.1.0-linux-x86_64.tar.gz",
-      "bytes": 3934969,
+      "bytes": 3961383,
       "capabilities": {
         "code": true,
         "network": true,
@@ -25,7 +25,9 @@
         "connector",
         "chat",
         "gateway",
-        "server"
+        "server",
+        "replies",
+        "reactions"
       ],
       "kind": [
         "connector"
@@ -33,8 +35,8 @@
       "license": "MIT",
       "platform": "linux-x86_64",
       "requires_hades": ">=0.1.23,<0.2",
-      "sha256": "5cbcff99c3d70f48b2a8e70a4c4087d252e03c8044cafe48fd8584b8247483a7",
-      "summary": "Run Hades inside a Discord server: mention it in a channel and it answers there, with a chat channel it cannot write from and a work channel that runs goals.",
+      "sha256": "a6404fef71e32d9b9fb6bf79e6bec54b892f53b36eb7dbcbb17b7c5b203be8ae",
+      "summary": "Run Hades inside a Discord server: mention it or reply to one of its messages and it answers there. Chat channels cannot write; a work channel runs goals. It inherits the gateway's model and provider, ships its own opening prompt and working animation, and can react instead of replying when a reply would add nothing.",
       "title": "Discord connector",
       "version": "0.1.0"
     },
