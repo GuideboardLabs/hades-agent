@@ -97,10 +97,15 @@ def main() -> int:
             "allowed_users": {"type": "array<string>", "required": True},
             "allowed_guilds": {"type": "array<string>", "default": []},
             "require_mention": {"type": "boolean", "default": True},
-            "model": {"type": "string", "note": "a preset name; overrides the top-level model"},
+            "model": {
+                "type": "string",
+                "optional": True,
+                "note": "defaults to the gateway's model; name one only to route this surface elsewhere",
+            },
             "provider": {
                 "type": "object",
-                "note": "endpoint, model, optional key_env/context/thinking; overrides model",
+                "optional": True,
+                "note": "not needed to install: the gateway's provider is used unless this is set",
             },
             "prompt": {"type": "string", "note": "replaces the pack's prompt.md"},
             "loading": {"type": "object", "note": "glyph, span, step_ms"},
@@ -113,8 +118,9 @@ def main() -> int:
         "# Hades Discord connector\n\n"
         "A surface pack for Hades. Install it with `hades pack add <this.tar.gz>` and run it with\n"
         "`hades connector run discord --config <config>`. The token is read from\n"
-        "`HADES_CONNECTOR_DISCORD_TOKEN`; configure `gateway.connectors.discord` in the same config\n"
-        "file the daemon reads.\n"
+        "`HADES_CONNECTOR_DISCORD_TOKEN`. The surface answers on the gateway's model and provider,\n"
+        "the same ones the rest of the install uses; `gateway.connectors.discord` only has to say\n"
+        "who may talk to it and where its channels are.\n"
     )
 
     sums = []

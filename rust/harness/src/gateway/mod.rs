@@ -192,12 +192,9 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if verify.trim().is_empty() {
-        return Err(format!(
-            "{}: `{name}.verify` is empty; a chat run needs a check to be judged by",
-            path.display()
-        ));
-    }
+    // A check is only needed where work runs. A freshly installed connector answers messages, and
+    // asking its installer for a shell command before it may say hello is how a pack becomes a
+    // project. `/run` refuses below when the channel has no check.
     // The section is the surface's own say over the file's defaults. A connector that names `model`
     // means it: reading only the top-level key made a Discord bot that said `heem-9b` answer on the
     // cloud preset, which looks like the model being ignored because it is.
@@ -1667,6 +1664,16 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                 )?;
                 return Ok(());
             }
+            if effective.verify.trim().is_empty() {
+                transport.send(
+                    &update.chat,
+                    "<b>No check.</b> This channel runs work, but the surface names no `verify` \
+                     command, so there is nothing a run could be judged by. Add one under \
+                     `gateway.connectors.<id>` or this channel's settings.",
+                    &[],
+                )?;
+                return Ok(());
+            }
             let request = json!({
                 "op": "submit",
                 "state": state.display().to_string(),
@@ -2339,6 +2346,29 @@ mod tests {
         assert_eq!(render_status(&face, 0.0, 1900), render_status(&face, 2.40, 1900));
         // No word of the model's own making is in it.
         assert!(!first.contains("thinking") && !first.contains("reasoning"));
+    }
+
+    /// Installing the pack is the whole setup. A connector that names no model answers on the
+    /// gateway's model, through the gateway's provider, exactly as a fresh Hermes install would:
+    /// the pack is a surface, not a second configuration to keep in step.
+    #[test]
+    fn a_connector_without_a_model_answers_on_the_gateways_model() {
+        let dir = scratch("inherit");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","provider":"ollama-cloud","root":"/tmp","vault":"/tmp",
+                "gateway":{"connectors":{"discord":{"allowed_users":["7"]}}}}"#,
+        )
+        .expect("config");
+        let settings = settings_for(&path, "discord").expect("settings");
+        assert_eq!(settings.model, "deepseek-v4.1-flash");
+        // No check: it is a conversation. A work channel refuses a run that has nothing to judge.
+        assert!(settings.verify.is_empty());
+        let effective = settings.effective(&Chat::new("discord", "7"));
+        assert_eq!(effective.model, "deepseek-v4.1-flash");
+        assert!(client_for(&settings, &effective.model).is_ok());
+        assert!(settings.provider.is_none() && settings.endpoints.is_empty());
     }
 
     /// A local model is a fact about this machine, so it lives in `endpoints`, not in the build.
