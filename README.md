@@ -630,6 +630,42 @@ fallback a run uses when the config names no root.
 Keep `~/.hades` out of version control. The repository contains no state, no sessions, no keys and no
 provider configuration.
 
+### Providers
+
+A provider is one endpoint, one key and any number of models. It is the shape to use when a model is
+not a shipped preset, because the URL and key are written once instead of once per model:
+
+```json
+{
+  "model": "groq/llama-3.3-70b",
+  "providers": {
+    "groq": {
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_mode": "chat_completions",
+      "key_env": "GROQ_API_KEY",
+      "models": ["llama-3.3-70b", "qwen-2.5-72b"],
+      "context_length": 131072
+    }
+  }
+}
+```
+
+A model is `provider/model`, which is explicit and always wins. A bare name resolves through the
+providers' own `models` lists when exactly one provider names it. `key_env` is the name of the
+variable, looked up in the environment and then `~/.hades/.env`; the config never holds the value.
+`base_url` is the root of the API, `hades models` prints the URL a call actually goes to, and a full
+`.../chat/completions` URL is used as given so a proxy that rewrites the path still works.
+
+`api_mode` says how the provider speaks. This build speaks `chat_completions`; naming anything else is
+refused when the config is read rather than sending an OpenAI body to an endpoint that wanted
+something else. `context_length` is the window the client asks for, and `thinking` is passed only when
+you set it, because an unknown template should be sent nothing.
+
+Providers are also how a gateway surface gets a model that is not the system's default: the connector
+section may name `model: "groq/llama-3.3-70b"`, and it resolves through this same map. Nothing about a
+provider is compiled in; `hades models` lists what the file names, and `hades config` prints the file
+back field by field.
+
 ### A check that is not Cargo
 
 The shipped `fix` and `sweep` profiles run `cargo test --quiet`. A repository that is not Rust says what its

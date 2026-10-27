@@ -175,6 +175,24 @@ is declared in the config's `endpoints` map, and then behaves like any other nam
 `hades turn --model local-9b`, the gateway and a connector all resolve it the same way: the surface's
 own provider first, then this map, then a shipped preset.
 
+A **provider** is the broader shape, and the one to use when a provider offers more than one model:
+one base URL and one key, with a list of models behind them.
+
+```json
+"providers": {
+  "groq": {
+    "base_url": "https://api.groq.com/openai/v1",
+    "key_env": "GROQ_API_KEY",
+    "models": ["llama-3.3-70b", "qwen-2.5-72b"],
+    "context_length": 131072
+  }
+}
+```
+
+`--model groq/qwen-2.5-72b` is explicit; a bare `qwen-2.5-72b` resolves when exactly one provider lists
+it. The mode is `chat_completions` and nothing else is pretended: a config that names
+`anthropic_messages` is refused at read time, in those words, rather than sent an OpenAI body.
+
 The turn is one-shot: the model is asked once, the answer is applied, the check runs. A model that needs
 three attempts needs a caller that runs three turns, which is the next section.
 

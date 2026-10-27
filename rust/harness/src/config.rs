@@ -41,6 +41,9 @@ pub struct Config {
     pub mcp: crate::mcp::McpConfig,
     /// Endpoints this owner named, so a model that is not a shipped preset is still choosable by id.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Providers this owner named: one URL, one key, several models. A model is `provider/model`, or a
+    /// bare name that exactly one provider lists.
+    pub providers: crate::provider::Registry,
     /// Toolchains under the home directory, named explicitly. Discovery never walks the home, so a rustup,
     /// nvm, pyenv or uv install there is unreadable inside the cage unless it is listed here.
     pub runtime_paths: Vec<PathBuf>,
@@ -195,11 +198,16 @@ fn endpoints(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, Endp
 fn check_model(
     model: &str,
     endpoints: &BTreeMap<String, Endpoint>,
+    providers: &crate::provider::Registry,
     path: &Path,
     field: &str,
 ) -> Result<(), String> {
-    if crate::model::preset(model).is_none() && !endpoints.contains_key(model) {
+    if crate::model::preset(model).is_none()
+        && !endpoints.contains_key(model)
+        && providers.resolve(model).is_none()
+    {
         let mut known = endpoints.keys().cloned().collect::<Vec<_>>();
+        known.extend(providers.known());
         known.extend(
             crate::model::presets()
                 .iter()
@@ -268,17 +276,19 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
     }
 
     let endpoints = endpoints(object.get("endpoints"), path)?;
+    let providers = crate::provider::Registry::parse(object.get("providers"), path)?;
     let model = field(object, "model", path)?;
-    check_model(&model, &endpoints, path, "model")?;
+    check_model(&model, &endpoints, &providers, path, "model")?;
 
     Ok(Some(Config {
         provider: field(object, "provider", path)?,
         model,
         root: PathBuf::from(field(object, "root", path)?),
         vault: PathBuf::from(field(object, "vault", path)?),
-        profile_models: profile_models(object.get("profile_models"), &endpoints, path)?,
+        profile_models: profile_models(object.get("profile_models"), &endpoints, &providers, path)?,
         mcp: crate::mcp::McpConfig::from_value(object.get("mcp"), path)?,
         endpoints,
+        providers,
         runtime_paths: runtime_paths(object.get("runtime_paths"), path)?,
         research: research(object.get("research"), path)?,
         vision: vision(object.get("vision"), path)?,
@@ -313,6 +323,21 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
             .iter()
             .map(|path| path.to_string_lossy().to_string())
             .collect::<Vec<String>>(),
+        "providers": config.providers.providers.iter().map(|(id, provider)| {
+            let mut value = json!({
+                "base_url": provider.base_url,
+                "api_mode": provider.api_mode.as_str(),
+                "models": provider.models,
+                "context_length": provider.context,
+            });
+            if let Some(key) = &provider.key_env {
+                value["key_env"] = json!(key);
+            }
+            if let Some(thinking) = provider.thinking {
+                value["thinking"] = json!(thinking);
+            }
+            (id.clone(), value)
+        }).collect::<Map<String, Value>>(),
         "endpoints": config.endpoints.iter().map(|(name, endpoint)| {
             let mut value = json!({
                 "url": endpoint.url,
@@ -491,6 +516,7 @@ fn vision(value: Option<&Value>, path: &Path) -> Result<Option<Vision>, String> 
 fn profile_models(
     value: Option<&Value>,
     endpoints: &BTreeMap<String, Endpoint>,
+    providers: &crate::provider::Registry,
     path: &Path,
 ) -> Result<BTreeMap<String, String>, String> {
     let Some(value) = value else {
@@ -530,11 +556,17 @@ fn profile_models(
                     path.display()
                 )
             })?;
-        if crate::model::preset(model).is_none() && !endpoints.contains_key(model) {
+        if crate::model::preset(model).is_none()
+            && !endpoints.contains_key(model)
+            && providers.resolve(model).is_none()
+        {
+            let mut known = providers.known();
+            known.extend(endpoints.keys().cloned());
             return Err(format!(
-                "{}: `profile_models.{profile}` names model `{model}`, which is neither a preset nor an \
-                 endpoint; try {presets}",
-                path.display()
+                "{}: `profile_models.{profile}` names model `{model}`, which is none of this config's \
+                 providers, endpoints or presets; try {} or {presets}",
+                path.display(),
+                known.join(", ")
             ));
         }
         out.insert(profile.clone(), model.to_string());
@@ -586,6 +618,7 @@ mod tests {
             research: Research::default(),
             endpoints: BTreeMap::new(),
             vision: None,
+            providers: Default::default(),
         }
     }
 
@@ -681,8 +714,43 @@ mod tests {
         )
         .expect("write");
         let said = load(&path).expect_err("an unknown preset is not ignored");
-        assert!(said.contains("neither a preset nor an endpoint"), "{said}");
+        assert!(said.contains("none of this config"), "{said}");
         assert!(said.contains("not-a-preset"), "{said}");
+    }
+
+    /// A provider is one URL, one key, several models. The model is `provider/model`, and a bare name
+    /// resolves when exactly one provider lists it.
+    #[test]
+    fn providers_round_trip_and_their_models_are_choosable_by_name() {
+        let dir = scratch("providers");
+        let path = path_in(&dir);
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"groq","model":"groq/llama-3.3-70b","root":"/r","vault":"/v",
+                "providers":{"groq":{"base_url":"https://api.groq.com/openai/v1","key_env":"GROQ_API_KEY",
+                                     "models":["llama-3.3-70b","qwen-2.5-72b"],"context_length":131072,
+                                     "profile_models":{}}}}"#,
+        )
+        .expect("write");
+        let config = load(&path).expect("load").expect("a config");
+        assert_eq!(config.model, "groq/llama-3.3-70b");
+        let (provider, model) = config.providers.resolve("qwen-2.5-72b").expect("bare");
+        assert_eq!(provider.id, "groq");
+        assert_eq!(model, "qwen-2.5-72b");
+        // Saved and read again, the provider keeps its shape.
+        save(&path, &config).expect("save");
+        let again = load(&path).expect("reload").expect("a config");
+        assert_eq!(again.providers, config.providers);
+
+        // A provider/model that names no provider is refused by name, with what does resolve.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"provider":"groq","model":"nope/llama","root":"/r","vault":"/v",
+                "providers":{"groq":{"base_url":"https://api.groq.com/openai/v1"}}}"#,
+        )
+        .expect("write");
+        let said = load(&path).expect_err("unknown provider");
+        assert!(said.contains("nope/llama"), "{said}");
     }
 
     #[test]
@@ -730,6 +798,7 @@ mod tests {
             runtime_paths: vec![toolchain.clone()],
             research: Research::default(),
             vision: None,
+            providers: Default::default(),
         };
         save(&path, &config).expect("a save");
         let read = load(&path).expect("a read").expect("a config");
@@ -790,6 +859,7 @@ mod tests {
             runtime_paths: Vec::new(),
             research: Research::default(),
             vision: None,
+            providers: Default::default(),
         };
         let mut config = base();
         config.runtime_paths = vec![PathBuf::from("relative/toolchain")];

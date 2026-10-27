@@ -86,6 +86,9 @@ pub struct Settings {
     /// The machine's own named endpoints, `endpoints.<name>`, the same map the daemon reads. A local
     /// model belongs here, not in a pack: the pack is the same file on every machine.
     pub endpoints: std::collections::BTreeMap<String, Value>,
+    /// The providers the same config names, so a surface can answer on `provider/model` exactly as the
+    /// daemon does. A connector gets this for free; it does not need a provider of its own.
+    pub providers: crate::provider::Registry,
 }
 
 /// What one channel changes about the surface it belongs to. Every field is optional: a channel that
@@ -277,6 +280,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             .clamp(40, 5_000),
     });
     let provider = section.get("provider").filter(|value| value.is_object()).cloned();
+    let providers = crate::provider::Registry::parse(value.get("providers"), path)?;
     let endpoints = value
         .get("endpoints")
         .and_then(Value::as_object)
@@ -387,6 +391,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         loading,
         provider,
         endpoints,
+        providers,
     })
 }
 
@@ -1123,6 +1128,9 @@ fn client_for(settings: &Settings, name: &str) -> Result<crate::model::OpenAi, S
     }
     if let Some(endpoint) = settings.endpoints.get(name) {
         return crate::model::from_config(endpoint);
+    }
+    if let Some((provider, model)) = settings.providers.resolve(name) {
+        return Ok(crate::model::from_provider(provider, &model));
     }
     let preset = crate::model::preset(name)
         .ok_or_else(|| format!("no model preset or endpoint named `{name}`"))?;
@@ -2302,6 +2310,7 @@ mod tests {
             loading: None,
             provider: None,
             endpoints: Default::default(),
+            providers: Default::default(),
         }
     }
 
@@ -2369,6 +2378,27 @@ mod tests {
         assert_eq!(effective.model, "deepseek-v4.1-flash");
         assert!(client_for(&settings, &effective.model).is_ok());
         assert!(settings.provider.is_none() && settings.endpoints.is_empty());
+    }
+
+    /// A surface answers on a provider the config names, without naming one of its own.
+    #[test]
+    fn a_connector_resolves_provider_models_from_the_shared_config() {
+        let dir = scratch("providers-gateway");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"groq/llama-3.3-70b","root":"/tmp","vault":"/tmp",
+                "providers":{"groq":{"base_url":"https://api.groq.com/openai/v1",
+                                     "models":["llama-3.3-70b"],"context_length":131072}},
+                "gateway":{"connectors":{"discord":{"allowed_users":["7"]}}}}"#,
+        )
+        .expect("config");
+        let settings = settings_for(&path, "discord").expect("settings");
+        assert_eq!(settings.model, "groq/llama-3.3-70b");
+        assert!(client_for(&settings, &settings.model).is_ok());
+        assert!(client_for(&settings, "llama-3.3-70b").is_ok());
+        let refused = client_for(&settings, "nope/nope").expect_err("unknown");
+        assert!(refused.contains("nope/nope"), "{refused}");
     }
 
     /// A local model is a fact about this machine, so it lives in `endpoints`, not in the build.

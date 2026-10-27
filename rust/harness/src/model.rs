@@ -1029,6 +1029,48 @@ pub fn preset(id: &str) -> Option<Preset> {
 }
 
 /// A preset as a harness.
+/// A provider is one URL, one key and any number of models. This is the route a config names when it
+/// does not want a shipped preset: `groq/llama-3.3-70b`, or the bare name if only one provider lists it.
+pub fn from_provider(provider: &crate::provider::Provider, model: &str) -> OpenAi {
+    let url = provider.chat_url();
+    let mut client = OpenAi::new(&url, model).with_context(provider.context);
+    if let Some(thinking) = provider.thinking {
+        client = client.with_thinking(thinking);
+    }
+    if let Some(var) = &provider.key_env {
+        client = client.with_key(Key::Home(var.clone()));
+    }
+    client
+}
+
+/// Resolve a model name the way every config-driven path should: a provider first (it is the most
+/// specific thing a person can write), then a named endpoint, then a shipped preset. The error lists
+/// what does resolve, because "no such model" without the list is a puzzle.
+pub fn client_for_config(config: &crate::config::Config, name: &str) -> Result<OpenAi, String> {
+    if let Some((provider, model)) = config.providers.resolve(name) {
+        return Ok(from_provider(provider, &model));
+    }
+    if let Some(endpoint) = config.endpoints.get(name) {
+        let mut client = OpenAi::new(&endpoint.url, &endpoint.model)
+            .with_context(endpoint.context_tokens)
+            .with_thinking(endpoint.thinking);
+        if let Some(var) = &endpoint.key_env {
+            client = client.with_key(Key::Home(var.clone()));
+        }
+        return Ok(client);
+    }
+    if let Some(preset) = preset(name) {
+        return Ok(from_preset(&preset));
+    }
+    let mut known = config.providers.known();
+    known.extend(config.endpoints.keys().cloned());
+    known.extend(presets().iter().map(|preset| preset.id.to_string()));
+    Err(format!(
+        "no model named `{name}`: try {}",
+        known.join(", ")
+    ))
+}
+
 /// A provider named in a surface's config instead of a preset, so a connector can answer through a
 /// different endpoint and model from the system it belongs to. The shape is deliberately the same as
 /// a preset: endpoint, model, optional context, thinking, key.

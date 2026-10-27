@@ -25,6 +25,12 @@ Connector packs, and a surface that behaves like a place rather than a second ag
 - **A working message says it is working.** The placeholder no longer streams the model's scratchpad; it is
   an animation until the answer replaces it whole. `think`-style blocks are stripped from anything that
   becomes a message, because a small model in a no-think template still emits them.
+- **Providers.** A config can name a provider once, with one base URL and one key, and list the models it
+  offers: `"providers": {"groq": {"base_url": …, "key_env": "GROQ_API_KEY", "models": ["llama-3.3-70b",
+  "qwen-2.5-72b"], "context_length": 131072}}`. A model is `provider/model`; a bare name resolves when
+  exactly one provider lists it. `hades models` and `hades config` print them, the TUI, the CLI, the daemon
+  and a gateway connector all resolve through the same map, and `api_mode` is refused by name when it is a
+  mode this build cannot speak rather than sending it a body it will misread.
 - **Models are configuration, not a compiled table.** The shipped presets are the cloud ones. A local model
   is an `endpoints` entry on the machine that has the server, resolved in the same order everywhere: the
   surface's own `provider`, then `endpoints`, then a preset. A pack installs onto the gateway's model and

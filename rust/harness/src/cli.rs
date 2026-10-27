@@ -738,6 +738,36 @@ fn models() -> Result<(String, i32), String> {
             text.push('\n');
         }
     }
+    // Providers the config names: one URL, one key, several models. `provider/model` is explicit; a bare
+    // model name resolves when exactly one provider lists it.
+    if let Ok(home) = hades_home()
+        && let Ok(Some(config)) = config::load(&config::path_in(&home))
+        && !config.providers.is_empty()
+    {
+        text.push_str("\nproviders:\n");
+        for provider in config.providers.providers.values() {
+            text.push_str(&format!(
+                "{:<20} {} ({})\n{:<20} {} ({} tokens)\n",
+                provider.id,
+                provider.api_mode.as_str(),
+                provider.base_url,
+                "",
+                provider.chat_url(),
+                provider.context
+            ));
+            if let Some(key) = &provider.key_env {
+                text.push_str(&format!("{:<20} key: ${key}\n", ""));
+            }
+            if provider.models.is_empty() {
+                text.push_str(&format!("{:<20} models: named as {}/<model>\n", "", provider.id));
+            } else {
+                for model in &provider.models {
+                    text.push_str(&format!("{:<20} {}/{}\n", "", provider.id, model));
+                }
+            }
+            text.push('\n');
+        }
+    }
     Ok((text, 0))
 }
 
@@ -1253,13 +1283,11 @@ fn answerer(
                 }
                 open
             }
-            None => {
-                if let Some(endpoint) = config
-                    .as_ref()
-                    .and_then(|config| config.endpoints.get(model_id.as_str()))
-                {
-                    from_named_endpoint(endpoint)
-                } else {
+            None => match config {
+                // A named model is resolved the way every config-driven path resolves one: providers,
+                // then endpoints, then a shipped preset.
+                Some(config) => model::client_for_config(config, model_id)?,
+                None => {
                     let preset = model::preset(model_id).ok_or_else(|| {
                         format!(
                             "no model named `{model_id}`: try {}",
@@ -1272,7 +1300,7 @@ fn answerer(
                     })?;
                     model::from_preset(&preset)
                 }
-            }
+            },
         },
         None => {
             if let Some(endpoint) = flags.named.get("endpoint") {
@@ -1295,21 +1323,13 @@ fn answerer(
             match config {
                 Some(config) => {
                     let chosen = profile_model.unwrap_or(&config.model);
-                    if let Some(endpoint) = config.endpoints.get(chosen) {
-                        return Ok(Answerer::Model(from_named_endpoint(endpoint)));
-                    }
-                    let preset = model::preset(chosen).ok_or_else(|| {
+                    let client = model::client_for_config(config, chosen).map_err(|said| {
                         format!(
-                            "the model `{chosen}` has no preset in this build. Run `hades init --model \
-                             <preset>` again, name a profile model that exists, or pass --model: {}",
-                            model::presets()
-                                .iter()
-                                .map(|preset| preset.id)
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            "{said}. Run `hades init --model <preset>` again, name a profile model that \
+                             exists, or pass --model"
                         )
                     })?;
-                    model::from_preset(&preset)
+                    return Ok(Answerer::Model(client));
                 }
                 None => {
                     return Err(
@@ -1366,19 +1386,6 @@ fn key_spec(spec: &str) -> Key {
     }
 }
 
-/// A named endpoint from the config, as an answerer. The key is resolved by name through the same seam a
-/// preset uses: the config records the variable and never the value.
-fn from_named_endpoint(endpoint: &crate::config::Endpoint) -> OpenAi {
-    let mut open = OpenAi::new(endpoint.url.clone(), endpoint.model.clone())
-        .with_context(endpoint.context_tokens);
-    if let Some(key) = &endpoint.key_env {
-        open = open.with_key(Key::Env(key.clone()));
-    }
-    if endpoint.thinking {
-        open = open.with_thinking(true);
-    }
-    open
-}
 
 /// Who answers. An enum rather than a boxed trait object, because there are two and the CLI prints which.
 pub(crate) enum Answerer {
@@ -3750,6 +3757,25 @@ fn config_cmd(args: &[String]) -> Result<(String, i32), String> {
                     text.push_str(&format!("profile model: {profile} -> {model}\n"));
                 }
             }
+            for provider in config.providers.providers.values() {
+                text.push_str(&format!(
+                    "provider: {id} -> {} ({}), {} tokens, {}{}\n",
+                    provider.chat_url(),
+                    provider.api_mode.as_str(),
+                    provider.context,
+                    if provider.models.is_empty() {
+                        "any model named as id/model".to_string()
+                    } else {
+                        provider.models.join(", ")
+                    },
+                    provider
+                        .key_env
+                        .as_ref()
+                        .map(|key| format!(", key ${key}"))
+                        .unwrap_or_default(),
+                    id = provider.id
+                ));
+            }
             for (name, endpoint) in &config.endpoints {
                 text.push_str(&format!(
                     "endpoint: {name} -> {} ({}), {} tokens{}\n",
@@ -5933,6 +5959,7 @@ fn init(
         profile_models: std::collections::BTreeMap::new(),
         mcp: crate::mcp::McpConfig::default(),
         endpoints: std::collections::BTreeMap::new(),
+        providers: Default::default(),
         runtime_paths: Vec::new(),
         research: Default::default(),
         vision: None,
@@ -7958,6 +7985,7 @@ mod profile_model_tests {
                 .collect(),
             mcp: Default::default(),
             endpoints: Default::default(),
+        providers: Default::default(),
             runtime_paths: Vec::new(),
             research: Default::default(),
             vision: None,

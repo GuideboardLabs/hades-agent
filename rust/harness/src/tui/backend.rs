@@ -153,6 +153,9 @@ impl Options {
                 return Err("model endpoints must use HTTP or HTTPS".into());
             }
             OpenAi::new(endpoint, &self.model)
+        } else if let Some(config) = &self.config {
+            // The same resolution the CLI and the gateway use: providers, then endpoints, then a preset.
+            crate::model::client_for_config(config, &self.model)?
         } else {
             let preset = crate::model::preset(&self.model).ok_or_else(|| {
                 format!(
@@ -172,10 +175,13 @@ impl Options {
         Ok(client)
     }
     pub fn provider(&self) -> String {
-        let endpoint = self
-            .endpoint
-            .clone()
-            .or_else(|| crate::model::preset(&self.model).map(|p| p.endpoint.into()));
+        let endpoint = self.endpoint.clone().or_else(|| {
+            self.config
+                .as_ref()
+                .and_then(|config| config.providers.resolve(&self.model))
+                .map(|(provider, _)| provider.chat_url())
+                .or_else(|| crate::model::preset(&self.model).map(|p| p.endpoint.into()))
+        });
         let Some(endpoint) = endpoint else {
             return "Not connected".into();
         };
