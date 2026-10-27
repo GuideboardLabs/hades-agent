@@ -190,8 +190,13 @@ one base URL and one key, with a list of models behind them.
 ```
 
 `--model groq/qwen-2.5-72b` is explicit; a bare `qwen-2.5-72b` resolves when exactly one provider lists
-it. The mode is `chat_completions` and nothing else is pretended: a config that names
-`anthropic_messages` is refused at read time, in those words, rather than sent an OpenAI body.
+it. Three transports are implemented: `chat_completions`, `anthropic_messages` and `responses`. A plain
+call works in any of them; the tool loop needs chat completions and faults by name otherwise, because a
+tool schema translated blind is worse than a sentence saying it is not supported yet.
+
+`fallback_providers` is a list of model names tried in order when the chosen one fails before producing
+anything. The chain is built once, every name is validated with the config, and the error from a chain
+that runs out names each provider and its own fault.
 
 The turn is one-shot: the model is asked once, the answer is applied, the check runs. A model that needs
 three attempts needs a caller that runs three turns, which is the next section.

@@ -744,6 +744,12 @@ fn models() -> Result<(String, i32), String> {
         && let Ok(Some(config)) = config::load(&config::path_in(&home))
         && !config.providers.is_empty()
     {
+        if !config.fallbacks.is_empty() {
+            text.push_str(&format!(
+                "\nfallbacks, in order: {}\n",
+                config.fallbacks.join(" -> ")
+            ));
+        }
         text.push_str("\nproviders:\n");
         for provider in config.providers.providers.values() {
             text.push_str(&format!(
@@ -3757,6 +3763,9 @@ fn config_cmd(args: &[String]) -> Result<(String, i32), String> {
                     text.push_str(&format!("profile model: {profile} -> {model}\n"));
                 }
             }
+            if !config.fallbacks.is_empty() {
+                text.push_str(&format!("fallbacks: {}\n", config.fallbacks.join(" -> ")));
+            }
             for provider in config.providers.providers.values() {
                 text.push_str(&format!(
                     "provider: {id} -> {} ({}), {} tokens, {}{}\n",
@@ -5960,6 +5969,7 @@ fn init(
         mcp: crate::mcp::McpConfig::default(),
         endpoints: std::collections::BTreeMap::new(),
         providers: Default::default(),
+        fallbacks: Vec::new(),
         runtime_paths: Vec::new(),
         research: Default::default(),
         vision: None,
@@ -7986,6 +7996,7 @@ mod profile_model_tests {
             mcp: Default::default(),
             endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
             runtime_paths: Vec::new(),
             research: Default::default(),
             vision: None,

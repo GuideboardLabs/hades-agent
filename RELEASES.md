@@ -25,6 +25,11 @@ Connector packs, and a surface that behaves like a place rather than a second ag
 - **A working message says it is working.** The placeholder no longer streams the model's scratchpad; it is
   an animation until the answer replaces it whole. `think`-style blocks are stripped from anything that
   becomes a message, because a small model in a no-think template still emits them.
+- **Three transports, and a fallback chain.** `api_mode` now covers `chat_completions`,
+  `anthropic_messages` (`/messages`, `x-api-key`, content blocks) and `responses` (`/responses`, `input`
+  and `instructions`). A plain call works in all three; the tool loop needs chat completions and says so
+  by name. `headers` carries a static provider header, and `fallback_providers` tries the named models in
+  order when one fails before answering, reporting every provider's own error if the chain runs out.
 - **Providers.** A config can name a provider once, with one base URL and one key, and list the models it
   offers: `"providers": {"groq": {"base_url": …, "key_env": "GROQ_API_KEY", "models": ["llama-3.3-70b",
   "qwen-2.5-72b"], "context_length": 131072}}`. A model is `provider/model`; a bare name resolves when

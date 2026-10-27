@@ -215,6 +215,14 @@ pub struct OpenAi {
     /// none, because a model that thinks before it writes a one-line program spends the whole answer
     /// thinking and leaves the program empty.
     thinking: Option<bool>,
+    /// The transport this endpoint speaks. Only the tool-calling loop requires chat completions; a plain
+    /// call works in any of the three.
+    mode: crate::provider::ApiMode,
+    /// Headers the provider itself needs, from its config entry.
+    extra_headers: Vec<(String, String)>,
+    /// The providers to try, in order, when this one fails before it has produced an answer. A chain is
+    /// built from `fallback_providers` and is empty unless the owner named one.
+    fallbacks: Vec<OpenAi>,
     /// Whether a fault from this client names the model it asked. A strict request is one the caller
     /// named, so a failure has to say which model failed rather than leave the reader guessing whether
     /// something else was tried.
@@ -326,6 +334,9 @@ impl OpenAi {
             context: 8192,
             usage_log: None,
             thinking: None,
+            mode: crate::provider::ApiMode::ChatCompletions,
+            extra_headers: Vec::new(),
+            fallbacks: Vec::new(),
             strict: false,
             system: SYSTEM.to_string(),
         }
@@ -366,6 +377,27 @@ impl OpenAi {
 
     /// Hold this client to the model it names: faults from it say which model failed, so a reader can
     /// tell a strict request from one that fell through to something else.
+    /// The transport to speak, and the headers the provider needs. Both come from a provider entry.
+    pub fn with_mode(mut self, mode: crate::provider::ApiMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// The clients to try when this one fails before answering. Order is the order they were named in.
+    pub fn with_fallbacks(mut self, fallbacks: Vec<OpenAi>) -> Self {
+        self.fallbacks = fallbacks;
+        self
+    }
+
+    pub fn mode(&self) -> crate::provider::ApiMode {
+        self.mode
+    }
+
     pub fn with_strict(mut self) -> Self {
         self.strict = true;
         self
@@ -466,14 +498,10 @@ impl OpenAi {
     }
 
     /// The request body. Separate from sending it, so a test can read exactly what would be sent.
-    pub fn body(
-        &self,
-        task: &TaskSpec,
-        bundle: &Bundle,
-        budget: &Budget,
-        streaming: bool,
-    ) -> String {
-        let user = format!(
+    /// The turn's user message. One place, so a transport that puts the system prompt somewhere else
+    /// still asks the same question.
+    fn user_text(&self, task: &TaskSpec, bundle: &Bundle, budget: &Budget) -> String {
+        format!(
             "Goal: {}\nWorking directory: {}\n\n{}\n\nAnswer with the JSON edit object when this step changes text already in a file, or with a shell \
              program for anything else (a new file, a build, an inspection). \
              Context budget for this turn: {} tokens.",
@@ -481,7 +509,17 @@ impl OpenAi {
             task.root().display(),
             bundle.text(),
             budget.context_tokens()
-        );
+        )
+    }
+
+    pub fn body(
+        &self,
+        task: &TaskSpec,
+        bundle: &Bundle,
+        budget: &Budget,
+        streaming: bool,
+    ) -> String {
+        let user = self.user_text(task, bundle, budget);
         let mut request = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -499,6 +537,259 @@ impl OpenAi {
     }
 }
 
+impl OpenAi {
+    /// The clients to try, this one first. A chain of one is the normal case.
+    fn chain(&self) -> Vec<&OpenAi> {
+        std::iter::once(self).chain(self.fallbacks.iter()).collect()
+    }
+
+    /// The headers a call carries: content type, the credential in whatever shape this transport wants,
+    /// and the provider's own headers last so a gateway header is never overwritten by a default.
+    fn wire(&self) -> Result<Vec<(&str, String)>, Fault> {
+        let mut headers: Vec<(&str, String)> =
+            vec![("Content-Type", "application/json".to_string())];
+        match self.mode {
+            crate::provider::ApiMode::AnthropicMessages => {
+                headers.push(("anthropic-version", "2023-06-01".to_string()));
+                if let Some(key) = &self.key {
+                    headers.push(("x-api-key", key.resolve()?));
+                }
+            }
+            _ => {
+                if let Some(key) = &self.key {
+                    headers.push(("Authorization", format!("Bearer {}", key.resolve()?)));
+                }
+            }
+        }
+        for (name, value) in &self.extra_headers {
+            headers.push((name.as_str(), value.clone()));
+        }
+        Ok(headers)
+    }
+
+    /// The body for a call with no tools. A system message is the top-level `system` in Anthropic's
+    /// shape and `instructions` in the responses API; chat completions carries it as a message.
+    fn plain_body(
+        &self,
+        system: Option<&str>,
+        messages: &[serde_json::Value],
+        cap: u32,
+    ) -> serde_json::Value {
+        let content = |message: &serde_json::Value| -> String {
+            message
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| message.get("content").cloned().unwrap_or_default().to_string())
+        };
+        match self.mode {
+            crate::provider::ApiMode::ChatCompletions => {
+                let mut all: Vec<serde_json::Value> = Vec::new();
+                if let Some(system) = system {
+                    all.push(serde_json::json!({ "role": "system", "content": system }));
+                }
+                all.extend(messages.iter().cloned());
+                serde_json::json!({
+                    "model": self.model,
+                    "messages": all,
+                    "temperature": self.temperature,
+                    "max_tokens": cap,
+                })
+            }
+            crate::provider::ApiMode::AnthropicMessages => {
+                let turns: Vec<serde_json::Value> = messages
+                    .iter()
+                    .filter(|message| {
+                        !matches!(
+                            message.get("role").and_then(|role| role.as_str()),
+                            Some("system")
+                        )
+                    })
+                    .map(|message| {
+                        serde_json::json!({
+                            "role": if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                                "assistant"
+                            } else {
+                                "user"
+                            },
+                            "content": content(message),
+                        })
+                    })
+                    .collect();
+                let mut body = serde_json::json!({
+                    "model": self.model,
+                    "messages": turns,
+                    "max_tokens": cap,
+                    "temperature": self.temperature,
+                });
+                if let Some(system) = system {
+                    body["system"] = serde_json::json!(system);
+                }
+                body
+            }
+            crate::provider::ApiMode::Responses => {
+                let input: Vec<serde_json::Value> = messages
+                    .iter()
+                    .filter(|message| {
+                        !matches!(
+                            message.get("role").and_then(|role| role.as_str()),
+                            Some("system")
+                        )
+                    })
+                    .map(|message| {
+                        serde_json::json!({
+                            "role": message.get("role").and_then(|r| r.as_str()).unwrap_or("user"),
+                            "content": content(message),
+                        })
+                    })
+                    .collect();
+                let mut body = serde_json::json!({
+                    "model": self.model,
+                    "input": input,
+                    "max_output_tokens": cap,
+                    "temperature": self.temperature,
+                });
+                if let Some(system) = system {
+                    body["instructions"] = serde_json::json!(system);
+                }
+                body
+            }
+        }
+    }
+
+    /// The answer text, in the shape the transport puts it in.
+    fn plain_text(&self, parsed: &serde_json::Value) -> Option<String> {
+        match self.mode {
+            crate::provider::ApiMode::ChatCompletions => parsed
+                .pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    parsed
+                        .pointer("/choices/0/text")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                }),
+            crate::provider::ApiMode::AnthropicMessages => {
+                let blocks = parsed.get("content")?.as_array()?;
+                let text = blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                    .collect::<String>();
+                Some(text)
+            }
+            crate::provider::ApiMode::Responses => parsed
+                .get("output_text")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    let output = parsed.get("output")?.as_array()?;
+                    Some(
+                        output
+                            .iter()
+                            .filter_map(|item| item.get("content").and_then(|c| c.as_array()))
+                            .flatten()
+                            .filter(|part| {
+                                part.get("type").and_then(|t| t.as_str()) == Some("output_text")
+                            })
+                            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                            .collect::<String>(),
+                    )
+                }),
+        }
+    }
+
+    /// The reasoning a transport reports, if it reports any.
+    fn plain_reasoning(&self, parsed: &serde_json::Value) -> String {
+        match self.mode {
+            crate::provider::ApiMode::AnthropicMessages => parsed
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(|t| t.as_str()) == Some("thinking")
+                        })
+                        .filter_map(|block| block.get("thinking").and_then(|t| t.as_str()))
+                        .collect::<String>()
+                })
+                .unwrap_or_default(),
+            _ => ["reasoning_content", "reasoning", "thinking"]
+                .iter()
+                .find_map(|field| {
+                    parsed
+                        .pointer(&format!("/choices/0/message/{field}"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("")
+                .to_string(),
+        }
+    }
+
+    /// Tokens and cache, named differently by each transport.
+    fn plain_usage(&self, parsed: &serde_json::Value, millis: u128) -> Usage {
+        let usage = parsed.get("usage").cloned().unwrap_or_default();
+        let (prompt, generated) = match self.mode {
+            crate::provider::ApiMode::ChatCompletions => (
+                usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            ),
+            _ => (
+                usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            ),
+        };
+        Usage {
+            prompt_tokens: prompt,
+            cached_tokens: cached_of(&usage),
+            generated_tokens: generated,
+            millis,
+            reasoning_chars: 0,
+        }
+    }
+
+    /// One call with no tools and no stream, in whichever transport this client speaks.
+    fn plain_call(
+        &self,
+        system: Option<&str>,
+        messages: &[serde_json::Value],
+        cap: u32,
+    ) -> Result<(serde_json::Value, Usage), Fault> {
+        let body = self.plain_body(system, messages, cap).to_string();
+        let headers = self.wire()?;
+        let started = Instant::now();
+        let reply = http::post(&self.target, &body, &headers, self.timeout)?;
+        let elapsed = started.elapsed();
+        if !reply.ok() {
+            return Err(Fault::model(format!(
+                "the model endpoint answered {}: {}",
+                reply.status,
+                first_line(&reply.body, 300)
+            )));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&reply.body).map_err(|error| {
+            Fault::model(format!(
+                "the model endpoint answered {} but not with JSON: {error} (it said: {})",
+                reply.status,
+                first_line(&reply.body, 200)
+            ))
+        })?;
+        if let Some(message) = parsed.pointer("/error/message").and_then(|v| v.as_str()) {
+            return Err(Fault::model(format!(
+                "the model endpoint returned an error: {}",
+                first_line(message, 300)
+            )));
+        }
+        let usage = self.plain_usage(&parsed, elapsed.as_millis());
+        Ok((parsed, usage))
+    }
+}
+
 impl Harness for OpenAi {
     /// The plan is a chat call, not a program call: one system message and one user message, no tools, and
     /// the answer is prose. The client's own system prompt is not used, because a plan is not an answer and
@@ -508,6 +799,29 @@ impl Harness for OpenAi {
     }
 
     fn complete(&self, system: &str, user: &str, _budget: &Budget) -> Result<Completion, Fault> {
+        if self.mode != crate::provider::ApiMode::ChatCompletions {
+            let messages = [serde_json::json!({ "role": "user", "content": user })];
+            let mut errors: Vec<String> = Vec::new();
+            for client in self.chain() {
+                match client.plain_call(Some(system), &messages, client.max_tokens) {
+                    Ok((parsed, usage)) => {
+                        return Ok(Completion {
+                            text: client
+                                .plain_text(&parsed)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string(),
+                            usage: Some(usage),
+                        });
+                    }
+                    Err(error) => errors.push(format!("{}: {error}", client.model)),
+                }
+            }
+            return Err(Fault::model(match errors.len() {
+                1 => errors.pop().unwrap_or_default(),
+                _ => format!("every provider failed: {}", errors.join("; ")),
+            }));
+        }
         let messages = serde_json::json!([
             { "role": "system", "content": system },
             { "role": "user", "content": user },
@@ -515,20 +829,31 @@ impl Harness for OpenAi {
         // A plain completion still has a cost. A local clone with a usage log makes the request ask
         // for `stream_options.include_usage`; without the log the endpoint is allowed to omit `usage`,
         // and the research ledger would read zero for a call that was not free.
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let client = self.clone().with_usage_log(log.clone());
-        let reply = client.chat(
-            messages.as_array().expect("an array of messages"),
-            None,
-            &|_, _| {},
-        )?;
-        let usage = reply
-            .usage
-            .or_else(|| log.lock().ok().and_then(|entries| entries.last().copied()));
-        Ok(Completion {
-            text: reply.content.trim().to_string(),
-            usage,
-        })
+        let mut errors: Vec<String> = Vec::new();
+        for candidate in self.chain() {
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let client = candidate.clone().with_usage_log(log.clone());
+            match client.chat(
+                messages.as_array().expect("an array of messages"),
+                None,
+                &|_, _| {},
+            ) {
+                Ok(reply) => {
+                    let usage = reply
+                        .usage
+                        .or_else(|| log.lock().ok().and_then(|entries| entries.last().copied()));
+                    return Ok(Completion {
+                        text: reply.content.trim().to_string(),
+                        usage,
+                    });
+                }
+                Err(error) => errors.push(format!("{}: {error}", client.model)),
+            }
+        }
+        Err(Fault::model(match errors.len() {
+            1 => errors.pop().unwrap_or_default(),
+            _ => format!("every provider failed: {}", errors.join("; ")),
+        }))
     }
 
     /// Stream when the endpoint streams, and fall back to one POST when it does not.
@@ -603,7 +928,7 @@ impl OpenAi {
         if let Some(key) = &self.key {
             headers.push(("Authorization", format!("Bearer {}", key.resolve()?)));
         }
-        http::stream(&self.target, &body, &headers, self.timeout, &mut |line| {
+        let streamed = http::stream(&self.target, &body, &headers, self.timeout, &mut |line| {
             let Some(data) = line.trim().strip_prefix("data:") else {
                 return;
             };
@@ -642,7 +967,15 @@ impl OpenAi {
                     .unwrap_or(0);
                 usage = Some((prompt, generated, cached_of(found)));
             }
-        })?;
+        });
+        if let Err(error) = streamed {
+            // Nothing was written, so the next provider in the chain gets the turn; `once` walks it and
+            // reports every failure if none of them answers. Content already on screen is not replayed.
+            if content.trim().is_empty() && !saw {
+                return self.once(task, bundle, budget);
+            }
+            return Err(error);
+        }
         let elapsed = started.elapsed();
 
         if !saw || content.trim().is_empty() {
@@ -700,58 +1033,127 @@ impl OpenAi {
         messages: &[serde_json::Value],
         feed: &dyn Fn(Feed, &str),
     ) -> Result<String, Fault> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": true,
-        });
-        let mut headers: Vec<(&str, String)> =
-            vec![("Content-Type", "application/json".to_string())];
-        if let Some(key) = &self.key {
-            headers.push(("Authorization", format!("Bearer {}", key.resolve()?)));
-        }
-        let mut content = String::new();
-        http::stream(
-            &self.target,
-            &body.to_string(),
-            &headers,
-            self.timeout,
-            &mut |line| {
-                let Some(data) = line.trim().strip_prefix("data:") else {
-                    return;
-                };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    return;
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                    return;
-                };
-                if let Some(delta) = value.pointer("/choices/0/delta") {
-                    if let Some(piece) = delta.get("content").and_then(|v| v.as_str())
-                        && !piece.is_empty()
-                    {
-                        content.push_str(piece);
-                        feed(Feed::Content, piece);
+        if self.mode != crate::provider::ApiMode::ChatCompletions {
+            // A transport without a stream: one call, then the whole answer is delivered at once so the
+            // surface behaves the same way to the person watching it.
+            let text_of = |message: &serde_json::Value| {
+                message
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let system = messages
+                .iter()
+                .filter(|message| message.get("role").and_then(|r| r.as_str()) == Some("system"))
+                .map(&text_of)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let turns: Vec<serde_json::Value> = messages
+                .iter()
+                .filter(|message| message.get("role").and_then(|r| r.as_str()) != Some("system"))
+                .cloned()
+                .collect();
+            let mut errors: Vec<String> = Vec::new();
+            for client in self.chain() {
+                match client.plain_call(
+                    (!system.is_empty()).then_some(system.as_str()),
+                    &turns,
+                    client.max_tokens,
+                ) {
+                    Ok((parsed, _)) => {
+                        let text = client.plain_text(&parsed).unwrap_or_default();
+                        if text.trim().is_empty() {
+                            errors.push(format!("{}: it answered nothing", client.model));
+                            continue;
+                        }
+                        feed(Feed::Content, &text);
+                        return Ok(text);
                     }
-                    for field in ["reasoning_content", "reasoning", "thinking"] {
-                        if let Some(piece) = delta.get(field).and_then(|v| v.as_str())
+                    Err(error) => errors.push(format!("{}: {error}", client.model)),
+                }
+            }
+            return Err(Fault::model(match errors.len() {
+                1 => errors.pop().unwrap_or_default(),
+                _ => format!("every provider failed: {}", errors.join("; ")),
+            }));
+        }
+        // One attempt per provider in the chain. A stream that fails before producing anything is the
+        // next provider's turn; one that fails after producing content is an error, not a stutter.
+        let mut errors: Vec<String> = Vec::new();
+        for candidate in self.chain() {
+            let body = serde_json::json!({
+                "model": candidate.model,
+                "messages": messages,
+                "temperature": candidate.temperature,
+                "max_tokens": candidate.max_tokens,
+                "stream": true,
+            });
+            let headers = candidate.wire()?;
+            let mut content = String::new();
+            let streamed = http::stream(
+                &candidate.target,
+                &body.to_string(),
+                &headers,
+                candidate.timeout,
+                &mut |line| {
+                    let Some(data) = line.trim().strip_prefix("data:") else {
+                        return;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        return;
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                        return;
+                    };
+                    if let Some(delta) = value.pointer("/choices/0/delta") {
+                        if let Some(piece) = delta.get("content").and_then(|v| v.as_str())
                             && !piece.is_empty()
                         {
-                            feed(Feed::Reasoning, piece);
+                            content.push_str(piece);
+                            feed(Feed::Content, piece);
+                        }
+                        for field in ["reasoning_content", "reasoning", "thinking"] {
+                            if let Some(piece) = delta.get(field).and_then(|v| v.as_str())
+                                && !piece.is_empty()
+                            {
+                                feed(Feed::Reasoning, piece);
+                            }
                         }
                     }
+                },
+            );
+            match streamed {
+                Ok(()) if !content.trim().is_empty() => return Ok(content),
+                Ok(()) => {
+                    // A server that ignores `stream` answers one object and produces no delta; one plain
+                    // call is the answer.
+                    match candidate.plain_call(None, messages, candidate.max_tokens) {
+                        Ok((parsed, _)) => {
+                            if let Some(text) = candidate.plain_text(&parsed)
+                                && !text.trim().is_empty()
+                            {
+                                feed(Feed::Content, &text);
+                                return Ok(text);
+                            }
+                            errors.push(format!("{}: it answered nothing", candidate.model));
+                        }
+                        Err(error) => errors.push(format!("{}: {error}", candidate.model)),
+                    }
                 }
-            },
-        )?;
-        if content.trim().is_empty() {
-            return Err(Fault::model(
-                "the endpoint streamed no answer at all".to_string(),
-            ));
+                Err(error) => {
+                    if !content.trim().is_empty() {
+                        return Err(error);
+                    }
+                    errors.push(format!("{}: {error}", candidate.model));
+                }
+            }
         }
-        Ok(content)
+        Err(Fault::model(match errors.len() {
+            1 => errors.pop().unwrap_or_default(),
+            _ => format!("every provider failed: {}", errors.join("; ")),
+        }))
     }
 
     fn once(
@@ -760,6 +1162,50 @@ impl OpenAi {
         bundle: &Bundle,
         budget: &Budget,
     ) -> Result<ModelAnswer, Fault> {
+        let mut errors: Vec<String> = Vec::new();
+        for client in self.chain() {
+            match client.once_one(task, bundle, budget) {
+                Ok(answer) => return Ok(answer),
+                Err(error) => errors.push(format!("{}: {error}", client.model)),
+            }
+        }
+        Err(Fault::model(match errors.len() {
+            1 => errors.pop().unwrap_or_default(),
+            _ => format!("every provider failed: {}", errors.join("; ")),
+        }))
+    }
+
+    fn once_one(
+        &self,
+        task: &TaskSpec,
+        bundle: &Bundle,
+        budget: &Budget,
+    ) -> Result<ModelAnswer, Fault> {
+        // A transport that is not chat completions has no tool protocol here, so a turn is one plain
+        // call: system prompt where that transport wants it, one user message, one program back.
+        if self.mode != crate::provider::ApiMode::ChatCompletions {
+            let user = self.user_text(task, bundle, budget);
+            let messages = [serde_json::json!({ "role": "user", "content": user })];
+            let (parsed, usage) = self.plain_call(Some(&self.system), &messages, self.max_tokens)?;
+            let content = self.plain_text(&parsed).unwrap_or_default();
+            let mut program = extract(&content);
+            if program.trim().is_empty()
+                && let Some((_, command)) = tool_call_program(&parsed)
+            {
+                program = command;
+            }
+            if program.trim().is_empty() {
+                return Err(Fault::model(format!(
+                    "the model answered with no program at all over {}: {} characters of content, \
+                     the endpoint gave no reason for it",
+                    self.mode.as_str(),
+                    content.trim().chars().count()
+                )));
+            }
+            return Ok(ModelAnswer::new(program)
+                .with_usage(usage)
+                .with_reasoning(self.plain_reasoning(&parsed)));
+        }
         let body = self.body(task, bundle, budget, false);
         let mut headers: Vec<(&str, String)> =
             vec![("Content-Type", "application/json".to_string())];
@@ -1032,8 +1478,17 @@ pub fn preset(id: &str) -> Option<Preset> {
 /// A provider is one URL, one key and any number of models. This is the route a config names when it
 /// does not want a shipped preset: `groq/llama-3.3-70b`, or the bare name if only one provider lists it.
 pub fn from_provider(provider: &crate::provider::Provider, model: &str) -> OpenAi {
-    let url = provider.chat_url();
-    let mut client = OpenAi::new(&url, model).with_context(provider.context);
+    let url = provider.endpoint_url();
+    let mut client = OpenAi::new(&url, model)
+        .with_context(provider.context)
+        .with_mode(provider.api_mode)
+        .with_headers(
+            provider
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        );
     if let Some(thinking) = provider.thinking {
         client = client.with_thinking(thinking);
     }
@@ -1047,6 +1502,19 @@ pub fn from_provider(provider: &crate::provider::Provider, model: &str) -> OpenA
 /// specific thing a person can write), then a named endpoint, then a shipped preset. The error lists
 /// what does resolve, because "no such model" without the list is a puzzle.
 pub fn client_for_config(config: &crate::config::Config, name: &str) -> Result<OpenAi, String> {
+    let client = one_for_config(config, name)?;
+    let mut chain = Vec::new();
+    for fallback in &config.fallbacks {
+        if fallback == name {
+            continue;
+        }
+        chain.push(one_for_config(config, fallback)?);
+    }
+    Ok(client.with_fallbacks(chain))
+}
+
+/// One client, without the chain: the name resolves to a provider, an endpoint or a preset.
+fn one_for_config(config: &crate::config::Config, name: &str) -> Result<OpenAi, String> {
     if let Some((provider, model)) = config.providers.resolve(name) {
         return Ok(from_provider(provider, &model));
     }
@@ -1126,6 +1594,155 @@ pub fn from_preset(preset: &Preset) -> OpenAi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot HTTP server: each entry is the response body, and every request it saw comes back so a
+    /// test can assert what was actually sent.
+    fn stub(codes: Vec<u16>, bodies: Vec<&'static str>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let address = format!("http://{}", listener.local_addr().expect("an address"));
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (code, body) in codes.iter().zip(bodies.iter()) {
+                let (mut stream, _) = listener.accept().expect("a connection");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut headers_done = false;
+                let mut content_length = 0usize;
+                loop {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if !headers_done && buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        headers_done = true;
+                        let text = String::from_utf8_lossy(&buffer).to_string();
+                        content_length = text
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                    }
+                    if headers_done {
+                        let split = buffer
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|at| at + 4)
+                            .unwrap_or(buffer.len());
+                        if buffer.len() >= split + content_length {
+                            break;
+                        }
+                    }
+                }
+                seen.push(String::from_utf8_lossy(&buffer).to_string());
+                let reply = format!(
+                    "HTTP/1.1 {code} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).ok();
+                stream.flush().ok();
+            }
+            seen
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn an_anthropic_call_puts_the_system_prompt_beside_the_turns_and_reads_content_blocks() {
+        let (address, server) = stub(
+            vec![200],
+            vec![r#"{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"output_tokens":2}}"#],
+        );
+        let client = OpenAi::new(format!("{address}/v1/messages"), "claude-x")
+            .with_mode(crate::provider::ApiMode::AnthropicMessages);
+        let completion = client.complete("be brief", "hello", &Budget::new(8192)).expect("an answer");
+        assert_eq!(completion.text, "ok");
+        let request = server.join().expect("the server");
+        let sent = &request[0];
+        assert!(sent.contains("anthropic-version: 2023-06-01"), "{sent}");
+        assert!(sent.contains("\"system\":\"be brief\""), "{sent}");
+        assert!(sent.contains("\"role\":\"user\""), "{sent}");
+        assert!(sent.contains("\"content\":\"hello\""), "{sent}");
+        assert!(!sent.contains("\"choices\""), "{sent}");
+    }
+
+    #[test]
+    fn a_responses_call_reads_output_text_and_still_puts_the_system_prompt_first() {
+        let (address, server) = stub(
+            vec![200],
+            vec![r#"{"output":[{"content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#],
+        );
+        let client = OpenAi::new(format!("{address}/v1/responses"), "gpt-x")
+            .with_mode(crate::provider::ApiMode::Responses);
+        let completion = client.complete("be brief", "hello", &Budget::new(8192)).expect("an answer");
+        assert_eq!(completion.text, "ok");
+        let request = server.join().expect("the server");
+        let sent = &request[0];
+        assert!(sent.contains("\"instructions\":\"be brief\""), "{sent}");
+        assert!(sent.contains("\"input\":["), "{sent}");
+        assert!(sent.contains("\"role\":\"user\""), "{sent}");
+    }
+
+    #[test]
+    fn a_config_chain_tries_the_named_fallbacks_in_the_order_written() {
+        let (first, first_server) = stub(vec![500], vec![r#"{"error":{"message":"down"}}"#]);
+        let (second, second_server) = stub(
+            vec![200],
+            vec![r#"{"content":[{"type":"text","text":"answered by the backup"}],"usage":{"input_tokens":1,"output_tokens":1}}"#],
+        );
+        let dir = std::env::temp_dir().join(format!("hades-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a dir");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"provider":"primary","model":"primary/m","root":"/tmp","vault":"/tmp",
+                    "providers":{{
+                      "primary":{{"base_url":"{first}/v1","api_mode":"anthropic_messages"}},
+                      "backup":{{"base_url":"{second}/v1","api_mode":"anthropic_messages"}}}},
+                    "fallback_providers":["backup/m"]}}"#
+            ),
+        )
+        .expect("write");
+        let config = crate::config::load(&path)
+            .expect("load")
+            .expect("a config");
+        assert_eq!(config.fallbacks, vec!["backup/m".to_string()]);
+        let client = client_for_config(&config, "primary/m").expect("a client");
+        let completion = client
+            .complete("be brief", "hello", &Budget::new(8192))
+            .expect("the backup answers");
+        assert_eq!(completion.text, "answered by the backup");
+        first_server.join().expect("first");
+        second_server.join().expect("second");
+    }
+
+    #[test]
+    fn a_failed_provider_is_followed_by_the_next_one_in_the_chain() {
+        let (first, first_server) = stub(vec![500], vec![r#"{"error":{"message":"upstream is down"}}"#]);
+        let (second, second_server) = stub(
+            vec![200],
+            vec![r#"{"content":[{"type":"text","text":"from the fallback"}],"usage":{"input_tokens":4,"output_tokens":2}}"#],
+        );
+        let primary = OpenAi::new(format!("{first}/v1/messages"), "primary")
+            .with_mode(crate::provider::ApiMode::AnthropicMessages);
+        let backup = OpenAi::new(format!("{second}/v1/messages"), "backup")
+            .with_mode(crate::provider::ApiMode::AnthropicMessages);
+        let client = primary.with_fallbacks(vec![backup]);
+        let completion = client.complete("be brief", "hello", &Budget::new(8192)).expect("the second answers");
+        assert_eq!(completion.text, "from the fallback");
+        first_server.join().expect("first");
+        second_server.join().expect("second");
+    }
+
+
 
     #[test]
     fn a_fenced_answer_is_unwrapped() {
@@ -1515,6 +2132,34 @@ impl OpenAi {
         cap: u64,
         feed: FeedFn<'_>,
     ) -> Result<Reply, Fault> {
+        let mut errors: Vec<String> = Vec::new();
+        for candidate in self.chain() {
+            match candidate.chat_one(messages, tools, cap, &feed) {
+                Ok(reply) => return Ok(reply),
+                Err(error) => errors.push(format!("{}: {error}", candidate.model)),
+            }
+        }
+        Err(Fault::model(match errors.len() {
+            1 => errors.pop().unwrap_or_default(),
+            _ => format!("every provider failed: {}", errors.join("; ")),
+        }))
+    }
+
+    fn chat_one(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        cap: u64,
+        feed: &FeedFn<'_>,
+    ) -> Result<Reply, Fault> {
+        if self.mode != crate::provider::ApiMode::ChatCompletions {
+            return Err(Fault::model(format!(
+                "`{}` has no tool protocol in this build: a turn with tools needs chat_completions, \
+                 and this provider is configured as {}",
+                self.model,
+                self.mode.as_str()
+            )));
+        }
         let mut cap = cap;
         // A model can end a turn with nothing at all after a tool result: finish "stop", no
         // content, no call. Repeating the identical request buys the same silence, so the retry

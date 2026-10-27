@@ -19,15 +19,23 @@ use serde_json::Value;
 /// accepting `anthropic_messages` and sending an OpenAI body to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiMode {
+    /// OpenAI-compatible chat completions. The default, and the one every local server speaks.
     ChatCompletions,
+    /// Anthropic messages: `/messages`, `x-api-key`, and a `content` array rather than `choices`.
+    AnthropicMessages,
+    /// OpenAI's responses API: `/responses`, `input` rather than `messages`.
+    Responses,
 }
 
 impl ApiMode {
     fn parse(text: &str) -> Result<Self, String> {
         match text {
             "chat_completions" | "chat-completions" | "openai" | "chat" => Ok(Self::ChatCompletions),
+            "anthropic_messages" | "anthropic" | "messages" | "claude" => Ok(Self::AnthropicMessages),
+            "responses" | "openai_responses" | "codex" => Ok(Self::Responses),
             other => Err(format!(
-                "api_mode `{other}` is not one this build speaks; say chat_completions"
+                "api_mode `{other}` is not one this build speaks; say chat_completions, \
+                 anthropic_messages or responses"
             )),
         }
     }
@@ -35,6 +43,17 @@ impl ApiMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat_completions",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::Responses => "responses",
+        }
+    }
+
+    /// The path a request is posted to, for a base URL that is a root rather than a full endpoint.
+    fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/chat/completions",
+            Self::AnthropicMessages => "/messages",
+            Self::Responses => "/responses",
         }
     }
 }
@@ -56,17 +75,27 @@ pub struct Provider {
     /// Whether to ask the template for thinking. `None` sends nothing, which is what a cloud endpoint
     /// wants and what an unknown template needs.
     pub thinking: Option<bool>,
+    /// Headers the provider needs on every call, for a gateway that routes by one. Values are literals:
+    /// a header is not a secret, and a secret belongs in `key_env`.
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 impl Provider {
-    /// The URL a chat completion is posted to.
-    pub fn chat_url(&self) -> String {
+    /// The URL a call is posted to, for this provider's mode. A base URL that already names a full
+    /// endpoint is used as given, so a proxy that rewrites the path still works.
+    pub fn endpoint_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/chat/completions") {
+        let path = self.api_mode.path();
+        if base.ends_with(path) {
             base.to_string()
         } else {
-            format!("{base}/chat/completions")
+            format!("{base}{path}")
         }
+    }
+
+    /// The chat-completions URL, kept as a name for the common case.
+    pub fn chat_url(&self) -> String {
+        self.endpoint_url()
     }
 }
 
@@ -240,6 +269,28 @@ impl Provider {
             .filter(|tokens| *tokens > 0)
             .unwrap_or(32_768) as usize;
         let thinking = object.get("thinking").and_then(Value::as_bool);
+        let headers = match object.get("headers") {
+            None | Some(Value::Null) => std::collections::BTreeMap::new(),
+            Some(Value::Object(map)) => {
+                let mut headers = std::collections::BTreeMap::new();
+                for (name, value) in map {
+                    let text = value.as_str().ok_or_else(|| {
+                        format!(
+                            "{}: `providers.{id}.headers.{name}` is a string",
+                            path.display()
+                        )
+                    })?;
+                    headers.insert(name.clone(), text.to_string());
+                }
+                headers
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{}: `providers.{id}.headers` is an object of header name to value",
+                    path.display()
+                ));
+            }
+        };
         Ok(Self {
             id: id.to_string(),
             base_url,
@@ -248,6 +299,7 @@ impl Provider {
             models,
             context,
             thinking,
+            headers,
         })
     }
 }
@@ -304,13 +356,26 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_this_build_cannot_speak_is_refused_by_name() {
+    fn the_three_modes_parse_and_a_fourth_is_refused_by_name() {
+        let registry = parse(json!({
+            "a": {"base_url": "https://api.example/v1", "api_mode": "anthropic_messages"},
+            "b": {"base_url": "https://api.example/v1", "api_mode": "responses"}
+        }))
+        .expect("two modes");
+        assert_eq!(
+            registry.get("a").expect("a").endpoint_url(),
+            "https://api.example/v1/messages"
+        );
+        assert_eq!(
+            registry.get("b").expect("b").endpoint_url(),
+            "https://api.example/v1/responses"
+        );
         let refused = parse(json!({
-            "anthropicish": {"base_url": "https://api.example/v1", "api_mode": "anthropic_messages"}
+            "gemini": {"base_url": "https://api.example/v1", "api_mode": "generate_content"}
         }))
         .expect_err("refused");
+        assert!(refused.contains("generate_content"), "{refused}");
         assert!(refused.contains("anthropic_messages"), "{refused}");
-        assert!(refused.contains("chat_completions"), "{refused}");
     }
 
     #[test]

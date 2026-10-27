@@ -1033,6 +1033,7 @@ mod tests {
             provider: None,
             endpoints: Default::default(),
             providers: Default::default(),
+            fallbacks: Default::default(),
         }
     }
 

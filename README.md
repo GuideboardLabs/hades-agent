@@ -656,10 +656,24 @@ variable, looked up in the environment and then `~/.hades/.env`; the config neve
 `base_url` is the root of the API, `hades models` prints the URL a call actually goes to, and a full
 `.../chat/completions` URL is used as given so a proxy that rewrites the path still works.
 
-`api_mode` says how the provider speaks. This build speaks `chat_completions`; naming anything else is
-refused when the config is read rather than sending an OpenAI body to an endpoint that wanted
-something else. `context_length` is the window the client asks for, and `thinking` is passed only when
-you set it, because an unknown template should be sent nothing.
+`api_mode` says how the provider speaks: `chat_completions` (every local server and most gateways),
+`anthropic_messages` (a `/messages` endpoint, `x-api-key`, content blocks) or `responses` (OpenAI's
+`/responses` with `input` and `instructions`). A plain call works in all three; a turn that uses tools
+needs `chat_completions` and says so by name otherwise, rather than sending a tool schema to an
+endpoint that cannot read it. `headers` carries a static header the provider insists on. `context_length`
+is the window the client asks for, and `thinking` is passed only when you set it, because an unknown
+template should be sent nothing.
+
+When the chosen model fails before it has answered, the next name in `fallback_providers` is tried, in
+order, and a chain that runs out reports every provider's own error:
+
+```json
+"model": "groq/llama-3.3-70b",
+"fallback_providers": ["anthropic/claude-sonnet-4", "deepseek-v4.1-flash"]
+```
+
+Every name in the list is resolved when the config is read, so a typo is a refusal rather than a
+fallback that quietly is not there.
 
 Providers are also how a gateway surface gets a model that is not the system's default: the connector
 section may name `model: "groq/llama-3.3-70b"`, and it resolves through this same map. Nothing about a

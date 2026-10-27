@@ -44,6 +44,9 @@ pub struct Config {
     /// Providers this owner named: one URL, one key, several models. A model is `provider/model`, or a
     /// bare name that exactly one provider lists.
     pub providers: crate::provider::Registry,
+    /// Model names to try, in order, when the chosen one fails before it has answered. Resolved the same
+    /// way a model name is: provider, endpoint, preset.
+    pub fallbacks: Vec<String>,
     /// Toolchains under the home directory, named explicitly. Discovery never walks the home, so a rustup,
     /// nvm, pyenv or uv install there is unreadable inside the cage unless it is listed here.
     pub runtime_paths: Vec<PathBuf>,
@@ -195,6 +198,41 @@ fn endpoints(value: Option<&Value>, path: &Path) -> Result<BTreeMap<String, Endp
 
 /// A model id is a shipped preset or a named endpoint. Anything else is refused by name, here, because the
 /// alternative is a run that starts and then cannot reach anything.
+/// The optional `fallback_providers` list. Every name must resolve, because a chain that silently drops
+/// a link is a chain the owner believes is there.
+fn fallbacks(
+    value: Option<&Value>,
+    endpoints: &BTreeMap<String, Endpoint>,
+    providers: &crate::provider::Registry,
+    path: &Path,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value.as_array().ok_or_else(|| {
+        format!(
+            "{}: `fallback_providers` is a list of model names",
+            path.display()
+        )
+    })?;
+    let mut out = Vec::new();
+    for item in items {
+        let name = item
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{}: `fallback_providers` holds something that is not a name",
+                    path.display()
+                )
+            })?;
+        check_model(name, endpoints, providers, path, "fallback_providers")?;
+        out.push(name.to_string());
+    }
+    Ok(out)
+}
+
 fn check_model(
     model: &str,
     endpoints: &BTreeMap<String, Endpoint>,
@@ -279,6 +317,7 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
     let providers = crate::provider::Registry::parse(object.get("providers"), path)?;
     let model = field(object, "model", path)?;
     check_model(&model, &endpoints, &providers, path, "model")?;
+    let fallbacks = fallbacks(object.get("fallback_providers"), &endpoints, &providers, path)?;
 
     Ok(Some(Config {
         provider: field(object, "provider", path)?,
@@ -289,6 +328,7 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         mcp: crate::mcp::McpConfig::from_value(object.get("mcp"), path)?,
         endpoints,
         providers,
+        fallbacks,
         runtime_paths: runtime_paths(object.get("runtime_paths"), path)?,
         research: research(object.get("research"), path)?,
         vision: vision(object.get("vision"), path)?,
@@ -323,6 +363,7 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
             .iter()
             .map(|path| path.to_string_lossy().to_string())
             .collect::<Vec<String>>(),
+        "fallback_providers": config.fallbacks,
         "providers": config.providers.providers.iter().map(|(id, provider)| {
             let mut value = json!({
                 "base_url": provider.base_url,
@@ -335,6 +376,9 @@ pub fn save(path: &Path, config: &Config) -> Result<(), String> {
             }
             if let Some(thinking) = provider.thinking {
                 value["thinking"] = json!(thinking);
+            }
+            if !provider.headers.is_empty() {
+                value["headers"] = json!(provider.headers);
             }
             (id.clone(), value)
         }).collect::<Map<String, Value>>(),
@@ -619,6 +663,7 @@ mod tests {
             endpoints: BTreeMap::new(),
             vision: None,
             providers: Default::default(),
+        fallbacks: Default::default(),
         }
     }
 
@@ -799,6 +844,7 @@ mod tests {
             research: Research::default(),
             vision: None,
             providers: Default::default(),
+        fallbacks: Default::default(),
         };
         save(&path, &config).expect("a save");
         let read = load(&path).expect("a read").expect("a config");
@@ -860,6 +906,7 @@ mod tests {
             research: Research::default(),
             vision: None,
             providers: Default::default(),
+        fallbacks: Default::default(),
         };
         let mut config = base();
         config.runtime_paths = vec![PathBuf::from("relative/toolchain")];

@@ -89,6 +89,8 @@ pub struct Settings {
     /// The providers the same config names, so a surface can answer on `provider/model` exactly as the
     /// daemon does. A connector gets this for free; it does not need a provider of its own.
     pub providers: crate::provider::Registry,
+    /// The chain tried when the surface's own model fails before answering.
+    pub fallbacks: Vec<String>,
 }
 
 /// What one channel changes about the surface it belongs to. Every field is optional: a channel that
@@ -281,6 +283,37 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     });
     let provider = section.get("provider").filter(|value| value.is_object()).cloned();
     let providers = crate::provider::Registry::parse(value.get("providers"), path)?;
+    let fallbacks = match value.get("fallback_providers") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut names = Vec::new();
+            for item in items {
+                let name = item.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| {
+                    format!(
+                        "{}: `fallback_providers` holds something that is not a name",
+                        path.display()
+                    )
+                })?;
+                // A fallback nobody can resolve is a link the owner believes is there.
+                if crate::model::preset(name).is_none()
+                    && !value
+                        .get("endpoints")
+                        .and_then(Value::as_object)
+                        .map(|endpoints| endpoints.contains_key(name))
+                        .unwrap_or(false)
+                    && providers.resolve(name).is_none()
+                {
+                    return Err(format!(
+                        "{}: `fallback_providers` names `{name}`, which is no provider, endpoint or preset",
+                        path.display()
+                    ));
+                }
+                names.push(name.to_string());
+            }
+            names
+        }
+        Some(_) => return Err(format!("{}: `fallback_providers` is a list", path.display())),
+    };
     let endpoints = value
         .get("endpoints")
         .and_then(Value::as_object)
@@ -392,6 +425,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         provider,
         endpoints,
         providers,
+        fallbacks,
     })
 }
 
@@ -1123,6 +1157,20 @@ impl Default for Loading {
 /// preset. In that order, because the narrower claim wins and a local server is a fact about this
 /// machine rather than about Hades.
 fn client_for(settings: &Settings, name: &str) -> Result<crate::model::OpenAi, String> {
+    let client = one_client(settings, name)?;
+    let mut chain = Vec::new();
+    for fallback in &settings.fallbacks {
+        if fallback == name {
+            continue;
+        }
+        chain.push(one_client(settings, fallback)?);
+    }
+    Ok(client.with_fallbacks(chain))
+}
+
+/// One client, without the chain: a surface's own provider block, then a machine endpoint, then a named
+/// provider, then a preset.
+fn one_client(settings: &Settings, name: &str) -> Result<crate::model::OpenAi, String> {
     if let Some(provider) = &settings.provider {
         return crate::model::from_config(provider);
     }
@@ -2311,6 +2359,7 @@ mod tests {
             provider: None,
             endpoints: Default::default(),
             providers: Default::default(),
+            fallbacks: Default::default(),
         }
     }
 

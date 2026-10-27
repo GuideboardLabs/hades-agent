@@ -200,6 +200,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
             provider: None,
             endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
         }
     );
 }
@@ -223,6 +224,7 @@ fn an_unauthorized_sender_gets_nothing() {
         provider: None,
         endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
     };
     let mut fake = Fake::default();
     // The socket does not exist: any attempt to reach the daemon would fail, which is the proof that
@@ -257,6 +259,7 @@ fn a_channel_set_to_chat_cannot_start_work() {
         provider: None,
         endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
     };
     settings.mode = harness::mode::Mode::Read;
     let mut fake = Fake::default();
@@ -332,6 +335,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
         provider: None,
         endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
     };
     let mut fake = Fake::default();
     handle(
@@ -451,6 +455,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
         provider: None,
         endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
     };
     let fake = Fake::default();
     let mut worker = fake.clone();
@@ -527,6 +532,7 @@ fn the_offset_advances_after_a_batch() {
         provider: None,
         endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
     };
     // One batch with one update, then nothing. `--once` handles the batch and returns.
     let fake = Fake::with(vec![vec![Update {
@@ -585,6 +591,7 @@ fn settings_for(chat: i64) -> Settings {
         provider: None,
         endpoints: Default::default(),
         providers: Default::default(),
+        fallbacks: Default::default(),
     }
 }
 
