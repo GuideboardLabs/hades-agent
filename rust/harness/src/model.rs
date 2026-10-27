@@ -996,7 +996,8 @@ pub struct Preset {
     pub note: &'static str,
 }
 
-/// The two paths, and the two strongest local models behind the agentic bench.
+/// Local models, then the two cloud presets. The notes are descriptions, not deployment notes: a
+/// preset is public configuration, and a public file does not name a person's box.
 pub fn presets() -> Vec<Preset> {
     vec![
         Preset {
@@ -1006,7 +1007,7 @@ pub fn presets() -> Vec<Preset> {
             model: "nanbeige-3b",
             key: None,
             context: 8192,
-            note: "the best Agon agentic result: 24/24, 44.9 t/s, Q4_K_M. Start a server on 8110 first.",
+            note: "a 3B local model on port 8110; start a llama.cpp server there first",
         },
         Preset {
             id: "bonsai-27b",
@@ -1015,7 +1016,7 @@ pub fn presets() -> Vec<Preset> {
             model: "bonsai-27b",
             key: None,
             context: 8192,
-            note: "the other 24/24, a 27B ternary at 10.9 t/s. Needs the Prism fork; port 8111.",
+            note: "a 27B ternary model on port 8111; needs a build with ternary support",
         },
         Preset {
             id: "heem-9b",
@@ -1024,8 +1025,8 @@ pub fn presets() -> Vec<Preset> {
             model: "heem-9b",
             key: None,
             context: 32768,
-            note: "the abliterated 9B (Qwen3.5-9B-Uncensored-HauhauCS-Aggressive Q4_K_M), fully \
-                   VRAM-resident on the 5700 XT. Start local-llm-heem9b.service on 8100 first",
+            note: "an abliterated 9B (Qwen3.5-9B-Uncensored-HauhauCS-Aggressive Q4_K_M) on port 8100; \
+                   start a llama.cpp server there first",
         },
         Preset {
             id: "deepseek-v4.1-flash",
@@ -1045,8 +1046,7 @@ pub fn presets() -> Vec<Preset> {
             model: "kimi-k2.7-code",
             key: Some(Key::Home("OLLAMA_API_KEY".to_string())),
             context: 32768,
-            note: "the account's coding model, for the agentic half of the test. The account has no \
-                   qwen3-coder, which was the first guess here and was wrong",
+            note: "the account's coding model, for the agentic half of a test",
         },
     ]
 }
