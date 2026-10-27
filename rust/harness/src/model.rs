@@ -996,38 +996,10 @@ pub struct Preset {
     pub note: &'static str,
 }
 
-/// Local models, then the two cloud presets. The notes are descriptions, not deployment notes: a
-/// preset is public configuration, and a public file does not name a person's box.
+/// The cloud presets only. A local model is a fact about a machine, not about Hades: it belongs in
+/// that machine's `endpoints` map, where the pack that ships has no opinion about it.
 pub fn presets() -> Vec<Preset> {
     vec![
-        Preset {
-            id: "nanbeige-3b",
-            thinking: Some(false),
-            endpoint: "http://127.0.0.1:8110/v1/chat/completions",
-            model: "nanbeige-3b",
-            key: None,
-            context: 8192,
-            note: "a 3B local model on port 8110; start a llama.cpp server there first",
-        },
-        Preset {
-            id: "bonsai-27b",
-            thinking: Some(false),
-            endpoint: "http://127.0.0.1:8111/v1/chat/completions",
-            model: "bonsai-27b",
-            key: None,
-            context: 8192,
-            note: "a 27B ternary model on port 8111; needs a build with ternary support",
-        },
-        Preset {
-            id: "heem-9b",
-            thinking: Some(false),
-            endpoint: "http://127.0.0.1:8100/v1/chat/completions",
-            model: "heem-9b",
-            key: None,
-            context: 32768,
-            note: "an abliterated 9B (Qwen3.5-9B-Uncensored-HauhauCS-Aggressive Q4_K_M) on port 8100; \
-                   start a llama.cpp server there first",
-        },
         Preset {
             id: "deepseek-v4.1-flash",
             thinking: None,
@@ -1068,6 +1040,7 @@ pub fn preset(id: &str) -> Option<Preset> {
 pub fn from_config(value: &serde_json::Value) -> Result<OpenAi, String> {
     let endpoint = value
         .get("endpoint")
+        .or_else(|| value.get("url"))
         .or_else(|| value.get("base_url"))
         .and_then(|text| text.as_str())
         .filter(|text| !text.trim().is_empty())
@@ -1079,6 +1052,7 @@ pub fn from_config(value: &serde_json::Value) -> Result<OpenAi, String> {
         .ok_or("a `provider` needs `model`")?;
     let context = value
         .get("context")
+        .or_else(|| value.get("context_tokens"))
         .and_then(|number| number.as_u64())
         .unwrap_or(32_768) as usize;
     let mut client = OpenAi::new(endpoint, name).with_context(context);
@@ -1441,16 +1415,17 @@ mod tests {
     }
 
     #[test]
-    fn every_preset_says_where_it_goes_and_two_of_them_are_the_cloud() {
+    fn every_preset_says_where_it_goes_and_only_the_cloud_ones_ship() {
         let all = presets();
-        assert_eq!(all.len(), 5, "three local, two cloud");
+        assert_eq!(all.len(), 2, "the cloud presets; local models live in `endpoints`");
         assert_eq!(all.iter().filter(|p| p.key.is_some()).count(), 2);
         for preset in &all {
             assert!(preset.endpoint.starts_with("http"), "{}", preset.id);
             assert!(parses(preset.endpoint), "{}", preset.id);
         }
-        assert!(preset("nanbeige-3b").is_some());
-        assert!(preset("heem-9b").is_some());
+        assert!(preset("deepseek-v4.1-flash").is_some());
+        // A local model is a fact about a machine, not about Hades: it must not be compiled in.
+        assert!(preset("heem-9b").is_none());
         assert!(preset("nope").is_none());
     }
 

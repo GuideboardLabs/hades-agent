@@ -1031,6 +1031,7 @@ mod tests {
             prompt: None,
             loading: None,
             provider: None,
+            endpoints: Default::default(),
         }
     }
 

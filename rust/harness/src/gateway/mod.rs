@@ -83,6 +83,9 @@ pub struct Settings {
     /// An endpoint this surface answers through instead of a preset, so one connector can be routed to a
     /// different provider from the system it belongs to.
     pub provider: Option<Value>,
+    /// The machine's own named endpoints, `endpoints.<name>`, the same map the daemon reads. A local
+    /// model belongs here, not in a pack: the pack is the same file on every machine.
+    pub endpoints: std::collections::BTreeMap<String, Value>,
 }
 
 /// What one channel changes about the surface it belongs to. Every field is optional: a channel that
@@ -277,6 +280,16 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             .clamp(40, 5_000),
     });
     let provider = section.get("provider").filter(|value| value.is_object()).cloned();
+    let endpoints = value
+        .get("endpoints")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter(|(_, endpoint)| endpoint.is_object())
+                .map(|(name, endpoint)| (name.clone(), endpoint.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let policy = section
         .get("policy")
@@ -376,6 +389,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         prompt,
         loading,
         provider,
+        endpoints,
     })
 }
 
@@ -1103,6 +1117,21 @@ impl Default for Loading {
     }
 }
 
+/// A name to a client: the surface's own provider, then the machine's endpoints, then a shipped
+/// preset. In that order, because the narrower claim wins and a local server is a fact about this
+/// machine rather than about Hades.
+fn client_for(settings: &Settings, name: &str) -> Result<crate::model::OpenAi, String> {
+    if let Some(provider) = &settings.provider {
+        return crate::model::from_config(provider);
+    }
+    if let Some(endpoint) = settings.endpoints.get(name) {
+        return crate::model::from_config(endpoint);
+    }
+    let preset = crate::model::preset(name)
+        .ok_or_else(|| format!("no model preset or endpoint named `{name}`"))?;
+    Ok(crate::model::from_preset(&preset))
+}
+
 /// A plain message is a conversation. It is not a goal, it does not get a program, a check or attempts, and
 /// the person sees the answer while it is written. `/run` is the door to the harness.
 fn chat<T: Transport + Clone + Send + 'static>(
@@ -1115,14 +1144,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<(), String> {
     let _ = state;
-    let client = match &settings.provider {
-        Some(provider) => crate::model::from_config(provider)?,
-        None => {
-            let preset = crate::model::preset(&effective.model)
-                .ok_or_else(|| format!("no model preset named `{}`", effective.model))?;
-            crate::model::from_preset(&preset)
-        }
-    };
+    let client = client_for(settings, &effective.model)?;
     let mut history = load_chat(state, &update.chat);
     let workspace = PathBuf::from(&effective.root);
     let mut world = world_for(
@@ -1911,14 +1933,7 @@ fn scheduled(
     step: &crate::retry::Step,
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<String, String> {
-    let client = match &settings.provider {
-        Some(provider) => crate::model::from_config(provider)?,
-        None => {
-            let preset = crate::model::preset(&settings.model)
-                .ok_or_else(|| format!("no model preset named `{}`", settings.model))?;
-            crate::model::from_preset(&preset)
-        }
-    };
+    let client = client_for(settings, &settings.model)?;
     let workspace = PathBuf::from(&settings.root);
     let world = world_for(
         settings,
@@ -2279,6 +2294,7 @@ mod tests {
             prompt: None,
             loading: None,
             provider: None,
+            endpoints: Default::default(),
         }
     }
 
@@ -2323,6 +2339,30 @@ mod tests {
         assert_eq!(render_status(&face, 0.0, 1900), render_status(&face, 2.40, 1900));
         // No word of the model's own making is in it.
         assert!(!first.contains("thinking") && !first.contains("reasoning"));
+    }
+
+    /// A local model is a fact about this machine, so it lives in `endpoints`, not in the build.
+    /// The gateway has to resolve it there, or a pack that ships nothing local cannot reach one.
+    #[test]
+    fn a_local_endpoint_is_found_by_name_and_an_unknown_name_is_refused() {
+        let dir = scratch("endpoints");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp",
+                "endpoints":{"heem-9b":{"url":"http://127.0.0.1:8100/v1/chat/completions",
+                                        "model":"heem-9b","context_tokens":32768}},
+                "gateway":{"connectors":{"discord":{"allowed_users":["7"],"verify":"true",
+                                                     "model":"heem-9b"}}}}"#,
+        )
+        .expect("config");
+        let settings = settings_for(&path, "discord").expect("settings");
+        assert!(settings.endpoints.contains_key("heem-9b"));
+        assert!(client_for(&settings, "heem-9b").is_ok());
+        let refused = client_for(&settings, "not-here").expect_err("unknown");
+        assert!(refused.contains("not-here"), "{refused}");
+        // Nothing local is compiled in, so a build without the endpoint cannot reach it.
+        assert!(crate::model::preset("heem-9b").is_none());
     }
 
     /// A connector can bring its own opening, its own animation and its own endpoint. Each is

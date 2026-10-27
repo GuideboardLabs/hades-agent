@@ -662,13 +662,13 @@ mod tests {
         let mut config = sample();
         config
             .profile_models
-            .insert("fix".to_string(), "nanbeige-3b".to_string());
+            .insert("fix".to_string(), "deepseek-v4.1-flash".to_string());
         save(&path, &config).expect("save");
         assert_eq!(load(&path).expect("load"), Some(config));
 
         std::fs::write(
             &path,
-            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v","profile_models":{"nope":"nanbeige-3b"}}"#,
+            r#"{"version":1,"provider":"ollama-cloud","model":"deepseek-v4.1-flash","root":"/r","vault":"/v","profile_models":{"nope":"deepseek-v4.1-flash"}}"#,
         )
         .expect("write");
         let said = load(&path).expect_err("an unknown profile is not ignored");

@@ -7982,40 +7982,40 @@ mod profile_model_tests {
             &flags(None),
             Some(&config("not-a-preset", &[])),
             None,
-            Some("nanbeige-3b"),
+            Some("deepseek-v4.1-flash"),
         )
         .expect("the profile's preset resolves");
-        assert!(answerer.describe().contains("nanbeige-3b"));
+        assert!(answerer.describe().contains("deepseek-v4.1-flash"));
     }
 
     #[test]
     fn the_flag_outranks_the_profile_model() {
         let answerer = answerer(
-            &flags(Some("bonsai-27b")),
+            &flags(Some("kimi-k2.7-code")),
             Some(&config("not-a-preset", &[])),
             None,
-            Some("nanbeige-3b"),
+            Some("deepseek-v4.1-flash"),
         )
         .expect("the flag's preset resolves");
-        assert!(answerer.describe().contains("bonsai-27b"));
+        assert!(answerer.describe().contains("kimi-k2.7-code"));
     }
 
     #[test]
     fn with_no_profile_model_the_config_is_used() {
-        let answerer = answerer(&flags(None), Some(&config("nanbeige-3b", &[])), None, None)
+        let answerer = answerer(&flags(None), Some(&config("deepseek-v4.1-flash", &[])), None, None)
             .expect("the config's preset resolves");
-        assert!(answerer.describe().contains("nanbeige-3b"));
+        assert!(answerer.describe().contains("deepseek-v4.1-flash"));
     }
 
     #[test]
     fn the_config_profile_model_outranks_the_profiles_own() {
-        let first = config("not-a-preset", &[("fix", "nanbeige-3b")]);
+        let first = config("not-a-preset", &[("fix", "deepseek-v4.1-flash")]);
         let fix = crate::profile::named("fix").expect("fix");
-        assert_eq!(effective_model(Some(&first), &fix), Some("nanbeige-3b"));
+        assert_eq!(effective_model(Some(&first), &fix), Some("deepseek-v4.1-flash"));
 
         let mut verify = crate::profile::named("verify").expect("verify");
-        verify.model = Some("bonsai-27b".to_string());
-        let second = config("not-a-preset", &[("verify", "nanbeige-3b")]);
-        assert_eq!(effective_model(Some(&second), &verify), Some("nanbeige-3b"));
+        verify.model = Some("kimi-k2.7-code".to_string());
+        let second = config("not-a-preset", &[("verify", "deepseek-v4.1-flash")]);
+        assert_eq!(effective_model(Some(&second), &verify), Some("deepseek-v4.1-flash"));
     }
 }
