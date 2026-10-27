@@ -1031,30 +1031,16 @@ fn save_chat(state: &Path, chat: &Chat, messages: &[Value]) {
 /// A chat card is prose, not a run card: the answer as it is written, and the thinking only until there is
 /// an answer to read. The live view shows the tail of a long answer, because the newest words are the ones
 /// a person is waiting for; the finished answer is split into messages instead of being cut.
-fn render_chat(reasoning: &str, content: &str, activity: &[String], limit: usize) -> String {
-    if !content.trim().is_empty() {
-        return esc(&tail(content.trim(), limit));
-    }
-    let mut parts = Vec::new();
-    if !activity.is_empty() {
-        parts.push(
-            activity
-                .iter()
-                .map(|line| format!("<i>· {}</i>", esc(line)))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-    }
-    let thought = tail(reasoning.trim(), 600);
-    if !thought.trim().is_empty() {
-        parts.push(format!("<i>{}</i>", esc(&thought)));
-    }
-    if parts.is_empty() {
-        "<i>…</i>".to_string()
-    } else {
-        clip(&parts.join("\n\n"), limit)
-    }
+fn render_status(seconds: f64, limit: usize) -> String {
+    // A loading line, not a transcript. Streaming the model's scratchpad into the message is how
+    // escaped `&lt;think&gt;` tags end up in a Discord channel: the person reads the machinery while it
+    // works, and its unfinished sentences look like an answer. One face, one word, moving dots.
+    const DOTS: [&str; 4] = ["", ".", "..", "..."];
+    let step = ((seconds / 0.55).floor() as usize) % DOTS.len();
+    let line = format!("💀 thinking{}", DOTS[step]);
+    clip(&format!("<i>{}</i>", line), limit)
 }
+
 
 /// A plain message is a conversation. It is not a goal, it does not get a program, a check or attempts, and
 /// the person sees the answer while it is written. `/run` is the door to the harness.
@@ -1158,57 +1144,35 @@ fn chat<T: Transport + Clone + Send + 'static>(
     if let Err(fault) = crate::agent::compress(&client, &mut messages, 8, 12000) {
         eprintln!("compression: not written, {fault}");
     }
-    let id = transport.send(&update.chat, "<i>…</i>", &[])?;
     let limit = transport.limit();
-    let shared = Arc::new(Mutex::new((
-        String::new(),
-        String::new(),
-        Vec::<String>::new(),
-    )));
+    let id = transport.send(&update.chat, &render_status(0.0, limit), &[])?;
     let stop = Arc::new(AtomicBool::new(false));
     // See `relay`: the claim is made once on this thread before the ticker owns it.
     let _ = transport.typing(&update.chat);
     let ticker = {
         let mut beat = transport.clone();
-        let shared = Arc::clone(&shared);
         let stop = Arc::clone(&stop);
         let chat_id = update.chat.clone();
+        let started = Instant::now();
         std::thread::spawn(move || {
-            let mut last = Instant::now() - EDIT_EVERY;
+            let mut last = Instant::now();
             while !stop.load(Ordering::SeqCst) {
                 let _ = beat.typing(&chat_id);
                 if last.elapsed() >= EDIT_EVERY
                     && let Some(message) = id
                 {
-                    let text = {
-                        let held = shared.lock().expect("the chat buffer");
-                        render_chat(&held.0, &held.1, &held.2, limit)
-                    };
+                    let text = render_status(started.elapsed().as_secs_f64(), limit);
                     let _ = beat.edit(&chat_id, message, &text, &[]);
                     last = Instant::now();
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(200));
             }
         })
     };
-    let feed = |kind: crate::model::Feed, piece: &str| {
-        if let Ok(mut held) = shared.lock() {
-            match kind {
-                crate::model::Feed::Reasoning => held.0.push_str(piece),
-                crate::model::Feed::Content => held.1.push_str(piece),
-            }
-        }
-    };
-    let activity = |event: crate::agent::Activity, label: &str| {
-        if event == crate::agent::Activity::Start
-            && let Ok(mut held) = shared.lock()
-        {
-            held.2.push(label.to_string());
-            if held.2.len() > 8 {
-                held.2.remove(0);
-            }
-        }
-    };
+    // Nothing the model writes while it works reaches the message. The answer replaces the
+    // placeholder whole, which is the only way a partial sentence never looks like a reply.
+    let feed = |_: crate::model::Feed, _: &str| {};
+    let activity = |_: crate::agent::Activity, _: &str| {};
     let answer =
         crate::agent::answer_stoppable(&client, &mut messages, &world, &feed, &activity, 20, halt);
     stop.store(true, Ordering::SeqCst);
@@ -1218,6 +1182,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
         Ok(Some(text)) => {
             // An answer longer than the surface accepts becomes several messages instead of a cut. The
             // placeholder is the first part when the surface gave us an id to edit.
+            let text = crate::agent::strip_thinking(&text);
             let parts = split(&esc(&text), transport.limit());
             match id {
                 Some(message) => {
@@ -1883,6 +1848,7 @@ fn scheduled(
     let silent = |_: crate::model::Feed, _: &str| {};
     let nothing = |_: crate::agent::Activity, _: &str| {};
     crate::agent::answer(&client, &mut messages, &world, &silent, &nothing, 16)
+        .map(|text| crate::agent::strip_thinking(&text))
         .map_err(|fault| format!("{fault:?}"))
 }
 
@@ -2251,6 +2217,17 @@ mod tests {
         // A channel that names nothing keeps the surface's own model and policy.
         assert_eq!(work.model, settings.model);
         assert_eq!(work.policy, settings.policy);
+    }
+
+    /// While it works the message says it is working, and nothing else. The dots move, because a
+    /// still "…" and a finished bot look the same.
+    #[test]
+    fn the_placeholder_says_it_is_thinking_and_the_dots_move() {
+        let first = render_status(0.0, 1900);
+        assert!(first.contains("thinking"), "{first}");
+        assert_eq!(first, render_status(0.1, 1900));
+        assert_ne!(first, render_status(1.3, 1900));
+        assert!(!first.contains("reasoning"));
     }
 
     /// A connector that names a model means it. This is the difference between a bot that says it

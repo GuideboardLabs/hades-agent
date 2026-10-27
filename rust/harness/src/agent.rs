@@ -2474,6 +2474,63 @@ fn fetch(args: &Value) -> String {
 
 /// A reaction is an answer. It is the one tool that leaves the reply empty on purpose, so the
 /// gateway needs to know whether it happened: that is why the surface records it as well as sending.
+/// What a model wrote for a person, with its own scratchpad taken out. A small model in a
+/// no-think template still emits the tags now and then, and a channel that shows them shows the
+/// machinery instead of the answer.
+pub fn strip_thinking(text: &str) -> String {
+    const THINK_OPEN: &str = concat!("<", "think", ">");
+    const THINK_CLOSE: &str = concat!("</", "think", ">");
+    const THINKING_OPEN: &str = concat!("<", "thinking", ">");
+    const THINKING_CLOSE: &str = concat!("</", "thinking", ">");
+    const REASON_OPEN: &str = concat!("<", "reasoning", ">");
+    const REASON_CLOSE: &str = concat!("</", "reasoning", ">");
+
+    let mut text = text.to_string();
+    for (open, close) in [
+        (THINK_OPEN, THINK_CLOSE),
+        (THINKING_OPEN, THINKING_CLOSE),
+        (REASON_OPEN, REASON_CLOSE),
+    ] {
+        text = drop_block(&text, open, close);
+    }
+    for tag in [
+        THINK_OPEN,
+        THINK_CLOSE,
+        THINKING_OPEN,
+        THINKING_CLOSE,
+        REASON_OPEN,
+        REASON_CLOSE,
+    ] {
+        text = text.replace(tag, "");
+    }
+    text.trim_start().to_string()
+}
+
+/// Remove from `open` to `close`, repeatedly. An unclosed block is a scratchpad that never ended,
+/// so the rest of the text goes with it: half a thought is not an answer.
+fn drop_block(text: &str, open: &str, close: &str) -> String {
+    if open.is_empty() || close.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(at) = lower.find(open) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at]);
+        let after = &rest[at + open.len()..];
+        let after_lower = after.to_ascii_lowercase();
+        match after_lower.find(close) {
+            Some(end) => rest = &after[end + close.len()..],
+            None => break,
+        }
+    }
+    out
+}
+
 fn react_tool(args: &Value, world: &World) -> String {
     let Some(react) = &world.react else {
         return "This surface cannot react to a message. Write a reply instead.".to_string();
@@ -3660,6 +3717,25 @@ mod tests {
             questions: None,
             react: None,
         }
+    }
+
+    /// The tags are machinery. A channel shows the answer, and it shows all of it.
+    #[test]
+    fn a_scratchpad_never_reaches_the_person() {
+        let open = concat!("<", "think", ">");
+        let close = concat!("</", "think", ">");
+        let block = format!("  {open}\nI should check the file.\n{close}\n\nIt is in /tmp.");
+        assert_eq!(strip_thinking(&block), "It is in /tmp.");
+        assert_eq!(strip_thinking("nothing to strip"), "nothing to strip");
+        // An unclosed block is a thought that never ended: the rest is not an answer.
+        let cut = format!("Answer.\n\n{open} and then I");
+        assert_eq!(strip_thinking(&cut), "Answer.\n\n");
+        // A stray tag from a stream that started mid-block is still a tag.
+        let stray = format!("done\n{close}");
+        assert_eq!(strip_thinking(&stray), "done\n");
+        // Two blocks, one answer.
+        let two = format!("{open}a{close}yes{open}b{close} no");
+        assert_eq!(strip_thinking(&two), "yes no");
     }
 
     /// A reaction is a reply, so a conversation must be handed the tool. A surface with nowhere to
