@@ -1028,6 +1028,9 @@ mod tests {
             mcp: crate::mcp::McpConfig::default(),
             mode: crate::mode::Mode::Act,
             channels: std::collections::HashMap::new(),
+            prompt: None,
+            loading: None,
+            provider: None,
         }
     }
 

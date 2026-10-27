@@ -24,6 +24,45 @@ const LIMIT: usize = 1_900;
 const INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
 const API: &str = "https://discord.com/api/v10";
 
+/// Discord speaks Markdown, not HTML. The gateway writes `<i>`, `<b>` and `<code>` for every
+/// surface; a connector that hands them over verbatim shows the tags instead of the emphasis.
+fn markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let (open, close, mark) = if tail.starts_with("<i>") {
+            ("<i>", "</i>", "*")
+        } else if tail.starts_with("<b>") {
+            ("<b>", "</b>", "**")
+        } else if tail.starts_with("<code>") {
+            ("<code>", "</code>", "`")
+        } else {
+            out.push('<');
+            rest = &tail[1..];
+            continue;
+        };
+        let body = &tail[open.len()..];
+        match body.find(close) {
+            Some(end) => {
+                out.push_str(mark);
+                out.push_str(&body[..end]);
+                out.push_str(mark);
+                rest = &body[end + close.len()..];
+            }
+            None => {
+                // An unclosed tag loses its emphasis, not its words.
+                out.push_str(body);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Percent-encode the emoji in a reaction path. Discord wants the code points escaped, and an
 /// unescaped surrogate or a stray space comes back 400 rather than reacting.
 fn quote(text: &str) -> String {
@@ -166,7 +205,7 @@ impl Transport for Discord {
     }
 
     fn send(&mut self, chat: &Chat, text: &str, buttons: &[Button]) -> Result<Option<i64>, String> {
-        let mut body = json!({"content": text, "allowed_mentions": {"parse": []}});
+        let mut body = json!({"content": markdown(text), "allowed_mentions": {"parse": []}});
         if !buttons.is_empty() {
             let row: Vec<Value> = buttons
                 .iter()
@@ -201,7 +240,7 @@ impl Transport for Discord {
         text: &str,
         buttons: &[Button],
     ) -> Result<(), String> {
-        let mut body = json!({"content": text, "allowed_mentions": {"parse": []}});
+        let mut body = json!({"content": markdown(text), "allowed_mentions": {"parse": []}});
         if buttons.is_empty() {
             body["components"] = json!([]);
         } else {
@@ -599,6 +638,17 @@ mod tests {
         other["message_reference"] = json!({"message_id": "1300000000000000008"});
         other["referenced_message"] = json!({"id": "1300000000000000008", "author": {"id": "8", "bot": false}});
         assert!(message_update(&inner, &other).is_none());
+    }
+
+    /// Discord renders Markdown. The gateway writes HTML-ish tags for every surface, and a
+    /// connector that forwards them shows the tags instead of the emphasis.
+    #[test]
+    fn html_emphasis_becomes_markdown_and_an_unclosed_tag_is_dropped() {
+        assert_eq!(markdown("<i>thinking</i>"), "*thinking*");
+        assert_eq!(markdown("<b>Hades</b> · working"), "**Hades** · working");
+        assert_eq!(markdown("run <code>ls -la</code>"), "run `ls -la`");
+        assert_eq!(markdown("plain < not a tag"), "plain < not a tag");
+        assert_eq!(markdown("<i>never closed"), "never closed");
     }
 
     #[test]

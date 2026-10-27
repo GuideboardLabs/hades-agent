@@ -58,6 +58,11 @@ impl Manifest {
             "entrypoint",
             "config_schema",
             "signature",
+            // The pack's own words and its own working animation. Optional, because a connector
+            // that has nothing to say may ship neither, but a pack that carries them is still a
+            // pack: they are content the surface installs, not code the harness runs.
+            "prompt",
+            "loading",
         ];
         for key in root.keys() {
             if !allowed.contains(&key.as_str()) {

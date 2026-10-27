@@ -1057,6 +1057,45 @@ pub fn preset(id: &str) -> Option<Preset> {
 }
 
 /// A preset as a harness.
+/// A provider named in a surface's config instead of a preset, so a connector can answer through a
+/// different endpoint and model from the system it belongs to. The shape is deliberately the same as
+/// a preset: endpoint, model, optional context, thinking, key.
+///
+/// ```json
+/// "provider": {"endpoint": "http://127.0.0.1:8100/v1/chat/completions",
+///              "model": "heem-9b", "key_env": "MY_KEY", "context": 32768}
+/// ```
+pub fn from_config(value: &serde_json::Value) -> Result<OpenAi, String> {
+    let endpoint = value
+        .get("endpoint")
+        .or_else(|| value.get("base_url"))
+        .and_then(|text| text.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .ok_or("a `provider` needs `endpoint`")?;
+    let name = value
+        .get("model")
+        .and_then(|text| text.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .ok_or("a `provider` needs `model`")?;
+    let context = value
+        .get("context")
+        .and_then(|number| number.as_u64())
+        .unwrap_or(32_768) as usize;
+    let mut client = OpenAi::new(endpoint, name).with_context(context);
+    if let Some(thinking) = value.get("thinking").and_then(|flag| flag.as_bool()) {
+        client = client.with_thinking(thinking);
+    }
+    if let Some(var) = value
+        .get("key_env")
+        .and_then(|text| text.as_str())
+        .filter(|text| !text.trim().is_empty())
+    {
+        // The name travels; the value is read when a call is made, so a config never holds a secret.
+        client = client.with_key(Key::Home(var.to_string()));
+    }
+    Ok(client)
+}
+
 pub fn from_preset(preset: &Preset) -> OpenAi {
     let mut model = OpenAi::new(preset.endpoint, preset.model).with_context(preset.context);
     if let Some(thinking) = preset.thinking {

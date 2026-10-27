@@ -2536,6 +2536,15 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 settings.root,
                 settings.model
             );
+            let opening = match &settings.prompt {
+                Some(text) => format!("{} line(s) of its own", text.lines().count()),
+                None => "the shared prompt alone".to_string(),
+            };
+            let loading = settings.loading.clone().unwrap_or_default();
+            text.push_str(&format!(
+                "   opening: {opening}; loading: {} across {} step(s) of {} ms\n",
+                loading.glyph, loading.span, loading.step_ms
+            ));
             let mut ids: Vec<&String> = settings.channels.keys().collect();
             ids.sort();
             for channel in ids {

@@ -49,7 +49,7 @@ const LIVE_LINES: usize = 14;
 
 /// What the config file says about the gateway. Read from the same file the daemon reads, because a
 /// second settings file is a second place to be out of date.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub allowed: Vec<String>,
     pub policy: String,
@@ -75,6 +75,14 @@ pub struct Settings {
     /// Per-channel overrides, keyed by the channel id the surface reports. A channel can change what a
     /// message may do (a talk channel that cannot touch the filesystem) without a second surface.
     pub channels: std::collections::HashMap<String, Channel>,
+    /// How this surface opens a conversation, before the shared prompt. A connector is a place, not a
+    /// second agent, and it is the place that knows what it needs said here.
+    pub prompt: Option<String>,
+    /// The working animation this surface uses. None means the skull across five spaces.
+    pub loading: Option<Loading>,
+    /// An endpoint this surface answers through instead of a preset, so one connector can be routed to a
+    /// different provider from the system it belongs to.
+    pub provider: Option<Value>,
 }
 
 /// What one channel changes about the surface it belongs to. Every field is optional: a channel that
@@ -244,6 +252,32 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             path.display()
         ));
     }
+    // Inline text, not a path: a pack ships its default and the config replaces it whole. Reading a
+    // file here would make the prompt a second config language with its own failure modes.
+    let prompt = section
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let loading = section.get("loading").map(|loading| Loading {
+        glyph: loading
+            .get("glyph")
+            .and_then(Value::as_str)
+            .unwrap_or("💀")
+            .to_string(),
+        span: loading
+            .get("span")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(1, 20) as usize,
+        step_ms: loading
+            .get("step_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(240)
+            .clamp(40, 5_000),
+    });
+    let provider = section.get("provider").filter(|value| value.is_object()).cloned();
+
     let policy = section
         .get("policy")
         .and_then(Value::as_str)
@@ -339,6 +373,9 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         mcp: crate::mcp::McpConfig::from_value(value.get("mcp"), path)?,
         mode,
         channels,
+        prompt,
+        loading,
+        provider,
     })
 }
 
@@ -1031,16 +1068,40 @@ fn save_chat(state: &Path, chat: &Chat, messages: &[Value]) {
 /// A chat card is prose, not a run card: the answer as it is written, and the thinking only until there is
 /// an answer to read. The live view shows the tail of a long answer, because the newest words are the ones
 /// a person is waiting for; the finished answer is split into messages instead of being cut.
-fn render_status(seconds: f64, limit: usize) -> String {
-    // A loading line, not a transcript. Streaming the model's scratchpad into the message is how
-    // escaped `&lt;think&gt;` tags end up in a Discord channel: the person reads the machinery while it
-    // works, and its unfinished sentences look like an answer. One face, one word, moving dots.
-    const DOTS: [&str; 4] = ["", ".", "..", "..."];
-    let step = ((seconds / 0.55).floor() as usize) % DOTS.len();
-    let line = format!("💀 thinking{}", DOTS[step]);
-    clip(&format!("<i>{}</i>", line), limit)
+fn render_status(loading: &Loading, seconds: f64, limit: usize) -> String {
+    // A ping-pong, not a transcript. Streaming the model's scratchpad into the message is how
+    // escaped tags end up in a Discord channel; an animation says "alive" without saying anything.
+    let span = loading.span.clamp(1, 20);
+    let step = (seconds * 1000.0 / loading.step_ms.max(40) as f64).floor() as i64;
+    let cycle = (step % (span as i64 * 2)) as i64;
+    let at = if cycle <= span as i64 { cycle } else { span as i64 * 2 - cycle } as usize;
+    // Non-breaking spaces: Discord trims and collapses ordinary runs at the edges, which would
+    // freeze the animation on the first frame.
+    let pad = "\u{00a0}".repeat(at);
+    let after = "\u{00a0}".repeat(span.saturating_sub(at));
+    clip(&format!("{pad}{}{after}", loading.glyph), limit)
 }
 
+
+/// How a surface animates "still working". The glyph moves across `span` slots and back, so the
+/// message never has to show the model's own words to prove it is alive. Defaults are the skull
+/// across five spaces; a pack can override them, and so can the config.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Loading {
+    pub glyph: String,
+    pub span: usize,
+    pub step_ms: u64,
+}
+
+impl Default for Loading {
+    fn default() -> Self {
+        Self {
+            glyph: "💀".to_string(),
+            span: 5,
+            step_ms: 240,
+        }
+    }
+}
 
 /// A plain message is a conversation. It is not a goal, it does not get a program, a check or attempts, and
 /// the person sees the answer while it is written. `/run` is the door to the harness.
@@ -1054,9 +1115,14 @@ fn chat<T: Transport + Clone + Send + 'static>(
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<(), String> {
     let _ = state;
-    let preset = crate::model::preset(&effective.model)
-        .ok_or_else(|| format!("no model preset named `{}`", effective.model))?;
-    let client = crate::model::from_preset(&preset);
+    let client = match &settings.provider {
+        Some(provider) => crate::model::from_config(provider)?,
+        None => {
+            let preset = crate::model::preset(&effective.model)
+                .ok_or_else(|| format!("no model preset named `{}`", effective.model))?;
+            crate::model::from_preset(&preset)
+        }
+    };
     let mut history = load_chat(state, &update.chat);
     let workspace = PathBuf::from(&effective.root);
     let mut world = world_for(
@@ -1087,9 +1153,15 @@ fn chat<T: Transport + Clone + Send + 'static>(
         }));
     }
 
+    let mut opening = settings.prompt.clone().unwrap_or_default();
+    let shared = system_prompt_for(effective.mode, &workspace);
+    if !opening.trim().is_empty() {
+        opening.push_str("\n\n");
+    }
+    opening.push_str(&shared);
     let mut messages = vec![json!({
         "role": "system",
-        "content": system_prompt_for(effective.mode, &workspace)
+        "content": opening
     })];
     messages.append(&mut history);
     let mut asked = update.text.trim().to_string();
@@ -1145,7 +1217,11 @@ fn chat<T: Transport + Clone + Send + 'static>(
         eprintln!("compression: not written, {fault}");
     }
     let limit = transport.limit();
-    let id = transport.send(&update.chat, &render_status(0.0, limit), &[])?;
+    let loading = settings
+        .loading
+        .clone()
+        .unwrap_or_else(Loading::default);
+    let id = transport.send(&update.chat, &render_status(&loading, 0.0, limit), &[])?;
     let stop = Arc::new(AtomicBool::new(false));
     // See `relay`: the claim is made once on this thread before the ticker owns it.
     let _ = transport.typing(&update.chat);
@@ -1154,18 +1230,21 @@ fn chat<T: Transport + Clone + Send + 'static>(
         let stop = Arc::clone(&stop);
         let chat_id = update.chat.clone();
         let started = Instant::now();
+        let beat_ms = loading.step_ms.max(40);
+        let loading = loading.clone();
         std::thread::spawn(move || {
-            let mut last = Instant::now();
+            let mut last: Option<Instant> = None;
             while !stop.load(Ordering::SeqCst) {
                 let _ = beat.typing(&chat_id);
-                if last.elapsed() >= EDIT_EVERY
+                let due = last.is_none_or(|when| when.elapsed().as_millis() as u64 >= beat_ms);
+                if due
                     && let Some(message) = id
                 {
-                    let text = render_status(started.elapsed().as_secs_f64(), limit);
+                    let text = render_status(&loading, started.elapsed().as_secs_f64(), limit);
                     let _ = beat.edit(&chat_id, message, &text, &[]);
-                    last = Instant::now();
+                    last = Some(Instant::now());
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(40));
             }
         })
     };
@@ -1832,9 +1911,14 @@ fn scheduled(
     step: &crate::retry::Step,
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<String, String> {
-    let preset = crate::model::preset(&settings.model)
-        .ok_or_else(|| format!("no model preset named `{}`", settings.model))?;
-    let client = crate::model::from_preset(&preset);
+    let client = match &settings.provider {
+        Some(provider) => crate::model::from_config(provider)?,
+        None => {
+            let preset = crate::model::preset(&settings.model)
+                .ok_or_else(|| format!("no model preset named `{}`", settings.model))?;
+            crate::model::from_preset(&preset)
+        }
+    };
     let workspace = PathBuf::from(&settings.root);
     let world = world_for(
         settings,
@@ -2192,6 +2276,9 @@ mod tests {
             mcp: crate::mcp::McpConfig::default(),
             mode: crate::mode::Mode::Act,
             channels: std::collections::HashMap::new(),
+            prompt: None,
+            loading: None,
+            provider: None,
         }
     }
 
@@ -2222,12 +2309,54 @@ mod tests {
     /// While it works the message says it is working, and nothing else. The dots move, because a
     /// still "…" and a finished bot look the same.
     #[test]
-    fn the_placeholder_says_it_is_thinking_and_the_dots_move() {
-        let first = render_status(0.0, 1900);
-        assert!(first.contains("thinking"), "{first}");
-        assert_eq!(first, render_status(0.1, 1900));
-        assert_ne!(first, render_status(1.3, 1900));
-        assert!(!first.contains("reasoning"));
+    fn the_placeholder_is_a_skull_crossing_five_spaces() {
+        let face = Loading::default();
+        assert_eq!(face.glyph, "💀");
+        assert_eq!(face.span, 5);
+        let first = render_status(&face, 0.0, 1900);
+        assert!(first.starts_with("💀"), "{first}");
+        // It moves on the beat, and the padding is non-breaking so Discord keeps it.
+        let second = render_status(&face, 0.30, 1900);
+        assert_ne!(first, second);
+        assert!(second.starts_with('\u{00a0}') && second.contains('💀'), "{second}");
+        // Ping-pong: the glyph comes back to the first slot rather than wrapping around.
+        assert_eq!(render_status(&face, 0.0, 1900), render_status(&face, 2.40, 1900));
+        // No word of the model's own making is in it.
+        assert!(!first.contains("thinking") && !first.contains("reasoning"));
+    }
+
+    /// A connector can bring its own opening, its own animation and its own endpoint. Each is
+    /// optional, and each is the surface's, not the system's.
+    #[test]
+    fn a_connector_can_bring_its_own_prompt_animation_and_provider() {
+        let dir = scratch("connbrings");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp","gateway":{"connectors":{
+                "discord":{"allowed_users":["7"],"verify":"true",
+                "prompt":"You are the Discord plugin.",
+                "loading":{"glyph":"🕯️","span":3,"step_ms":400},
+                "provider":{"endpoint":"http://127.0.0.1:8100/v1/chat/completions","model":"heem-9b",
+                            "key_env":null}}}}}"#,
+        )
+        .expect("config");
+        let settings = settings_for(&path, "discord").expect("settings");
+        assert_eq!(settings.prompt.as_deref(), Some("You are the Discord plugin."));
+        let loading = settings.loading.clone().expect("a loading animation");
+        assert_eq!((loading.glyph.as_str(), loading.span, loading.step_ms), ("🕯️", 3, 400));
+        let provider = settings.provider.clone().expect("a provider");
+        assert_eq!(provider["model"], "heem-9b");
+        assert!(crate::model::from_config(&provider).is_ok());
+        // Without them, the surface is plain: no opening, no animation, no provider.
+        std::fs::write(
+            &path,
+            r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp","gateway":{"connectors":{
+                "discord":{"allowed_users":["7"],"verify":"true"}}}}"#,
+        )
+        .expect("config");
+        let plain = settings_for(&path, "discord").expect("settings");
+        assert!(plain.prompt.is_none() && plain.loading.is_none() && plain.provider.is_none());
     }
 
     /// A connector that names a model means it. This is the difference between a bot that says it

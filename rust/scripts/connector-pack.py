@@ -69,6 +69,11 @@ def main() -> int:
     (stage / "bin").mkdir(parents=True)
     shutil.copy2(binary, stage / "bin" / "hades-connector-discord")
     (stage / "bin" / "hades-connector-discord").chmod(0o755)
+    # The pack's own words and its own animation live here, not in the harness: a connector that is
+    # fully removable has to carry what it says.
+    prompt = CRATE / "prompt.md"
+    if prompt.is_file():
+        shutil.copy2(prompt, stage / "prompt.md")
     for extra in ("LICENSE", "NOTICE"):
         source = ROOT / extra
         if source.is_file():
@@ -86,10 +91,20 @@ def main() -> int:
         "requires_hades": {"min": "0.1.22"},
         "platform": "linux-x86_64",
         "entrypoint": "bin/hades-connector-discord",
+        "prompt": "prompt.md",
+        "loading": {"glyph": "💀", "span": 5, "step_ms": 240},
         "config_schema": {
             "allowed_users": {"type": "array<string>", "required": True},
             "allowed_guilds": {"type": "array<string>", "default": []},
             "require_mention": {"type": "boolean", "default": True},
+            "model": {"type": "string", "note": "a preset name; overrides the top-level model"},
+            "provider": {
+                "type": "object",
+                "note": "endpoint, model, optional key_env/context/thinking; overrides model",
+            },
+            "prompt": {"type": "string", "note": "replaces the pack's prompt.md"},
+            "loading": {"type": "object", "note": "glyph, span, step_ms"},
+            "channels": {"type": "object", "note": "per-channel mode/policy/root/model"},
         },
         "signature": None,
     }
