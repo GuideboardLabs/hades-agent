@@ -1035,7 +1035,7 @@ pub fn preset(id: &str) -> Option<Preset> {
 ///
 /// ```json
 /// "provider": {"endpoint": "http://127.0.0.1:8100/v1/chat/completions",
-///              "model": "heem-9b", "key_env": "MY_KEY", "context": 32768}
+///              "model": "local-9b", "key_env": "MY_KEY", "context": 32768}
 /// ```
 pub fn from_config(value: &serde_json::Value) -> Result<OpenAi, String> {
     let endpoint = value
@@ -1132,10 +1132,10 @@ mod tests {
             vec![],
             12,
         );
-        let model = OpenAi::new("http://127.0.0.1:8110/v1/chat/completions", "nanbeige-3b");
+        let model = OpenAi::new("http://127.0.0.1:8110/v1/chat/completions", "local-9b");
         let body = model.body(&task, &bundle, &Budget::new(4096), false);
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        assert_eq!(parsed["model"], "nanbeige-3b");
+        assert_eq!(parsed["model"], "local-9b");
         assert_eq!(parsed["stream"], false);
         assert_eq!(parsed["messages"][0]["role"], "system");
         let user = parsed["messages"][1]["content"]
@@ -1155,7 +1155,7 @@ mod tests {
             vec![],
             12,
         );
-        let model = OpenAi::new("http://127.0.0.1:8110/v1/chat/completions", "nanbeige-3b")
+        let model = OpenAi::new("http://127.0.0.1:8110/v1/chat/completions", "local-9b")
             .with_system("You are terse.\n");
         let body = model.body(&task, &bundle, &Budget::new(4096), false);
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
@@ -1425,7 +1425,7 @@ mod tests {
         }
         assert!(preset("deepseek-v4.1-flash").is_some());
         // A local model is a fact about a machine, not about Hades: it must not be compiled in.
-        assert!(preset("heem-9b").is_none());
+        assert!(preset("local-9b").is_none());
         assert!(preset("nope").is_none());
     }
 

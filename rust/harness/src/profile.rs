@@ -565,8 +565,8 @@ mod tests {
             verify.model_or("deepseek-v4.1-flash"),
             "deepseek-v4.1-flash"
         );
-        verify.model = Some("nanbeige-3b".to_string());
-        assert_eq!(verify.model_or("deepseek-v4.1-flash"), "nanbeige-3b");
+        verify.model = Some("deepseek-v4.1-flash".to_string());
+        assert_eq!(verify.model_or("deepseek-v4.1-flash"), "deepseek-v4.1-flash");
         assert!(!verify.edits);
     }
 

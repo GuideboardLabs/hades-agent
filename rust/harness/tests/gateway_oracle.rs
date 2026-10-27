@@ -139,7 +139,7 @@ fn config_with(dir: &Path, allowed: &[i64], policy: &str) -> PathBuf {
         json!({
             "version": 1,
             "provider": "llama.cpp",
-            "model": "nanbeige-3b",
+            "model": "deepseek-v4.1-flash",
             "root": dir.join("work").display().to_string(),
             "vault": dir.join("mneme").display().to_string(),
             "gateway": {"telegram": {"allowed_users": allowed, "policy": policy,
@@ -175,8 +175,10 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
         .to_string(),
     )
     .expect("config");
-    let error = settings(&no_check).expect_err("a run without a check cannot be judged");
-    assert!(error.contains("verify"), "{error}");
+    // A check is only needed where work runs. The surface loads without one, and `/run` is where a
+    // channel that does work is told it has nothing to be judged by.
+    let loaded = settings(&no_check).expect("a surface may start without a check");
+    assert!(loaded.verify.trim().is_empty());
 
     let good = config_with(&dir, &[7], "open");
     let read = settings(&good).expect("settings");
@@ -186,7 +188,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
             allowed: vec!["7".to_string()],
             policy: "open".to_string(),
             verify: "test -f out.txt".to_string(),
-            model: "nanbeige-3b".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
             root: dir.join("work").display().to_string(),
             vault: dir.join("mneme").display().to_string(),
             heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
@@ -208,7 +210,7 @@ fn an_unauthorized_sender_gets_nothing() {
         allowed: vec!["1".to_string()],
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
-        model: "nanbeige-3b".to_string(),
+        model: "deepseek-v4.1-flash".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
@@ -241,7 +243,7 @@ fn a_channel_set_to_chat_cannot_start_work() {
         allowed: vec!["1".to_string()],
         policy: "open".to_string(),
         verify: "true".to_string(),
-        model: "nanbeige-3b".to_string(),
+        model: "deepseek-v4.1-flash".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
@@ -315,7 +317,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
         allowed: vec!["1".to_string()],
         policy: "open".to_string(),
         verify: "test -f out.txt".to_string(),
-        model: "nanbeige-3b".to_string(),
+        model: "deepseek-v4.1-flash".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
@@ -433,7 +435,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
         allowed: vec!["1".to_string()],
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
-        model: "nanbeige-3b".to_string(),
+        model: "deepseek-v4.1-flash".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
@@ -508,7 +510,7 @@ fn the_offset_advances_after_a_batch() {
         allowed: vec!["1".to_string()],
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
-        model: "nanbeige-3b".to_string(),
+        model: "deepseek-v4.1-flash".to_string(),
         root: "/tmp".to_string(),
         vault: "/tmp/v".to_string(),
         heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,

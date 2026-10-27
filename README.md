@@ -541,7 +541,7 @@ Every profile runs the config's `model` unless it is given its own. Add a `profi
 {
   "model": "deepseek-v4.1-flash",
   "profile_models": {
-    "verify": "nanbeige-3b"
+    "verify": "deepseek-v4.1-flash"
   }
 }
 ```

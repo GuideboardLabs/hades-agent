@@ -1021,7 +1021,7 @@ mod tests {
             allowed: vec!["7".to_string()],
             policy: "guarded".to_string(),
             verify: "true".to_string(),
-            model: "nanbeige-3b".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
             root: root.display().to_string(),
             vault: root.join("mneme").display().to_string(),
             heartbeat: DEFAULT_HEARTBEAT_SECS,
@@ -1237,7 +1237,7 @@ mod tests {
         let state = scratch("reload");
         let mut new = new_goal(9, "test -f out.txt", 5);
         new.session = "tg-9".to_string();
-        new.model = "nanbeige-3b".to_string();
+        new.model = "deepseek-v4.1-flash".to_string();
         let goal = set(&state, new, 100).expect("a goal");
         let (goals, problems) = load(&state);
         assert!(problems.is_empty(), "{problems:?}");

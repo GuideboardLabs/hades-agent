@@ -3,6 +3,34 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.1.23
+
+Connector packs, and a surface that behaves like a place rather than a second agent.
+
+- **Connector packs.** A surface can be installed from the shelf as a compiled pack: `hades pack add
+  discord`, then `hades connector service discord`. The pack is verified per file, re-hashed before every
+  spawn, and refused if its entrypoint does not match the approved digest. The runtime still knows nothing
+  about Discord; it knows about a transport.
+- **Chat and work, per channel.** A connector defaults to `chat`: it reads, searches, recalls and speaks,
+  and has no tool that writes a file, runs a shell or starts a goal. A channel whose settings say `work`
+  gets the full surface, and a surface can name its own check. `hades connector channels <id>` prints what
+  every channel resolves to.
+- **Replies and reactions.** A reply to one of the bot's messages counts as addressing it, not only a
+  mention. A reaction is a reply too: a `react` tool puts one emoji on the message being answered, and a
+  turn that produced only a reaction takes its working placeholder back down. The face list is fixed, so a
+  model cannot invent one the platform rejects.
+- **A surface brings its own words and its own animation.** A pack ships a prompt, prepended to the shared
+  system prompt, and a working animation (a glyph crossing *n* slots and back). Both are editable in config
+  without rebuilding anything, and neither is compiled into the runtime.
+- **A working message says it is working.** The placeholder no longer streams the model's scratchpad; it is
+  an animation until the answer replaces it whole. `think`-style blocks are stripped from anything that
+  becomes a message, because a small model in a no-think template still emits them.
+- **Models are configuration, not a compiled table.** The shipped presets are the cloud ones. A local model
+  is an `endpoints` entry on the machine that has the server, resolved in the same order everywhere: the
+  surface's own `provider`, then `endpoints`, then a preset. A pack installs onto the gateway's model and
+  provider without being configured first, and a chat surface no longer needs a `verify` command to start;
+  `/run` refuses, in the channel, when work has no check to be judged by.
+
 ## Unreleased
 
 - **A pending retry cannot outlive `until`.** `cron::due` already refused an expired job, but `retry::step`

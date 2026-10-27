@@ -196,7 +196,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     // asking its installer for a shell command before it may say hello is how a pack becomes a
     // project. `/run` refuses below when the channel has no check.
     // The section is the surface's own say over the file's defaults. A connector that names `model`
-    // means it: reading only the top-level key made a Discord bot that said `heem-9b` answer on the
+    // means it: reading only the top-level key made a Discord bot configured for a local model answer on the
     // cloud preset, which looks like the model being ignored because it is.
     let model = section
         .get("model")
@@ -2380,19 +2380,19 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp",
-                "endpoints":{"heem-9b":{"url":"http://127.0.0.1:8100/v1/chat/completions",
-                                        "model":"heem-9b","context_tokens":32768}},
+                "endpoints":{"local-9b":{"url":"http://127.0.0.1:8100/v1/chat/completions",
+                                        "model":"local-9b","context_tokens":32768}},
                 "gateway":{"connectors":{"discord":{"allowed_users":["7"],"verify":"true",
-                                                     "model":"heem-9b"}}}}"#,
+                                                     "model":"local-9b"}}}}"#,
         )
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
-        assert!(settings.endpoints.contains_key("heem-9b"));
-        assert!(client_for(&settings, "heem-9b").is_ok());
+        assert!(settings.endpoints.contains_key("local-9b"));
+        assert!(client_for(&settings, "local-9b").is_ok());
         let refused = client_for(&settings, "not-here").expect_err("unknown");
         assert!(refused.contains("not-here"), "{refused}");
         // Nothing local is compiled in, so a build without the endpoint cannot reach it.
-        assert!(crate::model::preset("heem-9b").is_none());
+        assert!(crate::model::preset("local-9b").is_none());
     }
 
     /// A connector can bring its own opening, its own animation and its own endpoint. Each is
@@ -2407,7 +2407,7 @@ mod tests {
                 "discord":{"allowed_users":["7"],"verify":"true",
                 "prompt":"You are the Discord plugin.",
                 "loading":{"glyph":"🕯️","span":3,"step_ms":400},
-                "provider":{"endpoint":"http://127.0.0.1:8100/v1/chat/completions","model":"heem-9b",
+                "provider":{"endpoint":"http://127.0.0.1:8100/v1/chat/completions","model":"local-9b",
                             "key_env":null}}}}}"#,
         )
         .expect("config");
@@ -2416,7 +2416,7 @@ mod tests {
         let loading = settings.loading.clone().expect("a loading animation");
         assert_eq!((loading.glyph.as_str(), loading.span, loading.step_ms), ("🕯️", 3, 400));
         let provider = settings.provider.clone().expect("a provider");
-        assert_eq!(provider["model"], "heem-9b");
+        assert_eq!(provider["model"], "local-9b");
         assert!(crate::model::from_config(&provider).is_ok());
         // Without them, the surface is plain: no opening, no animation, no provider.
         std::fs::write(
@@ -2438,15 +2438,15 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"model":"deepseek-v4.1-flash","root":"/tmp","vault":"/tmp","gateway":{"connectors":{
-                "discord":{"allowed_users":["7"],"verify":"true","model":"heem-9b",
+                "discord":{"allowed_users":["7"],"verify":"true","model":"local-9b",
                 "channels":{"99":{"mode":"chat"}}}}}}"#,
         )
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
-        assert_eq!(settings.model, "heem-9b");
+        assert_eq!(settings.model, "local-9b");
         assert_eq!(
             settings.effective(&Chat::new("discord", "99")).model,
-            "heem-9b"
+            "local-9b"
         );
         // A channel that names its own model still wins, and a connector that names none keeps the default.
         std::fs::write(
@@ -2655,7 +2655,7 @@ mod tests {
         let path = dir.join("config.json");
         let base = r#"{
             "gateway": {"telegram": {"allowed_users": [7], "verify": "true"}},
-            "model": "nanbeige-3b",
+            "model": "deepseek-v4.1-flash",
             "root": "/work",
             "vault": "/work/mneme"
         }"#;

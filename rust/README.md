@@ -156,30 +156,39 @@ the cage, which is why the check runs uncaged. The cage is for what the model wr
 
 ### The model
 
-`hades models` lists the ways this build can reach one; `turn --model <preset>` uses one. Both paths were
-driven for real, on the same three goals in the same scratch repo:
+`hades models` lists the ways this build can reach one; `turn --model <preset>` uses one. The build
+ships the cloud presets it can actually reach (`deepseek-v4.1-flash`, `kimi-k2.7-code`) and no local
+ones, because a llama.cpp server on port 8110 is a fact about a machine, not about Hades. A local model
+is declared in the config's `endpoints` map, and then behaves like any other name:
 
-- **Local**, the best Agon agentic result: `nanbeige-3b`, 24/24 on the agentic event, 2.6 GB Q4_K_M on a
-  llama.cpp server at 8110. Three turns, three checks passed, 52.9 to 62.5 tokens a second, 1.5 to 5.4
-  seconds a turn, 89 to 286 generated tokens.
-- **Cloud**, the account's default `deepseek-v4.1-flash` over HTTPS: the hardest of the three goals passed
-  at **235 tokens a second**, 359 generated tokens, 1.5 seconds. `kimi-k2.7-code` passed the same goal at
-  110 tokens a second after 1,261 characters of reasoning.
+```json
+"endpoints": {
+  "local-9b": {
+    "url": "http://127.0.0.1:8110/v1/chat/completions",
+    "model": "local-9b",
+    "context_tokens": 8192,
+    "thinking": false
+  }
+}
+```
 
-The turn is one-shot: the model is asked once, the answer is applied, the check runs. A model that needs three
-attempts needs a caller that runs three turns, which is the next section.
+`hades turn --model local-9b`, the gateway and a connector all resolve it the same way: the surface's
+own provider first, then this map, then a shipped preset.
 
-Three things the real calls taught, each now a test:
+The turn is one-shot: the model is asked once, the answer is applied, the check runs. A model that needs
+three attempts needs a caller that runs three turns, which is the next section.
 
-- **A thinking model returns an empty `content`.** Ask Nanbeige for a one-line program and it thinks until
-  the token budget is gone: 1,349 characters of reasoning, `content` empty, `finish_reason: length`. The
-  fault now says that, and names `--thinking off`, which is what the local presets ask for.
-- **The reasoning field has two names.** llama.cpp's template writes `reasoning_content`; the cloud endpoint
-  writes `reasoning`. Reading only the first made the client blame the endpoint for a cause the endpoint had
-  already stated in a field nobody read.
-- **A pinned model version dies with a 410.** `--model deepseek-v4-flash` reached the endpoint and came back
-  `deepseek-v4-flash:0731 was retired on September 25, 2026`. The presets carry unversioned aliases now, and
-  the account's real model list is in the preset table rather than in a guess.
+Three things real calls taught, each now a test:
+
+- **A thinking model returns an empty `content`.** Ask one for a one-line program and it can think until
+  the token budget is gone: the reasoning field is full, `content` is empty, `finish_reason: length`. The
+  fault says that, and names `--thinking off`, which is what a local endpoint asks for.
+- **The reasoning field has two names.** llama.cpp's template writes `reasoning_content`; the cloud
+  endpoint writes `reasoning`. Reading only the first made the client blame the endpoint for a cause the
+  endpoint had already stated in a field nobody read.
+- **A pinned model version dies with a 410.** `--model deepseek-v4-flash` reached the endpoint and came
+  back `deepseek-v4-flash:0731 was retired on September 25, 2026`. The presets carry unversioned aliases
+  now, and the endpoint's real model list is in the preset table rather than in a guess.
 
 ### A judge, and a plan before the program
 

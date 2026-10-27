@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUST = ROOT / "rust"
 CRATE = RUST / "connectors" / "discord"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 ID = "discord"
 
 
@@ -88,7 +88,7 @@ def main() -> int:
         "summary": "Discord gateway connector for Hades: DMs and guild mentions, approvals as buttons.",
         "license": "MIT",
         "protocol": {"min": 1, "max": 1},
-        "requires_hades": {"min": "0.1.22"},
+        "requires_hades": {"min": "0.1.23"},
         "platform": "linux-x86_64",
         "entrypoint": "bin/hades-connector-discord",
         "prompt": "prompt.md",
