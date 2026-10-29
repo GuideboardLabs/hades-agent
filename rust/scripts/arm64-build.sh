@@ -124,16 +124,10 @@ build_gnu() {
   # The sysroot is not part of rustc's fingerprint: without this, the C objects and the final link from the
   # previous sysroot are reused and the floor assertion measures the old build.
   "$CARGO" clean --release --target aarch64-unknown-linux-gnu -p harness -p libsqlite3-sys >/dev/null 2>&1 || true
-  # rustc asks for lld by default on this toolchain: it passes `-fuse-ld=lld` and a `-B` pointing at its own
-  # `gcc-ld` wrapper directory. lld does not resolve the absolute paths inside a sysroot's `libc.so` linker
-  # script against `--sysroot`, so Debian's `GROUP ( /lib/aarch64-linux-gnu/libc.so.6 ... )` sends it looking
-  # for that path on the build host and the link dies with `rust-lld: cannot open
-  # /lib/aarch64-linux-gnu/libc.so.6`. GNU ld, which the staged binutils ships, does prefix those paths with
-  # the sysroot. Turn the feature off instead of leaving the linker to a rustc default.
   CC_aarch64_unknown_linux_gnu=$PREFIX/bin/cc \
     AR_aarch64_unknown_linux_gnu=$PREFIX/bin/ar \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$PREFIX/bin/cc \
-    RUSTFLAGS="${RUSTFLAGS:-} -C linker-features=-lld -L native=$PREFIX/bullseye/lib/aarch64-linux-gnu -L native=$PREFIX/bullseye/usr/lib/aarch64-linux-gnu" \
+    RUSTFLAGS="${RUSTFLAGS:-} -L native=$PREFIX/bullseye/lib/aarch64-linux-gnu -L native=$PREFIX/bullseye/usr/lib/aarch64-linux-gnu" \
     "$CARGO" build --release --locked --manifest-path "$MANIFEST" -p harness --target aarch64-unknown-linux-gnu
   cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/hades" "$OUT/$name"
   chmod 755 "$OUT/$name"
