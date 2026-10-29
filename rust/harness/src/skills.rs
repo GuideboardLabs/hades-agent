@@ -242,6 +242,16 @@ fn directories_with_skill(dir: &Path) -> Vec<Skill> {
     let mut found: Vec<Skill> = entries
         .flatten()
         .map(|entry| entry.path())
+        // A hidden directory is a staging area, not content. An installer copies the new tree into
+        // `.<name>.install-<pid>-<nanos>-<n>` beside the target and renames it into place, so for as long as the
+        // copy runs that directory holds a real `SKILL.md` and used to be listed as an installed skill named
+        // after the staging file. A reader that then digested it (`pack plan`, the catalog, `skills list`) could
+        // lose the race against the rename and fail on a directory that had just become `state/skills/<name>`.
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+        })
         .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
         .filter_map(|path| {
             Some(Skill {
@@ -274,6 +284,14 @@ fn collect_skills(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Hidden directories are staging areas: a skill being installed is not a skill a generation records.
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
         if path.is_dir() {
             collect_skills(&path, depth + 1, found);
         } else if path.file_name().is_some_and(|name| name == "SKILL.md") {
@@ -747,5 +765,35 @@ mod tests {
             found.path.display()
         );
         assert!(find(&state, "missing").is_none());
+    }
+
+    /// The anti-drift for the staging rule: an installer's temporary directory sits beside its target and
+    /// carries a real `SKILL.md`, so every listing has to ignore a name that starts with a dot. Without this,
+    /// `installed` returned a skill called `.beta.install-...`, and a digest of it raced the rename.
+    #[test]
+    fn a_staging_directory_is_not_an_installed_skill() {
+        let state = scratch("staging-is-not-content");
+        std::fs::create_dir_all(state.join("skills/alpha")).expect("a skill directory");
+        std::fs::write(
+            state.join("skills/alpha/SKILL.md"),
+            "---\nname: alpha\n---\n",
+        )
+        .expect("a skill");
+        let staging = state.join("skills/.beta.install-1234-99-0");
+        std::fs::create_dir_all(&staging).expect("a staging directory");
+        std::fs::write(staging.join("SKILL.md"), "---\nname: beta\n---\n").expect("a staged skill");
+
+        let names: Vec<String> = installed(&state)
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(names, vec!["alpha".to_string()], "{names:?}");
+        let files = skill_files(&state);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(
+            files[0].ends_with("skills/alpha/SKILL.md"),
+            "{}",
+            files[0].display()
+        );
     }
 }

@@ -1765,6 +1765,13 @@ fn catalog(state: &Path) -> Result<Vec<CatalogItem>, String> {
         let mut dirs: Vec<PathBuf> = listing
             .flatten()
             .map(|entry| entry.path())
+            // A dot directory is a staging area, not a profile, for the same reason the skills listing skips
+            // one: an installer's temporary tree is not content.
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
             .filter(|path| path.is_dir())
             .collect();
         dirs.sort();
