@@ -25,31 +25,72 @@ esac
 
 PREFIX=${CROSS_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/hades-cross}
 TARGET=aarch64-unknown-linux-gnu
-# The cross gcc series follows the distribution: 13 on 24.04, 14 or 15 on newer images. `ubuntu-latest` moved
-# under us once already, and a hardcoded 13 made the whole staging step fail on a runner where every other
-# package existed. Ask apt which series is present instead of assuming.
+# The cross gcc series follows the distribution: 13 on 24.04, 15 and 16 on newer images. Two things have to
+# agree, and they are separate packages: `gcc-<series>-aarch64-linux-gnu` carries the compiler, while
+# `gcc-aarch64-linux-gnu` is a meta package whose only content is symlinks to the series *its own version*
+# chooses. Taking the first series the archive carries made those disagree on a 26.04 image: staging fetched
+# 21 MB of gcc-13 and the meta package then left `aarch64-linux-gnu-gcc` pointing at gcc-15, which was never
+# downloaded. The generic name was a dangling link, `-x` was false, and the job reported "the staged tree has
+# no aarch64-linux-gnu-gcc" while a perfectly good compiler sat beside it. Ask the meta package which series
+# it depends on, so the symlinks and the packages are chosen together, and require the series binary itself
+# rather than the name the meta package owns.
 GCC_SERIES=""
-for series in 13 14 15 16 12; do
-    if apt-cache policy "gcc-$series-aarch64-linux-gnu" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-        GCC_SERIES=$series
-        break
-    fi
-done
+if apt-cache show gcc-aarch64-linux-gnu >/dev/null 2>&1; then
+    GCC_SERIES=$(apt-cache depends gcc-aarch64-linux-gnu 2>/dev/null |
+        sed -n 's/.*Depends:[[:space:]]*gcc-\([0-9][0-9]*\)-aarch64-linux-gnu.*/\1/p' | head -n 1)
+fi
+if [ -z "$GCC_SERIES" ]; then
+    for series in 16 15 14 13 12; do
+        if apt-cache policy "gcc-$series-aarch64-linux-gnu" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+            GCC_SERIES=$series
+            break
+        fi
+    done
+fi
 if [ -z "$GCC_SERIES" ]; then
     echo "no gcc-<series>-aarch64-linux-gnu package is available; install the ARM64 cross toolchain or set CROSS_PREFIX to a staged one" >&2
     exit 1
 fi
+GCC_BIN="$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc-$GCC_SERIES"
+# The cross compiler is an x86 binary with x86 dependencies of its own: `cc1` wants libisl/libmpc/libmpfr and
+# `as` wants libsframe, none of which the runner image is obliged to ship. Staging only the -cross packages
+# left every one of them to the image, so a distribution bump could break the job with a missing soname that
+# reads as a build error. Take the host-side dependencies from apt itself — the soname follows the gcc
+# series (libisl23 today, another name tomorrow), so naming them by hand would break next time — and put
+# them in the same prefix, without dragging in glibc or the C++ runtime that belong to the host.
+HOST_PACKAGES=""
+for pkg in "gcc-$GCC_SERIES-aarch64-linux-gnu" "cpp-$GCC_SERIES-aarch64-linux-gnu" \
+    binutils-aarch64-linux-gnu; do
+    for dep in $(apt-cache depends "$pkg" 2>/dev/null | sed -n 's/^[[:space:]]*[|]*Depends:[[:space:]]*//p'); do
+        case "$dep" in
+            *-cross* | libc6 | libc6-dev | libstdc++6 | libgcc-s1) continue ;;
+        esac
+        case " $HOST_PACKAGES " in
+            *" $dep "*) ;;
+            *) HOST_PACKAGES="$HOST_PACKAGES $dep" ;;
+        esac
+    done
+done
 PACKAGES="gcc-aarch64-linux-gnu gcc-$GCC_SERIES-aarch64-linux-gnu cpp-$GCC_SERIES-aarch64-linux-gnu \
 binutils-aarch64-linux-gnu libc6-dev-arm64-cross libc6-arm64-cross linux-libc-dev-arm64-cross \
-libgcc-$GCC_SERIES-dev-arm64-cross libgcc-s1-arm64-cross"
+libgcc-$GCC_SERIES-dev-arm64-cross libgcc-s1-arm64-cross$HOST_PACKAGES"
+# The host-side set repeats what the cross packages already depend on; download each name once.
+UNIQUE=""
+for pkg in $PACKAGES; do
+    case " $UNIQUE " in
+        *" $pkg "*) ;;
+        *) UNIQUE="$UNIQUE $pkg" ;;
+    esac
+done
+PACKAGES=$UNIQUE
 
 if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo is not on PATH" >&2
     exit 1
 fi
 
-if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
-    echo "staging the cross toolchain under $PREFIX"
+if [ ! -x "$GCC_BIN" ]; then
+    echo "staging the cross toolchain under $PREFIX (gcc-$GCC_SERIES)"
     mkdir -p "$PREFIX/debs" "$PREFIX/root" "$PREFIX/bin"
     # `apt-get download` needs no privileges; `dpkg-deb -x` unpacks to a prefix we own. One package missing on
     # a newer image should be named and skipped, not take the whole step down before anything is compiled;
@@ -68,31 +109,54 @@ if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
         dpkg-deb -x "$deb" "$PREFIX/root"
     done
 fi
-if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
-    echo "the staged tree has no aarch64-linux-gnu-gcc; the cross toolchain could not be staged" >&2
+if [ ! -x "$GCC_BIN" ]; then
+    # Name the two things that matter: which compiler was expected, and what the staging actually produced.
+    # "the cross toolchain could not be staged" sent the last reader looking at the network when the fault was
+    # one package's symlink pointing at a series nobody downloaded.
+    echo "cross-check: expected the aarch64 compiler at $GCC_BIN after staging gcc-$GCC_SERIES-aarch64-linux-gnu" >&2
+    echo "cross-check: the staged tree has: $(ls "$PREFIX/root/usr/bin" 2>/dev/null | grep -E '^aarch64-linux-gnu-(gcc|as|ar)' | tr '\n' ' ')" >&2
     exit 1
 fi
 
 cat > "$PREFIX/bin/as" <<WRAPPER
 #!/bin/sh
-exec env LD_LIBRARY_PATH=$PREFIX/root/usr/lib/x86_64-linux-gnu \\
+exec env LD_LIBRARY_PATH=$PREFIX/root/usr/lib/x86_64-linux-gnu:$PREFIX/root/lib/x86_64-linux-gnu \\
     $PREFIX/root/usr/bin/aarch64-linux-gnu-as "\$@"
 WRAPPER
 
 cat > "$PREFIX/bin/ar" <<WRAPPER
 #!/bin/sh
-exec env LD_LIBRARY_PATH=$PREFIX/root/usr/lib/x86_64-linux-gnu \\
+exec env LD_LIBRARY_PATH=$PREFIX/root/usr/lib/x86_64-linux-gnu:$PREFIX/root/lib/x86_64-linux-gnu \\
     $PREFIX/root/usr/bin/aarch64-linux-gnu-ar "\$@"
 WRAPPER
 
+# The series binary, not the generic name: `aarch64-linux-gnu-gcc` belongs to the meta package and points at
+# whichever series that package's own version chose, which is a dangling link whenever the series differs.
+# The staged library path comes first so `cc1` finds the same libisl the driver was staged with.
 cat > "$PREFIX/bin/cc" <<WRAPPER
 #!/bin/sh
-exec $PREFIX/root/usr/bin/aarch64-linux-gnu-gcc --sysroot=${HADES_CROSS_SYSROOT:-$PREFIX/root} -B$PREFIX/bin "\$@"
+exec env LD_LIBRARY_PATH=$PREFIX/root/usr/lib/x86_64-linux-gnu:$PREFIX/root/lib/x86_64-linux-gnu \\
+    $GCC_BIN --sysroot=\${HADES_CROSS_SYSROOT:-$PREFIX/root} -B$PREFIX/bin "\$@"
 WRAPPER
 
 chmod +x "$PREFIX/bin/as" "$PREFIX/bin/ar" "$PREFIX/bin/cc"
 
+# A compiler that exists is not a compiler that works, and a staging step that only checks for a file reports
+# its own fault from inside `cargo check`, where it reads as a source error. Compile one file and read the
+# machine out of the object: e_machine 0xb7 is AArch64.
+printf 'int hades_cross_probe(void) { return 0; }\n' >"$PREFIX/probe.c"
+if ! "$PREFIX/bin/cc" -c -o "$PREFIX/probe.o" "$PREFIX/probe.c" >"$PREFIX/probe.log" 2>&1; then
+    echo "cross-check: the staged compiler at $GCC_BIN cannot compile a C file:" >&2
+    head -n 3 "$PREFIX/probe.log" >&2
+    exit 1
+fi
+if [ "$(od -An -tx1 -j18 -N2 "$PREFIX/probe.o" | tr -d ' \n')" != "b700" ]; then
+    echo "cross-check: the staged compiler produced an object that is not AArch64" >&2
+    exit 1
+fi
+
 if [ "$STAGE_ONLY" -eq 1 ]; then
+    echo "staged gcc-$GCC_SERIES under $PREFIX; it compiles an AArch64 object"
     exit 0
 fi
 
