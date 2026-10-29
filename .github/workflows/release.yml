@@ -178,8 +178,16 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           bash rust/scripts/release-notes.sh "${tag#v}" > /tmp/notes.md
-          gh release create "$tag" \
-            --title "hades $tag" \
-            --notes-file /tmp/notes.md \
-            dist/hades-*.tar.gz \
-            dist/hades-*.tar.gz.sha256
+          # A failed run before this one can leave a draft for the same tag, and `gh release create` refuses
+          # to touch an existing release: re-running the release after fixing a verify step then fails at the
+          # last step for a reason that has nothing to do with the fix. Fill the existing draft instead.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/hades-*.tar.gz dist/hades-*.tar.gz.sha256 --clobber
+            gh release edit "$tag" --title "hades $tag" --notes-file /tmp/notes.md --draft=false
+          else
+            gh release create "$tag" \
+              --title "hades $tag" \
+              --notes-file /tmp/notes.md \
+              dist/hades-*.tar.gz \
+              dist/hades-*.tar.gz.sha256
+          fi
