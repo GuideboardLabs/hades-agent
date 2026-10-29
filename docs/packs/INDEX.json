@@ -34,15 +34,15 @@
       ],
       "license": "MIT",
       "platform": "linux-x86_64",
-      "requires_hades": ">=0.1.23,<0.2",
+      "requires_hades": ">=0.1.23,<0.3",
       "sha256": "b5ffc6718c1120e326ffe17e821afa0202a642eeb96a32e1f0397fc642b5027f",
       "summary": "Run Hades inside a Discord server: mention it or reply to one of its messages and it answers there. Chat channels cannot write; a work channel runs goals. It inherits the gateway's model and provider, ships its own opening prompt and working animation, and can react instead of replying when a reply would add nothing.",
       "title": "Discord connector",
       "version": "0.1.1"
     },
     {
-      "archive": "dist/plan-a-change-1.0.0.hadepack",
-      "bytes": 1612,
+      "archive": "dist/plan-a-change-1.0.1.hadepack",
+      "bytes": 1619,
       "capabilities": {
         "code": false,
         "network": false,
@@ -66,14 +66,14 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.1.0,<0.2",
-      "sha256": "b4315e24ac8af9d3e9b722bb7552e7ff3d203d39f068d81da476a006e61a77a6",
+      "requires_hades": ">=0.1.0,<0.3",
+      "sha256": "aa30fe514413e43fa4085255d15e088e5d71bed278542cfa25c079937ed10644",
       "summary": "Break a change into steps a check can prove, before any file is touched.",
       "title": "Plan a change",
-      "version": "1.0.0"
+      "version": "1.0.1"
     },
     {
-      "archive": "dist/research-with-sources-1.0.0.hadepack",
+      "archive": "dist/research-with-sources-1.0.1.hadepack",
       "bytes": 1687,
       "capabilities": {
         "code": false,
@@ -98,15 +98,15 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.1.0,<0.2",
-      "sha256": "57979a5d33507c76317af2807dd92830ecb232593c8be6d243522748e2a47f89",
+      "requires_hades": ">=0.1.0,<0.3",
+      "sha256": "a105d8b12a16c48a02467b4a676a3656a6e50aa4e92c8d324d4a1b02c4d5cc81",
       "summary": "Answer a question from primary sources, with the quote and the date attached to every claim.",
       "title": "Research with sources",
-      "version": "1.0.0"
+      "version": "1.0.1"
     },
     {
-      "archive": "dist/review-a-diff-1.0.0.hadepack",
-      "bytes": 1693,
+      "archive": "dist/review-a-diff-1.0.1.hadepack",
+      "bytes": 1700,
       "capabilities": {
         "code": false,
         "network": false,
@@ -130,11 +130,11 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.1.0,<0.2",
-      "sha256": "61f5e1089bc15e06631002279ae3d471d0b914afa061f75d694f3a0b811df2b2",
+      "requires_hades": ">=0.1.0,<0.3",
+      "sha256": "08d2bed8deb9ca4ad80fd94437e80574cf7f074441f6551cba3136a213ee70b1",
       "summary": "Read a change as a reviewer: what it does, what it breaks, what it leaves untested.",
       "title": "Review a diff",
-      "version": "1.0.0"
+      "version": "1.0.1"
     }
   ]
 }

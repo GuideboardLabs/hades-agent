@@ -10,9 +10,9 @@ and why installing one asks for `--yes` and is verified file by file before it r
 | pack | kind | version | what it does | keywords | size | sha256 |
 |---|---|---|---|---|---|---|
 | `discord` | connector | 0.1.1 | Run Hades inside a Discord server: mention it or reply to one of its messages and it answers there. Chat channels cannot write; a work channel runs goals. It inherits the gateway's model and provider, ships its own opening prompt and working animation, and can react instead of replying when a reply would add nothing. | discord, connector, chat, gateway, server, replies, reactions | 3868.6 kB | `b5ffc6718c11` |
-| `plan-a-change` | skill | 1.0.0 | Break a change into steps a check can prove, before any file is touched. | planning, design, steps, check | 1.6 kB | `b4315e24ac8a` |
-| `research-with-sources` | skill | 1.0.0 | Answer a question from primary sources, with the quote and the date attached to every claim. | research, sources, citations, verification | 1.6 kB | `57979a5d3350` |
-| `review-a-diff` | skill | 1.0.0 | Read a change as a reviewer: what it does, what it breaks, what it leaves untested. | review, diff, tests, git | 1.7 kB | `61f5e1089bc1` |
+| `plan-a-change` | skill | 1.0.1 | Break a change into steps a check can prove, before any file is touched. | planning, design, steps, check | 1.6 kB | `aa30fe514413` |
+| `research-with-sources` | skill | 1.0.1 | Answer a question from primary sources, with the quote and the date attached to every claim. | research, sources, citations, verification | 1.6 kB | `a105d8b12a16` |
+| `review-a-diff` | skill | 1.0.1 | Read a change as a reviewer: what it does, what it breaks, what it leaves untested. | review, diff, tests, git | 1.7 kB | `08d2bed8deb9` |
 
 ## Using a pack
 
