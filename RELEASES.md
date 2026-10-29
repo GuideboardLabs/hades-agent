@@ -3,7 +3,9 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
-## 0.2.0 — The Charon Release
+## 0.2.0
+
+### The Charon Release: nothing crosses unchecked
 
 A pack now crosses to this machine checked, not assumed.
 
@@ -30,6 +32,8 @@ A pack now crosses to this machine checked, not assumed.
 Why it exists: every pack this project ships is written on one computer by one person, and its
 numbers describe that computer. Copying it elsewhere copies the circumstances with it. The ferryman
 takes the cargo across and looks at what boards.
+
+1174 tests, 13 ignored.
 
 ## 0.1.23
 

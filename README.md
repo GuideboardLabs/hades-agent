@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.22-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1095%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.0-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1174%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.1.22 |
+| **Version** | 0.2.0 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -62,7 +62,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1095 passing, 13 ignored (12 live browser) |
+| **Tests** | 1174 passing, 13 ignored (12 live browser) |
 
 ---
 
@@ -789,7 +789,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Current state: **1095 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
+Current state: **1174 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
