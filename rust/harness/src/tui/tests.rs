@@ -589,3 +589,27 @@ fn real_tool_loop_streams_reads_saves_and_resumes_a_new_branch() {
     assert!(restored.resume("fixture-session").is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn the_temperature_flag_is_what_the_request_carries() {
+    // A local model's sampling belongs to its card, so the flag has to reach the wire rather than stop at
+    // the options struct: prove it from the captured request body.
+    let (endpoint, server) = serve(vec![sse(
+        json!({"content": "ready"}),
+        json!({"prompt_tokens": 5, "completion_tokens": 1}),
+    )]);
+    let mut options = demo().options;
+    options.demo = false;
+    options.model = "fixture".into();
+    options.endpoint = Some(endpoint);
+    options.temperature = Some(1.0);
+    options
+        .client()
+        .unwrap()
+        .chat(&[], None, &|_, _| {})
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0]["temperature"], 1.0);
+    // Without the flag the cautious default stands, so a session that never asked for it is unchanged.
+    assert_eq!(demo().options.temperature, None);
+}

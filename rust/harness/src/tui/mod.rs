@@ -28,7 +28,8 @@ pub const HELP: &str = "Hades terminal workspace
   hades tui --state PATH        Runtime state directory
   hades tui --config PATH       Hades config.json
   hades tui --model PRESET      Model preset for this session
-  hades tui --model NAME --endpoint URL [--key ENV_NAME]
+  hades tui --model NAME --endpoint URL [--key ENV_NAME] [--temperature T]
+                               Reach a local or custom model; T pins sampling for the session
   hades tui --resume ID         Resume a saved terminal conversation
   hades tui --no-motion         Disable the animated blue flame
   hades tui --no-mouse          Preserve normal terminal mouse selection

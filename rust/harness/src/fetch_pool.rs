@@ -423,6 +423,13 @@ pub fn get(
         ))),
         CURLE_FILESIZE_EXCEEDED => Some(Err("cap".to_string())),
         CURLE_WRITE_ERROR => Some(Err("cap".to_string())),
+        // An HTTP error is not a transport failure: the body holds the provider's own words, and curl's
+        // "error: 500" throws away the only thing worth reading. A 500 from a local server says what it
+        // refused, which is the difference between a fixable turn and a mystery.
+        _ if status >= 400 && !sink.body.is_empty() => Some(Err(format!(
+            "HTTP {status}: {}",
+            failure_detail(&String::from_utf8_lossy(&sink.body))
+        ))),
         // The same sentence the process path prints, in the same shape: a caller that switches from one
         // path to the other must not see the message change. `clip_ref` is applied by the caller.
         _ if sentence.is_empty() => Some(Err(String::new())),
@@ -434,10 +441,54 @@ pub fn get(
     }
 }
 
+/// A refusal found in a stream body, in the server's own words. `None` when the text holds no error
+/// object, so the caller can fall back to the transport's own sentence.
+pub(crate) fn refusal_message(seen: &str) -> Option<String> {
+    for line in seen.lines() {
+        let line = line.trim().trim_start_matches("data:").trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("error").is_some() {
+            return Some(failure_detail(line));
+        }
+    }
+    // The whole body may be one object over several lines; try it as a single document too.
+    let joined = seen.trim();
+    if joined.starts_with('{') && joined.contains("\"error\"") {
+        return Some(failure_detail(joined));
+    }
+    None
+}
+
+/// The server's own message from an error body. OpenAI-shaped bodies nest it under `error.message`,
+/// and that is what llama-server answers with when it refuses a request, so a 500 reads as the reason
+/// instead of "error: 500". Falls back to the body itself, clipped to one readable line.
+pub(crate) fn failure_detail(body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let said = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message").and_then(|m| m.as_str()))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/message").and_then(|m| m.as_str()))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| body.trim().to_string());
+    let one_line = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(300) {
+        Some((cut, _)) => format!("{}...", &one_line[..cut]),
+        None => one_line,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// Ubuntu 22.04 ships 7.81, where the string protocol options do not exist and the whole transfer would
     /// be abandoned for the slow path. The parser decides which branch every transfer takes.
     #[test]
@@ -452,5 +503,31 @@ mod tests {
         assert!(!protocols_str_supported(""));
         assert!(!protocols_str_supported("something else"));
         assert!(!protocols_str_supported("libcurl/"));
+    }
+
+    /// A 500 is the interesting case: the local server refused the request and said why, and that reason
+    /// is the whole value of the message.
+    #[test]
+    fn an_error_body_is_read_for_the_servers_own_words() {
+        let said = failure_detail(
+            r#"{"error":{"code":500,"message":"Failed to parse tool call arguments as JSON:\n invalid string","type":"server_error"}}"#,
+        );
+        assert!(
+            said.starts_with("Failed to parse tool call arguments"),
+            "{said}"
+        );
+        assert!(!said.contains('\n'), "one line: {said}");
+        // A body that is not JSON is still worth more than the status code alone.
+        assert_eq!(
+            failure_detail("  plain text refusal  "),
+            "plain text refusal"
+        );
+        // A long body is clipped, not dumped into a transcript.
+        let clipped = failure_detail(&"x".repeat(500));
+        assert!(
+            clipped.len() <= 303 && clipped.ends_with("..."),
+            "{}",
+            clipped.len()
+        );
     }
 }

@@ -567,6 +567,43 @@ impl OpenAi {
         Ok(headers)
     }
 
+    /// The body for a tool-calling step. Sanitised here, at the one place every tool-mode step passes
+    /// through, so a transcript holding a cut-off tool call cannot reach a server that will refuse it.
+    fn tool_body(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        cap: u64,
+        attempt: u32,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": sanitized(messages),
+            "temperature": self.temperature,
+            "max_tokens": cap,
+            "stream": true,
+        });
+        if let Some(tools) = tools {
+            body["tools"] = tools.clone();
+        }
+        if attempt > 0 && tools.is_some() {
+            body["tool_choice"] = serde_json::json!("required");
+        }
+        body
+    }
+
+    /// The streaming request body, sanitised in one place so no surface (TUI, gateway, daemon) can send
+    /// a transcript the server will refuse.
+    fn streaming_body(&self, messages: &[serde_json::Value]) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "messages": sanitized(messages),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": true,
+        })
+    }
+
     /// The body for a call with no tools. A system message is the top-level `system` in Anthropic's
     /// shape and `instructions` in the responses API; chat completions carries it as a message.
     fn plain_body(
@@ -594,7 +631,7 @@ impl OpenAi {
                 if let Some(system) = system {
                     all.push(serde_json::json!({ "role": "system", "content": system }));
                 }
-                all.extend(messages.iter().cloned());
+                all.extend(sanitized(messages));
                 serde_json::json!({
                     "model": self.model,
                     "messages": all,
@@ -1101,13 +1138,7 @@ impl OpenAi {
         // next provider's turn; one that fails after producing content is an error, not a stutter.
         let mut errors: Vec<String> = Vec::new();
         for candidate in self.chain() {
-            let body = serde_json::json!({
-                "model": candidate.model,
-                "messages": messages,
-                "temperature": candidate.temperature,
-                "max_tokens": candidate.max_tokens,
-                "stream": true,
-            });
+            let body = candidate.streaming_body(messages);
             let headers = candidate.wire()?;
             let mut content = String::new();
             let streamed = http::stream(
@@ -1606,6 +1637,59 @@ pub fn from_preset(preset: &Preset) -> OpenAi {
         model = model.with_key(key.clone());
     }
     model
+}
+
+/// A tool call whose arguments were cut off mid-string is not valid JSON, and a server that parses tool
+/// calls answers such a request with a 500 instead of generating. The broken turn is already in the
+/// transcript, so every later turn fails the same way and the session is dead with no way back except
+/// starting over. Repair the arguments on the way out: the step then reads as a call that came back
+/// empty, and the conversation can continue.
+pub(crate) fn repaired_arguments(cut_off: &str) -> serde_json::Value {
+    serde_json::Value::String(
+        serde_json::json!({
+            "error": "these arguments were cut off before they were valid JSON",
+            "recovered_prefix": cut_off.chars().take(200).collect::<String>(),
+        })
+        .to_string(),
+    )
+}
+
+/// Every message that goes on the wire, with any tool call that cannot parse repaired. A transcript the
+/// server refuses is a dead session; a repaired call is one failed step.
+pub(crate) fn sanitized(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let Some(calls) = message.get("tool_calls").and_then(|calls| calls.as_array()) else {
+                return message.clone();
+            };
+            let mut fixed = message.clone();
+            let mut repaired = false;
+            let calls: Vec<serde_json::Value> = calls
+                .iter()
+                .map(|call| {
+                    let Some(text) = call.pointer("/function/arguments").and_then(|a| a.as_str())
+                    else {
+                        return call.clone();
+                    };
+                    if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+                        return call.clone();
+                    }
+                    repaired = true;
+                    let mut call = call.clone();
+                    if let Some(function) = call.get_mut("function").and_then(|f| f.as_object_mut())
+                    {
+                        function.insert("arguments".into(), repaired_arguments(text));
+                    }
+                    call
+                })
+                .collect();
+            if repaired {
+                fixed["tool_calls"] = serde_json::Value::Array(calls);
+            }
+            fixed
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2214,13 +2298,12 @@ impl OpenAi {
                 let wait = if attempt == 1 { 1_000 } else { 3_000 };
                 std::thread::sleep(std::time::Duration::from_millis(wait));
             }
-            let mut body = serde_json::json!({
-                "model": self.model,
-                "messages": nudged.as_deref().unwrap_or(messages),
-                "temperature": self.temperature,
-                "max_tokens": cap.min(u32::MAX as u64),
-                "stream": true,
-            });
+            let mut body = self.tool_body(
+                nudged.as_deref().unwrap_or(messages),
+                tools,
+                cap.min(u32::MAX as u64),
+                attempt,
+            );
             if self.usage_log.is_some() {
                 body["stream_options"] = serde_json::json!({"include_usage": true});
             }
@@ -2417,4 +2500,77 @@ impl OpenAi {
         }
         Err(Fault::model(last_fault))
     }
+}
+
+/// llama-server answers a request whose transcript holds a tool call with cut-off arguments with a
+/// 500, and that turn stays in the transcript: every retry fails the same way and the session is
+/// stuck with no way out but starting over. The body on the wire must therefore carry arguments
+/// that parse.
+#[test]
+fn a_tool_call_with_cut_off_arguments_is_repaired_on_the_wire() {
+    let client = OpenAi::new(
+        "http://127.0.0.1:1/v1/chat/completions".to_string(),
+        "local",
+    );
+    let transcript = vec![
+        serde_json::json!({ "role": "user", "content": "build the scene" }),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\": \"index.html\", \"content\": \"<!doctype html>\\n<scr",
+                },
+            }],
+        }),
+        serde_json::json!({ "role": "tool", "tool_call_id": "call_1", "content": "no path given" }),
+    ];
+    let tools = serde_json::json!([{ "type": "function", "function": { "name": "write_file" } }]);
+    let body = client.tool_body(&transcript, Some(&tools), 1200, 0);
+    let sent = &body["messages"][1];
+    let arguments = sent
+        .pointer("/tool_calls/0/function/arguments")
+        .and_then(|value| value.as_str())
+        .expect("the call keeps its arguments");
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).expect("the arguments on the wire must parse");
+    assert!(
+        parsed.get("error").is_some(),
+        "the repair says what happened: {arguments}"
+    );
+    assert_eq!(
+        sent.pointer("/tool_calls/0/function/name")
+            .and_then(|value| value.as_str()),
+        Some("write_file"),
+        "the tool keeps its name"
+    );
+    assert_eq!(
+        body["messages"][2]["tool_call_id"], "call_1",
+        "the result still pairs with its call"
+    );
+    // The transcript in hand is not rewritten: the session file keeps what the model actually wrote.
+    assert!(
+        transcript[1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .ends_with("<scr")
+    );
+    // A call that parses goes out untouched.
+    let fine = vec![serde_json::json!({
+        "role": "assistant",
+        "tool_calls": [{ "function": { "name": "shell", "arguments": "{\"command\":\"true\"}" } }],
+    })];
+    assert_eq!(
+        client.tool_body(&fine, None, 64, 0)["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        "{\"command\":\"true\"}"
+    );
+    // The step body carries the caller's tools and asks for an action on a retry.
+    assert_eq!(body["tools"][0]["function"]["name"], "write_file");
+    assert_eq!(
+        client.tool_body(&fine, Some(&tools), 64, 1)["tool_choice"],
+        "required"
+    );
 }

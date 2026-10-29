@@ -315,17 +315,8 @@ pub fn stream(
     };
 
     let mut command = Command::new("curl");
-    command.args([
-        "-sS",
-        "--no-buffer",
-        "--fail-with-body",
-        "--max-time",
-        &timeout.as_secs().max(1).to_string(),
-        "-X",
-        "POST",
-        "--data-binary",
-        "@-",
-    ]);
+    command.args(stream_args(timeout));
+    command.args(["-X", "POST", "--data-binary", "@-"]);
     if let Some(secret) = &secret {
         command.arg("-K");
         command.arg(secret.path());
@@ -356,6 +347,7 @@ pub fn stream(
         .take()
         .ok_or_else(|| Fault::model("curl gave no stream to read".to_string()))?;
     let mut reader = std::io::BufReader::new(stdout);
+    let mut seen = String::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -364,6 +356,12 @@ pub fn stream(
             .map_err(|e| Fault::model(format!("the model stream stopped: {e}")))?;
         if read == 0 {
             break;
+        }
+        // `--fail-with-body` puts the provider's error body on stdout, where the SSE reader would
+        // otherwise discard it. Keep a bounded copy so a refusal can be reported in the server's own
+        // words instead of "error: 500".
+        if seen.len() < 8192 {
+            seen.push_str(&line);
         }
         on_line(&line);
     }
@@ -374,12 +372,38 @@ pub fn stream(
     drop(secret);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let refusal = crate::fetch_pool::refusal_message(&seen);
+        let said = match refusal {
+            Some(said) => said,
+            None => stderr.lines().next().unwrap_or("").to_string(),
+        };
         return Err(Fault::model(format!(
-            "the model stream ended badly: {}",
-            stderr.lines().next().unwrap_or("")
+            "the model stream ended badly: {said}"
         )));
     }
     Ok(())
+}
+
+/// The transport arguments for a streamed answer. A long generation is not a stalled one, and a single
+/// `--max-time` cannot tell them apart: on a 20 tokens/second local model the budget is reached after a
+/// few thousand tokens and the turn is cut mid-answer, which reads as "the model stream ended badly".
+/// Kill a stream that delivers nothing for the budget instead, under a ceiling no single answer reaches.
+fn stream_args(timeout: Duration) -> Vec<String> {
+    let stall = timeout.as_secs().max(1);
+    let ceiling = stall.saturating_mul(8);
+    vec![
+        "-sS".to_string(),
+        "--no-buffer".to_string(),
+        "--fail-with-body".to_string(),
+        "--connect-timeout".to_string(),
+        "30".to_string(),
+        "--speed-limit".to_string(),
+        "1".to_string(),
+        "--speed-time".to_string(),
+        stall.to_string(),
+        "--max-time".to_string(),
+        ceiling.to_string(),
+    ]
 }
 
 fn curl(
@@ -621,5 +645,32 @@ mod tests {
     fn a_status_line_without_a_code_is_refused_rather_than_guessed() {
         let fault = split(b"nonsense\r\n\r\n{}").expect_err("refused");
         assert!(fault.detail().contains("status"), "{}", fault.detail());
+    }
+
+    /// A streamed answer gets a stall budget, not a total cap: the transfer may run as long as it is
+    /// moving, and only silence for the budget ends it. A total cap at the budget is what cut a healthy
+    /// generation mid-file on a 20 tokens/second local model.
+    #[test]
+    fn a_stream_is_cut_for_silence_not_for_being_long() {
+        let args = stream_args(std::time::Duration::from_secs(180));
+        let value = |name: &str| {
+            let at = args
+                .iter()
+                .position(|arg| arg == name)
+                .unwrap_or_else(|| panic!("{name} missing from {args:?}"));
+            args[at + 1].clone()
+        };
+        assert_eq!(
+            value("--speed-time"),
+            "180",
+            "the stall budget is the timeout"
+        );
+        assert_eq!(value("--speed-limit"), "1");
+        assert!(
+            value("--max-time").parse::<u64>().unwrap() >= 180 * 4,
+            "the ceiling leaves room for a long answer: {:?}",
+            args
+        );
+        assert_eq!(value("--connect-timeout"), "30");
     }
 }

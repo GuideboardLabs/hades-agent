@@ -18,6 +18,9 @@ pub struct Options {
     pub model: String,
     pub endpoint: Option<String>,
     pub key: Option<String>,
+    /// Sampling temperature for this session. A local model's card is the authority, so the operator can
+    /// pin it here instead of accepting the client's cautious default.
+    pub temperature: Option<f32>,
     pub user: String,
     pub demo: bool,
     pub motion: bool,
@@ -45,6 +48,7 @@ impl Options {
                     | "--model"
                     | "--endpoint"
                     | "--key"
+                    | "--temperature"
                     | "--resume"
                     | "--snapshot"
                     | "--width"
@@ -129,6 +133,14 @@ impl Options {
             model,
             endpoint: flags.get("--endpoint").cloned(),
             key: flags.get("--key").cloned(),
+            temperature: match flags.get("--temperature") {
+                Some(value) => Some(
+                    value
+                        .parse::<f32>()
+                        .map_err(|_| format!("`--temperature {value}` is not a number"))?,
+                ),
+                None => None,
+            },
             user: flags
                 .get("--name")
                 .cloned()
@@ -165,6 +177,9 @@ impl Options {
             })?;
             crate::model::from_preset(&preset)
         };
+        if let Some(temperature) = self.temperature {
+            client = client.with_temperature(temperature);
+        }
         if let Some(key) = &self.key {
             client = client.with_key(if let Some(var) = key.strip_prefix("env:") {
                 Key::Env(var.into())
@@ -456,8 +471,13 @@ pub fn start_chat(
             // model advertises is not the window a turn needs: a 1M-token model that re-sends 150k
             // tokens per step burns the budget and slows every call. 64k is the working set.
             let cap = client.context().min(crate::agent::WORKING_SET);
-            if crate::agent::estimate_tokens(&transcript) > cap + cap / 2 {
-                crate::agent::compact_context(&mut transcript, cap - cap / 4);
+            if crate::agent::estimate_tokens(&transcript)
+                > crate::agent::compaction_trigger(client.context(), cap)
+            {
+                crate::agent::compact_context(
+                    &mut transcript,
+                    crate::agent::compaction_target(client.context(), cap),
+                );
                 let _ = sender.send(Event::Notice("Earlier context was trimmed at a complete turn boundary. The full conversation remains in the session record.".into()));
             }
             transcript.push(json!({"role":"user","content":prompt}));

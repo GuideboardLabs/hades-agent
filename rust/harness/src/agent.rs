@@ -810,8 +810,8 @@ pub fn answer_stoppable(
         // compactor never fired. Trim with hysteresis: cut at 1.5x the working set back to 0.75x,
         // so a transcript hovering at the limit does not drop one message on every single step.
         let cap = client.context().min(WORKING_SET);
-        if estimate_tokens(messages) > cap + cap / 2 {
-            compact_context(messages, cap - cap / 4);
+        if estimate_tokens(messages) > compaction_trigger(client.context(), cap) {
+            compact_context(messages, compaction_target(client.context(), cap));
             // The read results the model just lost are not a loop; let it fetch them again.
             repeats.clear();
         }
@@ -1059,6 +1059,25 @@ const REPEATS: u32 = 3;
 /// The working set for a long turn. Quality first: 400k keeps the whole plan and its evidence in
 /// view, which is what the 90.5 run had. A trim at 1.5x is only a guard against a runaway transcript.
 pub const WORKING_SET: usize = 400_000;
+
+/// When a transcript has to be trimmed. The trigger has to sit inside the model's own window: that window
+/// is a wall, and a request wider than it is refused outright ("request (20679 tokens) exceeds the
+/// available context size (20480 tokens)"), not quietly shortened. Where the window is far wider than the
+/// working set, the 1.5x rule still wins, because there the cost being avoided is re-sending tokens, not a
+/// refusal.
+pub fn compaction_trigger(wall: usize, cap: usize) -> usize {
+    // Room for the answer the trimmed transcript is about to ask for.
+    let reserve = (cap / 4).max(1_024);
+    (cap + cap / 2).min(wall.saturating_sub(reserve))
+}
+
+/// How far a trim goes. Far enough below the trigger that the next several steps do not each pay for
+/// another trim, and never above three quarters of the working set.
+pub fn compaction_target(wall: usize, cap: usize) -> usize {
+    let trigger = compaction_trigger(wall, cap);
+    let target = trigger - trigger / 5;
+    target.min(cap - cap / 4).max(1)
+}
 
 fn repeats_refuse(count: u32) -> bool {
     count >= REPEATS
@@ -3335,6 +3354,33 @@ pub fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The window is a wall, not a budget: a request above it is refused with the server's own sentence.
+    /// A local model that declares 20,480 used to be trimmed only above 30,720, so a long session could not
+    /// continue at all.
+    #[test]
+    fn a_trim_fires_inside_the_models_own_window() {
+        let (wall, cap) = (20_480, 20_480);
+        let trigger = compaction_trigger(wall, cap);
+        assert!(
+            trigger < wall,
+            "a trim above the wall is a refusal, not a trim: {trigger} vs {wall}"
+        );
+        assert_eq!(trigger, 15_360);
+        let target = compaction_target(wall, cap);
+        assert!(target < trigger, "a trim has to land below its trigger");
+        assert_eq!(target, 12_288);
+        // A small local window still leaves room for an answer.
+        assert!(compaction_trigger(4_096, 4_096) < 4_096);
+    }
+
+    /// Where the window is far wider than the working set, re-sending is the cost, so the 1.5x rule holds.
+    #[test]
+    fn a_wide_window_keeps_the_working_set_rule() {
+        let (wall, cap) = (1_000_000, 400_000);
+        assert_eq!(compaction_trigger(wall, cap), 600_000);
+        assert_eq!(compaction_target(wall, cap), 300_000);
+    }
+
     use crate::approval::ApprovalBroker as _;
     use crate::mode::Mode;
 
