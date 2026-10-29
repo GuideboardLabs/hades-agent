@@ -3,6 +3,34 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.2.0 — The Charon Release
+
+A pack now crosses to this machine checked, not assumed.
+
+- **`hades pack check <file>`.** A pack may declare `requires.assumptions`: claims about the host it
+  was written on, each with the check that decides it and the remedy if it is false. `check` reads
+  those claims and decides every one against this machine before anything is installed. Nothing is
+  written and nothing is installed; a false claim prints what the machine actually is and what to do
+  instead. Exit 0 when every hard claim holds, 3 when one does not, 4 when a claim could not be
+  decided here.
+- **Thirteen checks, and `unknown` is a verdict.** `gpu_present`, `gpu_vendor`, `vram_at_least`,
+  `vram_at_most`, `vram_idle`, `physical_cores`, `port_free`, `ram_at_least`, `disk_local`,
+  `file_exists`, `socket_alive`, `config_json`, `service_active`. A check this build does not know
+  reports undecided, never fine, because a pack written for a newer Hades must not read as passing.
+- **`at_least` and `at_most` are different claims.** A 24 GiB card satisfies "at least 8 GiB" and
+  contradicts "tuned for 8 GiB". The first asks whether the pack runs; the second asks whether its
+  advice still applies, and that is the one that catches a pack carrying another machine's flags.
+- **A pack with no assumptions still installs.** It prints that it declared none, which is the older,
+  weaker contract: read the docs against this machine yourself. The field is optional in the manifest,
+  so every pack written before this release keeps parsing.
+- **Facts, then decisions.** `pack_check` reads the host once (card, memory, what is loaded on it,
+  physical cores, RAM, mount types) and every claim is decided against that snapshot, so the report
+  is one machine's answer rather than thirteen probes that could disagree with each other.
+
+Why it exists: every pack this project ships is written on one computer by one person, and its
+numbers describe that computer. Copying it elsewhere copies the circumstances with it. The ferryman
+takes the cargo across and looks at what boards.
+
 ## 0.1.23
 
 Connector packs, and a surface that behaves like a place rather than a second agent.

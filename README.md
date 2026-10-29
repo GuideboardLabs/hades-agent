@@ -588,7 +588,8 @@ is refused when the config is read, not silently ignored. Precedence is `--model
 | `hades library add\|list\|search\|show\|verify\|remove` | The local shelf of documents, with FTS5 search and a hash check |
 | `hades mneme import\|export\|upgrade` | Move a vault in or out of the record; `upgrade` writes the new tree and can retire `40 Topics` |
 | `hades pack menu\|find\|add` | Read the shipped shelf of skill, tool and test packs, search it before writing a skill by hand, and add one with a digest check before anything is read |
-| `hades pack export\|inspect\|plan\|apply\|uninstall\|list` | Move skills, a harness and cases between installs as a signed-shaped archive with a decision file |
+| `hades pack export|inspect|plan|apply|uninstall|list` | Move skills, a harness and cases between installs as a signed-shaped archive with a decision file |
+| `hades pack check` | Decide the pack's declared assumptions against this machine before installing: card, memory in use, cores, RAM, ports, paths, endpoints |
 | `hades mcp list\|tools\|call` | The MCP servers the config names, what each offers, and a call to one allowed tool |
 | `hades context <goal>` / `hades map <goal>` | Build the context for a goal, or rank the tree for one and say what the map cache did |
 | `hades daemon\|http\|status\|submit\|attach` | Own the sessions under one state directory, or reach a running one |

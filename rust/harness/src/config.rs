@@ -317,7 +317,12 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
     let providers = crate::provider::Registry::parse(object.get("providers"), path)?;
     let model = field(object, "model", path)?;
     check_model(&model, &endpoints, &providers, path, "model")?;
-    let fallbacks = fallbacks(object.get("fallback_providers"), &endpoints, &providers, path)?;
+    let fallbacks = fallbacks(
+        object.get("fallback_providers"),
+        &endpoints,
+        &providers,
+        path,
+    )?;
 
     Ok(Some(Config {
         provider: field(object, "provider", path)?,
@@ -663,7 +668,7 @@ mod tests {
             endpoints: BTreeMap::new(),
             vision: None,
             providers: Default::default(),
-        fallbacks: Default::default(),
+            fallbacks: Default::default(),
         }
     }
 
@@ -844,7 +849,7 @@ mod tests {
             research: Research::default(),
             vision: None,
             providers: Default::default(),
-        fallbacks: Default::default(),
+            fallbacks: Default::default(),
         };
         save(&path, &config).expect("a save");
         let read = load(&path).expect("a read").expect("a config");
@@ -906,7 +911,7 @@ mod tests {
             research: Research::default(),
             vision: None,
             providers: Default::default(),
-        fallbacks: Default::default(),
+            fallbacks: Default::default(),
         };
         let mut config = base();
         config.runtime_paths = vec![PathBuf::from("relative/toolchain")];

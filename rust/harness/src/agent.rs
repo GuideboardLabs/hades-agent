@@ -790,7 +790,18 @@ pub fn answer_stoppable(
     // is exploring its own machinery instead of doing the task. Cap them per turn; the model gets a
     // refusal and carries on with the tools that do the work.
     let mut used: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    const TOOL_BUDGETS: &[(&str, u32)] = &[("session_search", 2), ("recall", 2), ("goal", 4), ("skills", 8), ("remember", 2), ("library", 2), ("web_search", 25), ("react", 6), ("fetch", 60), ("shell", 120)];
+    const TOOL_BUDGETS: &[(&str, u32)] = &[
+        ("session_search", 2),
+        ("recall", 2),
+        ("goal", 4),
+        ("skills", 8),
+        ("remember", 2),
+        ("library", 2),
+        ("web_search", 25),
+        ("react", 6),
+        ("fetch", 60),
+        ("shell", 120),
+    ];
     for _ in 0..steps {
         if stopped() {
             return Ok(None);
@@ -890,13 +901,17 @@ pub fn answer_stoppable(
             let label = label(&call.name, &call.arguments);
             activity(Activity::Start, &label);
             if let Some((_, cap)) = TOOL_BUDGETS.iter().find(|(name, _)| *name == call.name) {
-                let n = used.entry(call.name.clone()).and_modify(|n| *n += 1).or_insert(1);
+                let n = used
+                    .entry(call.name.clone())
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
                 if *n > *cap {
                     let said = format!(
                         "Refused: this turn has used its {} call(s) to `{}`. Continue the task with the tools that do the work.",
                         cap, call.name
                     );
-                    messages.push(json!({"role": "tool", "tool_call_id": call.id, "content": said}));
+                    messages
+                        .push(json!({"role": "tool", "tool_call_id": call.id, "content": said}));
                     activity(Activity::End, &label);
                     continue;
                 }
@@ -972,7 +987,10 @@ fn leaked_tool_call(text: &str) -> bool {
         return true;
     }
     let first = text.lines().next().unwrap_or("").trim_start();
-    first.split_whitespace().next().is_some_and(|word| word.ends_with("to="))
+    first
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.ends_with("to="))
 }
 
 pub(crate) fn label(name: &str, arguments: &str) -> String {
@@ -1051,8 +1069,15 @@ fn repeats_refuse(count: u32) -> bool {
 fn repeat_guarded(name: &str) -> bool {
     !matches!(
         name,
-        "read_file" | "list_dir" | "search" | "grep" | "skills" | "recall" | "remember"
-            | "session_search" | "goal"
+        "read_file"
+            | "list_dir"
+            | "search"
+            | "grep"
+            | "skills"
+            | "recall"
+            | "remember"
+            | "session_search"
+            | "goal"
     )
 }
 
@@ -3143,7 +3168,10 @@ pub fn compact_context(messages: &mut Vec<Value>, limit: usize) {
         .first()
         .filter(|message| message["role"] == "system")
         .cloned();
-    let Some(start) = messages.iter().rposition(|message| message["role"] == "user") else {
+    let Some(start) = messages
+        .iter()
+        .rposition(|message| message["role"] == "user")
+    else {
         return;
     };
     let mut used = estimate_tokens(&messages[start..start + 1]);
@@ -3441,13 +3469,28 @@ mod tests {
     #[test]
     fn a_conversation_keeps_the_tools_that_answer_and_loses_the_tools_that_start_work() {
         let chat = names(&schemas(0, Mode::Chat));
-        for kept in ["read_file", "search", "web_search", "fetch", "recall", "library"] {
+        for kept in [
+            "read_file",
+            "search",
+            "web_search",
+            "fetch",
+            "recall",
+            "library",
+        ] {
             assert!(
                 chat.contains(&kept.to_string()),
                 "a conversation lost {kept}: {chat:?}"
             );
         }
-        for gone in ["shell", "write_file", "patch", "cron", "delegate", "goal", "remember"] {
+        for gone in [
+            "shell",
+            "write_file",
+            "patch",
+            "cron",
+            "delegate",
+            "goal",
+            "remember",
+        ] {
             assert!(
                 !chat.contains(&gone.to_string()),
                 "a conversation still has {gone}: {chat:?}"
@@ -3743,7 +3786,10 @@ mod tests {
     #[test]
     fn a_conversation_is_offered_the_reaction_and_a_surface_without_one_refuses() {
         let offered = names(&schemas(0, Mode::Chat));
-        assert!(offered.contains(&"react".to_string()), "a chat can react: {offered:?}");
+        assert!(
+            offered.contains(&"react".to_string()),
+            "a chat can react: {offered:?}"
+        );
 
         let dir = crate::scratch::root().join("agent-react");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3757,8 +3803,14 @@ mod tests {
             sink.lock().expect("the sink").push(emoji.to_string());
             Ok(())
         }));
-        assert!(react_tool(&serde_json::json!({"emoji": "not-a-face"}), &world).contains("not a reaction"));
-        assert!(seen.lock().expect("the sink").is_empty(), "a refused face never reaches the surface");
+        assert!(
+            react_tool(&serde_json::json!({"emoji": "not-a-face"}), &world)
+                .contains("not a reaction")
+        );
+        assert!(
+            seen.lock().expect("the sink").is_empty(),
+            "a refused face never reaches the surface"
+        );
         react_tool(&serde_json::json!({"emoji": "✅"}), &world);
         assert_eq!(seen.lock().expect("the sink").as_slice(), ["✅"]);
     }
@@ -3784,7 +3836,10 @@ mod tests {
 
         let mut read = world_at(&root, Mode::Read, "job:7");
         read.vault = dir.join("vault");
-        assert!(read.policy().read(&note).is_err(), "a read job lost a boundary it had");
+        assert!(
+            read.policy().read(&note).is_err(),
+            "a read job lost a boundary it had"
+        );
     }
 
     #[test]
@@ -4225,12 +4280,22 @@ mod tests {
             estimate_tokens(&messages)
         );
         assert_eq!(messages[0]["role"], "system");
-        assert!(messages[2]["content"].as_str().unwrap().contains("build the thing"));
-        assert_ne!(messages[3]["role"], "tool", "the tail orphaned a tool result");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("build the thing")
+        );
+        assert_ne!(
+            messages[3]["role"], "tool",
+            "the tail orphaned a tool result"
+        );
         assert_eq!(messages.last().unwrap()["role"], "tool");
-        assert!(messages
-            .iter()
-            .any(|m| m["content"].as_str().is_some_and(|c| c.contains("trimmed from context"))));
+        assert!(messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("trimmed from context"))
+        }));
     }
 
     #[test]
@@ -4243,12 +4308,16 @@ mod tests {
             messages.push(json!({"role":"tool","tool_call_id":id,"content":"y".repeat(200_000)}));
         }
         compact_context(&mut messages, 64_000);
-        assert!(messages
-            .iter()
-            .any(|m| m["content"].as_str().is_some_and(|c| c == "task 3")));
-        assert!(!messages
-            .iter()
-            .any(|m| m["content"].as_str().is_some_and(|c| c == "task 0")));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["content"].as_str().is_some_and(|c| c == "task 3"))
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m["content"].as_str().is_some_and(|c| c == "task 0"))
+        );
     }
 
     #[test]

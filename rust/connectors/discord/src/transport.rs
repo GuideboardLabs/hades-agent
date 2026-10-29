@@ -98,8 +98,8 @@ impl Discord {
     pub fn new(token: String, config: &Path) -> Result<Discord, String> {
         let text = std::fs::read_to_string(config)
             .map_err(|error| format!("{}: {error}", config.display()))?;
-        let value: Value =
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", config.display()))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("{}: {error}", config.display()))?;
         let section = value
             .pointer("/gateway/connectors/discord")
             .cloned()
@@ -149,7 +149,10 @@ impl Discord {
             .agent
             .request(method, &url)
             .set("Authorization", &format!("Bot {}", self.inner.token))
-            .set("User-Agent", "Hades (https://github.com/GuideboardLabs, 0.1)");
+            .set(
+                "User-Agent",
+                "Hades (https://github.com/GuideboardLabs, 0.1)",
+            );
         let outcome = match body {
             Some(body) => request.send_json(body),
             None => request.call(),
@@ -437,8 +440,9 @@ fn identify(
 fn text_of(message: Result<Message, tungstenite::Error>) -> Result<String, String> {
     match message.map_err(|error| format!("read: {error}"))? {
         Message::Text(text) => Ok(text.to_string()),
-        Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
-            .map_err(|error| format!("binary frame: {error}")),
+        Message::Binary(bytes) => {
+            String::from_utf8(bytes.to_vec()).map_err(|error| format!("binary frame: {error}"))
+        }
         other => Ok(other.to_string()),
     }
 }
@@ -515,9 +519,7 @@ fn message_update(inner: &Arc<Inner>, message: &Value) -> Option<Update> {
         .clone();
     // Answering a message of ours is addressing us. A reply is how a person continues a thread
     // without typing the name again, and it is the only mention-free way in a guild.
-    let answering_us = message
-        .pointer("/message_reference/message_id")
-        .is_some()
+    let answering_us = message.pointer("/message_reference/message_id").is_some()
         && message
             .pointer("/referenced_message/author/id")
             .and_then(Value::as_str)
@@ -629,14 +631,16 @@ mod tests {
         let inner = inner();
         let mut reply = message("7", "and then what", Some("9"));
         reply["message_reference"] = json!({"message_id": "1300000000000000009"});
-        reply["referenced_message"] = json!({"id": "1300000000000000009", "author": {"id": "42", "bot": true}});
+        reply["referenced_message"] =
+            json!({"id": "1300000000000000009", "author": {"id": "42", "bot": true}});
         let update = message_update(&inner, &reply).expect("a reply to us reaches the chat");
         assert_eq!(update.text, "and then what");
 
         // replying to somebody else is still not addressing us
         let mut other = message("7", "and then what", Some("9"));
         other["message_reference"] = json!({"message_id": "1300000000000000008"});
-        other["referenced_message"] = json!({"id": "1300000000000000008", "author": {"id": "8", "bot": false}});
+        other["referenced_message"] =
+            json!({"id": "1300000000000000008", "author": {"id": "8", "bot": false}});
         assert!(message_update(&inner, &other).is_none());
     }
 

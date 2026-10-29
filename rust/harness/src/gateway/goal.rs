@@ -795,7 +795,8 @@ pub fn continuation_with<T: crate::gateway::Transport>(
             refresh(state, goal);
             charge(state, goal, spent, now)?;
             if goal.state == State::Paused {
-                transport.send(&goal.chat,
+                transport.send(
+                    &goal.chat,
                     &format!(
                         "<b>Goal {} paused: budget.</b> The goal has spent all {} of its model \
                          calls, so no continuation will run until a person resumes it.",
@@ -809,7 +810,8 @@ pub fn continuation_with<T: crate::gateway::Transport>(
         Ok(None) => {
             // A person stopped it. The interval was already stamped, and a stopped turn is not the
             // assistant's turn, so neither the prompt nor a refusal is stored.
-            transport.send(&goal.chat,
+            transport.send(
+                &goal.chat,
                 "<b>Goal continuation stopped.</b> What already ran is not undone.",
                 &[],
             )?;
@@ -839,7 +841,8 @@ pub fn continuation_with<T: crate::gateway::Transport>(
             goal.reason = format!("continuation failed: {}", fault.detail());
             save(state, goal)?;
             record(state, goal, "failed");
-            transport.send(&goal.chat,
+            transport.send(
+                &goal.chat,
                 &format!(
                     "<b>Goal {} continuation failed.</b> {}",
                     goal.id,

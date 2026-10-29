@@ -5,8 +5,8 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use harness::gateway::{Chat, 
-    Button, Callback, Settings, Signals, Transport, Update, handle, handle_with, load_offset,
+use harness::gateway::{
+    Button, Callback, Chat, Settings, Signals, Transport, Update, handle, handle_with, load_offset,
     serve, settings,
 };
 use serde_json::json;
@@ -193,14 +193,14 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
             vault: dir.join("mneme").display().to_string(),
             heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
             mcp: harness::mcp::McpConfig::default(),
-        mode: harness::mode::Mode::Act,
-        channels: std::collections::HashMap::new(),
+            mode: harness::mode::Mode::Act,
+            channels: std::collections::HashMap::new(),
             prompt: None,
             loading: None,
             provider: None,
             endpoints: Default::default(),
-        providers: Default::default(),
-        fallbacks: Default::default(),
+            providers: Default::default(),
+            fallbacks: Default::default(),
         }
     );
 }

@@ -232,6 +232,13 @@ hades — the harness, one turn or a whole graph
   hades pack list [--state <dir>] [--json]
       print the installed catalog
 
+  hades pack check <file> [--json]
+      read the pack's `requires.assumptions` and decide each one against this machine: the
+      card, its memory, what is loaded on it, the core count, RAM, a port, a path, an endpoint.
+      A false claim prints its remedy; nothing is installed and nothing is written. Exit 0 when
+      every hard claim holds, 3 when one does not, 4 when a claim could not be decided here. A
+      pack with no assumptions prints that it has none, which is the older, weaker contract
+
   hades pack adapt <file> --item <kind>:<identity> [--accept] [model flags]
       rewrite one skill or harness for this home. Without --accept it only prints
       a diff, changes and conflicts. Adaptation needs derivatives: allowed
@@ -765,7 +772,10 @@ fn models() -> Result<(String, i32), String> {
                 text.push_str(&format!("{:<20} key: ${key}\n", ""));
             }
             if provider.models.is_empty() {
-                text.push_str(&format!("{:<20} models: named as {}/<model>\n", "", provider.id));
+                text.push_str(&format!(
+                    "{:<20} models: named as {}/<model>\n",
+                    "", provider.id
+                ));
             } else {
                 for model in &provider.models {
                     text.push_str(&format!("{:<20} {}/{}\n", "", provider.id, model));
@@ -1391,7 +1401,6 @@ fn key_spec(spec: &str) -> Key {
         None => Key::Home(spec.to_string()),
     }
 }
-
 
 /// Who answers. An enum rather than a boxed trait object, because there are two and the CLI prints which.
 pub(crate) enum Answerer {
@@ -2480,7 +2489,6 @@ fn case_cmd(args: &[String]) -> Result<(String, i32), String> {
     Ok((text, 0))
 }
 
-
 /// Connectors are installed packs, not built-ins: this resolves one through the catalog, checks that
 /// the binary still hashes to what was approved, and hands the process the same state and config the
 /// gateway uses. The connector itself owns auth and its event loop; core owns install and trust.
@@ -2562,7 +2570,8 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
             ids.sort();
             for channel in ids {
                 let entry = &settings.channels[channel];
-                let effective = settings.effective(&crate::gateway::Chat::new(id, channel.as_str()));
+                let effective =
+                    settings.effective(&crate::gateway::Chat::new(id, channel.as_str()));
                 let mut changed = Vec::new();
                 if entry.mode.is_some() {
                     changed.push(format!("mode {}", word(effective.mode)));
@@ -2604,13 +2613,8 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
             let home = std::env::var("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("."));
-            let text = crate::service::connector_unit(
-                &manifest.id,
-                &binary,
-                &config,
-                &state,
-                &home,
-            );
+            let text =
+                crate::service::connector_unit(&manifest.id, &binary, &config, &state, &home);
             let name = format!("hades-connector-{}.service", manifest.id);
             if switched(&flags, "dry-run") {
                 return Ok((text, 0));
@@ -2619,8 +2623,7 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 Some(dir) => PathBuf::from(dir),
                 None => home.join(".config/systemd/user"),
             };
-            std::fs::create_dir_all(&out)
-                .map_err(|error| format!("{}: {error}", out.display()))?;
+            std::fs::create_dir_all(&out).map_err(|error| format!("{}: {error}", out.display()))?;
             let path = out.join(&name);
             std::fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
             Ok((
@@ -2683,7 +2686,9 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 .to_string(),
             0,
         )),
-        other => Err(format!("`connector {other}`: say list, check, run, remove or help")),
+        other => Err(format!(
+            "`connector {other}`: say list, check, run, remove or help"
+        )),
     }
 }
 
@@ -2702,9 +2707,10 @@ fn pack_cmd(args: &[String]) -> Result<(String, i32), String> {
         "menu" => pack_menu(rest),
         "find" => pack_find(rest),
         "add" => pack_add(rest),
+        "check" => pack_check(rest),
         "help" | "--help" => Ok((pack_help(), 0)),
         other => Err(format!(
-            "`pack {other}`: say export, inspect, plan, apply, uninstall, list, adapt, merge or help"
+            "`pack {other}`: say export, inspect, check, plan, apply, uninstall, list, adapt, merge or help"
         )),
     }
 }
@@ -2884,6 +2890,25 @@ fn pack_export(args: &[String]) -> Result<(String, i32), String> {
         ),
         0,
     ))
+}
+
+fn pack_check(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &[], &["json"])?;
+    let file = flags
+        .positional
+        .first()
+        .ok_or_else(|| "`pack check` needs a pack file".to_string())?;
+    let pack = crate::pack::Pack::open(Path::new(file))?;
+    let facts = crate::pack_check::facts();
+    let verdicts = crate::pack_check::evaluate_all(&pack.manifest.requires.assumptions, &facts);
+    let code = crate::pack_check::exit_code(&verdicts);
+    if switched(&flags, "json") {
+        let text =
+            serde_json::to_string_pretty(&crate::pack_check::report_json(&pack, &facts, &verdicts))
+                .map_err(|error| format!("could not encode the check: {error}"))?;
+        return Ok((format!("{text}\n"), code));
+    }
+    Ok((crate::pack_check::report(&pack, &facts, &verdicts), code))
 }
 
 fn pack_inspect(args: &[String]) -> Result<(String, i32), String> {
@@ -3726,7 +3751,10 @@ fn doctor(args: &[String]) -> Result<(String, i32), String> {
             .join(format!("hades-connector-{}", row.id));
         match crate::connector_pack::digest_for(&path) {
             Ok(got) if got.eq_ignore_ascii_case(&row.live_digest) => {
-                text.push_str(&format!("ok  connector    {} {} ({})\n", row.id, row.version, row.platform));
+                text.push_str(&format!(
+                    "ok  connector    {} {} ({})\n",
+                    row.id, row.version, row.platform
+                ));
             }
             Ok(got) => {
                 text.push_str(&format!(
@@ -3736,7 +3764,10 @@ fn doctor(args: &[String]) -> Result<(String, i32), String> {
                 code = 1;
             }
             Err(said) => {
-                text.push_str(&format!("FAIL connector  {} {}: {said}\n", row.id, row.version));
+                text.push_str(&format!(
+                    "FAIL connector  {} {}: {said}\n",
+                    row.id, row.version
+                ));
                 code = 1;
             }
         }
@@ -7995,8 +8026,8 @@ mod profile_model_tests {
                 .collect(),
             mcp: Default::default(),
             endpoints: Default::default(),
-        providers: Default::default(),
-        fallbacks: Default::default(),
+            providers: Default::default(),
+            fallbacks: Default::default(),
             runtime_paths: Vec::new(),
             research: Default::default(),
             vision: None,
@@ -8041,8 +8072,13 @@ mod profile_model_tests {
 
     #[test]
     fn with_no_profile_model_the_config_is_used() {
-        let answerer = answerer(&flags(None), Some(&config("deepseek-v4.1-flash", &[])), None, None)
-            .expect("the config's preset resolves");
+        let answerer = answerer(
+            &flags(None),
+            Some(&config("deepseek-v4.1-flash", &[])),
+            None,
+            None,
+        )
+        .expect("the config's preset resolves");
         assert!(answerer.describe().contains("deepseek-v4.1-flash"));
     }
 
@@ -8050,11 +8086,17 @@ mod profile_model_tests {
     fn the_config_profile_model_outranks_the_profiles_own() {
         let first = config("not-a-preset", &[("fix", "deepseek-v4.1-flash")]);
         let fix = crate::profile::named("fix").expect("fix");
-        assert_eq!(effective_model(Some(&first), &fix), Some("deepseek-v4.1-flash"));
+        assert_eq!(
+            effective_model(Some(&first), &fix),
+            Some("deepseek-v4.1-flash")
+        );
 
         let mut verify = crate::profile::named("verify").expect("verify");
         verify.model = Some("kimi-k2.7-code".to_string());
         let second = config("not-a-preset", &[("verify", "deepseek-v4.1-flash")]);
-        assert_eq!(effective_model(Some(&second), &verify), Some("deepseek-v4.1-flash"));
+        assert_eq!(
+            effective_model(Some(&second), &verify),
+            Some("deepseek-v4.1-flash")
+        );
     }
 }

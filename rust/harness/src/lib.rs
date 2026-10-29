@@ -72,6 +72,7 @@ pub mod memory;
 pub mod mode;
 pub mod model;
 pub mod pack;
+pub mod pack_check;
 pub mod pack_fit;
 pub mod packs_install;
 pub mod packs_menu;

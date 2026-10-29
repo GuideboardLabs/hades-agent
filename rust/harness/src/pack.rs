@@ -83,6 +83,33 @@ pub struct Requires {
     pub hades: String,
     pub roles: Vec<String>,
     pub tools: Vec<String>,
+    /// Claims the pack makes about the machine it will run on, checked by `hades pack check` before
+    /// anything is installed. Optional: a pack that declares none is installed on the older terms,
+    /// where a person reads the docs.
+    pub assumptions: Vec<Assumption>,
+}
+
+/// One claim about the host: "8 GiB of VRAM", "port 8115 is free", "the endpoint answers".
+///
+/// The pack wrote these on the machine it was built on. `pack check` re-reads them here, and the
+/// remedy travels with the claim so a false one arrives with what to do instead of a verdict alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assumption {
+    pub id: String,
+    pub claim: String,
+    pub check: String,
+    /// A scalar argument for the check, carried as text so the manifest stays plain JSON.
+    pub arg: Option<String>,
+    pub severity: Severity,
+    pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// Results are meaningless until this is settled.
+    Hard,
+    /// Translate the pack's advice rather than stop.
+    Soft,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,13 +291,18 @@ fn item_value(item: &Provided) -> Value {
 
 fn parse_requires(value: &Value) -> Result<Requires, String> {
     let map = object(value, "requires")?;
-    keys(map, &["hades", "roles", "tools"], "requires")?;
+    keys(map, &["hades", "roles", "tools", "assumptions"], "requires")?;
     let hades = string(map, "hades", "requires")?;
     version_range(&hades)?;
+    let assumptions = match map.get("assumptions") {
+        Some(value) => parse_assumptions(value)?,
+        None => Vec::new(),
+    };
     Ok(Requires {
         hades,
         roles: strings(map, "roles", "requires")?,
         tools: strings(map, "tools", "requires")?,
+        assumptions,
     })
 }
 
@@ -465,6 +497,80 @@ fn parse_version(text: &str) -> Result<(u64, u64, u64), String> {
             .map_err(|_| format!("`{text}` is not a version"))?;
     }
     Ok((numbers[0], numbers[1], numbers[2]))
+}
+
+/// The Hades line a pack exported from this build was written against.
+///
+/// The upper bound is derived, not fixed. A hard-coded `<0.2` made every pack exported from 0.2.0
+/// declare a range no build could satisfy, so the pack refused to install where it was made.
+fn default_range() -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    let mut parts = current.split('.');
+    let major = parts.next().unwrap_or("0");
+    let minor = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+    format!(">={current},<{major}.{}", minor + 1)
+}
+
+fn parse_assumptions(value: &Value) -> Result<Vec<Assumption>, String> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| "requires `assumptions` must be an array".to_string())?;
+    let mut out: Vec<Assumption> = Vec::new();
+    for (index, item) in array.iter().enumerate() {
+        let context = format!("requires.assumptions[{index}]");
+        let map = object(item, &context)?;
+        keys(
+            map,
+            &["id", "claim", "check", "arg", "severity", "resolution"],
+            &context,
+        )?;
+        let id = string(map, "id", &context)?;
+        if id.trim().is_empty() {
+            return Err(format!("{context} `id` must not be empty"));
+        }
+        if out.iter().any(|seen| seen.id == id) {
+            return Err(format!("{context} repeats the id `{id}`"));
+        }
+        let claim = string(map, "claim", &context)?;
+        if claim.trim().is_empty() {
+            return Err(format!("{context} `claim` must say what was assumed"));
+        }
+        let check = string(map, "check", &context)?;
+        let severity = match string(map, "severity", &context)?.as_str() {
+            "hard" => Severity::Hard,
+            "soft" => Severity::Soft,
+            other => {
+                return Err(format!(
+                    "{context} `severity` is `{other}`; say `hard` or `soft`"
+                ));
+            }
+        };
+        let arg = match map.get("arg") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(Value::Number(number)) => Some(number.to_string()),
+            Some(Value::Bool(flag)) => Some(flag.to_string()),
+            Some(_) => {
+                return Err(format!(
+                    "{context} `arg` must be a string, a number or a bool"
+                ));
+            }
+        };
+        let resolution = map
+            .get("resolution")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        out.push(Assumption {
+            id,
+            claim,
+            check,
+            arg,
+            severity,
+            resolution,
+        });
+    }
+    Ok(out)
 }
 
 fn version_range(range: &str) -> Result<(), String> {
@@ -1201,7 +1307,8 @@ pub fn export(options: &ExportOptions) -> Result<PathBuf, String> {
         },
         derivatives: options.derivatives.clone(),
         requires: Requires {
-            hades: format!(">={},<0.2", env!("CARGO_PKG_VERSION")),
+            assumptions: Vec::new(),
+            hades: default_range(),
             roles: unique(&options.requires_roles),
             tools: unique(&options.requires_tools),
         },
@@ -1850,6 +1957,53 @@ mod tests {
         assert!(!range_ok(">=9", "0.0.19").expect("range"));
         assert!(version_range(">=0.0.19,").is_err());
         assert!(version_range(">=x").is_err());
+    }
+
+    #[test]
+    fn the_range_an_export_declares_admits_the_build_that_wrote_it() {
+        let current = env!("CARGO_PKG_VERSION");
+        let range = default_range();
+        assert!(
+            range_ok(&range, current).expect("range"),
+            "a pack exported from {current} declares {range}, which must admit {current}"
+        );
+        // The next minor line is outside it, which is what the upper bound is for.
+        let next = default_range_next_minor_for_test();
+        assert!(!range_ok(&range, &next).expect("range"));
+    }
+
+    fn default_range_next_minor_for_test() -> String {
+        let current = env!("CARGO_PKG_VERSION");
+        let mut parts = current.split('.');
+        let major = parts.next().unwrap_or("0").to_string();
+        let minor = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        format!("{major}.{}.0", minor + 1)
+    }
+
+    #[test]
+    fn an_assumption_without_a_severity_is_refused_by_name() {
+        let value: Value =
+            serde_json::from_str(r#"[{"id":"x","claim":"something","check":"gpu_present"}]"#)
+                .expect("json");
+        let error = parse_assumptions(&value).expect_err("no severity");
+        assert!(error.contains("severity"), "{error}");
+    }
+
+    #[test]
+    fn an_assumption_carries_its_check_argument_and_remedy() {
+        let value: Value = serde_json::from_str(
+            r#"[{"id":"vram","claim":"8 GiB","check":"vram_at_least","arg":8,
+                 "severity":"hard","resolution":"recompute the offload"}]"#,
+        )
+        .expect("json");
+        let assumptions = parse_assumptions(&value).expect("assumptions");
+        assert_eq!(assumptions.len(), 1);
+        assert_eq!(assumptions[0].arg.as_deref(), Some("8"));
+        assert_eq!(assumptions[0].severity, Severity::Hard);
+        assert_eq!(
+            assumptions[0].resolution.as_deref(),
+            Some("recompute the offload")
+        );
     }
 
     #[test]

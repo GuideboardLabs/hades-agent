@@ -37,7 +37,9 @@ pub struct Manifest {
 impl Manifest {
     pub fn parse(text: &str) -> Result<Manifest, String> {
         if text.len() > MAX_MANIFEST {
-            return Err(format!("connector.json is larger than {MAX_MANIFEST} bytes"));
+            return Err(format!(
+                "connector.json is larger than {MAX_MANIFEST} bytes"
+            ));
         }
         let value: Value = serde_json::from_str(text)
             .map_err(|error| format!("connector.json is not JSON: {error}"))?;
@@ -84,7 +86,9 @@ impl Manifest {
         }
         let kind = text_of("kind")?;
         if kind != "connector" {
-            return Err(format!("connector.json kind is {kind:?}; this is not a connector"));
+            return Err(format!(
+                "connector.json kind is {kind:?}; this is not a connector"
+            ));
         }
         let id = text_of("id")?;
         crate::pack::valid_id(&id)?;
@@ -97,13 +101,17 @@ impl Manifest {
         let min = protocol
             .get("min")
             .and_then(Value::as_u64)
-            .ok_or_else(|| "`protocol.min` must be an integer".to_string())? as u32;
+            .ok_or_else(|| "`protocol.min` must be an integer".to_string())?
+            as u32;
         let max = protocol
             .get("max")
             .and_then(Value::as_u64)
-            .ok_or_else(|| "`protocol.max` must be an integer".to_string())? as u32;
+            .ok_or_else(|| "`protocol.max` must be an integer".to_string())?
+            as u32;
         if min > max {
-            return Err(format!("`protocol.min` {min} is above `protocol.max` {max}"));
+            return Err(format!(
+                "`protocol.min` {min} is above `protocol.max` {max}"
+            ));
         }
         let requires_hades = match root.get("requires_hades") {
             None | Some(Value::Null) => None,
@@ -177,7 +185,9 @@ fn valid_entrypoint(path: &str) -> Result<(), String> {
     let parts: Vec<&str> = path.split('/').collect();
     for part in &parts {
         if part.is_empty() || *part == "." || *part == ".." {
-            return Err(format!("entrypoint {path:?} has a path segment that climbs"));
+            return Err(format!(
+                "entrypoint {path:?} has a path segment that climbs"
+            ));
         }
     }
     if parts.len() != 2 || parts[0] != "bin" {
@@ -282,8 +292,7 @@ pub fn install_dir(state: &Path, source: &Path, manifest: &Manifest) -> Result<P
             .map(|since| since.as_nanos())
             .unwrap_or(0)
     ));
-    std::fs::create_dir_all(&staging)
-        .map_err(|error| format!("{}: {error}", staging.display()))?;
+    std::fs::create_dir_all(&staging).map_err(|error| format!("{}: {error}", staging.display()))?;
     copy_tree(source, &staging)?;
     let result = validate_tree(&staging, manifest).and_then(|digest| {
         let target = installed(state, &manifest.id, &manifest.version);
@@ -322,7 +331,10 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
         let meta = std::fs::symlink_metadata(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         if meta.file_type().is_symlink() {
-            return Err(format!("{} is a symlink; a connector tree may not carry one", path.display()));
+            return Err(format!(
+                "{} is a symlink; a connector tree may not carry one",
+                path.display()
+            ));
         }
         if meta.is_dir() {
             std::fs::create_dir_all(&to).map_err(|error| format!("{}: {error}", to.display()))?;
@@ -330,7 +342,10 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
         } else if meta.is_file() {
             std::fs::copy(&path, &to).map_err(|error| format!("{}: {error}", to.display()))?;
         } else {
-            return Err(format!("{} is not a regular file or directory", path.display()));
+            return Err(format!(
+                "{} is not a regular file or directory",
+                path.display()
+            ));
         }
     }
     Ok(())
@@ -339,8 +354,12 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
 /// Walk the staged tree, hash every file, and compare it with `SHA256SUMS`. Returns the entrypoint digest.
 fn validate_tree(staging: &Path, manifest: &Manifest) -> Result<String, String> {
     let sums_path = staging.join("SHA256SUMS");
-    let sums = std::fs::read_to_string(&sums_path)
-        .map_err(|error| format!("{}: {error} (a connector pack needs one)", sums_path.display()))?;
+    let sums = std::fs::read_to_string(&sums_path).map_err(|error| {
+        format!(
+            "{}: {error} (a connector pack needs one)",
+            sums_path.display()
+        )
+    })?;
     let mut listed: BTreeMap<String, String> = BTreeMap::new();
     for line in sums.lines() {
         let line = line.trim();
@@ -352,13 +371,20 @@ fn validate_tree(staging: &Path, manifest: &Manifest) -> Result<String, String> 
             .or_else(|| line.split_once(' '))
             .ok_or_else(|| format!("SHA256SUMS line does not read: {line:?}"))?;
         if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!("SHA256SUMS has a digest that is not sha256: {digest:?}"));
+            return Err(format!(
+                "SHA256SUMS has a digest that is not sha256: {digest:?}"
+            ));
         }
         let name = name.trim_start_matches("./");
         if name.starts_with('/') || name.contains("..") {
-            return Err(format!("SHA256SUMS names a path outside the pack: {name:?}"));
+            return Err(format!(
+                "SHA256SUMS names a path outside the pack: {name:?}"
+            ));
         }
-        if listed.insert(name.to_string(), digest.to_string()).is_some() {
+        if listed
+            .insert(name.to_string(), digest.to_string())
+            .is_some()
+        {
             return Err(format!("SHA256SUMS lists {name} twice"));
         }
     }
@@ -390,7 +416,9 @@ fn validate_tree(staging: &Path, manifest: &Manifest) -> Result<String, String> 
             }
             seen += 1;
             if seen > MAX_FILES {
-                return Err(format!("a connector pack may hold at most {MAX_FILES} files"));
+                return Err(format!(
+                    "a connector pack may hold at most {MAX_FILES} files"
+                ));
             }
             if meta.len() > MAX_EXPANDED {
                 return Err(format!("{} is larger than the pack cap", name));
@@ -414,7 +442,10 @@ fn validate_tree(staging: &Path, manifest: &Manifest) -> Result<String, String> 
     let meta = std::fs::symlink_metadata(&entry)
         .map_err(|_| format!("the entrypoint {} is missing", manifest.entrypoint))?;
     if !meta.is_file() {
-        return Err(format!("the entrypoint {} is not a regular file", manifest.entrypoint));
+        return Err(format!(
+            "the entrypoint {} is not a regular file",
+            manifest.entrypoint
+        ));
     }
     #[cfg(unix)]
     {
@@ -422,7 +453,12 @@ fn validate_tree(staging: &Path, manifest: &Manifest) -> Result<String, String> 
         std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("{}: {error}", entry.display()))?;
     }
-    entry_digest.ok_or_else(|| format!("the entrypoint {} is not in SHA256SUMS", manifest.entrypoint))
+    entry_digest.ok_or_else(|| {
+        format!(
+            "the entrypoint {} is not in SHA256SUMS",
+            manifest.entrypoint
+        )
+    })
 }
 
 /// Unpack a `.tar.gz` into staging, with a listing pass that refuses anything that could climb or link
@@ -441,11 +477,7 @@ pub fn install_tar(state: &Path, archive: &Path) -> Result<(PathBuf, Manifest), 
     }
     for name in names.lines() {
         let name = name.trim();
-        if name.is_empty()
-            || name.starts_with('/')
-            || name.contains("..")
-            || name.contains('\\')
-        {
+        if name.is_empty() || name.starts_with('/') || name.contains("..") || name.contains('\\') {
             return Err(format!("the archive names {name:?}, which is refused"));
         }
     }
@@ -613,9 +645,7 @@ mod tests {
         };
         std::fs::write(
             dir.join("SHA256SUMS"),
-            format!(
-                "{digest}  bin/test\n{readme}  README.md\n{manifest_digest}  connector.json\n"
-            ),
+            format!("{digest}  bin/test\n{readme}  README.md\n{manifest_digest}  connector.json\n"),
         )
         .expect("sums");
         std::fs::write(dir.join("connector.json"), manifest_text).expect("manifest");

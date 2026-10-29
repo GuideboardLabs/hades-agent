@@ -45,7 +45,11 @@ impl Chat {
     /// The name a person reads in the ledger: the built-in surface keeps its old name so the record stays
     /// continuous, and a connector reports its own id.
     pub fn surface_name(&self) -> &str {
-        if self.surface == "tg" { "telegram" } else { &self.surface }
+        if self.surface == "tg" {
+            "telegram"
+        } else {
+            &self.surface
+        }
     }
 
     pub fn id(&self) -> &str {
@@ -132,7 +136,10 @@ mod tests {
         assert_eq!(old, Chat::telegram(42));
         let new: Chat = serde_json::from_str("\"discord-1180\"").expect("a key");
         assert_eq!(new, Chat::new("discord", "1180"));
-        assert_eq!(serde_json::to_string(&new).expect("written"), "\"discord-1180\"");
+        assert_eq!(
+            serde_json::to_string(&new).expect("written"),
+            "\"discord-1180\""
+        );
     }
 
     #[test]

@@ -123,13 +123,7 @@ pub fn render(prefix: &Path, home: &Path) -> Result<Units, String> {
 
 /// One unit for one installed connector. It is written next to the daemon's units rather than shipped
 /// inside the pack: a pack brings a binary, the install decides how it is supervised.
-pub fn connector_unit(
-    id: &str,
-    binary: &Path,
-    config: &Path,
-    state: &Path,
-    home: &Path,
-) -> String {
+pub fn connector_unit(id: &str, binary: &Path, config: &Path, state: &Path, home: &Path) -> String {
     format!(
         "[Unit]\n\
          Description=Hades connector: {id}\n\

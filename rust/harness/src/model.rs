@@ -580,7 +580,13 @@ impl OpenAi {
                 .get("content")
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
-                .unwrap_or_else(|| message.get("content").cloned().unwrap_or_default().to_string())
+                .unwrap_or_else(|| {
+                    message
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_string()
+                })
         };
         match self.mode {
             crate::provider::ApiMode::ChatCompletions => {
@@ -733,15 +739,24 @@ impl OpenAi {
         let usage = parsed.get("usage").cloned().unwrap_or_default();
         let (prompt, generated) = match self.mode {
             crate::provider::ApiMode::ChatCompletions => (
-                usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 usage
                     .get("completion_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
             ),
             _ => (
-                usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
             ),
         };
         Usage {
@@ -1020,7 +1035,11 @@ fn cached_of(usage: &serde_json::Value) -> u64 {
     usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(serde_json::Value::as_u64)
-        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            usage
+                .get("prompt_cache_hit_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
         .unwrap_or(0)
 }
 
@@ -1186,7 +1205,8 @@ impl OpenAi {
         if self.mode != crate::provider::ApiMode::ChatCompletions {
             let user = self.user_text(task, bundle, budget);
             let messages = [serde_json::json!({ "role": "user", "content": user })];
-            let (parsed, usage) = self.plain_call(Some(&self.system), &messages, self.max_tokens)?;
+            let (parsed, usage) =
+                self.plain_call(Some(&self.system), &messages, self.max_tokens)?;
             let content = self.plain_text(&parsed).unwrap_or_default();
             let mut program = extract(&content);
             if program.trim().is_empty()
@@ -1533,10 +1553,7 @@ fn one_for_config(config: &crate::config::Config, name: &str) -> Result<OpenAi, 
     let mut known = config.providers.known();
     known.extend(config.endpoints.keys().cloned());
     known.extend(presets().iter().map(|preset| preset.id.to_string()));
-    Err(format!(
-        "no model named `{name}`: try {}",
-        known.join(", ")
-    ))
+    Err(format!("no model named `{name}`: try {}", known.join(", ")))
 }
 
 /// A provider named in a surface's config instead of a preset, so a connector can answer through a
@@ -1597,7 +1614,10 @@ mod tests {
 
     /// A one-shot HTTP server: each entry is the response body, and every request it saw comes back so a
     /// test can assert what was actually sent.
-    fn stub(codes: Vec<u16>, bodies: Vec<&'static str>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    fn stub(
+        codes: Vec<u16>,
+        bodies: Vec<&'static str>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         let address = format!("http://{}", listener.local_addr().expect("an address"));
@@ -1658,11 +1678,15 @@ mod tests {
     fn an_anthropic_call_puts_the_system_prompt_beside_the_turns_and_reads_content_blocks() {
         let (address, server) = stub(
             vec![200],
-            vec![r#"{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"output_tokens":2}}"#],
+            vec![
+                r#"{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"output_tokens":2}}"#,
+            ],
         );
         let client = OpenAi::new(format!("{address}/v1/messages"), "claude-x")
             .with_mode(crate::provider::ApiMode::AnthropicMessages);
-        let completion = client.complete("be brief", "hello", &Budget::new(8192)).expect("an answer");
+        let completion = client
+            .complete("be brief", "hello", &Budget::new(8192))
+            .expect("an answer");
         assert_eq!(completion.text, "ok");
         let request = server.join().expect("the server");
         let sent = &request[0];
@@ -1677,11 +1701,15 @@ mod tests {
     fn a_responses_call_reads_output_text_and_still_puts_the_system_prompt_first() {
         let (address, server) = stub(
             vec![200],
-            vec![r#"{"output":[{"content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#],
+            vec![
+                r#"{"output":[{"content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}"#,
+            ],
         );
         let client = OpenAi::new(format!("{address}/v1/responses"), "gpt-x")
             .with_mode(crate::provider::ApiMode::Responses);
-        let completion = client.complete("be brief", "hello", &Budget::new(8192)).expect("an answer");
+        let completion = client
+            .complete("be brief", "hello", &Budget::new(8192))
+            .expect("an answer");
         assert_eq!(completion.text, "ok");
         let request = server.join().expect("the server");
         let sent = &request[0];
@@ -1695,7 +1723,9 @@ mod tests {
         let (first, first_server) = stub(vec![500], vec![r#"{"error":{"message":"down"}}"#]);
         let (second, second_server) = stub(
             vec![200],
-            vec![r#"{"content":[{"type":"text","text":"answered by the backup"}],"usage":{"input_tokens":1,"output_tokens":1}}"#],
+            vec![
+                r#"{"content":[{"type":"text","text":"answered by the backup"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            ],
         );
         let dir = std::env::temp_dir().join(format!("hades-chain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a dir");
@@ -1711,9 +1741,7 @@ mod tests {
             ),
         )
         .expect("write");
-        let config = crate::config::load(&path)
-            .expect("load")
-            .expect("a config");
+        let config = crate::config::load(&path).expect("load").expect("a config");
         assert_eq!(config.fallbacks, vec!["backup/m".to_string()]);
         let client = client_for_config(&config, "primary/m").expect("a client");
         let completion = client
@@ -1726,23 +1754,28 @@ mod tests {
 
     #[test]
     fn a_failed_provider_is_followed_by_the_next_one_in_the_chain() {
-        let (first, first_server) = stub(vec![500], vec![r#"{"error":{"message":"upstream is down"}}"#]);
+        let (first, first_server) = stub(
+            vec![500],
+            vec![r#"{"error":{"message":"upstream is down"}}"#],
+        );
         let (second, second_server) = stub(
             vec![200],
-            vec![r#"{"content":[{"type":"text","text":"from the fallback"}],"usage":{"input_tokens":4,"output_tokens":2}}"#],
+            vec![
+                r#"{"content":[{"type":"text","text":"from the fallback"}],"usage":{"input_tokens":4,"output_tokens":2}}"#,
+            ],
         );
         let primary = OpenAi::new(format!("{first}/v1/messages"), "primary")
             .with_mode(crate::provider::ApiMode::AnthropicMessages);
         let backup = OpenAi::new(format!("{second}/v1/messages"), "backup")
             .with_mode(crate::provider::ApiMode::AnthropicMessages);
         let client = primary.with_fallbacks(vec![backup]);
-        let completion = client.complete("be brief", "hello", &Budget::new(8192)).expect("the second answers");
+        let completion = client
+            .complete("be brief", "hello", &Budget::new(8192))
+            .expect("the second answers");
         assert_eq!(completion.text, "from the fallback");
         first_server.join().expect("first");
         second_server.join().expect("second");
     }
-
-
 
     #[test]
     fn a_fenced_answer_is_unwrapped() {
@@ -2076,7 +2109,11 @@ mod tests {
     #[test]
     fn every_preset_says_where_it_goes_and_only_the_cloud_ones_ship() {
         let all = presets();
-        assert_eq!(all.len(), 2, "the cloud presets; local models live in `endpoints`");
+        assert_eq!(
+            all.len(),
+            2,
+            "the cloud presets; local models live in `endpoints`"
+        );
         assert_eq!(all.iter().filter(|p| p.key.is_some()).count(), 2);
         for preset in &all {
             assert!(preset.endpoint.starts_with("http"), "{}", preset.id);
@@ -2170,7 +2207,8 @@ impl OpenAi {
         if let Some(key) = &self.key {
             headers.push(("Authorization", format!("Bearer {}", key.resolve()?)));
         }
-        let mut last_fault = String::from("the endpoint streamed neither an answer nor a tool call");
+        let mut last_fault =
+            String::from("the endpoint streamed neither an answer nor a tool call");
         for attempt in 0..3u32 {
             if attempt > 0 {
                 let wait = if attempt == 1 { 1_000 } else { 3_000 };
@@ -2312,8 +2350,16 @@ impl OpenAi {
                 let transient = {
                     let text = last_fault.to_lowercase();
                     [
-                        "429", "500", "502", "503", "504", "overload", "rate limit", "timeout",
-                        "temporar", "try again",
+                        "429",
+                        "500",
+                        "502",
+                        "503",
+                        "504",
+                        "overload",
+                        "rate limit",
+                        "timeout",
+                        "temporar",
+                        "try again",
                     ]
                     .iter()
                     .any(|needle| text.contains(needle))

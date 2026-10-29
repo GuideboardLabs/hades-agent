@@ -289,7 +289,10 @@ mod tests {
             at: 0,
             error: "endpoint refused".to_string(),
         };
-        assert_eq!(step(&job_until(now - 60, "2026-10-24"), Some(&pending), now), None);
+        assert_eq!(
+            step(&job_until(now - 60, "2026-10-24"), Some(&pending), now),
+            None
+        );
     }
 
     #[test]
@@ -303,7 +306,8 @@ mod tests {
             at: 0,
             error: "endpoint refused".to_string(),
         };
-        let next = step(&job_until(now - 60, "2026-10-24"), Some(&pending), now).expect("the retry");
+        let next =
+            step(&job_until(now - 60, "2026-10-24"), Some(&pending), now).expect("the retry");
         assert_eq!(next.attempt, 2);
         assert_eq!(next.window, "2@1");
     }
@@ -328,7 +332,10 @@ mod tests {
         .expect("the pending try");
         let reread = read(&state, 2).expect("persisted across the restart");
         let now = start + 86_400 + 60;
-        assert_eq!(step(&job_until(now - 60, "2026-10-24"), Some(&reread), now), None);
+        assert_eq!(
+            step(&job_until(now - 60, "2026-10-24"), Some(&reread), now),
+            None
+        );
     }
 
     #[test]

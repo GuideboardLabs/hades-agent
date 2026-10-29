@@ -118,9 +118,7 @@ impl Settings {
     pub fn effective(&self, chat: &Chat) -> Effective {
         let channel = self.channels.get(chat.id());
         let pick = |field: fn(&Channel) -> Option<String>, base: &str| {
-            channel
-                .and_then(field)
-                .unwrap_or_else(|| base.to_string())
+            channel.and_then(field).unwrap_or_else(|| base.to_string())
         };
         Effective {
             mode: channel.and_then(|c| c.mode).unwrap_or(self.mode),
@@ -158,7 +156,10 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     let value: Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     let (section, name) = if surface == "tg" {
-        (value.pointer("/gateway/telegram").cloned(), "gateway.telegram".to_string())
+        (
+            value.pointer("/gateway/telegram").cloned(),
+            "gateway.telegram".to_string(),
+        )
     } else {
         (
             value
@@ -281,19 +282,26 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             .unwrap_or(240)
             .clamp(40, 5_000),
     });
-    let provider = section.get("provider").filter(|value| value.is_object()).cloned();
+    let provider = section
+        .get("provider")
+        .filter(|value| value.is_object())
+        .cloned();
     let providers = crate::provider::Registry::parse(value.get("providers"), path)?;
     let fallbacks = match value.get("fallback_providers") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => {
             let mut names = Vec::new();
             for item in items {
-                let name = item.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| {
-                    format!(
-                        "{}: `fallback_providers` holds something that is not a name",
-                        path.display()
-                    )
-                })?;
+                let name = item
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "{}: `fallback_providers` holds something that is not a name",
+                            path.display()
+                        )
+                    })?;
                 // A fallback nobody can resolve is a link the owner believes is there.
                 if crate::model::preset(name).is_none()
                     && !value
@@ -312,7 +320,12 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             }
             names
         }
-        Some(_) => return Err(format!("{}: `fallback_providers` is a list", path.display())),
+        Some(_) => {
+            return Err(format!(
+                "{}: `fallback_providers` is a list",
+                path.display()
+            ));
+        }
     };
     let endpoints = value
         .get("endpoints")
@@ -360,8 +373,9 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         let mode = match word.trim().to_ascii_lowercase().as_str() {
             "chat" => crate::mode::Mode::Chat,
             "work" => crate::mode::Mode::Act,
-            other => crate::mode::Mode::parse(other)
-                .ok_or_else(|| format!("{owner}: `mode` is {other:?}; say chat, work, read, plan or act"))?,
+            other => crate::mode::Mode::parse(other).ok_or_else(|| {
+                format!("{owner}: `mode` is {other:?}; say chat, work, read, plan or act")
+            })?,
         };
         Ok(Some(mode))
     };
@@ -372,12 +386,17 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     } else {
         crate::mode::Mode::Chat
     };
-    let mode = parse_mode(section.get("mode").unwrap_or(&Value::Null), &format!("{name}.mode"))?
-        .unwrap_or(default_mode);
+    let mode = parse_mode(
+        section.get("mode").unwrap_or(&Value::Null),
+        &format!("{name}.mode"),
+    )?
+    .unwrap_or(default_mode);
     let mut channels = std::collections::HashMap::new();
     if let Some(map) = section.get("channels") {
         let Some(map) = map.as_object() else {
-            return Err(format!("{name}.channels must be an object of channel id -> settings"));
+            return Err(format!(
+                "{name}.channels must be an object of channel id -> settings"
+            ));
         };
         for (id, entry) in map {
             let owner = format!("{name}.channels.{id}");
@@ -400,7 +419,10 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             channels.insert(
                 id.clone(),
                 Channel {
-                    mode: parse_mode(body.get("mode").unwrap_or(&Value::Null), &format!("{owner}.mode"))?,
+                    mode: parse_mode(
+                        body.get("mode").unwrap_or(&Value::Null),
+                        &format!("{owner}.mode"),
+                    )?,
                     policy,
                     verify: text("verify"),
                     root: text("root"),
@@ -916,11 +938,14 @@ fn follow<T: Transport + Clone + Send + 'static>(
                 asked = true;
                 match pending_save(state, id, goal, session) {
                     Ok(()) => {
-                        let text = clip(&format!(
-                            "<b>Permission needed</b>\n{}\n<i>{}</i>",
-                            pre(action),
-                            esc(reason)
-                        ), transport.limit());
+                        let text = clip(
+                            &format!(
+                                "<b>Permission needed</b>\n{}\n<i>{}</i>",
+                                pre(action),
+                                esc(reason)
+                            ),
+                            transport.limit(),
+                        );
                         if !transport.buttons() {
                             // A surface with no buttons cannot answer this question. Saying so and stopping
                             // is better than parking a run behind a prompt that can never be pressed; the
@@ -1124,14 +1149,17 @@ fn render_status(loading: &Loading, seconds: f64, limit: usize) -> String {
     let span = loading.span.clamp(1, 20);
     let step = (seconds * 1000.0 / loading.step_ms.max(40) as f64).floor() as i64;
     let cycle = (step % (span as i64 * 2)) as i64;
-    let at = if cycle <= span as i64 { cycle } else { span as i64 * 2 - cycle } as usize;
+    let at = if cycle <= span as i64 {
+        cycle
+    } else {
+        span as i64 * 2 - cycle
+    } as usize;
     // Non-breaking spaces: Discord trims and collapses ordinary runs at the edges, which would
     // freeze the animation on the first frame.
     let pad = "\u{00a0}".repeat(at);
     let after = "\u{00a0}".repeat(span.saturating_sub(at));
     clip(&format!("{pad}{}{after}", loading.glyph), limit)
 }
-
 
 /// How a surface animates "still working". The glyph moves across `span` slots and back, so the
 /// message never has to show the model's own words to prove it is alive. Defaults are the skull
@@ -1292,10 +1320,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
         eprintln!("compression: not written, {fault}");
     }
     let limit = transport.limit();
-    let loading = settings
-        .loading
-        .clone()
-        .unwrap_or_else(Loading::default);
+    let loading = settings.loading.clone().unwrap_or_else(Loading::default);
     let id = transport.send(&update.chat, &render_status(&loading, 0.0, limit), &[])?;
     let stop = Arc::new(AtomicBool::new(false));
     // See `relay`: the claim is made once on this thread before the ticker owns it.
@@ -1312,9 +1337,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
             while !stop.load(Ordering::SeqCst) {
                 let _ = beat.typing(&chat_id);
                 let due = last.is_none_or(|when| when.elapsed().as_millis() as u64 >= beat_ms);
-                if due
-                    && let Some(message) = id
-                {
+                if due && let Some(message) = id {
                     let text = render_status(&loading, started.elapsed().as_secs_f64(), limit);
                     let _ = beat.edit(&chat_id, message, &text, &[]);
                     last = Some(Instant::now());
@@ -1522,7 +1545,15 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     let text = update.text.trim();
     if !text.starts_with('/') {
         let halt = signals.flag(&update.chat);
-        return chat(update, settings, &effective, state, transport, halt.as_deref(), mcp);
+        return chat(
+            update,
+            settings,
+            &effective,
+            state,
+            transport,
+            halt.as_deref(),
+            mcp,
+        );
     }
     match command(text) {
         ("/help", _) => {
@@ -1569,7 +1600,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or(0);
-            transport.send(&update.chat,
+            transport.send(
+                &update.chat,
                 &format!("<b>{sessions}</b> session(s), <b>{waiting}</b> question(s) waiting"),
                 &[],
             )?;
@@ -1591,7 +1623,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                 Ok(response) => response,
                 Err(said) => {
                     // A stop with no daemon to stop is not a stop. Say that, not "the answer failed".
-                    transport.send(&update.chat,
+                    transport.send(
+                        &update.chat,
                         &format!("<b>Could not stop.</b> {}", esc(&said)),
                         &[],
                     )?;
@@ -1603,7 +1636,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("the daemon refused the stop");
-                transport.send(&update.chat,
+                transport.send(
+                    &update.chat,
                     &format!("<b>Could not stop.</b> {}", esc(said)),
                     &[],
                 )?;
@@ -1649,7 +1683,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             let id = match job.trim().parse::<u64>() {
                 Ok(id) => id,
                 Err(_) => {
-                    transport.send(&update.chat,
+                    transport.send(
+                        &update.chat,
                         "That command needs a job number, as in <code>/cancel 3</code>.",
                         &[],
                     )?;
@@ -1678,7 +1713,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             let response = match ask(socket, &json!({"op": "shutdown", "by": by})) {
                 Ok(response) => response,
                 Err(said) => {
-                    transport.send(&update.chat,
+                    transport.send(
+                        &update.chat,
                         &format!("<b>Could not shut down.</b> {}", esc(&said)),
                         &[],
                     )?;
@@ -1690,7 +1726,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("the daemon refused the shutdown");
-                transport.send(&update.chat,
+                transport.send(
+                    &update.chat,
                     &format!("<b>Could not shut down.</b> {}", esc(said)),
                     &[],
                 )?;
@@ -1745,7 +1782,8 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             Ok(())
         }
         (unknown, _) => {
-            transport.send(&update.chat,
+            transport.send(
+                &update.chat,
                 &format!("There is no command called {}. Send /help.", esc(unknown)),
                 &[],
             )?;
@@ -1817,7 +1855,8 @@ fn scheduler<T: Transport + Clone + Send + 'static>(
             }
             match result {
                 Ok(text) => {
-                    if let Err(said) = transport.send(&job.chat,
+                    if let Err(said) = transport.send(
+                        &job.chat,
                         &format!("<b>{headline}</b>\n\n{}", esc(&text)),
                         &[],
                     ) {
@@ -1834,7 +1873,8 @@ fn scheduler<T: Transport + Clone + Send + 'static>(
                             eprintln!("cron: job {}: could not schedule a retry: {error}", job.id);
                         }
                     } else {
-                        if let Err(error) = transport.send(&job.chat,
+                        if let Err(error) = transport.send(
+                            &job.chat,
                             &format!(
                                 "<b>{headline}</b>\n\nAfter {} attempts this job failed: {}",
                                 step.attempt,
@@ -2164,7 +2204,9 @@ impl Runtime {
                 let socket = socket.clone();
                 let mcp = Arc::clone(&mcp);
                 let signals = Arc::clone(&signals);
-                std::thread::spawn(move || heartbeat(worker, settings, state, socket, mcp, signals));
+                std::thread::spawn(move || {
+                    heartbeat(worker, settings, state, socket, mcp, signals)
+                });
             }
         }
         Ok(Runtime {
@@ -2377,7 +2419,10 @@ mod tests {
         )
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
-        assert_eq!(settings.effective(&Chat::new("discord", "1")).mode, crate::mode::Mode::Chat);
+        assert_eq!(
+            settings.effective(&Chat::new("discord", "1")).mode,
+            crate::mode::Mode::Chat
+        );
         let work = settings.effective(&Chat::new("discord", "99"));
         assert_eq!(work.mode, crate::mode::Mode::Act);
         assert_eq!(work.verify, "cargo test --quiet");
@@ -2399,9 +2444,15 @@ mod tests {
         // It moves on the beat, and the padding is non-breaking so Discord keeps it.
         let second = render_status(&face, 0.30, 1900);
         assert_ne!(first, second);
-        assert!(second.starts_with('\u{00a0}') && second.contains('💀'), "{second}");
+        assert!(
+            second.starts_with('\u{00a0}') && second.contains('💀'),
+            "{second}"
+        );
         // Ping-pong: the glyph comes back to the first slot rather than wrapping around.
-        assert_eq!(render_status(&face, 0.0, 1900), render_status(&face, 2.40, 1900));
+        assert_eq!(
+            render_status(&face, 0.0, 1900),
+            render_status(&face, 2.40, 1900)
+        );
         // No word of the model's own making is in it.
         assert!(!first.contains("thinking") && !first.contains("reasoning"));
     }
@@ -2491,9 +2542,15 @@ mod tests {
         )
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
-        assert_eq!(settings.prompt.as_deref(), Some("You are the Discord plugin."));
+        assert_eq!(
+            settings.prompt.as_deref(),
+            Some("You are the Discord plugin.")
+        );
         let loading = settings.loading.clone().expect("a loading animation");
-        assert_eq!((loading.glyph.as_str(), loading.span, loading.step_ms), ("🕯️", 3, 400));
+        assert_eq!(
+            (loading.glyph.as_str(), loading.span, loading.step_ms),
+            ("🕯️", 3, 400)
+        );
         let provider = settings.provider.clone().expect("a provider");
         assert_eq!(provider["model"], "local-9b");
         assert!(crate::model::from_config(&provider).is_ok());
@@ -2593,7 +2650,14 @@ mod tests {
         );
         assert_eq!(read.mode, crate::mode::Mode::Read);
         assert_eq!(read.chat, Chat::telegram(7));
-        let act = world_for(&settings(), state, Chat::telegram(8), crate::mode::Mode::Act, "job:2", &mcp);
+        let act = world_for(
+            &settings(),
+            state,
+            Chat::telegram(8),
+            crate::mode::Mode::Act,
+            "job:2",
+            &mcp,
+        );
         assert_eq!(act.mode, crate::mode::Mode::Act);
         assert_eq!(act.actor, "job:2");
         assert!(act.mode.acts());
@@ -2719,7 +2783,10 @@ mod tests {
     #[test]
     fn a_chat_answer_makes_the_heartbeat_see_the_session_as_busy() {
         let signals = Signals::default();
-        assert!(!signals.busy(&Chat::telegram(7)), "an idle chat is not busy");
+        assert!(
+            !signals.busy(&Chat::telegram(7)),
+            "an idle chat is not busy"
+        );
         let lock = signals.lock(&Chat::telegram(7));
         let _held = lock.lock().expect("the chat lock");
         assert!(
@@ -2815,7 +2882,11 @@ mod tests {
 
         save_chat(&dir, &chat, &history);
         assert!(
-            dir.join("gateway").join("tg").join("chat").join("7.json").exists(),
+            dir.join("gateway")
+                .join("tg")
+                .join("chat")
+                .join("7.json")
+                .exists(),
             "a save goes to the surface path"
         );
         assert!(

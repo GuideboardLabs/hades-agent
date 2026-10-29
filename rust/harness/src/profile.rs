@@ -566,7 +566,10 @@ mod tests {
             "deepseek-v4.1-flash"
         );
         verify.model = Some("deepseek-v4.1-flash".to_string());
-        assert_eq!(verify.model_or("deepseek-v4.1-flash"), "deepseek-v4.1-flash");
+        assert_eq!(
+            verify.model_or("deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
         assert!(!verify.edits);
     }
 

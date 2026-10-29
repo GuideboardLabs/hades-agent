@@ -207,6 +207,16 @@ and, when present, `tool_guidance.md`. A case writes `case.json` and its pinned 
 is checked again at plan time. `--network`, `--writes vault|state`, `--requires-role` and
 `--requires-tool` are declared, not inferred, and a selector-less export is refused.
 
+`hades pack check` is the machine pass, and it is read-only too. A pack may declare
+`requires.assumptions`: claims about the host it was written on, each naming a check, an optional
+scalar argument, a severity and the remedy if the claim is false. The machine is read once, every
+claim is decided against that snapshot, and a false one prints what this host actually is beside what
+the pack assumed. `hard` means the pack's results mean nothing until it is settled; `soft` means
+translate the advice and carry on. Exit 0 when every hard claim holds, 3 when one does not, 4 when a
+claim could not be decided here. An unknown check name is undecided, never a pass. A pack that
+declares no assumptions still installs, and the report says it declared none, because that is the
+older and weaker contract.
+
 `hades pack inspect` is read-only: manifest, item counts, uncompressed bytes, archive hash, signature
 status, and warnings for network or vault writes. `hades pack plan` is also read-only: each item is
 `new`, `duplicate`, `conflict`, `redundant` or `incompatible` against the live catalog. Identity and

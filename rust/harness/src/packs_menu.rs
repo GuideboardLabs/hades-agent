@@ -60,10 +60,7 @@ impl Row {
         };
         format!(
             "{:<26} {:<22} {:<10} {}",
-            self.id,
-            kind,
-            self.version,
-            self.summary
+            self.id, kind, self.version, self.summary
         )
     }
 }

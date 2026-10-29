@@ -32,7 +32,8 @@ impl Lease {
     pub fn take(state: &Path, surface: &str) -> Result<Lease, String> {
         let path = state.join("gateway").join("owner.json");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
         }
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(value) = serde_json::from_str::<Value>(&text)
@@ -98,7 +99,8 @@ mod tests {
         let _held = Lease::take(&dir, "telegram").expect("the first lease");
         // The record names this process, which is treated as ours; a foreign live pid is what refuses.
         let record = json!({"pid": 1, "token": "other", "surface": "discord"});
-        std::fs::write(dir.join("gateway").join("owner.json"), record.to_string()).expect("a record");
+        std::fs::write(dir.join("gateway").join("owner.json"), record.to_string())
+            .expect("a record");
         let refused = Lease::take(&dir, "telegram").expect_err("a live owner");
         assert!(refused.contains("already owns this state"), "{refused}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -108,7 +110,8 @@ mod tests {
     fn a_dead_owner_is_replaced_and_a_released_lease_is_removed() {
         let dir = state("replaced");
         let record = json!({"pid": 999_999_999_u64, "token": "gone", "surface": "telegram"});
-        std::fs::write(dir.join("gateway").join("owner.json"), record.to_string()).expect("a record");
+        std::fs::write(dir.join("gateway").join("owner.json"), record.to_string())
+            .expect("a record");
         let held = Lease::take(&dir, "discord").expect("a dead owner is not an owner");
         assert!(dir.join("gateway").join("owner.json").exists());
         drop(held);

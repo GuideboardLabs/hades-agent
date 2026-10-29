@@ -30,8 +30,12 @@ pub enum ApiMode {
 impl ApiMode {
     fn parse(text: &str) -> Result<Self, String> {
         match text {
-            "chat_completions" | "chat-completions" | "openai" | "chat" => Ok(Self::ChatCompletions),
-            "anthropic_messages" | "anthropic" | "messages" | "claude" => Ok(Self::AnthropicMessages),
+            "chat_completions" | "chat-completions" | "openai" | "chat" => {
+                Ok(Self::ChatCompletions)
+            }
+            "anthropic_messages" | "anthropic" | "messages" | "claude" => {
+                Ok(Self::AnthropicMessages)
+            }
             "responses" | "openai_responses" | "codex" => Ok(Self::Responses),
             other => Err(format!(
                 "api_mode `{other}` is not one this build speaks; say chat_completions, \
@@ -174,12 +178,9 @@ impl Registry {
 
 impl Provider {
     fn parse(id: &str, value: &Value, path: &Path) -> Result<Self, String> {
-        let object = value.as_object().ok_or_else(|| {
-            format!(
-                "{}: `providers.{id}` is not an object",
-                path.display()
-            )
-        })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("{}: `providers.{id}` is not an object", path.display()))?;
         let base_url = object
             .get("base_url")
             .and_then(Value::as_str)
@@ -200,9 +201,8 @@ impl Provider {
         }
         let api_mode = match object.get("api_mode") {
             None => ApiMode::ChatCompletions,
-            Some(Value::String(text)) => ApiMode::parse(text).map_err(|said| {
-                format!("{}: `providers.{id}.{said}`", path.display())
-            })?,
+            Some(Value::String(text)) => ApiMode::parse(text)
+                .map_err(|said| format!("{}: `providers.{id}.{said}`", path.display()))?,
             Some(other) => {
                 return Err(format!(
                     "{}: `providers.{id}.api_mode` is {other}; it is a string",
