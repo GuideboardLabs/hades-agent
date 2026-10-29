@@ -133,10 +133,18 @@ WRAPPER
 # The series binary, not the generic name: `aarch64-linux-gnu-gcc` belongs to the meta package and points at
 # whichever series that package's own version chose, which is a dangling link whenever the series differs.
 # The staged library path comes first so `cc1` finds the same libisl the driver was staged with.
+#
+# `-fuse-ld=bfd` is appended last, after the caller's arguments, because gcc takes the last `-fuse-ld` and
+# rustc asks for lld: it passes `-fuse-ld=lld` plus a `-B` at `lib/rustlib/<host>/bin/gcc-ld`, which is where
+# its own `ld.lld` lives. lld resolves library search paths against `--sysroot` but not the absolute paths
+# inside a linker script, and Debian 11's `libc.so` is one: `GROUP ( /lib/aarch64-linux-gnu/libc.so.6 ... )`
+# made it look for that path on the build host and the link died with `cannot open
+# /lib/aarch64-linux-gnu/libc.so.6`. GNU ld, which the staged binutils ships and this wrapper names, prefixes
+# those paths with the sysroot. A staged toolchain links with the linker it staged.
 cat > "$PREFIX/bin/cc" <<WRAPPER
 #!/bin/sh
 exec env LD_LIBRARY_PATH=$PREFIX/root/usr/lib/x86_64-linux-gnu:$PREFIX/root/lib/x86_64-linux-gnu \\
-    $GCC_BIN --sysroot=\${HADES_CROSS_SYSROOT:-$PREFIX/root} -B$PREFIX/bin "\$@"
+    $GCC_BIN --sysroot=\${HADES_CROSS_SYSROOT:-$PREFIX/root} -B$PREFIX/bin "\$@" -fuse-ld=bfd
 WRAPPER
 
 chmod +x "$PREFIX/bin/as" "$PREFIX/bin/ar" "$PREFIX/bin/cc"
