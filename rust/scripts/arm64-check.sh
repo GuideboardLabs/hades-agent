@@ -47,19 +47,49 @@ if [ -z "$QEMU" ]; then
     QEMU=$(command -v qemu-aarch64-static)
   elif [ -x "$PREFIX/qemu/usr/bin/qemu-aarch64-static" ]; then
     QEMU="$PREFIX/qemu/usr/bin/qemu-aarch64-static"
+  elif command -v qemu-aarch64 >/dev/null 2>&1; then
+    # A workstation that installed the distro's `qemu-user` has the dynamically linked binary and no `-static`
+    # one. It runs an ARM64 file just as well; only a chroot needs the static build.
+    QEMU=$(command -v qemu-aarch64)
   fi
 fi
 if [ -z "$QEMU" ] && command -v apt-get >/dev/null 2>&1; then
+  # Ubuntu 26.04 dropped `qemu-user-static` (no candidate at all), and its `qemu-user` package ships only the
+  # dynamically linked `qemu-aarch64`, which drags in `ubuntu-virt`. So the distribution is asked first and
+  # Debian answers when it cannot: the same `Packages` lookup and `dpkg-deb -x` the sysroot staging uses, which
+  # needs no root and no binfmt registration.
   mkdir -p "$PREFIX/qemu" "$PREFIX/qemu-debs"
-  if (cd "$PREFIX/qemu-debs" && apt-get download qemu-user-static >/dev/null 2>&1); then
-    for deb in "$PREFIX"/qemu-debs/qemu-user-static_*.deb; do
-      dpkg-deb -x "$deb" "$PREFIX/qemu" >/dev/null 2>&1 || true
-    done
-    [ -x "$PREFIX/qemu/usr/bin/qemu-aarch64-static" ] && QEMU="$PREFIX/qemu/usr/bin/qemu-aarch64-static"
+  (cd "$PREFIX/qemu-debs" && apt-get download qemu-user-static >"$PREFIX/qemu-debs/apt.log" 2>&1) || true
+  for deb in "$PREFIX"/qemu-debs/qemu-user-static_*.deb; do
+    [ -f "$deb" ] || continue
+    dpkg-deb -x "$deb" "$PREFIX/qemu" >/dev/null 2>&1 || true
+  done
+  [ -x "$PREFIX/qemu/usr/bin/qemu-aarch64-static" ] && QEMU="$PREFIX/qemu/usr/bin/qemu-aarch64-static"
+fi
+if [ -z "$QEMU" ] && command -v curl >/dev/null 2>&1; then
+  base=https://deb.debian.org/debian
+  index=$PREFIX/qemu-debs/Packages.gz
+  if curl -sSL --max-time 120 "$base/dists/bookworm/main/binary-amd64/Packages.gz" -o "$index"; then
+    file=$(gzip -dc "$index" | awk '
+      /^Package: / { name = $2 }
+      name == "qemu-user-static" && /^Filename: / { print $2; exit }
+    ')
+    if [ -n "$file" ]; then
+      deb=$PREFIX/qemu-debs/$(basename "$file")
+      if curl -sSL --max-time 180 "$base/$file" -o "$deb"; then
+        mkdir -p "$PREFIX/qemu"
+        dpkg-deb -x "$deb" "$PREFIX/qemu" >/dev/null 2>&1 || true
+        [ -x "$PREFIX/qemu/usr/bin/qemu-aarch64-static" ] && QEMU="$PREFIX/qemu/usr/bin/qemu-aarch64-static"
+      fi
+    fi
   fi
 fi
 if [ -z "$QEMU" ]; then
   if [ "$REQUIRE" -eq 1 ]; then
+    if [ -s "$PREFIX/qemu-debs/apt.log" ]; then
+      echo "the distribution had no static qemu:" >&2
+      head -n 2 "$PREFIX/qemu-debs/apt.log" >&2
+    fi
     fail "no qemu-aarch64-static and it could not be staged, so the ARM64 artifact was not run"
   fi
   echo "SKIP no qemu-aarch64-static on this machine; $BIN was not run"
