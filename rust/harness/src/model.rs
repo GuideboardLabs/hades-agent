@@ -2048,7 +2048,7 @@ mod tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let reply = client
-            .chat(&messages, None, &mut |_, _| {})
+            .chat(&messages, None, &|_, _| {})
             .expect("the second attempt answers");
         assert_eq!(reply.content, "ok");
         server.join().expect("server");
@@ -2091,7 +2091,7 @@ mod tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let reply = client
-            .chat_with_cap(&messages, None, 4_096, &mut |_, _| {})
+            .chat_with_cap(&messages, None, 4_096, &|_, _| {})
             .expect("the bigger cap answers");
         assert_eq!(reply.content, "ok");
         server.join().expect("server");
@@ -2147,7 +2147,7 @@ mod tests {
             {"type": "function", "function": {"name": "shell", "parameters": {"type": "object"}}}
         ]);
         let reply = client
-            .chat(&messages, Some(&tools), &mut |_, _| {})
+            .chat(&messages, Some(&tools), &|_, _| {})
             .expect("the forced call answers");
         assert_eq!(reply.calls.len(), 1);
         assert_eq!(reply.calls[0].name, "shell");

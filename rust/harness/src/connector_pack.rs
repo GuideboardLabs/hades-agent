@@ -169,8 +169,7 @@ impl Manifest {
 /// at spawn, where the error is a kernel message instead of a sentence.
 pub fn current_platform() -> String {
     let arch = match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
+        "x86_64" | "aarch64" => std::env::consts::ARCH,
         other => other,
     };
     format!("linux-{arch}")

@@ -160,7 +160,7 @@ impl Discord {
         match outcome {
             Ok(response) => {
                 let text = response.into_string().unwrap_or_default();
-                serde_json::from_str(&text).or_else(|_| Ok(Value::Null))
+                serde_json::from_str(&text).or(Ok(Value::Null))
             }
             Err(ureq::Error::Status(code, response)) => {
                 let text = response.into_string().unwrap_or_default();
@@ -406,7 +406,7 @@ fn read_gateway(inner: &Arc<Inner>, sender: &Sender<Update>) -> Result<(), Strin
                 if last_beat.elapsed() >= Duration::from_millis(interval) {
                     let beat = json!({"op": 1, "d": Value::Null});
                     socket
-                        .send(Message::Text(beat.to_string().into()))
+                        .send(Message::Text(beat.to_string()))
                         .map_err(|error| format!("heartbeat: {error}"))?;
                     last_beat = std::time::Instant::now();
                 }
@@ -432,7 +432,7 @@ fn identify(
         }
     });
     socket
-        .send(Message::Text(payload.to_string().into()))
+        .send(Message::Text(payload.to_string()))
         .map_err(|error| format!("identify: {error}"))?;
     Ok(())
 }
@@ -595,15 +595,14 @@ mod tests {
 
     fn inner() -> Arc<Inner> {
         let (_, receiver) = channel();
-        let inner = Arc::new(Inner {
+        Arc::new(Inner {
             token: "unused".to_string(),
             agent: ureq::AgentBuilder::new().build(),
             incoming: Mutex::new(receiver),
             guilds: Vec::new(),
             require_mention: true,
             me: Mutex::new(Some("42".to_string())),
-        });
-        inner
+        })
     }
 
     fn message(author: &str, content: &str, guild: Option<&str>) -> Value {

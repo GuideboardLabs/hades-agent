@@ -553,7 +553,7 @@ impl Signals {
     pub fn leave(&self, chat: &Chat, flag: &Arc<AtomicBool>) {
         let mut flags = self.flags.lock().unwrap_or_else(|held| held.into_inner());
         if flags.get(chat).is_some_and(|held| Arc::ptr_eq(held, flag)) {
-            flags.remove(&chat);
+            flags.remove(chat);
         }
     }
 
@@ -1148,7 +1148,7 @@ fn render_status(loading: &Loading, seconds: f64, limit: usize) -> String {
     // escaped tags end up in a Discord channel; an animation says "alive" without saying anything.
     let span = loading.span.clamp(1, 20);
     let step = (seconds * 1000.0 / loading.step_ms.max(40) as f64).floor() as i64;
-    let cycle = (step % (span as i64 * 2)) as i64;
+    let cycle = step % (span as i64 * 2);
     let at = if cycle <= span as i64 {
         cycle
     } else {
@@ -1320,7 +1320,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
         eprintln!("compression: not written, {fault}");
     }
     let limit = transport.limit();
-    let loading = settings.loading.clone().unwrap_or_else(Loading::default);
+    let loading = settings.loading.clone().unwrap_or_default();
     let id = transport.send(&update.chat, &render_status(&loading, 0.0, limit), &[])?;
     let stop = Arc::new(AtomicBool::new(false));
     // See `relay`: the claim is made once on this thread before the ticker owns it.
