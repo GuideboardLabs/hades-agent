@@ -54,8 +54,14 @@ if [ ! -x "$PREFIX/root/usr/bin/aarch64-linux-gnu-gcc" ]; then
     # `apt-get download` needs no privileges; `dpkg-deb -x` unpacks to a prefix we own. One package missing on
     # a newer image should be named and skipped, not take the whole step down before anything is compiled;
     # the check below is what decides whether the staging is usable.
+    # A fresh runner's package lists can be old enough that every download fails, and the old form of this
+    # loop swallowed the reason: the job then died on "the staged tree has no aarch64-linux-gnu-gcc" with no
+    # word about why. Refresh the lists when we are allowed to, and keep the last line of each failure.
+    sudo -n apt-get update -qq >/dev/null 2>&1 || apt-get update -qq >/dev/null 2>&1 || true
     (cd "$PREFIX/debs" && for package in $PACKAGES; do
-        apt-get download "$package" >/dev/null 2>&1 || echo "cross-check: $package is not in this image, skipping"
+        if ! apt-get download "$package" >"$package.log" 2>&1; then
+            echo "cross-check: apt-get download $package failed: $(tail -n 1 "$package.log" 2>/dev/null)"
+        fi
     done)
     for deb in "$PREFIX"/debs/*.deb; do
         [ -f "$deb" ] || continue
