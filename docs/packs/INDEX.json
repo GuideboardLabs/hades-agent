@@ -41,8 +41,8 @@
       "version": "0.1.1"
     },
     {
-      "archive": "dist/llama-cpp-pack-2.2.0.hadepack",
-      "bytes": 73639,
+      "archive": "dist/llama-cpp-pack-2.2.1.hadepack",
+      "bytes": 74290,
       "capabilities": {
         "code": false,
         "network": false,
@@ -77,10 +77,10 @@
       ],
       "license": "MIT",
       "requires_hades": ">=0.2.0,<0.3",
-      "sha256": "9eb672163084734ea539064453a8db07dba2f00dbe7dba325010404ad73d0379",
+      "sha256": "a322bd592cec5cfbdbda90c70625c083e7cea8746980526715915ba36b82f01b",
       "summary": "Take a GGUF from a file on disk to a tuned, pre-tested, served model on a consumer gaming GPU: probe the box, choose the backend by silicon, do the VRAM maths, tune, smoke-test and write the unit. `--choice` answers the other question, six intents with three seats each so speed and depth can be traded deliberately. Every number carries the measurement that produced it, and every tool refuses the action that would produce a lie.",
       "title": "llama.cpp serving",
-      "version": "2.2.0"
+      "version": "2.2.1"
     },
     {
       "archive": "dist/plan-a-change-1.0.1.hadepack",
