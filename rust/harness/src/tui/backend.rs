@@ -636,12 +636,56 @@ pub fn update_status() -> String {
         .filter(|o| o.status.success())
         .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
         .and_then(|v| v["sha"].as_str().map(str::to_string));
-    match remote {
-        Some(sha) if sha == env!("HADES_BUILD_REVISION") => "main · up to date".into(),
-        Some(sha) if !env!("HADES_BUILD_REVISION").is_empty() => {
-            format!("main differs · {}", sha.chars().take(7).collect::<String>())
-        }
-        Some(_) => "main · build revision unknown".into(),
-        None => "main · check unavailable".into(),
+    revision_status(remote.as_deref(), env!("HADES_BUILD_REVISION"))
+}
+
+/// What the check can honestly say about the remote head, given the revision this build was made from.
+///
+/// A **build with no revision** is a real state and not a missing one: `build.rs` asks git for the head and
+/// gets nothing when the tree has no `.git`, which is exactly the shape of a release tarball or a `git
+/// archive` export. The empty string is not a revision, so it is answered before any comparison is made;
+/// comparing against it reported every remote commit as a difference from a build that never knew its own.
+/// The four states are kept apart on purpose: a build that cannot know, a check that could not run, a head
+/// that matches, and a head that has moved.
+fn revision_status(remote: Option<&str>, revision: &str) -> String {
+    let Some(sha) = remote else {
+        return "main · check unavailable".into();
+    };
+    if revision.is_empty() {
+        return "main · build revision unknown".into();
+    }
+    if sha == revision {
+        "main · up to date".into()
+    } else {
+        format!("main differs · {}", sha.chars().take(7).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::revision_status;
+
+    /// The defect this exists for: a build made from an exported tree (`git archive`, a release tarball, a
+    /// copy with no `.git`) has no revision, because `build.rs` asks git and gets nothing. The check then
+    /// compared the remote head against the empty string, so every remote commit read as a change and the
+    /// status line said `main differs` for a build that could not know. The empty revision is a fourth
+    /// state and it says so.
+    #[test]
+    fn a_build_without_a_revision_says_so_instead_of_calling_every_commit_a_change() {
+        assert_eq!(
+            revision_status(Some("9f2c1ab"), ""),
+            "main · build revision unknown",
+            "a build with no revision claims to differ from every commit"
+        );
+        assert_eq!(
+            revision_status(Some("9f2c1ab"), "9f2c1ab"),
+            "main · up to date"
+        );
+        assert_eq!(
+            revision_status(Some("4d1e0c9"), "9f2c1ab"),
+            "main differs · 4d1e0c9"
+        );
+        assert_eq!(revision_status(None, "9f2c1ab"), "main · check unavailable");
+        assert_eq!(revision_status(None, ""), "main · check unavailable");
     }
 }
