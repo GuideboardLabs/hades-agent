@@ -916,7 +916,7 @@ pub fn answer_stoppable(
                     continue;
                 }
             }
-            let key = format!("{}:{}", call.name, call.arguments);
+            let key = call_key(&call.name, &call.arguments);
             // Read-only tools are not loops. After a trim the model may legitimately need the same
             // file again, and refusing the read leaves it no way to rebuild its working set.
             let guarded = repeat_guarded(&call.name);
@@ -1083,9 +1083,73 @@ fn repeats_refuse(count: u32) -> bool {
     count >= REPEATS
 }
 
+/// The key one call is counted under: the tool, and its arguments with the parts that change only where
+/// the output goes removed.
+///
+/// Both the guard above and the watchdog decide "the same call", and two answers to that question are one
+/// answer too many: the run that issued its test command fifty-five times was invisible because each
+/// invocation differed only in the pipe at the end. A command is therefore cut at the first pipe,
+/// redirection or input mark outside quotes, a lone file descriptor left behind by `2>&1` is dropped, and
+/// the rest is collapsed to single spaces.
+pub(crate) fn call_key(tool: &str, arguments: &str) -> String {
+    // The same shape `label` renders in the activity log, so one call reads the same everywhere.
+    format!("{tool}: {}", normalise(arguments))
+        .trim_end()
+        .to_string()
+}
+
+fn normalise(arguments: &str) -> String {
+    // The arguments arrive as a JSON object in the tool loop and as a program's own text from a session
+    // entry. Take the command out of the object when it holds one, so both shapes key the same way.
+    let text = match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => ["command", "program", "code", "cmd"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+            .map(str::to_string)
+            .unwrap_or_else(|| arguments.to_string()),
+        _ => arguments.to_string(),
+    };
+
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    for character in text.chars() {
+        match quote {
+            Some(open) => {
+                if character == open {
+                    quote = None;
+                }
+                out.push(character);
+            }
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    out.push(character);
+                }
+                '|' | '>' | '<' => break,
+                _ => out.push(character),
+            },
+        }
+    }
+
+    // `cmd 2>&1` leaves the descriptor behind when the redirect is cut. A trailing bare number is that
+    // descriptor, never part of the command: everything after the cut was about the output.
+    let trimmed = out.trim_end();
+    let kept = match trimmed.rsplit_once(char::is_whitespace) {
+        Some((before, last)) if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) => {
+            before
+        }
+        None if trimmed.chars().all(|c| c.is_ascii_digit()) => "",
+        _ => trimmed,
+    };
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Only mutating or expensive calls are loop-guarded. A repeat read after a context trim is how the
 /// model rebuilds what it lost; refusing it turns a trim into an infinite exploration loop.
-fn repeat_guarded(name: &str) -> bool {
+///
+/// The watchdog asks the same question for the opposite reason: a step this returns `false` for is one
+/// that looked at something, so a run of them is a run doing work rather than a run standing still.
+pub(crate) fn repeat_guarded(name: &str) -> bool {
     !matches!(
         name,
         "read_file"
@@ -4285,6 +4349,27 @@ mod tests {
         assert!(!repeats_refuse(2));
         assert!(repeats_refuse(3));
         assert!(repeats_refuse(4));
+    }
+
+    /// The guard counts a call by what it does, not by how it was typed. A run that piped its test
+    /// command to `tail -30`, then `tail -20`, then `head -40` made one call five times; keyed on the raw
+    /// arguments it made five, and the guard never fired.
+    #[test]
+    fn a_command_rephrased_in_its_tail_has_one_key() {
+        let tail = json!({ "command": "python3 -m unittest -q | tail -30" }).to_string();
+        let head = json!({ "command": "python3 -m  unittest -q | head -40" }).to_string();
+        let redirect = json!({ "command": "python3 -m unittest -q > out.txt 2>&1" }).to_string();
+        let plain = json!({ "command": "python3 -m unittest -q" }).to_string();
+        let key = call_key("shell", &plain);
+        assert_eq!(key, "shell: python3 -m unittest -q");
+        assert_eq!(call_key("shell", &tail), key);
+        assert_eq!(call_key("shell", &head), key);
+        assert_eq!(call_key("shell", &redirect), key);
+        // Two different calls stay two calls.
+        assert_ne!(
+            call_key("shell", &json!({"command": "cargo build"}).to_string()),
+            key
+        );
     }
 
     #[test]

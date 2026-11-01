@@ -106,6 +106,23 @@ pub fn trigger_ignored(state: &Path, actor: &str, reason: &str) {
     }
 }
 
+/// A run the watchdog stopped because it was alive and no longer productive. Its own word, because the
+/// question it answers is "why did this end" and the answer is neither a person nor a bound.
+pub fn watchdog_stopped(state: &Path, actor: &str, reason: &str) {
+    let line = Line {
+        at: epoch(),
+        actor: actor.to_string(),
+        layer: "watchdog".to_string(),
+        action: "watchdog_stopped".to_string(),
+        decision: "stop".to_string(),
+        reason: reason.to_string(),
+        artifact: String::new(),
+    };
+    if let Err(said) = record(state, &line) {
+        eprintln!("activity: could not record a watchdog stop: {said}");
+    }
+}
+
 fn epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

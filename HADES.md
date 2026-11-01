@@ -343,6 +343,13 @@ The graph has the same memory. `hades run` recalls once before the walk, puts th
 every attempt, and files one note at the accept terminal, so a retry does not pay the search twice and a
 refused run files nothing. The daemon uses the same seam, so a submitted run is not a second-class one.
 
+The daemon also watches the runs it holds. Once a second, beside the connections it is already serving, it
+reads the tail of each running session's log and asks one question: is this run still doing anything? A run
+that issues one command five times in a row, or twelve steps in a row with nothing written and nothing read,
+is stopped the same way `/stop` stops it, and the ledger records `watchdog_stopped` with the finding in one
+sentence. Calls are compared after normalisation, so a command rephrased only in its pipe is one call. A run
+that has finished is not inspected: its log is history.
+
 ## The gateway
 
 `hades gateway` attaches Telegram to the daemon that already owns the sessions. A plain message is a

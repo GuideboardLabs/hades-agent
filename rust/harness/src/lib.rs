@@ -103,6 +103,7 @@ pub mod tuning;
 pub mod turn;
 pub mod verify;
 pub mod vision;
+pub mod watchdog;
 
 pub use approval::{
     Answer, ApprovalBroker, ApprovalRequest, InMemory, OnDisk, PendingId, Question, Scope, Standing,
