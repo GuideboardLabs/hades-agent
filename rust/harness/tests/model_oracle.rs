@@ -14,13 +14,16 @@ use harness::model::{self, OpenAi};
 use harness::task::{Budget, TaskSpec};
 use harness::{Harness, Key};
 
+#[path = "fixtures/accept.rs"]
+mod accept;
+
 /// A socket that answers one request with the given bytes and hands back what it was asked.
 fn stub(response: impl Into<String>) -> (String, std::thread::JoinHandle<String>) {
     let response = response.into();
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
     let port = listener.local_addr().expect("an address").port();
     let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("a connection");
+        let mut stream = accept::tcp_within(&listener, "connection from the model call");
         let mut raw = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut headers_end = None;

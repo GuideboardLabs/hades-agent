@@ -9,22 +9,24 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+#[path = "fixtures/accept.rs"]
+mod accept;
+
 #[test]
 fn a_curlrc_proxy_does_not_take_a_subprocess_fetch() {
     let fixture = TcpListener::bind("127.0.0.1:0").expect("a fixture port");
     let fixture_address = fixture.local_addr().expect("an address");
     let destination = std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = fixture.accept() {
-            let mut buffer = [0u8; 1024];
-            let _ = stream.read(&mut buffer);
-            let body = "page";
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-        }
+        let mut stream = accept::tcp_within(&fixture, "request from the fetch");
+        let mut buffer = [0u8; 1024];
+        let _ = stream.read(&mut buffer);
+        let body = "page";
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
     });
 
     let proxy = TcpListener::bind("127.0.0.1:0").expect("a proxy port");

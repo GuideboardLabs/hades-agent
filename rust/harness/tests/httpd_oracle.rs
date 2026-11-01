@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "fixtures/accept.rs"]
+mod accept;
+
 fn scratch_base() -> PathBuf {
     let base = harness::scratch::root();
     std::fs::create_dir_all(&base).ok();
@@ -710,19 +713,18 @@ fn stop_all_sends_a_request_with_no_session() {
     let listener = UnixListener::bind(&socket).expect("a fake daemon socket");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().expect("a copy"));
-            if reader.read_line(&mut line).is_ok() {
-                let _ = sender.send(line);
-            }
-            writeln!(
-                stream,
-                "{}",
-                json!({"ok": true, "count": 0, "stopping": []})
-            )
-            .ok();
+        let mut stream = accept::unix_within(&listener, "request from the status server");
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().expect("a copy"));
+        if reader.read_line(&mut line).is_ok() {
+            let _ = sender.send(line);
         }
+        writeln!(
+            stream,
+            "{}",
+            json!({"ok": true, "count": 0, "stopping": []})
+        )
+        .ok();
     });
     std::fs::write(
         state.join("daemon.json"),
@@ -775,14 +777,13 @@ fn an_answer_can_name_question_zero() {
     let listener = UnixListener::bind(&socket).expect("a fake daemon socket");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().expect("a copy"));
-            if reader.read_line(&mut line).is_ok() {
-                let _ = sender.send(line);
-            }
-            writeln!(stream, "{}", json!({"ok": true, "id": 0})).ok();
+        let mut stream = accept::unix_within(&listener, "request from the status server");
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().expect("a copy"));
+        if reader.read_line(&mut line).is_ok() {
+            let _ = sender.send(line);
         }
+        writeln!(stream, "{}", json!({ "ok": true, "id": 0 })).ok();
     });
     std::fs::write(
         state.join("daemon.json"),
