@@ -214,6 +214,12 @@ impl Daemon {
     /// Run until asked to stop. One thread per connection, and a connection that is following a log holds
     /// its own thread for as long as it is watching.
     pub fn serve(self) -> Result<(), Fault> {
+        self.serve_every(WATCHDOG_EVERY)
+    }
+
+    /// The same loop with the watchdog's interval named, so a test can watch one tick without waiting a
+    /// second for it. The interval is the only thing a caller can change about the loop.
+    fn serve_every(self, every: Duration) -> Result<(), Fault> {
         let listener = UnixListener::bind(&self.socket).map_err(|error| {
             Fault::harness(format!(
                 "could not bind {}: {error}{}",
@@ -252,7 +258,7 @@ impl Daemon {
         while !shared.stopping.load(Ordering::SeqCst) {
             // The one periodic check this loop does: a run that is alive and going nowhere is stopped
             // here, beside the connections, rather than in a thread of its own.
-            if watched.elapsed() >= WATCHDOG_EVERY {
+            if watched.elapsed() >= every {
                 watched = Instant::now();
                 shared.watchdog();
             }
@@ -1508,6 +1514,42 @@ mod watchdog_tests {
             load_ms,
             window.len()
         );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The defect this exists for: the call that runs the tick inside the accept loop had no test, so
+    /// deleting it left the whole suite green and the watchdog stopped watching. The interval is a parameter
+    /// so that this costs a millisecond rather than a second per look.
+    #[test]
+    fn the_accept_loop_runs_the_tick_while_it_serves() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let state = scratch("watchdog-loop-wired");
+        let id = looping_run(&state, 5);
+        let (daemon, flag) = holding(&state, &id, 0, None);
+        let socket = daemon.socket().to_path_buf();
+        let served = std::thread::spawn(move || daemon.serve_every(Duration::from_millis(1)));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stopped(&state).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !stopped(&state).is_empty(),
+            "the loop served connections without ever running the tick"
+        );
+        assert!(flag.load(Ordering::SeqCst), "the run was not asked to stop");
+
+        // End the loop the way a person does, so the thread joins and the socket is cleaned up.
+        let mut stream = UnixStream::connect(&socket).expect("connect to the daemon");
+        writeln!(stream, "{}", json!({"op": "shutdown", "by": "test"})).expect("shutdown");
+        drop(stream);
+        served
+            .join()
+            .expect("the serving thread")
+            .expect("a clean exit");
+        assert_eq!(stopped(&state).len(), 1, "{:?}", stopped(&state));
         let _ = std::fs::remove_dir_all(&state);
     }
 
