@@ -349,7 +349,8 @@ doing anything? The judgement covers the entries this run wrote; the history abo
 have already ended, is not parsed, and on a session with twenty thousand entries that is the difference
 between a tick of a fraction of a millisecond and one of three seconds. A run that issues one command five
 times in a row, or twelve steps in a row that neither wrote a file nor looked at anything, is stopped the
-same way `/stop` stops it, and the ledger records `watchdog_stopped` with the finding in one sentence. A
+same way `/stop` stops it, and the ledger records `watchdog_stopped: run {run} in {session}` with the
+finding in one sentence, so a session stopped twice is two records rather than one repeated line. A
 step is judged on what it did, not on the name of its tool: `turn` logs every program a run writes under
 `shell`, so the name of a `grep` step and the name of a build are the same word. A program is read for its
 own words instead, and it looked at something when every command in it only reports (`cat`, `grep`, `sed -n`,

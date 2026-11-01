@@ -128,12 +128,16 @@ pub fn trigger_candidate(state: &Path, actor: &str, reason: &str) {
 
 /// A run the watchdog stopped because it was alive and no longer productive. Its own word, because the
 /// question it answers is "why did this end" and the answer is neither a person nor a bound.
-pub fn watchdog_stopped(state: &Path, actor: &str, reason: &str) {
+///
+/// The run number goes in the action, in the same shape `stop` writes one (`stop: run {run} in {id}`): a
+/// session can be taken on again, and a run number restarts at 1 with the daemon, so a record that named only
+/// the session would make two stops of two different runs one repeated line.
+pub fn watchdog_stopped(state: &Path, run: u64, session: &str, reason: &str) {
     let line = Line {
         at: epoch(),
-        actor: actor.to_string(),
+        actor: "watchdog".to_string(),
         layer: "watchdog".to_string(),
-        action: "watchdog_stopped".to_string(),
+        action: format!("watchdog_stopped: run {run} in {session}"),
         decision: "stop".to_string(),
         reason: reason.to_string(),
         artifact: String::new(),

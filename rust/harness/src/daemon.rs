@@ -411,11 +411,7 @@ impl Daemon {
         if asked {
             return false;
         }
-        crate::activity::watchdog_stopped(
-            &self.state,
-            &format!("session:{session}"),
-            &stall.sentence(),
-        );
+        crate::activity::watchdog_stopped(&self.state, held.run, session, &stall.sentence());
         true
     }
 
@@ -1387,12 +1383,23 @@ mod watchdog_tests {
         from: u64,
         allowance: Option<u64>,
     ) -> (Daemon, Arc<AtomicBool>) {
+        holding_as(state, id, 1, from, allowance)
+    }
+
+    /// The same, with the number the lease table would carry: a session taken on a second time is run 2.
+    fn holding_as(
+        state: &Path,
+        id: &str,
+        run: u64,
+        from: u64,
+        allowance: Option<u64>,
+    ) -> (Daemon, Arc<AtomicBool>) {
         let daemon = Daemon::bind(state, state.join("daemon.sock")).expect("bind");
         let flag = Arc::new(AtomicBool::new(false));
         daemon.runs.lock().expect("runs").insert(
             id.to_string(),
             Lease {
-                run: 1,
+                run,
                 since: SystemClock.now(),
                 from,
                 allowance,
@@ -1551,8 +1558,45 @@ mod watchdog_tests {
     fn stopped(state: &Path) -> Vec<crate::activity::Line> {
         crate::activity::read(state)
             .into_iter()
-            .filter(|line| line.action == "watchdog_stopped")
+            .filter(|line| line.action.starts_with("watchdog_stopped"))
             .collect()
+    }
+
+    /// The defect this exists for: `watchdog_stopped` named the session and the finding but not the run,
+    /// while `stop` writes `run {run} in {id}`. Two stops across runs, or across a restart where the
+    /// numbering starts again at 1, were two copies of one indistinguishable record.
+    #[test]
+    fn a_watchdog_stop_carries_the_run_it_stopped() {
+        let state = scratch("watchdog-run-number");
+        let id = looping_run(&state, 5);
+        let (daemon, _first) = holding(&state, &id, 0, None);
+        assert_eq!(daemon.watchdog(), 1, "the first run stalls");
+        daemon.release(&id, 1).expect("release");
+
+        // The session is taken on again and repeats the same loop: run 2, judged on its own window.
+        let from = log_end(&state, &id);
+        more_of_the_same(&state, &id, 5);
+        let (daemon, _second) = holding_as(&state, &id, 2, from, None);
+        assert_eq!(daemon.watchdog(), 1, "the second run stalls");
+
+        let lines = stopped(&state);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, run) in lines.iter().zip([1, 2]) {
+            assert!(
+                line.action.contains(&format!("run {run}")),
+                "a stop does not name its run: {:?}",
+                line.action
+            );
+            assert!(
+                line.action.contains(&id),
+                "a stop does not name its session: {:?}",
+                line.action
+            );
+        }
+        assert_ne!(
+            lines[0].action, lines[1].action,
+            "two stops across two runs are one record"
+        );
     }
 
     #[test]
@@ -1575,9 +1619,9 @@ mod watchdog_tests {
             lines[0].reason
         );
         assert!(
-            lines[0].actor.contains(&id),
-            "the session is named: {:?}",
-            lines[0].actor
+            lines[0].action.contains("run 1") && lines[0].action.contains(&id),
+            "the run and the session are named: {:?}",
+            lines[0].action
         );
         let _ = std::fs::remove_dir_all(&state);
     }
