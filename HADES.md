@@ -374,8 +374,12 @@ Two settings live in `config.json` under `gateway.telegram`: `allowed_users`, a 
 ids, and `policy`, `guarded` by default. An absent section or an empty list refuses to start. A surface
 may also name `trigger`: `always`, the default, answers every message from an allowed sender; `mention`
 answers a direct message, and a group message only when it names the surface or starts with a command;
-`never` parks it. A channel entry may override it, an unknown word is refused by name, and a message that
-fails the filter is dropped before any model call and recorded as `trigger_ignored`. The token is
+`never` parks it. A mention is recognised by the surface's own detection where the surface has one, because
+Discord spells one `<@id>` and strips it before the message reaches the gateway; the text is read only where
+there is no such detection. A channel entry may override it, an unknown word is refused by name, and a
+message that fails the filter is dropped before any model call and recorded as `trigger_ignored`. `never`
+drops `/stop` as well, so a run started before the surface was parked is stopped with `hades stop` at the
+CLI: the filter exempts nothing, and that is what parking a surface costs. The token is
 `HADES_TELEGRAM_TOKEN` in `~/.hades/.env` or the environment, never in the JSON, and it is never printed.
 
 A goal is session state, not a schedule. `hades goal set <text> --chat <id> --check <command>` records one

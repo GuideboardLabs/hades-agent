@@ -129,6 +129,7 @@ fn message(from: i64, chat: i64, text: &str) -> Update {
         text: text.to_string(),
         callback: None,
         photo: None,
+        mention: None,
     }
 }
 
@@ -598,6 +599,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
                 data: "a:42:1".to_string(),
             }),
             photo: None,
+            mention: None,
         },
         &settings,
         &socket,
@@ -648,6 +650,7 @@ fn the_offset_advances_after_a_batch() {
         text: "/help".to_string(),
         callback: None,
         photo: None,
+        mention: None,
     }]]);
     serve(
         fake.clone(),

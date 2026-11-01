@@ -213,6 +213,9 @@ fn parse_update(value: &Value) -> Option<Update> {
             text,
             callback: None,
             photo,
+            // Telegram leaves an @name in the text, so the gateway reads it there; the transport does not
+            // call getMe and has no name of its own to look for.
+            mention: None,
         });
     }
     let query = value.get("callback_query")?;
@@ -226,6 +229,7 @@ fn parse_update(value: &Value) -> Option<Update> {
             data: query.get("data")?.as_str()?.to_string(),
         }),
         photo: None,
+        mention: None,
     })
 }
 

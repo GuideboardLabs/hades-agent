@@ -524,6 +524,13 @@ fn message_update(inner: &Arc<Inner>, message: &Value) -> Option<Update> {
             .pointer("/referenced_message/author/id")
             .and_then(Value::as_str)
             .is_some_and(|author| me.as_deref() == Some(author));
+    // Whether this message names us, said here because this is where the token is visible: Discord spells a
+    // mention `<@id>` or `<@!id>`, and it is stripped below before the update is built, so the gateway could
+    // not tell a stripped mention from a sentence nobody addressed to us.
+    let named_us = answering_us
+        || me.as_ref().is_some_and(|me| {
+            text.contains(&format!("<@{me}>")) || text.contains(&format!("<@!{me}>"))
+        });
     if guild.is_some() && inner.require_mention && !answering_us {
         let me = me?;
         let plain = format!("<@{me}>");
@@ -555,6 +562,7 @@ fn message_update(inner: &Arc<Inner>, message: &Value) -> Option<Update> {
         text,
         callback: None,
         photo,
+        mention: Some(named_us),
     })
 }
 
@@ -584,6 +592,7 @@ fn press_update(interaction: &Value) -> Option<Update> {
             data: custom,
         }),
         photo: None,
+        mention: None,
     })
 }
 
@@ -685,6 +694,40 @@ mod tests {
         });
         assert!(message_update(&strict, &message("7", "hi", Some("9"))).is_none());
         assert!(message_update(&strict, &message("7", "hi", Some("100"))).is_some());
+    }
+
+    /// The defect this exists for: Discord spells a mention `<@id>` (or `<@!id>`) and the connector strips it
+    /// before the update reaches the gateway, so the gateway's text heuristic read the stripped sentence and
+    /// ignored every real mention. The connector says what it saw, and that answer is what the trigger uses.
+    #[test]
+    fn a_mention_the_connector_stripped_is_reported_as_one() {
+        let inner = inner();
+        let update = message_update(&inner, &message("7", "<@!42> the build broke", Some("9")))
+            .expect("a mention reaches the chat");
+        assert_eq!(update.text, "the build broke", "the token is stripped");
+        assert_eq!(update.mention, Some(true), "the surface saw its own name");
+
+        // A reply to one of our messages is addressing us with no token in the text at all.
+        let mut reply = message("7", "and then what", Some("9"));
+        reply["message_reference"] = json!({"message_id": "1300000000000000009"});
+        reply["referenced_message"] =
+            json!({"id": "1300000000000000009", "author": {"id": "42", "bot": true}});
+        let answered = message_update(&inner, &reply).expect("a reply to us");
+        assert_eq!(answered.mention, Some(true), "a reply names us");
+
+        // And a guild message that names nobody says so, rather than leaving the gateway to read the text.
+        let (_, receiver) = channel();
+        let loose = Arc::new(Inner {
+            token: "unused".to_string(),
+            agent: ureq::AgentBuilder::new().build(),
+            incoming: Mutex::new(receiver),
+            guilds: Vec::new(),
+            require_mention: false,
+            me: Mutex::new(Some("42".to_string())),
+        });
+        let bare = message_update(&loose, &message("7", "the build broke", Some("9")))
+            .expect("a guild message");
+        assert_eq!(bare.mention, Some(false), "nothing named us");
     }
 
     #[test]

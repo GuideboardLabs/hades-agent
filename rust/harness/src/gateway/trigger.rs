@@ -65,21 +65,33 @@ pub fn resolved(settings: &Settings, chat: &Chat) -> Trigger {
         .unwrap_or(settings.trigger)
 }
 
-/// Whether the text names this surface: a mention token anywhere in it, or a command at the start.
+/// Whether the text opens with a command. Every surface can see this, so it is judged here rather than
+/// delegated: a connector that strips mentions still passes `/status` through untouched.
+fn commanded(text: &str) -> bool {
+    text.trim().starts_with('/')
+}
+
+/// Whether the message names this surface: a mention token anywhere in it.
 ///
 /// A *reply* to one of our own messages cannot be seen from here: `Update` carries the text, the sender
-/// and the chat, and the surface does not hand over what was replied to. So a reply that names nobody
-/// reads as unaddressed, and a surface set to `mention` will ignore it.
-fn addressed(text: &str) -> bool {
-    let text = text.trim();
-    if text.starts_with('/') {
-        return true;
-    }
+/// and the chat, and the surface does not hand over what was replied to. A surface that can see a reply
+/// says so through `Update::mention`, which is why that field outranks this.
+fn text_mentions(text: &str) -> bool {
     text.split_whitespace().any(|word| {
         word.strip_prefix('@')
             .and_then(|name| name.chars().next())
             .is_some_and(|first| first.is_alphanumeric() || first == '_')
     })
+}
+
+/// Whether this message names the surface, from the surface's own detection when it has one. A connector
+/// that recognises its mention tokens strips them before the update is built, and then no word in the text
+/// begins with `@`: reading the text alone would ignore every real mention on that surface.
+fn named(update: &Update) -> bool {
+    match update.mention {
+        Some(seen) => seen,
+        None => text_mentions(&update.text),
+    }
 }
 
 /// One sentence for the ledger, naming the setting that dropped the message. `None` when this trigger
@@ -109,7 +121,7 @@ pub fn classify(update: &Update, settings: &Settings) -> Verdict {
     match trigger {
         // The behaviour before the key existed: every message from an allowed sender is a request.
         Trigger::Always => Verdict::Requested,
-        Trigger::MentionOnly if addressed(&update.text) => Verdict::Requested,
+        Trigger::MentionOnly if commanded(&update.text) || named(update) => Verdict::Requested,
         // A channel somebody listed on purpose is where an unaddressed sentence is still worth reading:
         // the configuration already said this channel matters, and the model judges the rest.
         Trigger::MentionOnly if settings.channels.contains_key(update.chat.id()) => {
@@ -157,6 +169,7 @@ mod tests {
             text: text.to_string(),
             callback: None,
             photo: None,
+            mention: None,
         }
     }
 
@@ -201,6 +214,36 @@ mod tests {
             classify(&update(42, -100123, "/status"), &settings),
             Verdict::Requested
         );
+    }
+
+    /// The defect this exists for: a connector recognises its own mention tokens and strips them before the
+    /// update is built, so on that surface the text said "the build broke" and every real mention read as an
+    /// unaddressed sentence. The surface's own answer travels on the update, because it is the only thing
+    /// that saw the token.
+    #[test]
+    fn a_surface_that_saw_its_own_name_is_addressed_though_the_text_was_stripped() {
+        let settings = settings(Trigger::MentionOnly);
+        let stripped = Update {
+            text: "the build broke again".to_string(),
+            mention: Some(true),
+            ..update(42, -100123, "")
+        };
+        assert_eq!(classify(&stripped, &settings), Verdict::Requested);
+
+        // A surface that looked and found nothing is not rescued by the text, and a command is still a
+        // command on a surface that does its own detection.
+        let looked = Update {
+            text: "@alice the build broke again".to_string(),
+            mention: Some(false),
+            ..update(42, -100123, "")
+        };
+        assert_eq!(classify(&looked, &settings), Verdict::Ignore);
+        let command = Update {
+            text: "/status".to_string(),
+            mention: Some(false),
+            ..update(42, -100123, "")
+        };
+        assert_eq!(classify(&command, &settings), Verdict::Requested);
     }
 
     /// A channel somebody listed on purpose is the one place an unaddressed sentence is worth reading:

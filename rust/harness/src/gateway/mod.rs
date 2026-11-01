@@ -494,6 +494,10 @@ pub struct Update {
     /// The largest size of a photo the person sent, when they sent one. The gateway downloads it, looks at
     /// it with the vision pair, and gives the chat model the description: the chat model does not see pixels.
     pub photo: Option<String>,
+    /// Whether this surface saw its own name in the message, when it does that detection itself. Discord
+    /// spells a mention `<@id>` and strips it before the update exists, so the text cannot answer this
+    /// there; `None` means the surface said nothing and the text is all there is to read.
+    pub mention: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
