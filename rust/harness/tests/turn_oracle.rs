@@ -829,6 +829,98 @@ fn the_watchdog_reads_what_the_turn_recorded_and_a_run_of_git_reads_is_not_stopp
     );
 }
 
+/// A tool that runs nothing: these tests are about the judgement the turn writes down for a program, and a
+/// real spawn per step would make them slow and dependent on what the machine happens to have installed.
+struct Quiet;
+
+impl Tool for Quiet {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: harness::SHELL.to_string(),
+            summary: "a stub that runs nothing".to_string(),
+        }
+    }
+
+    fn call(&self, call: &Call) -> Result<Run, Fault> {
+        Ok(Run {
+            status: 0,
+            output: call.program.clone(),
+            truncated: false,
+            timed_out: false,
+        })
+    }
+}
+
+/// One run, written by the real turn: one turn per program, in one session, read back the way the daemon
+/// reads it. Nothing here builds a history by hand, because `turn` is the only thing that knows what a step
+/// did and the rule is only honest if it reads that record.
+fn driven(name: &str, programs: &[String]) -> Vec<harness::watchdog::Step> {
+    let root = scratch(name);
+    let task = TaskSpec::new("work through the list", &root);
+    let work = profile("true", false);
+    let policy = allow();
+    let builder = context(&task);
+    let tool = Quiet;
+    let verifier = CommandVerifier::new(LIMIT);
+    let model = ScriptedModel::new(programs.iter().cloned());
+    let mut log = session(&root, name);
+    for _ in programs {
+        Seams::new(&task, &work, &policy, &builder, &model, &tool, &verifier)
+            .turn(&mut log)
+            .expect("a turn");
+    }
+    harness::watchdog::steps(log.entries())
+}
+
+/// The check the turn appends after every step is not a step the run chose, and counting it makes the
+/// trailing run of one call no longer than one: `shell`, `check`, `shell`, `check`, ... So `Repeating` could
+/// only ever fire on a history a test wrote by hand, while a real run issuing one command five times was
+/// recorded as "12 steps with nothing written or read" instead of "repeating shell: cargo build, 5 times".
+#[test]
+fn a_build_repeated_five_times_in_one_run_reaches_repeating() {
+    let steps = driven("repeating-build", &vec!["cargo build".to_string(); 5]);
+    match harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default()) {
+        Some(harness::watchdog::Stall::Repeating { tool, times }) => {
+            assert_eq!(times, 5, "{tool}");
+            assert_eq!(tool, "shell: cargo build");
+        }
+        other => panic!("five turns of one build were not reported as a loop: {other:?}"),
+    }
+}
+
+/// The same over-count seen from the other side: every check carries a step, so twelve steps of a run that
+/// wrote nothing reached the twelve-step bound after six of them.
+#[test]
+fn twelve_builds_written_by_the_turn_are_no_progress_at_twelve_steps() {
+    let programs: Vec<String> = (0..12)
+        .map(|n| format!("cargo test --test case-{n}"))
+        .collect();
+    let steps = driven("no-progress-bound", &programs);
+    assert_eq!(
+        harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default()),
+        Some(harness::watchdog::Stall::NoProgress { steps: 12 }),
+        "the check appended after each step was counted as one of the run's, so the bound fired at half the \
+         steps it promises"
+    );
+}
+
+/// The other side of the same rule: a run that alternates a build with a read of something new is working,
+/// and the check between them must not weld two turns into one repeated call.
+#[test]
+fn a_run_that_alternates_a_build_with_a_new_read_is_not_repeating() {
+    let mut programs = Vec::new();
+    for n in 0..4 {
+        programs.push("cargo build".to_string());
+        programs.push(format!("grep -n 'case-{n}' src/lib.rs"));
+    }
+    let steps = driven("alternating-build", &programs);
+    let stall = harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default());
+    assert!(
+        stall.is_none(),
+        "a run that built and then read something new was stopped: {stall:?}"
+    );
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:

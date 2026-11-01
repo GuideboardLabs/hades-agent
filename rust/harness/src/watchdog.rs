@@ -121,15 +121,27 @@ impl Default for Limits {
     }
 }
 
+/// Whether a step is the harness's own check rather than a call the run made.
+///
+/// `turn` appends the check after every step it acts on, under its own tool. Counting it as one of the run's
+/// steps makes every turn two steps and the trailing run of one call no longer than one, so `Repeating` could
+/// not fire on a log a real run wrote, and a run that wrote nothing reached the twelve-step bound after six.
+fn is_check(step: &Step) -> bool {
+    step.tool == crate::VERIFY
+}
+
 /// The verdict on a step history, or nothing when nothing is wrong.
 ///
 /// Only the tail is examined: the question is whether the run is stalled *now*, not whether it ever
 /// repeated itself. A loop that a write interrupted and never resumed is a run that recovered.
 pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
-    let last = steps.last()?;
+    // The run's own steps. The check is written by the harness, after the step it checked: it is evidence
+    // about the tree, not a call the run chose, so neither the repeat rule nor the stall rule may count it.
+    let run: Vec<&Step> = steps.iter().filter(|step| !is_check(step)).collect();
+    let last = run.last()?;
 
     let key = crate::agent::call_key(&last.tool, &last.arguments);
-    let times = steps
+    let times = run
         .iter()
         .rev()
         .take_while(|step| crate::agent::call_key(&step.tool, &step.arguments) == key)
@@ -138,7 +150,8 @@ pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
         return Some(Stall::Repeating { tool: key, times });
     }
 
-    // A loop that has also spent its allowance is a loop: the more specific finding is the useful one.
+    // A loop that has also spent its allowance is a loop: the more specific finding is the useful one. The
+    // sum is over every step, the check's model calls included: that is money, and money was spent.
     let spent: u64 = steps.iter().map(|step| step.tokens).sum();
     if let Some(allowance) = limits.allowance
         && spent >= allowance
@@ -151,7 +164,7 @@ pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
     // working set after a trim, so counting reads as standing still would stop the runs that are recovering.
     // "Reading" is a fact about the step, not the name of its tool: a daemon run logs every program as
     // `shell`, and twelve `cat`/`grep` steps are one long look, not a stall.
-    let still = steps
+    let still = run
         .iter()
         .rev()
         .take_while(|step| step.did == Did::Nothing)
