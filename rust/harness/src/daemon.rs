@@ -399,7 +399,7 @@ impl Daemon {
             // about a run that no longer exists, and the flag now belongs to a different one.
             return false;
         }
-        let Ok(mut cancels) = self.cancels.lock() else {
+        let Ok(cancels) = self.cancels.lock() else {
             return false;
         };
         let Some(flag) = cancels.get(session).cloned() else {
