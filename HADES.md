@@ -371,15 +371,16 @@ call or a shell command already in flight finishes first, so a stop can be prece
 The same three verbs exist at the CLI as `hades stop`, `hades cancel` and `hades shutdown`.
 
 Two settings live in `config.json` under `gateway.telegram`: `allowed_users`, a list of numeric Telegram
-ids, and `policy`, `guarded` by default. An absent section or an empty list refuses to start. A surface
-may also name `trigger`: `always`, the default, answers every message from an allowed sender; `mention`
-answers a direct message, and a group message only when it names the surface or starts with a command;
-`never` parks it. A mention is recognised by the surface's own detection where the surface has one, because
-Discord spells one `<@id>` and strips it before the message reaches the gateway; the text is read only where
-there is no such detection, and there a name counts when it is this surface's own: the `username` the
-section names, or the surface's own name. Any other `@word` addresses somebody else. A channel entry may
-override it, an unknown word is refused by name, and a
-message that fails the filter is dropped before any model call and recorded as `trigger_ignored`. `never`
+ids, and `policy`, `guarded` by default. An absent section or an empty list refuses to start. A surface may
+also name `trigger`: `always`, the default, answers every message from an allowed sender; `mention` answers
+a direct message, and a group message only when it names the surface or starts with a command; `never`
+parks it. A mention is recognised by the surface's own detection where the surface has one, because Discord
+spells one `<@id>` and strips it before the message reaches the gateway; the text is read only where there
+is no such detection, and there a name counts when it is this surface's own: the `username` the section
+names, or the surface's own name. Any other `@word` addresses somebody else. A channel entry may override
+it, and an unknown word is refused by name. A message the filter drops never reaches a model and is
+recorded as `trigger_ignored`; an unaddressed message in a channel somebody listed on purpose is read
+instead, recorded as `trigger_candidate`, and the channel's policy decides what may come of it. `never`
 drops `/stop` as well, so a run started before the surface was parked is stopped with `hades stop` at the
 CLI: the filter exempts nothing, and that is what parking a surface costs. The token is
 `HADES_TELEGRAM_TOKEN` in `~/.hades/.env` or the environment, never in the JSON, and it is never printed.

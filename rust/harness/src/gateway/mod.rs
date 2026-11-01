@@ -1541,16 +1541,25 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     // is an answer to a question this agent asked, so it is addressed by definition and is not filtered.
     if update.callback.is_none() {
         let verdict = trigger::classify(update, settings);
-        if verdict == trigger::Verdict::Ignore {
-            let resolved = trigger::resolved(settings, &update.chat);
+        if verdict != trigger::Verdict::Requested {
             let actor = format!("{}:{}", update.chat.surface_name(), update.chat.id());
-            crate::activity::trigger_ignored(
+            if verdict == trigger::Verdict::Ignore {
+                let resolved = trigger::resolved(settings, &update.chat);
+                crate::activity::trigger_ignored(
+                    state,
+                    &actor,
+                    trigger::why_ignored(resolved)
+                        .unwrap_or("the message was not addressed to this surface"),
+                );
+                return Ok(());
+            }
+            // A candidate is read, not dropped: the channel was listed on purpose, so the model is asked
+            // and the policy below decides what it may do. The line is what separates that from a request.
+            crate::activity::trigger_candidate(
                 state,
                 &actor,
-                trigger::why_ignored(resolved)
-                    .unwrap_or("the message was not addressed to this surface"),
+                "the channel is listed and nothing in the message names this surface",
             );
-            return Ok(());
         }
     }
     // One channel can be a conversation and another a workspace, on the same surface.

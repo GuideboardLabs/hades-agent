@@ -57,7 +57,9 @@ pub struct Line {
     pub action: String,
     /// `allow`, `refuse` (a layer said no without a person), `ask` (a question was raised), or `stop` (a
     /// person ended work). A stop has its own word because the question it answers is "who stopped what",
-    /// the same way `allow` answers "who allowed what".
+    /// the same way `allow` answers "who allowed what". The trigger adds `ignore` (dropped before any model
+    /// call) and `read` (a listed channel, read without being named), because being filtered is neither an
+    /// allow nor a refusal by a person.
     pub decision: String,
     pub reason: String,
     /// The path the action named, when it named one. Empty when it did not: a shell command has no one
@@ -103,6 +105,26 @@ pub fn trigger_ignored(state: &Path, actor: &str, reason: &str) {
     };
     if let Err(said) = record(state, &line) {
         eprintln!("activity: could not record an ignored message: {said}");
+    }
+}
+
+/// A message this surface was not addressed in, in a channel somebody listed on purpose. The configuration
+/// said this place matters, so the model reads it and the policy decides what may come of it. Its own word,
+/// because the question it answers is "why was this read at all", which neither a request nor an ignore
+/// answers.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn trigger_candidate(state: &Path, actor: &str, reason: &str) {
+    let line = Line {
+        at: epoch(),
+        actor: actor.to_string(),
+        layer: "trigger".to_string(),
+        action: "trigger_candidate".to_string(),
+        decision: "read".to_string(),
+        reason: reason.to_string(),
+        artifact: String::new(),
+    };
+    if let Err(said) = record(state, &line) {
+        eprintln!("activity: could not record a read message: {said}");
     }
 }
 

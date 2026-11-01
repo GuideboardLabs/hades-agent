@@ -688,6 +688,56 @@ fn the_offset_advances_after_a_batch() {
     assert_eq!(load_offset(&dir), Some(42));
 }
 
+/// A channel somebody listed on purpose is where an unaddressed sentence is worth reading, so the model is
+/// asked to read it; that is a different decision from being named, and it has to be visible. Without a
+/// record the two verdicts are one behaviour with two names, which is a third state that means nothing.
+#[test]
+fn an_unaddressed_message_in_a_listed_channel_is_read_and_recorded() {
+    use harness::gateway::trigger::Trigger;
+
+    let dir = scratch("trigger-candidate");
+    let socket = socket_under(&dir);
+    let mut settings = Settings {
+        trigger: Trigger::MentionOnly,
+        // A model no build knows: a message that is read reaches this and fails here, fast and offline.
+        model: "no-such-preset".to_string(),
+        ..settings_for(7)
+    };
+    settings
+        .channels
+        .insert("-100123".to_string(), Default::default());
+    let mut fake = Fake::default();
+    let outcome = handle(
+        &message(7, -100123, "the build broke again"),
+        &settings,
+        &socket,
+        &dir,
+        &mut fake,
+    );
+    assert!(
+        outcome.is_err(),
+        "the message was not read: it never reached the model ({outcome:?})"
+    );
+
+    let recorded = harness::activity::read(&dir);
+    let candidates: Vec<_> = recorded
+        .iter()
+        .filter(|line| line.action == "trigger_candidate")
+        .collect();
+    assert_eq!(candidates.len(), 1, "{recorded:?}");
+    assert_eq!(candidates[0].decision, "read");
+    assert_eq!(candidates[0].layer, "trigger");
+    assert!(
+        candidates[0].actor.contains("-100123"),
+        "the channel is named: {:?}",
+        candidates[0].actor
+    );
+    assert!(
+        recorded.iter().all(|line| line.action != "trigger_ignored"),
+        "a candidate was recorded as ignored: {recorded:?}"
+    );
+}
+
 /// The stop verbs on the surface. `/stop` is scoped to this chat, `/cancel` is a file verb, and `/shutdown`
 /// is the one that also ends the poller.
 fn settings_for(chat: i64) -> Settings {
