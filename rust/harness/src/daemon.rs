@@ -654,6 +654,51 @@ impl Daemon {
         Ok(json!({"ok": true, "shutdown": true, "stopping": count}))
     }
 
+    /// Take a session on for one run, or refuse because another run holds it.
+    ///
+    /// The window this run is judged on is read here, under the lease and after the refusal, and handed back
+    /// with the run number: the same two numbers the follower and the watchdog use. A run that appends its
+    /// last entries and lets the session go while this thread waits for the table has moved the end of the
+    /// log; a length read before the lock opened the new run's window over that run's tail, and the watchdog
+    /// judged it on steps it did not take.
+    fn lease(
+        &self,
+        session: &str,
+        log: &Path,
+        cancel: &Arc<AtomicBool>,
+        allowance: Option<u64>,
+    ) -> Result<(u64, u64), String> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| "the lease table was poisoned by a panic in another thread".to_string())?;
+        if let Some(lease) = runs.get(session) {
+            return Err(format!(
+                "session {session} is already running as run {} (since {}); the log has no lock, so the \
+                 daemon refuses a second writer rather than corrupting it",
+                lease.run, lease.since
+            ));
+        }
+        let from = fs::metadata(log).map(|meta| meta.len()).unwrap_or(0);
+        let run = self.next_run.fetch_add(1, Ordering::SeqCst) + 1;
+        runs.insert(
+            session.to_string(),
+            Lease {
+                run,
+                since: SystemClock.now(),
+                from,
+                allowance,
+            },
+        );
+        // The flag goes in under the same lease, so a stop that arrives after this point finds a run and a
+        // stop that arrives before it finds nothing rather than a lease with no way to reach it.
+        self.cancels
+            .lock()
+            .map_err(|_| "the stop table was poisoned by a panic in another thread".to_string())?
+            .insert(session.to_string(), Arc::clone(cancel));
+        Ok((run, from))
+    }
+
     /// Take a run on. The lease is the whole concurrency story: two runs on one session id would be two
     /// writers on one log, and the log has no lock to stop them.
     fn submit(&self, request: &Value, stream: &mut UnixStream) -> Result<Value, Fault> {
@@ -677,44 +722,10 @@ impl Daemon {
         let session_id = engine.session_id().to_string();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        // Where this run's entries begin, taken before the acknowledgement: the length of the log the run
-        // before it left behind. Taken early rather than late, because a window that starts too early holds
-        // at worst a meta root, and one that starts after the run's first entry hides work that was done.
         let log = engine.log_path();
-        let from = fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0);
-        let run = {
-            let mut runs = self.runs.lock().map_err(|_| {
-                Fault::harness("the lease table was poisoned by a panic in another thread")
-            })?;
-            if let Some(lease) = runs.get(&session_id) {
-                return Ok(json!({
-                    "ok": false,
-                    "error": format!(
-                        "session {session_id} is already running as run {} (since {}); the log has no lock, \
-                         so the daemon refuses a second writer rather than corrupting it",
-                        lease.run, lease.since
-                    ),
-                }));
-            }
-            let run = self.next_run.fetch_add(1, Ordering::SeqCst) + 1;
-            runs.insert(
-                session_id.clone(),
-                Lease {
-                    run,
-                    since: SystemClock.now(),
-                    from,
-                    allowance: bounds.tokens(),
-                },
-            );
-            // The flag goes in under the same lease, so a stop that arrives after this point finds a run and
-            // a stop that arrives before it finds nothing rather than a lease with no way to reach it.
-            self.cancels
-                .lock()
-                .map_err(|_| {
-                    Fault::harness("the stop table was poisoned by a panic in another thread")
-                })?
-                .insert(session_id.clone(), Arc::clone(&cancel));
-            run
+        let (run, from) = match self.lease(&session_id, &log, &cancel, bounds.tokens()) {
+            Ok(taken) => taken,
+            Err(said) => return Ok(json!({"ok": false, "error": said})),
         };
 
         // The acknowledgement goes out before any work, so a client knows the run is taken on and can follow
@@ -1371,6 +1382,63 @@ mod watchdog_tests {
             .expect("cancels")
             .insert(id.to_string(), Arc::clone(&flag));
         (daemon, flag)
+    }
+
+    /// The defect this exists for: `submit` read the log length before taking the runs lock. A run that
+    /// appended its last entries and released in that gap left the new lease recording an offset older than
+    /// the boundary, so run 2 was judged on run 1's tail. The interleaving is forced: the table is held
+    /// while run 1 appends and lets the session go, and only then may run 2 take it.
+    #[test]
+    fn a_run_that_finishes_while_the_submit_waits_for_the_lease_is_not_in_the_new_runs_window() {
+        let state = scratch("lease-window");
+        let id = looping_run(&state, 3);
+        let log = store(&state).path_of(&SessionId::new(&id));
+        let start = std::fs::metadata(&log).expect("a log").len();
+        let (daemon, _) = holding(&state, &id, start, None);
+        // Run 1 was taken on through the same path, so the counter says the next lease is run 2.
+        daemon.next_run.store(1, Ordering::SeqCst);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let mut runs = daemon.runs.lock().expect("runs");
+        let run = std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let session = id.clone();
+            let daemon = &daemon;
+            let taker = scope.spawn(move || {
+                let _ = ready_tx.send(());
+                daemon.lease(&session, &log, &cancel, None)
+            });
+            ready_rx.recv().expect("the submit started");
+            // Run 1 is holding the session while run 2 waits for the table: it appends its last steps and
+            // lets go, which is exactly the gap this test is about.
+            std::thread::sleep(Duration::from_millis(200));
+            more_of_the_same(&state, &id, 2);
+            runs.remove(&id);
+            daemon.cancels.lock().expect("cancels").remove(&id);
+            drop(runs);
+            taker.join().expect("the submit thread")
+        });
+        let (run, from) = run.expect("run 2 is taken on");
+
+        assert_eq!(run, 2);
+        let end = log_end(&state, &id);
+        assert!(
+            end > start,
+            "run 1's tail was never appended, so the window proves nothing"
+        );
+        assert_eq!(
+            from, end,
+            "run 2's window opened before run 1's tail, so it is judged on steps it did not take"
+        );
+        let held = daemon
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&id)
+            .cloned()
+            .expect("a lease");
+        assert_eq!(held.from, from, "the lease records the window it was given");
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     fn stopped(state: &Path) -> Vec<crate::activity::Line> {
