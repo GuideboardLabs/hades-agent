@@ -54,6 +54,10 @@ const WATCHDOG_EVERY: Duration = Duration::from_secs(1);
 struct Lease {
     run: u64,
     since: String,
+    /// The byte offset in the session log where this run's entries begin: the length of the log at the
+    /// moment the run was taken on. The log is cumulative and every run appends to the same file, so this
+    /// is the only thing that separates this run's steps from every run before it.
+    from: u64,
     /// The token allowance the submit declared, when it declared one. The watchdog asks whether that
     /// allowance was spent without a file written; a run that declared none has no such bound.
     allowance: Option<u64>,
@@ -337,38 +341,37 @@ impl Daemon {
     }
 
     /// One pass over the runs this daemon holds. Returns how many it stopped, which is what the test
-    /// asserts on and what a future status line could report. A finished run has released its lease and
-    /// is never inspected: the session log it left behind is history, not work in progress.
+    /// asserts on and what a future status line could report. The lease is taken as a snapshot and handed
+    /// with the session, so the judgement is made about one numbered run and not about whatever the table
+    /// says a moment later. A finished run has released its lease and is never inspected: the session log
+    /// it left behind is history, not work in progress.
     fn watchdog(&self) -> usize {
-        let sessions: Vec<String> = match self.runs.lock() {
-            Ok(runs) => runs.keys().cloned().collect(),
+        let held: Vec<(String, Lease)> = match self.runs.lock() {
+            Ok(runs) => runs
+                .iter()
+                .map(|(session, lease)| (session.clone(), lease.clone()))
+                .collect(),
             Err(_) => return 0,
         };
-        let mut stopped = 0;
-        for session in sessions {
-            if self.watch_session(&session) {
-                stopped += 1;
-            }
-        }
-        stopped
+        held.iter()
+            .filter(|(session, lease)| self.watch_session(session, lease))
+            .count()
     }
 
-    fn watch_session(&self, session: &str) -> bool {
-        let Ok(loaded) = Session::load(
-            FileStore::new(self.state.join("sessions")),
-            SystemClock,
-            SessionId::new(session),
-        ) else {
-            // A log that will not read is `status`'s to report; stopping the run would be a guess.
+    /// One run, judged on the steps it wrote and on nothing before them. `held` is the lease the tick
+    /// snapshotted: the run number and the offset where that run's entries begin. Judging the whole log
+    /// would let a brand-new run inherit the last four calls of the previous one and be stopped by them.
+    fn watch_session(&self, session: &str, held: &Lease) -> bool {
+        let Ok(entries) =
+            FileStore::new(self.state.join("sessions")).since(&SessionId::new(session), held.from)
+        else {
+            // A log that will not read is `status`'s to report; stopping the run would be a guess. A torn
+            // tail is the usual cause and the next tick reads it whole.
             return false;
         };
-        let steps = crate::watchdog::steps(loaded.entries());
+        let steps = crate::watchdog::steps(&entries);
         let limits = crate::watchdog::Limits {
-            allowance: self
-                .runs
-                .lock()
-                .ok()
-                .and_then(|runs| runs.get(session).and_then(|lease| lease.allowance)),
+            allowance: held.allowance,
             ..crate::watchdog::Limits::default()
         };
         let Some(stall) = crate::watchdog::inspect(&steps, &limits) else {
@@ -653,6 +656,11 @@ impl Daemon {
         let session_id = engine.session_id().to_string();
 
         let cancel = Arc::new(AtomicBool::new(false));
+        // Where this run's entries begin, taken before the acknowledgement: the length of the log the run
+        // before it left behind. Taken early rather than late, because a window that starts too early holds
+        // at worst a meta root, and one that starts after the run's first entry hides work that was done.
+        let log = engine.log_path();
+        let from = fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0);
         let run = {
             let mut runs = self.runs.lock().map_err(|_| {
                 Fault::harness("the lease table was poisoned by a panic in another thread")
@@ -673,6 +681,7 @@ impl Daemon {
                 Lease {
                     run,
                     since: SystemClock.now(),
+                    from,
                     allowance: bounds.tokens(),
                 },
             );
@@ -697,8 +706,8 @@ impl Daemon {
         .map_err(send_failed)?;
 
         // The log is followed by a thread of its own while the walk runs here, so an entry reaches a watching
-        // client as soon as it is written rather than when the whole run is over.
-        let log = engine.log_path();
+        // client as soon as it is written rather than when the whole run is over. It follows from the same
+        // offset the watchdog's window opens at.
         let done = Arc::new(AtomicBool::new(false));
         let (progress_tx, progress_rx) = std::sync::mpsc::channel::<Value>();
         let feed = move |kind: crate::model::Feed, piece: &str| {
@@ -712,7 +721,6 @@ impl Daemon {
             let mut watcher = stream.try_clone().map_err(|error| {
                 Fault::harness(format!("could not clone the connection: {error}"))
             })?;
-            let from = fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0);
             thread::spawn(move || {
                 let _ = follow(&log, &mut watcher, from, &done, &stopping, &progress_rx);
             })
@@ -1152,6 +1160,94 @@ mod watchdog_tests {
         base
     }
 
+    /// The same command once more, exactly as the run before it issued it. A second run on a session the
+    /// first one left behind begins by repeating what was last said here.
+    fn more_of_the_same(state: &Path, id: &str, calls: usize) {
+        let mut session = Session::load(
+            FileStore::new(state.join("sessions")),
+            SystemClock,
+            SessionId::new(id),
+        )
+        .expect("the session");
+        for _ in 0..calls {
+            session
+                .append(
+                    Kind::ToolCall,
+                    json!({"tool": "shell", "program": "cargo test --quiet"}),
+                )
+                .expect("a call");
+            session
+                .append(
+                    Kind::ToolResult,
+                    json!({"tool": "shell", "status": 1, "output": "test failed"}),
+                )
+                .expect("a result");
+        }
+    }
+
+    /// A run that reads nothing and writes nothing: `calls` distinct calls, each recording the tokens the
+    /// model spent beside it.
+    fn spending_run(state: &Path, calls: usize, tokens: u64) -> String {
+        let id = "spending";
+        let mut session = Session::create(
+            FileStore::new(state.join("sessions")),
+            SystemClock,
+            SessionId::new(id),
+        )
+        .expect("a session");
+        for n in 0..calls {
+            session
+                .append(
+                    Kind::ToolCall,
+                    json!({
+                        "tool": "shell",
+                        "program": format!("cargo test --test case-{n}"),
+                        "model": {
+                            "prompt_tokens": tokens / 2,
+                            "generated_tokens": tokens - tokens / 2,
+                        },
+                    }),
+                )
+                .expect("a call");
+            session
+                .append(
+                    Kind::ToolResult,
+                    json!({"tool": "shell", "status": 1, "output": "test failed"}),
+                )
+                .expect("a result");
+        }
+        id.to_string()
+    }
+
+    /// One more call of a run's own, with its own spend.
+    fn one_more_spending(state: &Path, id: &str, program: &str, tokens: u64) {
+        let mut session = Session::load(
+            FileStore::new(state.join("sessions")),
+            SystemClock,
+            SessionId::new(id),
+        )
+        .expect("the session");
+        session
+            .append(
+                Kind::ToolCall,
+                json!({
+                    "tool": "shell",
+                    "program": program,
+                    "model": {
+                        "prompt_tokens": tokens / 2,
+                        "generated_tokens": tokens - tokens / 2,
+                    },
+                }),
+            )
+            .expect("a call");
+        session
+            .append(
+                Kind::ToolResult,
+                json!({"tool": "shell", "status": 1, "output": "test failed"}),
+            )
+            .expect("a result");
+    }
+
     /// A run that keeps issuing one command: five calls, one after another, each differing only in the
     /// pipe at its end the way a model's retries do.
     fn looping_run(state: &Path, calls: usize) -> String {
@@ -1217,9 +1313,26 @@ mod watchdog_tests {
         id.to_string()
     }
 
+    /// Where a session log currently ends: the offset a run taken on now would write from.
+    fn log_end(state: &Path, id: &str) -> u64 {
+        std::fs::metadata(store(state).path_of(&SessionId::new(id)))
+            .expect("a log")
+            .len()
+    }
+
+    fn store(state: &Path) -> FileStore {
+        FileStore::new(state.join("sessions"))
+    }
+
     /// A daemon holding one run, with the stop flag a submit installs. No socket is served and no thread
-    /// is started: the tick is a method precisely so a test can call it twice.
-    fn holding(state: &Path, id: &str) -> (Daemon, Arc<AtomicBool>) {
+    /// is started: the tick is a method precisely so a test can call it twice. `from` opens the window the
+    /// run is judged on, as the submit of a run does.
+    fn holding(
+        state: &Path,
+        id: &str,
+        from: u64,
+        allowance: Option<u64>,
+    ) -> (Daemon, Arc<AtomicBool>) {
         let daemon = Daemon::bind(state, state.join("daemon.sock")).expect("bind");
         let flag = Arc::new(AtomicBool::new(false));
         daemon.runs.lock().expect("runs").insert(
@@ -1227,7 +1340,8 @@ mod watchdog_tests {
             Lease {
                 run: 1,
                 since: SystemClock.now(),
-                allowance: None,
+                from,
+                allowance,
             },
         );
         daemon
@@ -1249,7 +1363,7 @@ mod watchdog_tests {
     fn a_looping_run_is_stopped_once_and_recorded_once() {
         let state = scratch("watchdog-loop");
         let id = looping_run(&state, 5);
-        let (daemon, flag) = holding(&state, &id);
+        let (daemon, flag) = holding(&state, &id, 0, None);
 
         assert_eq!(daemon.watchdog(), 1, "the loop was found");
         assert!(flag.load(Ordering::SeqCst), "the run was asked to stop");
@@ -1278,7 +1392,7 @@ mod watchdog_tests {
     fn a_second_tick_over_a_run_already_stopping_records_nothing_more() {
         let state = scratch("watchdog-twice");
         let id = looping_run(&state, 5);
-        let (daemon, _flag) = holding(&state, &id);
+        let (daemon, _flag) = holding(&state, &id, 0, None);
         assert_eq!(daemon.watchdog(), 1);
         for _ in 0..3 {
             assert_eq!(daemon.watchdog(), 0);
@@ -1293,7 +1407,7 @@ mod watchdog_tests {
     fn a_finished_run_is_not_inspected() {
         let state = scratch("watchdog-finished");
         let id = looping_run(&state, 5);
-        let (daemon, flag) = holding(&state, &id);
+        let (daemon, flag) = holding(&state, &id, 0, None);
         daemon.runs.lock().expect("runs").remove(&id);
         assert_eq!(daemon.watchdog(), 0);
         assert!(!flag.load(Ordering::SeqCst), "a finished run was stopped");
@@ -1305,11 +1419,127 @@ mod watchdog_tests {
     fn a_healthy_run_is_left_alone() {
         let state = scratch("watchdog-healthy");
         let id = healthy_run(&state);
-        let (daemon, flag) = holding(&state, &id);
+        let (daemon, flag) = holding(&state, &id, 0, None);
         for _ in 0..3 {
             assert_eq!(daemon.watchdog(), 0);
         }
         assert!(!flag.load(Ordering::SeqCst), "a working run was stopped");
+        assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The cost of a tick on a long session. The tick used to load and parse the whole log once a second
+    /// for every running session; the audit measured 3.06 s for 2.9 MB and 20,001 entries in a debug build,
+    /// which is time the accept loop spends not accepting. It now reads from the offset the run was taken
+    /// on, so the numbers printed here are the difference between reading a history and reading a run.
+    /// They are printed and not asserted: a wall clock on a shared machine is not evidence a build can
+    /// keep, and a flaky ceiling would teach a person to ignore this test.
+    #[test]
+    fn a_tick_over_a_long_history_reads_only_this_runs_window() {
+        let state = scratch("watchdog-long-log");
+        let id = looping_run(&state, 1);
+        let mut session =
+            Session::load(store(&state), SystemClock, SessionId::new(&id)).expect("the session");
+        for n in 0..10_000 {
+            session
+                .append(
+                    Kind::ToolCall,
+                    json!({
+                        "tool": "shell",
+                        "program": format!("cargo test --test case-{n}"),
+                        "model": {"prompt_tokens": 100, "generated_tokens": 100},
+                    }),
+                )
+                .expect("a call");
+            session
+                .append(
+                    Kind::ToolResult,
+                    json!({"tool": "shell", "status": 1, "output": "test failed"}),
+                )
+                .expect("a result");
+        }
+        let from = log_end(&state, &id);
+        for n in 0..3 {
+            one_more_spending(&state, &id, &format!("cargo test --test fresh-{n}"), 100);
+        }
+
+        let (daemon, flag) = holding(&state, &id, from, None);
+        let window = store(&state)
+            .since(&SessionId::new(&id), from)
+            .expect("the window");
+        let whole = std::time::Instant::now();
+        let loaded =
+            Session::load(store(&state), SystemClock, SessionId::new(&id)).expect("the whole log");
+        let load_ms = whole.elapsed().as_secs_f64() * 1_000.0;
+        let ticked = std::time::Instant::now();
+        assert_eq!(daemon.watchdog(), 0, "a healthy run was stopped");
+        let tick_ms = ticked.elapsed().as_secs_f64() * 1_000.0;
+
+        assert_eq!(
+            window.len(),
+            6,
+            "the window holds this run's entries and nothing else"
+        );
+        assert_eq!(
+            loaded.len(),
+            20_009,
+            "a twenty-thousand-entry history, the size the audit measured"
+        );
+        assert!(!flag.load(Ordering::SeqCst), "a working run was stopped");
+        println!(
+            "{} entries, {} bytes: a whole log {} ms, one tick {tick_ms} ms over {} entries",
+            loaded.len(),
+            from,
+            load_ms,
+            window.len()
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The defect this exists for: the tick judged a run on the whole session log, so a brand-new run that
+    /// repeated the previous run's last call was stopped inside its first second. Four identical calls in
+    /// run 1 and one of its own in run 2 is a fresh run, not a loop.
+    #[test]
+    fn a_new_run_is_not_stopped_for_the_calls_the_run_before_it_made() {
+        let state = scratch("watchdog-second-run");
+        let id = looping_run(&state, 4);
+        let from = log_end(&state, &id);
+        more_of_the_same(&state, &id, 1);
+        let (daemon, flag) = holding(&state, &id, from, None);
+        assert_eq!(
+            daemon.watchdog(),
+            0,
+            "a fresh run was stopped on its predecessor's calls: {:?}",
+            stopped(&state)
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the new run was asked to stop"
+        );
+        assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The same flaw spent the allowance twice: the budget belongs to the run that declared it, so a second
+    /// run's spend is measured from where it started. Run 1 spent 4,000 and wrote nothing; run 2 has spent
+    /// 200 of its own against 4,000.
+    #[test]
+    fn a_new_run_spends_its_own_allowance_and_not_the_run_before_its() {
+        let state = scratch("watchdog-second-run-spend");
+        let id = spending_run(&state, 4, 1_000);
+        let from = log_end(&state, &id);
+        one_more_spending(&state, &id, "cargo test --test one", 200);
+        let (daemon, flag) = holding(&state, &id, from, Some(4_000));
+        assert_eq!(
+            daemon.watchdog(),
+            0,
+            "a fresh run was stopped on its predecessor's spend: {:?}",
+            stopped(&state)
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the new run was asked to stop"
+        );
         assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
         let _ = std::fs::remove_dir_all(&state);
     }

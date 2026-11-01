@@ -248,6 +248,57 @@ fn view_equals_the_chain_without_compaction() {
     assert_eq!(view, vec![0, 1]);
 }
 
+/// The daemon asks a session log one question a second while it holds a run: what has this run appended?
+/// A log is cumulative, and a three-megabyte history read to look at five entries is work with no answer
+/// in it. The offset is the length of the file when the run started, so it is always a line boundary.
+#[test]
+fn a_window_from_an_offset_holds_only_what_was_appended_after_it() {
+    let (mut session, store, dir) = session("window");
+    session
+        .append(Kind::User, json!({"text": "the run before"}))
+        .unwrap();
+    session
+        .append(Kind::User, json!({"text": "and the one before that"}))
+        .unwrap();
+    let log = store.path_of(&SessionId::new("s1"));
+    let from = std::fs::metadata(&log).expect("a log").len();
+    session
+        .append(Kind::User, json!({"text": "this run"}))
+        .unwrap();
+    session
+        .append(Kind::ToolCall, json!({"tool": "shell"}))
+        .unwrap();
+
+    let window = store
+        .since(&SessionId::new("s1"), from)
+        .expect("the window");
+    assert_eq!(window.len(), 2, "{window:?}");
+    assert_eq!(payload_text(&window[0]), Some("this run"));
+    assert_eq!(window[1].kind, Kind::ToolCall);
+
+    // A window opened at the end of the log is empty: that is a run that has written nothing yet.
+    let end = std::fs::metadata(&log).expect("a log").len();
+    assert!(
+        store
+            .since(&SessionId::new("s1"), end)
+            .expect("an empty window")
+            .is_empty()
+    );
+
+    // A torn line is reported, never skipped, even when it is the only thing in the window.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .expect("append");
+    std::io::Write::write_all(&mut file, b"{\"v\": 1, torn").expect("a torn line");
+    assert!(
+        store.since(&SessionId::new("s1"), end).is_err(),
+        "a line that will not decode was skipped"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compaction_is_lossless() {
     let (mut session, store, _) = session("compaction");

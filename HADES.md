@@ -344,11 +344,14 @@ every attempt, and files one note at the accept terminal, so a retry does not pa
 refused run files nothing. The daemon uses the same seam, so a submitted run is not a second-class one.
 
 The daemon also watches the runs it holds. Once a second, beside the connections it is already serving, it
-reads the tail of each running session's log and asks one question: is this run still doing anything? A run
-that issues one command five times in a row, or twelve steps in a row with nothing written and nothing read,
-is stopped the same way `/stop` stops it, and the ledger records `watchdog_stopped` with the finding in one
-sentence. Calls are compared after normalisation, so a command rephrased only in its pipe is one call. A run
-that has finished is not inspected: its log is history.
+reads each running session's log from the offset the run started at and asks one question: is this run still
+doing anything? The judgement covers the entries this run wrote; the history above them belongs to runs that
+have already ended, is not parsed, and on a session with twenty thousand entries that is the difference
+between a tick of a fraction of a millisecond and one of three seconds. A run that issues one command five
+times in a row, or twelve steps in a row with nothing written and nothing read, is stopped the same way `/stop`
+stops it, and the ledger records `watchdog_stopped` with the finding in one sentence. Calls are compared after
+normalisation, so a command rephrased only in its pipe is one call, and an allowance is spent by the run that
+declared it. A run that has finished is not inspected: its log is history.
 
 ## The gateway
 

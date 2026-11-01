@@ -1,7 +1,7 @@
 //! One JSONL file per session, one JSON object per line, append-only.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -38,6 +38,36 @@ impl FileStore {
             line,
             detail: detail.into(),
         }
+    }
+
+    /// Read the entries appended to a session's log since a byte offset.
+    ///
+    /// The daemon asks this once a second for each run it holds, and a log is cumulative: reading a
+    /// three-megabyte history to look at the five entries a run wrote is work with no answer in it.
+    ///
+    /// `from` must be a line boundary, which the length of the file at the moment a run started always is.
+    /// A line that will not decode is reported, never skipped, for the same reason [`FileStore::load`]
+    /// reports it: a silently skipped line rewrites history. The duplicate-id and parent-before-child
+    /// checks are not repeated here, because they need the entries before the window; the window holds
+    /// what one process appended under a lease, so the chain up to `from` was read when it was taken on.
+    pub fn since(&self, session: &SessionId, from: u64) -> Result<Vec<Entry>, Fault> {
+        let path = self.path_of(session);
+        let file = File::open(&path).map_err(|e| FileStore::io(&path, e))?;
+        let mut reader = BufReader::new(file);
+        reader
+            .seek(SeekFrom::Start(from))
+            .map_err(|e| FileStore::io(&path, e))?;
+        let mut entries: Vec<Entry> = Vec::new();
+        for (index, line) in reader.lines().enumerate() {
+            let raw = line.map_err(|e| FileStore::io(&path, e))?;
+            if raw.trim().is_empty() {
+                continue;
+            }
+            // The line number counts from the start of the window: this read never sees the lines before
+            // `from`, and a number invented for them would point at the wrong place in the file.
+            entries.push(decode(&path, index + 1, &raw)?);
+        }
+        Ok(entries)
     }
 }
 
