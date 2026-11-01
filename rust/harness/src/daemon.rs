@@ -377,17 +377,32 @@ impl Daemon {
         let Some(stall) = crate::watchdog::inspect(&steps, &limits) else {
             return false;
         };
-        let Some(flag) = self
-            .cancels
-            .lock()
-            .ok()
-            .and_then(|cancels| cancels.get(session).cloned())
-        else {
+        // The lease is read again under the lock `submit` takes to release it. A run whose lease is gone has
+        // finished, and the stop flag outliving it by a moment is cleanup, not work in progress: swapping
+        // that flag would record `watchdog_stopped` for a run that ended before the judgement landed. The
+        // same lock also keeps the one-record guarantee, since a run that is already stopping leaves its
+        // flag set.
+        let Ok(runs) = self.runs.lock() else {
             return false;
         };
-        // The swap is the one-record guarantee: a run that is already stopping is not asked twice, and the
-        // line that says why is written once by the tick that asked.
-        if flag.swap(true, Ordering::SeqCst) {
+        let Some(current) = runs.get(session) else {
+            return false;
+        };
+        if current.run != held.run {
+            // The session was released and taken on again while this tick was reading it: the judgement is
+            // about a run that no longer exists, and the flag now belongs to a different one.
+            return false;
+        }
+        let Ok(mut cancels) = self.cancels.lock() else {
+            return false;
+        };
+        let Some(flag) = cancels.get(session).cloned() else {
+            return false;
+        };
+        let asked = flag.swap(true, Ordering::SeqCst);
+        drop(cancels);
+        drop(runs);
+        if asked {
             return false;
         }
         crate::activity::watchdog_stopped(
@@ -1493,6 +1508,38 @@ mod watchdog_tests {
             load_ms,
             window.len()
         );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The defect this exists for: the tick snapshotted the leases and then swapped the stop flag without
+    /// looking at the lease again. `submit` releases the run before it removes the flag, so a tick landing in
+    /// that window found a finished run's flag and recorded `watchdog_stopped` for work that had already
+    /// ended. The flag outliving the lease is cleanup, and cleanup is not a run in progress.
+    #[test]
+    fn a_run_that_finished_between_the_snapshot_and_the_record_is_not_stopped() {
+        let state = scratch("watchdog-finished-mid-tick");
+        let id = looping_run(&state, 5);
+        let (daemon, flag) = holding(&state, &id, 0, None);
+        let held = daemon
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&id)
+            .cloned()
+            .expect("a lease");
+        // The run reaches its end between the snapshot and the record, in the order `submit` uses: the lease
+        // goes first and the flag a moment later.
+        daemon.runs.lock().expect("runs").remove(&id);
+
+        assert!(
+            !daemon.watch_session(&id, &held),
+            "a finished run was recorded as stopped"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a finished run was asked to stop"
+        );
+        assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
         let _ = std::fs::remove_dir_all(&state);
     }
 

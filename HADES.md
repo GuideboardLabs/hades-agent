@@ -351,7 +351,9 @@ between a tick of a fraction of a millisecond and one of three seconds. A run th
 times in a row, or twelve steps in a row with nothing written and nothing read, is stopped the same way `/stop`
 stops it, and the ledger records `watchdog_stopped` with the finding in one sentence. Calls are compared after
 normalisation, so a command rephrased only in its pipe is one call, and an allowance is spent by the run that
-declared it. A run that has finished is not inspected: its log is history.
+declared it. A run that has finished is never recorded as stopped: its lease is read again, under the same
+lock a finishing run takes to release it, before anything is written, so the flag that outlives a lease by a
+moment is cleanup and not a stop.
 
 ## The gateway
 
