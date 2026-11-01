@@ -786,10 +786,14 @@ can live anywhere; a public menu stays public content.
 
 ```sh
 cd rust
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+./scripts/gate.sh
 ```
+
+That is the whole gate in the order CI runs it: `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, then the workspace suite. The suite runs through `scripts/ci-test.sh`,
+which is where the deadline lives: 1800 seconds, `HADES_TEST_TIMEOUT` to override. Cargo has no per-test
+timeout, so a test that parks would otherwise hold the command until something outside killed it, and a
+hang prints no test name; under the deadline the run ends with a `the suite timed out` line instead.
 
 Current state: **1175 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
 

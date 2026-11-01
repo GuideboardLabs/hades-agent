@@ -51,9 +51,12 @@ Install stable Rust with rustup; no custom `CARGO_HOME` or target directory is r
 ## Running it
 
     cd rust
-    cargo fmt --all
-    cargo test
-    cargo clippy --all-targets -- -D warnings
+    ./scripts/gate.sh
+
+That is the whole gate: the format check, clippy with warnings refused, and the workspace suite. The suite
+runs under `scripts/ci-test.sh`'s deadline (1800 s, `HADES_TEST_TIMEOUT` to override), because cargo has no
+per-test timeout: a test that parks would otherwise hold the terminal until something outside killed it,
+and a hang names no test. `cargo test` on its own has no deadline.
 
 Cargo writes to `rust/target/`, which is gitignored. The upstream Python reference tree is not part of
 this checkout; the Rust tests are self-contained.
