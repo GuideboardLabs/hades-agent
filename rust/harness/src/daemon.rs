@@ -1346,6 +1346,12 @@ fn send_failed(error: std::io::Error) -> Fault {
 mod watchdog_tests {
     use super::*;
 
+    use crate::context::Section;
+    use crate::{
+        Budgeted, CommandVerifier, Effort, Outcome, Policy, Profile, ProfileId, Role, Rule,
+        ScriptedModel, Seams, Shell, TaskSpec,
+    };
+
     fn scratch(name: &str) -> PathBuf {
         let base = crate::scratch::root().join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -2017,6 +2023,221 @@ mod watchdog_tests {
         assert!(
             !flag.load(Ordering::SeqCst),
             "the new run was asked to stop"
+        );
+        assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The pieces a real turn runs on, so a test that drives the writer does not rebuild six seams inline.
+    #[allow(clippy::type_complexity)]
+    fn bench(
+        state: &Path,
+    ) -> (
+        PathBuf,
+        TaskSpec,
+        Profile,
+        Policy,
+        Budgeted,
+        Shell,
+        CommandVerifier,
+    ) {
+        let root = state.join("work");
+        std::fs::create_dir_all(&root).expect("a work root");
+        let task = TaskSpec::new("build the tree and read what it wrote", &root);
+        let profile = Profile {
+            id: ProfileId::new("test"),
+            role: Role::Patch,
+            model: Some("scripted".to_string()),
+            effort: Effort::Medium,
+            context_tokens: 4096,
+            verify: "true".to_string(),
+            judge: false,
+            plan_first: false,
+            edits: true,
+            shadow: true,
+            attempts: 3,
+            minutes: 10,
+            protect: Vec::new(),
+            network: true,
+        };
+        let policy = Policy::new(vec![Rule::new(
+            crate::SHELL,
+            Decision::Allow,
+            "the test allows the shell",
+        )]);
+        let context = Budgeted::new(vec![Section::new("goal", task.goal())]);
+        let shell = Shell::new(&root, 64 * 1024);
+        let verifier = CommandVerifier::new(64 * 1024);
+        (root, task, profile, policy, context, shell, verifier)
+    }
+
+    /// The chain the headline claim rests on, assembled once instead of argued in halves.
+    ///
+    /// Every other stop in this module is judged on a history this module wrote by hand, and every one of
+    /// those `ToolCall`s carries no `did`: the daemon has therefore only ever been proven against the text
+    /// fallback, while a real run's history is the one the writer produces. So this test drives the real
+    /// seams: `Seams::turn` writes five identical builds, each with the classification the producer decided,
+    /// under the lease a submit takes. The same tick then has to stop that run, name it in the ledger, and
+    /// leave the second run alone, which is a live run re-reading the file the first one wrote.
+    #[test]
+    fn the_tick_stops_a_run_real_turns_wrote_and_leaves_the_next_run_alone() {
+        // A build whose output is the file the second run reads. The redirect is what puts the artifact on
+        // disk, and it is also what makes the step a write: `cargo build` alone is a build the log cannot see
+        // into, which is the shape the repeat rule is for.
+        const BUILD: &str = "cargo build --quiet > build.log";
+
+        let state = scratch("watchdog-assembled");
+        let (root, task, profile, policy, context, shell, verifier) = bench(&state);
+        let daemon = Daemon::bind(&state, state.join("daemon.sock")).expect("bind");
+
+        // Run 1, taken on the way a submit takes it on: the lease first, then the turns that write while it
+        // is held.
+        let building = "building";
+        let mut log = Session::create(store(&state), SystemClock, SessionId::new(building))
+            .expect("a session");
+        let path = store(&state).path_of(&SessionId::new(building));
+        let first = Arc::new(AtomicBool::new(false));
+        let (run, _from) = daemon
+            .lease(building, &path, &first, None)
+            .expect("run 1 is taken on");
+        assert_eq!(run, 1, "a fresh state names its first run 1");
+
+        let model = ScriptedModel::new([BUILD; 5]);
+        for n in 0..5 {
+            let turn = Seams::new(
+                &task, &profile, &policy, &context, &model, &shell, &verifier,
+            )
+            .turn(&mut log)
+            .unwrap_or_else(|fault| panic!("turn {}: {}", n + 1, fault.detail()));
+            assert!(
+                matches!(turn.outcome, Outcome::Ran { .. }),
+                "turn {} did not run the program: {:?}",
+                n + 1,
+                turn.outcome
+            );
+        }
+        drop(log);
+        assert!(
+            root.join("build.log").is_file(),
+            "the build wrote no file, so the second run has nothing of the first one's to read"
+        );
+
+        // Run 2 is a different session, because one session takes one run at a time. It re-reads the file run
+        // 1 wrote: three looks at one artifact, which is the commonest stuck shape there is, and the tick
+        // must leave it alone. It is the shape the read rule was made for, and the tick answers it from the
+        // run's own window.
+        let reading = "reading";
+        let mut reread = Session::create(store(&state), SystemClock, SessionId::new(reading))
+            .expect("a second session");
+        let reread_path = store(&state).path_of(&SessionId::new(reading));
+        let second = Arc::new(AtomicBool::new(false));
+        let (run, _) = daemon
+            .lease(reading, &reread_path, &second, None)
+            .expect("run 2 is taken on");
+        assert_eq!(run, 2, "the second lease is run 2");
+        let reader = ScriptedModel::new(["cat build.log"; 3]);
+        for _ in 0..3 {
+            Seams::new(
+                &task, &profile, &policy, &context, &reader, &shell, &verifier,
+            )
+            .turn(&mut reread)
+            .expect("a turn that reads");
+        }
+        drop(reread);
+
+        let count = daemon.watchdog();
+        assert_eq!(
+            count,
+            1,
+            "the tick stopped {count} runs: {:?}",
+            stopped(&state)
+        );
+        assert!(
+            first.load(Ordering::SeqCst),
+            "the run that wrote the repeated history was never asked to stop"
+        );
+        assert!(
+            !second.load(Ordering::SeqCst),
+            "the run reading what the stopped one wrote was stopped for it"
+        );
+
+        let lines = stopped(&state);
+        assert_eq!(lines.len(), 1, "one stop, one record: {lines:?}");
+        assert_eq!(lines[0].layer, "watchdog");
+        assert_eq!(lines[0].decision, "stop");
+        assert!(
+            lines[0]
+                .reason
+                .contains("repeating shell: cargo build --quiet"),
+            "the record does not name the call the run repeated: {:?}",
+            lines[0].reason
+        );
+        assert!(
+            lines[0].action.contains("run 1") && lines[0].action.contains(building),
+            "the record does not name the run it stopped: {:?}",
+            lines[0].action
+        );
+        assert!(
+            !lines[0].action.contains(reading),
+            "the record names the run that was left alone: {:?}",
+            lines[0].action
+        );
+        println!("assembled: {:?}", lines[0].action);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The other half of the same claim, and the one the hand-written fixtures could never reach: the tick
+    /// reads the judgement the producer recorded, not the program's text.
+    ///
+    /// `git log` is a look. The record says so, because the producer had the tool and its arguments in hand.
+    /// The text fallback, which exists only for logs written before the field existed, names a fixed list of
+    /// reporters and `git` is not on it, so it reads the same twelve steps as twelve that looked at nothing
+    /// and stops the run. Twelve *distinct* reads are progress under the record and a stall under the text.
+    /// Nothing here is hand-built: the calls are the ones `Seams::turn` wrote, and the only thing this test
+    /// changes is which run the daemon holds.
+    #[test]
+    fn the_tick_reads_the_record_the_writer_made_rather_than_the_program_text() {
+        let state = scratch("watchdog-record");
+        let (_root, task, profile, policy, context, shell, verifier) = bench(&state);
+        let daemon = Daemon::bind(&state, state.join("daemon.sock")).expect("bind");
+
+        let looking = "looking";
+        let mut log = Session::create(store(&state), SystemClock, SessionId::new(looking))
+            .expect("a session");
+        let path = store(&state).path_of(&SessionId::new(looking));
+        let flag = Arc::new(AtomicBool::new(false));
+        daemon
+            .lease(looking, &path, &flag, None)
+            .expect("the run is taken on");
+
+        let programs: Vec<String> = (0..12)
+            .map(|n| format!("git log --oneline case-{n}"))
+            .collect();
+        let model = ScriptedModel::new(programs);
+        for _ in 0..12 {
+            let turn = Seams::new(
+                &task, &profile, &policy, &context, &model, &shell, &verifier,
+            )
+            .turn(&mut log)
+            .expect("a turn that looks");
+            assert!(
+                matches!(turn.outcome, Outcome::Ran { .. }),
+                "{:?}",
+                turn.outcome
+            );
+        }
+        drop(log);
+
+        let count = daemon.watchdog();
+        assert_eq!(
+            count,
+            0,
+            "the tick stopped a run of twelve distinct looks: {:?}",
+            stopped(&state)
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the run was asked to stop for looking"
         );
         assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
         let _ = std::fs::remove_dir_all(&state);
