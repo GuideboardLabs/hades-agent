@@ -509,6 +509,11 @@ pub struct Update {
     /// spells a mention `<@id>` and strips it before the update exists, so the text cannot answer this
     /// there; `None` means the surface said nothing and the text is all there is to read.
     pub mention: Option<bool>,
+    /// Whether this surface knows the message is a one-to-one conversation. Discord carries the DM
+    /// channel's own snowflake as the chat id and the person's id as the sender, so the ids never match
+    /// there; a surface that can tell the shapes apart says so. `None` means it said nothing, and the
+    /// older reading (the chat id is the sender's, which is how Telegram spells a private chat) is used.
+    pub direct: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

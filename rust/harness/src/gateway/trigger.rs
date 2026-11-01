@@ -129,8 +129,15 @@ pub fn classify(update: &Update, settings: &Settings) -> Verdict {
     if trigger == Trigger::Never {
         return Verdict::Ignore;
     }
-    // A direct chat is addressed by existing: the sender wrote here and nowhere else.
-    if update.from == update.chat.id() {
+    // A direct chat is addressed by existing: the sender wrote here and nowhere else. The surface says
+    // whether this is one when it can tell the shapes apart — Discord hands over the DM channel's own
+    // snowflake as the chat id, so comparing the sender with the chat would call every direct message a
+    // stranger's. A surface that says nothing keeps the older reading, which is how Telegram spells a
+    // private chat: the chat id is the person's own id.
+    let direct = update
+        .direct
+        .unwrap_or_else(|| update.from == update.chat.id());
+    if direct {
         return Verdict::Requested;
     }
     match trigger {
@@ -188,7 +195,57 @@ mod tests {
             callback: None,
             photo: None,
             mention: None,
+            direct: None,
         }
+    }
+
+    /// The defect this exists for: a Discord DM carries the DM channel's own snowflake as the chat id and
+    /// the person's id as the sender, so `from == chat.id()` is false there and, under `mention`, a plain
+    /// direct message was dropped after the connector delivered it. The surface says the chat is
+    /// one-to-one, and the filter stops guessing from ids.
+    #[test]
+    fn a_direct_chat_the_surface_names_is_a_request_though_the_ids_differ() {
+        let dir = crate::scratch::unique("trigger-direct");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "model": "none",
+                "root": "/work",
+                "vault": "/work/mneme",
+                "gateway": {
+                    "connectors": {
+                        "discord": {"allowed_users": ["7"], "trigger": "mention"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("a config");
+        let settings = crate::gateway::settings_for(&path, "discord").expect("the surface");
+        let dm = Update {
+            from: "7".to_string(),
+            chat: Chat::new("discord", "1300000000000000002"),
+            text: "the build broke again".to_string(),
+            direct: Some(true),
+            ..update(0, 0, "")
+        };
+        assert_eq!(
+            classify(&dm, &settings),
+            Verdict::Requested,
+            "a direct message the surface named was filtered as unaddressed"
+        );
+
+        // The surface's answer outranks the id guess in both directions: two ids that happen to match do
+        // not make a channel somebody else is reading a direct chat.
+        let channel = Update {
+            from: "7".to_string(),
+            chat: Chat::new("discord", "7"),
+            text: "the build broke again".to_string(),
+            direct: Some(false),
+            ..update(0, 0, "")
+        };
+        assert_eq!(classify(&channel, &settings), Verdict::Ignore);
     }
 
     #[test]

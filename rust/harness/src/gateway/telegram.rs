@@ -187,6 +187,13 @@ fn keyboard(buttons: &[Button]) -> Value {
     json!({"inline_keyboard": [row]})
 }
 
+/// The kind of chat an update belongs to, when the surface names it. A private chat is where the person
+/// wrote and nowhere else, and Telegram says so in the chat's own `type` instead of leaving the shape to
+/// be guessed from the ids.
+fn chat_kind(chat: Option<&Value>) -> Option<&str> {
+    chat?.get("type").and_then(Value::as_str)
+}
+
 fn parse_update(value: &Value) -> Option<Update> {
     let id = value.get("update_id")?.as_i64()?;
     if let Some(message) = value.get("message") {
@@ -216,6 +223,8 @@ fn parse_update(value: &Value) -> Option<Update> {
             // Telegram leaves an @name in the text, so the gateway reads it there; the transport does not
             // call getMe and has no name of its own to look for.
             mention: None,
+            // A private chat says so in its own type, rather than leaving the shape to be guessed from ids.
+            direct: chat_kind(message.get("chat")).map(|kind| kind == "private"),
         });
     }
     let query = value.get("callback_query")?;
@@ -230,6 +239,7 @@ fn parse_update(value: &Value) -> Option<Update> {
         }),
         photo: None,
         mention: None,
+        direct: chat_kind(query.pointer("/message/chat")).map(|kind| kind == "private"),
     })
 }
 
@@ -269,6 +279,33 @@ mod tests {
         let update = parse_update(&value).expect("an update");
         assert_eq!(update.photo.as_deref(), Some("large"));
         assert_eq!(update.text, "what is this");
+    }
+
+    #[test]
+    fn a_private_chat_is_named_by_the_surface_not_left_to_the_ids() {
+        let private = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "from": {"id": 11},
+                "chat": {"id": 11, "type": "private"},
+                "text": "hello"
+            }
+        });
+        assert_eq!(
+            parse_update(&private).expect("a message").direct,
+            Some(true),
+            "a private chat says so in its own type"
+        );
+
+        let group = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "from": {"id": 11},
+                "chat": {"id": -100123, "type": "supergroup"},
+                "text": "hello"
+            }
+        });
+        assert_eq!(parse_update(&group).expect("a message").direct, Some(false));
     }
 
     #[test]

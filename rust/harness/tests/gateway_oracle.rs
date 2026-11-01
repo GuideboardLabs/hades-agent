@@ -130,6 +130,7 @@ fn message(from: i64, chat: i64, text: &str) -> Update {
         callback: None,
         photo: None,
         mention: None,
+        direct: None,
     }
 }
 
@@ -606,6 +607,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
             }),
             photo: None,
             mention: None,
+            direct: None,
         },
         &settings,
         &socket,
@@ -658,6 +660,7 @@ fn the_offset_advances_after_a_batch() {
         callback: None,
         photo: None,
         mention: None,
+        direct: None,
     }]]);
     serve(
         fake.clone(),

@@ -563,6 +563,9 @@ fn message_update(inner: &Arc<Inner>, message: &Value) -> Option<Update> {
         callback: None,
         photo,
         mention: Some(named_us),
+        // Discord's DM channel has a snowflake of its own, so the ids cannot answer this: a message with no
+        // guild is a one-to-one conversation and the person wrote here and nowhere else.
+        direct: Some(guild.is_none()),
     })
 }
 
@@ -593,6 +596,7 @@ fn press_update(interaction: &Value) -> Option<Update> {
         }),
         photo: None,
         mention: None,
+        direct: None,
     })
 }
 
@@ -632,6 +636,7 @@ mod tests {
             .expect("a mention reaches the chat");
         assert_eq!(update.text, "hello");
         assert_eq!(update.chat, Chat::new(SURFACE, "1300000000000000002"));
+        assert_eq!(update.direct, Some(false), "a guild message is not a DM");
     }
 
     #[test]
@@ -674,6 +679,11 @@ mod tests {
         let inner = inner();
         let update = message_update(&inner, &message("7", "hello", None)).expect("a dm");
         assert_eq!(update.text, "hello");
+        assert_eq!(
+            update.direct,
+            Some(true),
+            "a message with no guild is a one-to-one chat"
+        );
     }
 
     #[test]
