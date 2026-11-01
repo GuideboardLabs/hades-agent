@@ -23,12 +23,39 @@ use session_tree::{Entry, Kind};
 /// tool and its own arguments together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Did {
-    /// It looked at something: a file read, a search, a listing, a program that only reports.
+    /// It looked at something, or the log has no evidence that it changed a file and it is not one of the
+    /// programs whose value is work on the tree. Reading is how a run rebuilds its working set after a trim,
+    /// so this is the state the stall rule exempts: a false stop costs more than a slow run.
     Read,
     /// It created or changed a file: an edit that landed, or a program that sends its output into one.
     Write,
-    /// Neither, as far as the log can tell: a program that runs work, or a tool nobody classified.
+    /// A program that runs work whose writes the log cannot see, or a tool nobody classified. This is the
+    /// only state that counts toward a stall, so it is the only one where silence is evidence.
     Nothing,
+}
+
+impl Did {
+    /// The word the session log carries for it. The producer writes this beside the call, because it is the
+    /// only place where the tool, its arguments and its result are all in hand at once.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Did::Read => "read",
+            Did::Write => "write",
+            Did::Nothing => "nothing",
+        }
+    }
+
+    /// The judgement a log carries, when it carries one this build knows. A word from a later build is not
+    /// guessed at: the text classifier answers instead, exactly as it does for a log written before the
+    /// field existed.
+    fn recorded(label: &str) -> Option<Did> {
+        match label {
+            "read" => Some(Did::Read),
+            "write" => Some(Did::Write),
+            "nothing" => Some(Did::Nothing),
+            _ => None,
+        }
+    }
 }
 
 /// One step of a run, as the session log recorded it.
@@ -136,29 +163,55 @@ pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
     None
 }
 
-/// The step a tool call records: what ran, what it was asked, what it did, and what it cost.
-///
-/// Classification happens here, where the tool's name and its arguments are both in hand. The name alone is
-/// not enough for the reason this module exists for: `turn` logs a program as `shell`, so the name of a
-/// `grep` step and the name of a `cargo build` step are the same word.
-fn classify(tool: &str, arguments: &str) -> Did {
+/// What a step did, decided where the tool's name, its arguments and, for an edit, its result are all in
+/// hand. `turn` calls this and writes the word into the log it produces; `steps` reads it back. This is the
+/// seam the rule depends on: a reader that re-derived the judgement from text would be re-deriving it from
+/// less than the writer had.
+pub(crate) fn classify(tool: &str, arguments: &str) -> Did {
     match tool {
-        // The tools whose name is the whole claim. An edit is a write when it lands, and the result's own
-        // status is what says so: a refused edit changed nothing, and `steps` corrects this.
+        crate::SHELL => program(arguments),
+        _ => by_tool(tool),
+    }
+}
+
+/// The judgement a log with no recorded classification gets: the text alone.
+///
+/// Narrower than `classify` by design, and kept only for logs written before the field existed. Its program
+/// rule is a list of reporters, so a read-only program that list does not name is judged to have done
+/// nothing; a read-only `git` step in an old log therefore counts toward the stall. That limit is the reason
+/// the producer records the judgement at all.
+fn classify_text(tool: &str, arguments: &str) -> Did {
+    match tool {
+        crate::SHELL => legacy_program(arguments),
+        _ => by_tool(tool),
+    }
+}
+
+/// The tools whose name is the whole claim. An edit is a write when it lands, and the result's own status is
+/// what says so: a refused edit changed nothing, and `steps` corrects this for a log that does not carry the
+/// classification.
+fn by_tool(tool: &str) -> Did {
+    match tool {
         "patch" | "write_file" | "edit" => Did::Write,
         "read_file" | "list_dir" | "search" | "grep" | "skills" | "recall" | "session_search"
         | "fetch" | "library" | "image" => Did::Read,
-        crate::SHELL => program(arguments),
         _ => Did::Nothing,
     }
 }
 
-/// The programs that only report: a command whose every segment is one of these looked at something and
-/// changed nothing.
+/// The programs whose value is work on the tree: builders, compilers and test runners, whose writes a log
+/// cannot see. A step in one of these is the only shape where "nothing was written" is a fair reading, so it
+/// is the only shape that counts toward a stall.
 ///
-/// `cargo` and `rustc` are deliberately absent: they run work, and a run that builds twelve times without
-/// writing is exactly the shape this rule exists to find. `git` is absent too, because the same word logs
-/// and commits, and a name that cannot tell those apart is the defect this classifier replaced.
+/// This list is deliberately short, and its failure is benign: a build tool nobody listed is exempted from
+/// the stall rule rather than having a run stopped for it. The list it replaced named the *readers*, which
+/// had to hold every program anyone runs and never could.
+const WORK: &[&str] = &[
+    "cargo", "rustc", "make", "cmake", "ninja", "gcc", "cc", "clang", "ld", "go", "npm", "pnpm",
+    "yarn", "pytest", "mvn", "gradle", "zig", "tsc", "javac", "dotnet", "bazel",
+];
+
+/// The programs that only report, for the text fallback only.
 const REPORTERS: &[&str] = &[
     "cat",
     "bat",
@@ -223,10 +276,33 @@ const REPORTERS: &[&str] = &[
 
 /// What a program did, from its own words.
 ///
-/// Three questions, cheapest first: did it send output into a file, did it edit one in place, and does every
-/// command in it only report? A program that fails all three ran something, and the log cannot say what it
-/// touched, so it counts as neither.
+/// Three questions, cheapest first: did it send output into a file or edit one in place, and does any part
+/// of it run work whose writes the log cannot see? A writer wrote. A builder is the one thing counted as
+/// standing still. Everything else is a look, including the programs this build has never heard of: they
+/// did not write, and a run cannot be stopped for what the log merely does not recognise.
 fn program(text: &str) -> Did {
+    if !crate::floor::redirections(text).is_empty() || writes(text) {
+        return Did::Write;
+    }
+    let segments = crate::floor::segments(text);
+    if segments.is_empty() {
+        return Did::Nothing;
+    }
+    for segment in segments {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(word) = crate::floor::command_word(&words) else {
+            // A segment with no program in it (`FOO=1` alone) is neutral, not a look.
+            continue;
+        };
+        if WORK.contains(&word.to_ascii_lowercase().as_str()) {
+            return Did::Nothing;
+        }
+    }
+    Did::Read
+}
+
+/// What a program did, from its own words, for a log written before the classification was recorded.
+fn legacy_program(text: &str) -> Did {
     if !crate::floor::redirections(text).is_empty() || writes(text) {
         return Did::Write;
     }
@@ -239,7 +315,6 @@ fn program(text: &str) -> Did {
     for segment in segments {
         let words: Vec<&str> = segment.split_whitespace().collect();
         let Some(word) = crate::floor::command_word(&words) else {
-            // A segment with no program in it (`FOO=1` alone) is neutral, not a look.
             continue;
         };
         if !REPORTERS.contains(&word.to_ascii_lowercase().as_str()) {
@@ -312,7 +387,15 @@ pub fn steps(entries: &[Entry]) -> Vec<Step> {
                             .sum()
                     })
                     .unwrap_or(0);
-                let did = classify(&tool, &arguments);
+                // The producer recorded what this step did, in the only place where the tool, its arguments
+                // and its result were all in hand. A log written before that field existed is judged by its
+                // text, and the text is read only as far as it can be trusted.
+                let did = entry
+                    .payload
+                    .get("did")
+                    .and_then(|value| value.as_str())
+                    .and_then(Did::recorded)
+                    .unwrap_or_else(|| classify_text(&tool, &arguments));
                 steps.push(Step {
                     tool,
                     arguments,
@@ -324,13 +407,24 @@ pub fn steps(entries: &[Entry]) -> Vec<Step> {
                 let Some(step) = steps.last_mut() else {
                     continue;
                 };
+                // An edit's result is the only thing that says whether the write landed, and the producer
+                // writes that judgement here. A log without it keeps the older reading: a refused edit
+                // changed nothing, while a program's exit status is not evidence about what it wrote (a
+                // `grep` with no match exits 1 and still wrote the file it was redirected into).
+                if let Some(did) = entry
+                    .payload
+                    .get("did")
+                    .and_then(|value| value.as_str())
+                    .and_then(Did::recorded)
+                {
+                    step.did = did;
+                    continue;
+                }
                 let status = entry
                     .payload
                     .get("status")
                     .and_then(|value| value.as_i64())
                     .unwrap_or(1);
-                // Only an edit says whether it landed. A program's exit status is not evidence about what
-                // it wrote: a `grep` with no match exits 1 and still wrote the file it was redirected into.
                 if status != 0 && matches!(step.tool.as_str(), "patch" | "write_file" | "edit") {
                     step.did = Did::Nothing;
                 }
@@ -392,6 +486,83 @@ mod tests {
             .expect("the log")
             .entries()
             .to_vec()
+    }
+
+    /// A session log in the shape `turn` writes *after* it records what each step did: the call carries the
+    /// classification, so the reader never has to re-derive it from text.
+    fn recorded(programs: &[&str], did: &str) -> Vec<Entry> {
+        let root = crate::scratch::unique("watchdog-recorded");
+        let mut session = Session::create(
+            FileStore::new(&root),
+            SystemClock,
+            SessionId::new("recorded"),
+        )
+        .expect("a session");
+        for program in programs {
+            session
+                .append(
+                    Kind::ToolCall,
+                    json!({"tool": "shell", "program": program, "did": did}),
+                )
+                .expect("a call");
+            session
+                .append(
+                    Kind::ToolResult,
+                    json!({"tool": "shell", "status": 1, "output": ""}),
+                )
+                .expect("a result");
+        }
+        Session::load(
+            FileStore::new(&root),
+            SystemClock,
+            SessionId::new("recorded"),
+        )
+        .expect("the log")
+        .entries()
+        .to_vec()
+    }
+
+    /// The defect A was narrowed to, not closed: every read-only program the text classifier could not
+    /// place was judged to have done nothing, so twelve *distinct* `git` reads stopped a run for looking.
+    /// The producer records the judgement, and the rule reads the record rather than the text.
+    #[test]
+    fn twelve_distinct_read_only_programs_are_not_no_progress() {
+        let entries = recorded(
+            &[
+                "git log --oneline -3",
+                "git diff --stat",
+                "git show HEAD",
+                "git status --short",
+                "git log --format=%H -1",
+                "git diff HEAD~1",
+                "git show HEAD:rust/harness/src/lib.rs",
+                "git status",
+                "git log --oneline -1",
+                "git diff --name-only",
+                "git show --stat HEAD",
+                "git status --porcelain",
+            ],
+            "read",
+        );
+        let steps = steps(&entries);
+        assert!(
+            inspect(&steps, &limits()).is_none(),
+            "a run of read-only git steps was stopped for looking: {:?}",
+            inspect(&steps, &limits())
+        );
+    }
+
+    /// The same history recorded as a look, but with the words the log writes: the classification read from
+    /// the entry is what decides, not the text underneath it.
+    #[test]
+    fn the_classification_the_producer_recorded_is_what_the_rule_reads() {
+        let entries = recorded(&["cargo test --test case-1"], "read");
+        let steps = steps(&entries);
+        assert_eq!(
+            steps[0].did,
+            Did::Read,
+            "the recorded classification was discarded and the text judged instead"
+        );
     }
 
     /// An edit that landed, as `turn` records one: the call names the file, and the result's status says it

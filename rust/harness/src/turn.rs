@@ -312,7 +312,11 @@ impl<'a> Seams<'a> {
             let reason = "this profile accepts a program, not edit answers".to_string();
             entries.push(session.append(
                 Kind::ToolCall,
-                json!({ "tool": "patch", "refused": reason }),
+                json!({
+                    "tool": "patch",
+                    "refused": reason,
+                    "did": crate::watchdog::Did::Nothing.label(),
+                }),
             )?);
             entries.push(session.append(
                 Kind::ToolResult,
@@ -386,6 +390,10 @@ impl<'a> Seams<'a> {
         match answer.draft() {
             Draft::Refused(reason) => {
                 payload.insert("tool".to_string(), json!("patch"));
+                payload.insert(
+                    "did".to_string(),
+                    json!(crate::watchdog::Did::Nothing.label()),
+                );
                 payload.insert("refused".to_string(), json!(reason));
                 payload.insert("rendered".to_string(), json!(answer.rendered()));
                 entries.push(session.append(Kind::ToolCall, serde_json::Value::Object(payload))?);
@@ -404,6 +412,12 @@ impl<'a> Seams<'a> {
             }
             Draft::Edits(edits) => {
                 payload.insert("tool".to_string(), json!("patch"));
+                // The call is a write until the result says otherwise: planning the whole edit and finding a
+                // bad anchor is the one way an edit changes nothing, and that path records it below.
+                payload.insert(
+                    "did".to_string(),
+                    json!(crate::watchdog::Did::Write.label()),
+                );
                 payload.insert(
                     "edits".to_string(),
                     json!(
@@ -431,7 +445,13 @@ impl<'a> Seams<'a> {
                         );
                         entries.push(session.append(
                             Kind::ToolResult,
-                            json!({ "tool": "patch", "status": 1, "truncated": false, "output": reason }),
+                            json!({
+                                "tool": "patch",
+                                "status": 1,
+                                "truncated": false,
+                                "output": reason,
+                                "did": crate::watchdog::Did::Nothing.label(),
+                            }),
                         )?);
                         return Ok(Turn {
                             entries,
@@ -452,7 +472,13 @@ impl<'a> Seams<'a> {
                     Err(reason) => {
                         entries.push(session.append(
                             Kind::ToolResult,
-                            json!({ "tool": "patch", "status": 1, "truncated": false, "output": reason }),
+                            json!({
+                                "tool": "patch",
+                                "status": 1,
+                                "truncated": false,
+                                "output": reason,
+                                "did": crate::watchdog::Did::Nothing.label(),
+                            }),
                         )?);
                         return Ok(Turn {
                             entries,
@@ -468,12 +494,19 @@ impl<'a> Seams<'a> {
                         "status": run.status,
                         "truncated": run.truncated,
                         "output": run.output,
+                        "did": crate::watchdog::Did::Write.label(),
                     }),
                 )?);
                 self.finish(session, &mut entries, &answer, run)
             }
             Draft::Program(program) => {
                 payload.insert("tool".to_string(), json!(SHELL));
+                // The judgement the watchdog reads back. It is decided here because this is the one place
+                // that holds the program's text; the reader would only be able to guess from it.
+                payload.insert(
+                    "did".to_string(),
+                    json!(crate::watchdog::classify(SHELL, program.as_str()).label()),
+                );
                 payload.insert("program".to_string(), json!(program));
                 // What the program could reach. An edit has no cage: it is path-checked and written by
                 // this process, not run in a sandbox, so it does not claim one.

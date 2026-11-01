@@ -767,6 +767,68 @@ fn the_log_says_what_the_tool_was_allowed_to_do() {
     );
 }
 
+/// The seam A kept missing: the producer is the only thing that knows what a step did, and every test of
+/// the rule built its history by hand. This drives twelve real turns and reads the log they left, so a key
+/// the writer and the reader disagree on is red here instead of invisible on a green suite.
+#[test]
+fn the_watchdog_reads_what_the_turn_recorded_and_a_run_of_git_reads_is_not_stopped() {
+    let programs = [
+        "git log --oneline -3",
+        "git diff --stat",
+        "git show HEAD",
+        "git status --short",
+        "git log --format=%H -1",
+        "git diff HEAD~1",
+        "git show HEAD:rust/harness/src/lib.rs",
+        "git status",
+        "git log --oneline -1",
+        "git diff --name-only",
+        "git show --stat HEAD",
+        "git status --porcelain",
+    ];
+    let root = scratch("did-seam");
+    let task = TaskSpec::new("look through the history", &root);
+    let work = profile("true", false);
+    let policy = allow();
+    let builder = context(&task);
+    let shell = Shell::new(&root, LIMIT);
+    let verifier = CommandVerifier::new(LIMIT);
+    // Whether git is installed changes the exit status of these programs, never their classification:
+    // what is under test is the judgement the turn writes down.
+    let model = ScriptedModel::answers(programs.iter().map(|program| ModelAnswer::new(*program)));
+    let mut log = session(&root, "did-seam");
+    for _ in &programs {
+        Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
+            .turn(&mut log)
+            .expect("a turn");
+    }
+
+    let call = log
+        .entries()
+        .iter()
+        .find(|entry| entry.kind == Kind::ToolCall && entry.payload["tool"] == harness::SHELL)
+        .expect("the program's call");
+    assert_eq!(
+        call.payload["did"], "read",
+        "the producer did not record what the step did, so a reader is left to guess from the text"
+    );
+
+    let steps = harness::watchdog::steps(log.entries());
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step.did == harness::watchdog::Did::Read)
+            .count(),
+        programs.len(),
+        "the log's own record of what each step did was not read back"
+    );
+    let stall = harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default());
+    assert!(
+        stall.is_none(),
+        "twelve real read-only git steps stopped a run for looking: {stall:?}"
+    );
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:
