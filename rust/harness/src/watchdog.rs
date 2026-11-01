@@ -333,16 +333,63 @@ const WRITERS: &[&str] = &[
 fn writes(text: &str) -> bool {
     crate::floor::segments(text).iter().any(|segment| {
         let words: Vec<&str> = segment.split_whitespace().collect();
+        let lower = |word: &str| word.to_ascii_lowercase();
         match crate::floor::command_word(&words) {
-            Some(word) if matches!(word.to_ascii_lowercase().as_str(), "sed" | "perl") => words
-                .iter()
-                .skip(1)
-                .any(|word| *word == "--in-place" || word.starts_with("-i")),
+            // `--in-place=.bak` names a backup suffix and is the same flag as `--in-place`, just as `-i.bak`
+            // is the same flag as `-i`. A word that merely starts with `-i` catches both, and `--` is
+            // excluded because no long option writes in place.
+            Some(word) if matches!(lower(word).as_str(), "sed" | "perl") => {
+                words.iter().skip(1).any(|word| {
+                    let word = lower(word);
+                    word.starts_with("--in-place")
+                        || (word.starts_with("-i") && !word.starts_with("--"))
+                })
+            }
+            // `find ... -exec rm {} ;` removes what it matched, and `-delete` does the same without a
+            // program to name. A `-exec` that runs a reporter (`-exec cat {} +`) only prints.
+            Some(word) if lower(word) == "find" => {
+                let mut arguments = words.iter().skip(1);
+                while let Some(word) = arguments.next() {
+                    let flag = lower(word);
+                    if flag == "-delete" {
+                        return true;
+                    }
+                    if matches!(flag.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
+                        && let Some(next) = arguments.next()
+                    {
+                        let next = lower(next);
+                        let next = next.rsplit('/').next().unwrap_or(next.as_str());
+                        if WRITERS.contains(&next)
+                            || (matches!(next, "sed" | "perl")
+                                && words.iter().any(|word| lower(word).starts_with("-i")))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            // `sort -o out` writes the file it names; with no destination it only prints.
+            Some(word) if lower(word) == "sort" => words.iter().skip(1).any(|word| {
+                let word = lower(word);
+                word == "-o"
+                    || word.starts_with("--output")
+                    || (word.starts_with("-o") && word.len() > 2)
+            }),
+            // `uniq in out` takes a second file and writes it; `uniq in` only prints.
+            Some(word) if lower(word) == "uniq" => {
+                words
+                    .iter()
+                    .skip(1)
+                    .filter(|word| !word.starts_with('-'))
+                    .count()
+                    > 1
+            }
             // `tee` with no file writes to standard output, which changes nothing on disk.
             Some(word) if word.eq_ignore_ascii_case("tee") => {
                 words.iter().skip(1).any(|word| !word.starts_with('-'))
             }
-            Some(word) => WRITERS.contains(&word.to_ascii_lowercase().as_str()),
+            Some(word) => WRITERS.contains(&lower(word).as_str()),
             None => false,
         }
     })
@@ -597,6 +644,47 @@ mod tests {
         .to_vec()
     }
 
+    /// A refused edit in a log that predates the recorded classification. The call says `patch`, which is a
+    /// write by name; only the result's own status says it did not land. That correction is the whole of the
+    /// older reading and no test built the shape before this one, so deleting it left the suite green and a
+    /// refused edit counting as a write.
+    #[test]
+    fn an_old_log_reads_a_refused_edit_as_nothing() {
+        let root = crate::scratch::unique("watchdog-refused");
+        let mut session = Session::create(
+            FileStore::new(&root),
+            SystemClock,
+            SessionId::new("refused"),
+        )
+        .expect("a session");
+        session
+            .append(
+                Kind::ToolCall,
+                json!({"tool": "patch", "edits": [{"path": "note.txt"}]}),
+            )
+            .expect("a call");
+        session
+            .append(
+                Kind::ToolResult,
+                json!({"tool": "patch", "status": 1, "output": "note.txt: the old text was not found"}),
+            )
+            .expect("a result");
+        let entries = Session::load(
+            FileStore::new(&root),
+            SystemClock,
+            SessionId::new("refused"),
+        )
+        .expect("the log")
+        .entries()
+        .to_vec();
+        let steps = steps(&entries);
+        assert_eq!(
+            steps[0].did,
+            Did::Nothing,
+            "a refused edit was read as a write, so a run that only tried counts as one that wrote"
+        );
+    }
+
     /// The defect this exists for: `unittest ... | tail -30` and the same command with `| head -40` are
     /// one command rephrased in its tail, and a guard keyed on the exact text never sees the loop.
     #[test]
@@ -663,6 +751,72 @@ mod tests {
     #[test]
     fn an_empty_history_is_not_a_stall() {
         assert!(inspect(&[], &limits()).is_none());
+    }
+
+    /// The allowance branch is guarded by "and nothing was written", and the only test of it used steps that
+    /// had all done nothing. A write anywhere in the window is what makes the branch skip, so without this
+    /// case the guard could be deleted and the suite would not know.
+    #[test]
+    fn a_run_that_spent_its_allowance_and_wrote_something_is_not_stopped() {
+        let steps = vec![
+            Step {
+                tool: crate::SHELL.to_string(),
+                arguments: "git log --oneline -1".to_string(),
+                did: Did::Read,
+                tokens: 3_000,
+            },
+            Step {
+                tool: "write_file".to_string(),
+                arguments: "src/lib.rs".to_string(),
+                did: Did::Write,
+                tokens: 0,
+            },
+            Step {
+                tool: crate::SHELL.to_string(),
+                arguments: "git status --short".to_string(),
+                did: Did::Read,
+                tokens: 3_000,
+            },
+        ];
+        let mut limits = limits();
+        limits.allowance = Some(5_000);
+        assert!(
+            inspect(&steps, &limits).is_none(),
+            "a run that wrote was stopped for spending: {:?}",
+            inspect(&steps, &limits)
+        );
+    }
+
+    /// A write folded into an option or a program's argument is still a write. Each of these was judged a
+    /// look, which is the direction that hides a stall instead of killing a run: `sed --in-place=.bak` edits
+    /// the file, `find -exec rm` removes what it matched, and `sort -o` and `uniq in out` write the file they
+    /// name. Same family as the reader list: the text decides, and these four shapes were read as nothing.
+    #[test]
+    fn a_write_folded_into_an_argument_is_a_write() {
+        for text in [
+            "sed --in-place=.bak 's/alpha/beta/' note.txt",
+            "sed -i.bak 's/alpha/beta/' note.txt",
+            "find . -name '*.tmp' -exec rm {} \\;",
+            "find . -name '*.tmp' -delete",
+            "sort -o sorted.txt names.txt",
+            "uniq names.txt unique.txt",
+        ] {
+            assert_eq!(program(text), Did::Write, "{text}");
+        }
+    }
+
+    /// The other side of the same rule: `sort` and `uniq` with no output file only print, and `find` with no
+    /// destructive action only lists. A fix that called every one of them a write would stop measuring.
+    #[test]
+    fn a_reporter_with_no_destination_is_still_a_look() {
+        for text in [
+            "sort names.txt",
+            "uniq names.txt",
+            "find . -name '*.tmp'",
+            "sed -n '1,20p' note.txt",
+        ] {
+            assert_ne!(program(text), Did::Write, "{text}");
+        }
     }
 
     /// Reading is how a run rebuilds its working set after a trim. Counting reads as standing still would

@@ -940,6 +940,14 @@ fn a_refused_edit_writes_nothing_and_runs_no_check() {
         "the file is untouched"
     );
     assert_eq!(turn.entries.len(), 3, "user, call, result: no check");
+    // The record says the edit changed nothing, and the watchdog reads that record: a refused edit is not a
+    // step that wrote.
+    let steps = harness::watchdog::steps(log.entries());
+    assert_eq!(
+        steps.first().expect("a step").did,
+        harness::watchdog::Did::Nothing,
+        "a refused edit was recorded as a write"
+    );
     let kinds: Vec<Kind> = log.entries().iter().map(|entry| entry.kind).collect();
     assert_eq!(
         kinds,
