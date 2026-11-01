@@ -229,7 +229,7 @@ fn shell(command: &str, root: &Path) -> Option<Floor> {
 /// quotes (a `>` in a commit message is not a redirect), and reads the word after `>` or `>>`. `2>&1`,
 /// `&>`, `/dev/null` and `/dev/stdout` are descriptors or devices, not files, and are skipped. A target
 /// assembled at run time (`> "$FILE"`) is outside what this can see, which is stated in the module note.
-fn redirections(command: &str) -> Vec<String> {
+pub(crate) fn redirections(command: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut quote: Option<char> = None;
     let mut chars = command.chars().peekable();
@@ -270,7 +270,7 @@ fn redirections(command: &str) -> Vec<String> {
 
 /// One command, cut at the operators a shell treats as separators. `&` inside a query string splits a
 /// URL, which costs a missed match on the tail and never invents one.
-fn segments(command: &str) -> Vec<String> {
+pub(crate) fn segments(command: &str) -> Vec<String> {
     command
         .replace("&&", ";")
         .replace("||", ";")
@@ -288,7 +288,7 @@ const TAKES_VALUE: &[&str] = &["-u", "-g", "-p", "-n", "-C", "-U", "-r", "-t"];
 
 /// The first word that is actually the command: wrappers, their flags, and leading assignments are not
 /// the program. Without this, `sudo -u root rm x` reads as `sudo`.
-fn command_word<'a>(words: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn command_word<'a>(words: &[&'a str]) -> Option<&'a str> {
     let mut index = 0;
     let mut wrapped = false;
     while index < words.len() {

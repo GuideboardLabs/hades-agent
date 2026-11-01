@@ -1147,8 +1147,8 @@ fn normalise(arguments: &str) -> String {
 /// Only mutating or expensive calls are loop-guarded. A repeat read after a context trim is how the
 /// model rebuilds what it lost; refusing it turns a trim into an infinite exploration loop.
 ///
-/// The watchdog asks the same question for the opposite reason: a step this returns `false` for is one
-/// that looked at something, so a run of them is a run doing work rather than a run standing still.
+/// The watchdog does not ask this question: a daemon run logs every program under one tool, so what a step
+/// did is read from its arguments instead (`watchdog::Did`), and a name-based answer there was the defect.
 pub(crate) fn repeat_guarded(name: &str) -> bool {
     !matches!(
         name,

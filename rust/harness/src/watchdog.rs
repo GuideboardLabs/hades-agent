@@ -15,6 +15,22 @@
 
 use session_tree::{Entry, Kind};
 
+/// What a step did with the tree, as far as the log can tell.
+///
+/// The daemon records every step of a run under the tool it used, and `turn` uses one tool for a program:
+/// `shell`. So the tool's *name* says nothing about what a step looked at or wrote, and a rule that judged
+/// by name was blind to every shell read in a real run. This is the fact the rule needs, decided from the
+/// tool and its own arguments together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Did {
+    /// It looked at something: a file read, a search, a listing, a program that only reports.
+    Read,
+    /// It created or changed a file: an edit that landed, or a program that sends its output into one.
+    Write,
+    /// Neither, as far as the log can tell: a program that runs work, or a tool nobody classified.
+    Nothing,
+}
+
 /// One step of a run, as the session log recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -22,9 +38,10 @@ pub struct Step {
     pub tool: String,
     /// What it was asked to do: a program's text, an edit's arguments, the raw arguments of anything else.
     pub arguments: String,
-    /// Whether this step created or modified a file. A shell program that writes through the shell is not
-    /// counted: the log does not say what a program touched, and inventing "it wrote" would hide a stall.
-    pub wrote: bool,
+    /// Whether this step created or modified a file, looked at something, or neither. A program is read for
+    /// its own words: a shell program that writes through a redirect is counted, because the redirect is in
+    /// the text, while a program that runs a build is not, because the log cannot see what it touched.
+    pub did: Did,
     /// The tokens the step spent, prompt and generated together. Zero when the log did not record them.
     pub tokens: u64,
 }
@@ -47,7 +64,7 @@ impl Stall {
     pub fn sentence(&self) -> String {
         match self {
             Stall::Repeating { tool, times } => format!("repeating {tool}, {times} times"),
-            Stall::NoProgress { steps } => format!("{steps} steps with nothing written"),
+            Stall::NoProgress { steps } => format!("{steps} steps with nothing written or read"),
             Stall::SpentWithoutOutput { tokens } => {
                 format!("{tokens} tokens spent with nothing written")
             }
@@ -98,23 +115,162 @@ pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
     let spent: u64 = steps.iter().map(|step| step.tokens).sum();
     if let Some(allowance) = limits.allowance
         && spent >= allowance
-        && steps.iter().all(|step| !step.wrote)
+        && steps.iter().all(|step| step.did != Did::Write)
     {
         return Some(Stall::SpentWithoutOutput { tokens: spent });
     }
 
     // A step stands still when it neither wrote nor looked at anything. Reading is how a run rebuilds its
     // working set after a trim, so counting reads as standing still would stop the runs that are recovering.
+    // "Reading" is a fact about the step, not the name of its tool: a daemon run logs every program as
+    // `shell`, and twelve `cat`/`grep` steps are one long look, not a stall.
     let still = steps
         .iter()
         .rev()
-        .take_while(|step| !step.wrote && crate::agent::repeat_guarded(&step.tool))
+        .take_while(|step| step.did == Did::Nothing)
         .count();
     if still >= limits.no_progress {
         return Some(Stall::NoProgress { steps: still });
     }
 
     None
+}
+
+/// The step a tool call records: what ran, what it was asked, what it did, and what it cost.
+///
+/// Classification happens here, where the tool's name and its arguments are both in hand. The name alone is
+/// not enough for the reason this module exists for: `turn` logs a program as `shell`, so the name of a
+/// `grep` step and the name of a `cargo build` step are the same word.
+fn classify(tool: &str, arguments: &str) -> Did {
+    match tool {
+        // The tools whose name is the whole claim. An edit is a write when it lands, and the result's own
+        // status is what says so: a refused edit changed nothing, and `steps` corrects this.
+        "patch" | "write_file" | "edit" => Did::Write,
+        "read_file" | "list_dir" | "search" | "grep" | "skills" | "recall" | "session_search"
+        | "fetch" | "library" | "image" => Did::Read,
+        crate::SHELL => program(arguments),
+        _ => Did::Nothing,
+    }
+}
+
+/// The programs that only report: a command whose every segment is one of these looked at something and
+/// changed nothing.
+///
+/// `cargo` and `rustc` are deliberately absent: they run work, and a run that builds twelve times without
+/// writing is exactly the shape this rule exists to find. `git` is absent too, because the same word logs
+/// and commits, and a name that cannot tell those apart is the defect this classifier replaced.
+const REPORTERS: &[&str] = &[
+    "cat",
+    "bat",
+    "tac",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ack",
+    "ag",
+    "ls",
+    "tree",
+    "stat",
+    "wc",
+    "file",
+    "find",
+    "fd",
+    "jq",
+    "yq",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "nl",
+    "comm",
+    "diff",
+    "cmp",
+    "column",
+    "pwd",
+    "echo",
+    "printf",
+    "which",
+    "type",
+    "env",
+    "printenv",
+    "md5sum",
+    "sha256sum",
+    "sha1sum",
+    "realpath",
+    "readlink",
+    "basename",
+    "dirname",
+    "date",
+    "id",
+    "whoami",
+    "ps",
+    "ss",
+    "df",
+    "du",
+    "uname",
+    "nproc",
+    "free",
+    "uptime",
+    "sed",
+    "awk",
+    "test",
+];
+
+/// What a program did, from its own words.
+///
+/// Three questions, cheapest first: did it send output into a file, did it edit one in place, and does every
+/// command in it only report? A program that fails all three ran something, and the log cannot say what it
+/// touched, so it counts as neither.
+fn program(text: &str) -> Did {
+    if !crate::floor::redirections(text).is_empty() || writes(text) {
+        return Did::Write;
+    }
+    // Every segment has to be a reporter, and a program with no command in it at all is not a read: an
+    // empty call is a step that looked at nothing.
+    let segments = crate::floor::segments(text);
+    if segments.is_empty() {
+        return Did::Nothing;
+    }
+    for segment in segments {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(word) = crate::floor::command_word(&words) else {
+            // A segment with no program in it (`FOO=1` alone) is neutral, not a look.
+            continue;
+        };
+        if !REPORTERS.contains(&word.to_ascii_lowercase().as_str()) {
+            return Did::Nothing;
+        }
+    }
+    Did::Read
+}
+
+/// The programs that change a file without a redirect to show for it: `sed -i` edits in place, `tee` writes
+/// the files it names, and the copy, move, remove and create commands write what they touch.
+const WRITERS: &[&str] = &[
+    "tee", "cp", "mv", "rm", "rmdir", "touch", "truncate", "dd", "ln", "mkdir", "install",
+];
+
+fn writes(text: &str) -> bool {
+    crate::floor::segments(text).iter().any(|segment| {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        match crate::floor::command_word(&words) {
+            Some(word) if matches!(word.to_ascii_lowercase().as_str(), "sed" | "perl") => words
+                .iter()
+                .skip(1)
+                .any(|word| *word == "--in-place" || word.starts_with("-i")),
+            // `tee` with no file writes to standard output, which changes nothing on disk.
+            Some(word) if word.eq_ignore_ascii_case("tee") => {
+                words.iter().skip(1).any(|word| !word.starts_with('-'))
+            }
+            Some(word) => WRITERS.contains(&word.to_ascii_lowercase().as_str()),
+            None => false,
+        }
+    })
 }
 
 /// The steps a session log records, in order. One tool call is one step, and the result recorded beside it
@@ -156,10 +312,11 @@ pub fn steps(entries: &[Entry]) -> Vec<Step> {
                             .sum()
                     })
                     .unwrap_or(0);
+                let did = classify(&tool, &arguments);
                 steps.push(Step {
                     tool,
                     arguments,
-                    wrote: false,
+                    did,
                     tokens,
                 });
             }
@@ -172,8 +329,10 @@ pub fn steps(entries: &[Entry]) -> Vec<Step> {
                     .get("status")
                     .and_then(|value| value.as_i64())
                     .unwrap_or(1);
-                if step.tool == "patch" && status == 0 {
-                    step.wrote = true;
+                // Only an edit says whether it landed. A program's exit status is not evidence about what
+                // it wrote: a `grep` with no match exits 1 and still wrote the file it was redirected into.
+                if status != 0 && matches!(step.tool.as_str(), "patch" | "write_file" | "edit") {
+                    step.did = Did::Nothing;
                 }
             }
             _ => {}
@@ -185,12 +344,15 @@ pub fn steps(entries: &[Entry]) -> Vec<Step> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use session_tree::{FileStore, Session, SessionId, SystemClock};
 
+    /// A program, classified the way the log classifies one.
     fn shell(command: &str) -> Step {
         Step {
-            tool: "shell".to_string(),
+            tool: crate::SHELL.to_string(),
             arguments: command.to_string(),
-            wrote: false,
+            did: program(command),
             tokens: 100,
         }
     }
@@ -199,13 +361,69 @@ mod tests {
         Step {
             tool: "write_file".to_string(),
             arguments: path.to_string(),
-            wrote: true,
+            did: Did::Write,
             tokens: 100,
         }
     }
 
     fn limits() -> Limits {
         Limits::default()
+    }
+
+    /// A session log with one call and one result per program, in the shape `turn` writes it: the whole
+    /// history a daemon run leaves behind, read back the way the watchdog reads it.
+    fn logged(programs: &[&str]) -> Vec<Entry> {
+        let root = crate::scratch::unique("watchdog-log");
+        let mut session =
+            Session::create(FileStore::new(&root), SystemClock, SessionId::new("logged"))
+                .expect("a session");
+        for program in programs {
+            session
+                .append(Kind::ToolCall, json!({"tool": "shell", "program": program}))
+                .expect("a call");
+            session
+                .append(
+                    Kind::ToolResult,
+                    json!({"tool": "shell", "status": 1, "output": ""}),
+                )
+                .expect("a result");
+        }
+        Session::load(FileStore::new(&root), SystemClock, SessionId::new("logged"))
+            .expect("the log")
+            .entries()
+            .to_vec()
+    }
+
+    /// An edit that landed, as `turn` records one: the call names the file, and the result's status says it
+    /// was written.
+    fn applied(path: &str) -> Vec<Entry> {
+        let root = crate::scratch::unique("watchdog-edit");
+        let mut session = Session::create(
+            FileStore::new(&root),
+            SystemClock,
+            SessionId::new("applied"),
+        )
+        .expect("a session");
+        session
+            .append(
+                Kind::ToolCall,
+                json!({"tool": "patch", "edits": [{"path": path}]}),
+            )
+            .expect("an edit");
+        session
+            .append(
+                Kind::ToolResult,
+                json!({"tool": "patch", "status": 0, "output": "applied"}),
+            )
+            .expect("applied");
+        Session::load(
+            FileStore::new(&root),
+            SystemClock,
+            SessionId::new("applied"),
+        )
+        .expect("the log")
+        .entries()
+        .to_vec()
     }
 
     /// The defect this exists for: `unittest ... | tail -30` and the same command with `| head -40` are
@@ -259,7 +477,7 @@ mod tests {
             .map(|n| Step {
                 tool: "shell".to_string(),
                 arguments: format!("cargo test --test case-{n}"),
-                wrote: false,
+                did: Did::Nothing,
                 tokens: 1_000,
             })
             .collect();
@@ -278,17 +496,97 @@ mod tests {
 
     /// Reading is how a run rebuilds its working set after a trim. Counting reads as standing still would
     /// stop exactly the runs that are recovering.
+    ///
+    /// The history here is the one a daemon run writes: `turn` records a program under the tool `shell`, so
+    /// twelve `cat`/`grep`/`sed` steps in a row all read as `shell` and never as `read_file`. The defect this
+    /// exists for: the rule exempted a step by tool *name*, so every one of these was judged "nothing
+    /// written" and a run was stopped for reading.
     #[test]
-    fn a_run_of_reads_is_not_no_progress() {
-        let steps: Vec<Step> = (0..40)
-            .map(|n| Step {
-                tool: "read_file".to_string(),
-                arguments: format!("src/file-{n}.rs"),
-                wrote: false,
-                tokens: 100,
-            })
+    fn a_run_of_shell_reads_is_not_no_progress() {
+        let entries = logged(&[
+            "cat src/watchdog.rs",
+            "grep -n 'no_progress' src/watchdog.rs",
+            "sed -n '100,140p' src/watchdog.rs",
+            "head -40 src/daemon.rs",
+            "ls -la src",
+            "rg watchdog src",
+            "wc -l src/watchdog.rs",
+            "cat src/daemon.rs",
+            "grep -rn lease src/daemon.rs",
+            "awk '{print $2}' src/daemon.rs",
+            "find src -name '*.rs'",
+            "sort src/names.txt",
+        ]);
+        let steps = steps(&entries);
+        assert!(
+            inspect(&steps, &limits()).is_none(),
+            "a run of reads was stopped for reading: {:?}",
+            inspect(&steps, &limits())
+        );
+    }
+
+    /// The other half of the rule: a step that looked at nothing and wrote nothing is still standing still,
+    /// and twelve of them are a stall. Without this, a classifier that calls everything a read would pass the
+    /// test above and stop measuring anything.
+    #[test]
+    fn twelve_shell_steps_that_look_at_nothing_are_no_progress() {
+        let entries = logged(&[
+            "cargo test --test case-1",
+            "cargo test --test case-2",
+            "cargo test --test case-3",
+            "cargo test --test case-4",
+            "cargo test --test case-5",
+            "cargo test --test case-6",
+            "cargo test --test case-7",
+            "cargo test --test case-8",
+            "cargo test --test case-9",
+            "cargo test --test case-10",
+            "cargo test --test case-11",
+            "cargo test --test case-12",
+        ]);
+        let steps = steps(&entries);
+        assert!(
+            matches!(
+                inspect(&steps, &limits()),
+                Some(Stall::NoProgress { steps: 12 })
+            ),
+            "{:?}",
+            inspect(&steps, &limits())
+        );
+    }
+
+    /// A run that reads a file and then edits it is working, and the write is the one a daemon run really
+    /// makes: `turn` records an applied edit as a result with status 0.
+    #[test]
+    fn a_run_that_alternates_a_read_with_an_applied_edit_is_not_no_progress() {
+        let mut entries = Vec::new();
+        for n in 0..20 {
+            entries.extend(logged(&[&format!("grep -n helper-{n} src/lib.rs")]));
+            entries.extend(applied(&format!("src/file-{n}.rs")));
+        }
+        let steps = steps(&entries);
+        assert!(
+            inspect(&steps, &limits()).is_none(),
+            "{:?}",
+            inspect(&steps, &limits())
+        );
+    }
+
+    /// A program that sends its output into a file wrote that file, even though the log cannot say which
+    /// paths it touched: the redirect is the evidence, and it is in the program's own words.
+    #[test]
+    fn a_program_that_writes_through_the_shell_is_a_write() {
+        let programs: Vec<String> = (0..12)
+            .map(|n| format!("echo line-{n} > notes-{n}.md"))
             .collect();
-        assert!(inspect(&steps, &limits()).is_none());
+        let owned: Vec<&str> = programs.iter().map(String::as_str).collect();
+        let entries = logged(&owned);
+        let steps = steps(&entries);
+        assert!(
+            inspect(&steps, &limits()).is_none(),
+            "{:?}",
+            inspect(&steps, &limits())
+        );
     }
 
     /// A loop that has also spent its allowance is a loop: the more specific finding wins, so the record
@@ -299,7 +597,7 @@ mod tests {
             .map(|_| Step {
                 tool: "shell".to_string(),
                 arguments: "cargo test | tail -5".to_string(),
-                wrote: false,
+                did: Did::Nothing,
                 tokens: 2_000,
             })
             .collect();
@@ -321,7 +619,7 @@ mod tests {
         assert_eq!(stall.sentence(), "repeating shell: cargo test, 5 times");
         assert_eq!(
             Stall::NoProgress { steps: 12 }.sentence(),
-            "12 steps with nothing written"
+            "12 steps with nothing written or read"
         );
         assert_eq!(
             Stall::SpentWithoutOutput { tokens: 40_000 }.sentence(),
