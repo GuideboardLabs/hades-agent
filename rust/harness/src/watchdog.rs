@@ -247,9 +247,14 @@ pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
     // The other half is what a look is worth. A look at something the run has not looked at before tells it
     // something it did not have; the same look again tells it nothing, and a run doing that is the most
     // common shape of stuck work there is: one URL fetched again, one tree inspected again, one file catted
-    // again, each spelled a little differently so no loop counter sees it. The run's own history is the set:
-    // the first look at a key is progress, every later one is standing still. A file that was written is new
-    // again, so only looks are recorded here.
+    // again, each spelled a little differently so no loop counter sees it. The run's own history is the set,
+    // and nothing takes a key back out of it: the first look at a key is progress and every later one is
+    // standing still, whatever happened in between. Only looks go into the set, and a write is not one of
+    // them. It does not need to be: a write is progress by itself, so a run that edits a file and reads it
+    // back is a write followed by a look and never a stall, and the only verdict a reset would change is a
+    // run that writes once and then reads the same file a dozen times. Undoing a look when a write touched
+    // that path would need a second classifier to pair an edit's JSON, or a redirect's target, with the key a
+    // later look is counted under, and a guess there is the direction that costs a healthy run its work.
     let keys: Vec<Option<String>> = steps
         .iter()
         .map(|step| read_key(&step.tool, &step.arguments))
@@ -1018,6 +1023,36 @@ mod tests {
             inspect(&steps, &limits()).is_none(),
             "{:?}",
             inspect(&steps, &limits())
+        );
+    }
+
+    /// What a look is worth after a write, pinned because the rule's own comment used to promise the
+    /// opposite: it said a file that was written is new again, and no code did that. The code is the rule that
+    /// ships, so this test holds the code's reading and the comment now says the same thing: a write moves the
+    /// run on by itself, and it does not take back the look that came before it. A run that reads one file,
+    /// edits it and then reads it twice more is standing still on the second of those reads.
+    ///
+    /// The bound is two steps so the reading cannot be confused with the twelve-step default. If someone makes
+    /// a write reset the seen-set, this test goes red and the comment above `inspect` has to move with it,
+    /// which is the whole point of pinning it.
+    #[test]
+    fn a_write_does_not_erase_what_the_run_has_already_read() {
+        let mut entries = logged(&["cat a.rs"]);
+        entries.extend(applied("a.rs"));
+        entries.extend(logged(&["cat a.rs"]));
+        entries.extend(logged(&["cat a.rs"]));
+        let steps = steps(&entries);
+        let tight = Limits {
+            no_progress: 2,
+            ..Limits::default()
+        };
+        assert!(
+            matches!(
+                inspect(&steps, &tight),
+                Some(Stall::NoProgress { steps: 2 })
+            ),
+            "a write was read as making the file new again: {:?}",
+            inspect(&steps, &tight)
         );
     }
 
