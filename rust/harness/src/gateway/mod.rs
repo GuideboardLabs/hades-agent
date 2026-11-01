@@ -25,6 +25,7 @@ pub mod goal;
 pub mod lease;
 pub mod session;
 pub mod telegram;
+pub mod trigger;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -72,6 +73,9 @@ pub struct Settings {
     pub mcp: crate::mcp::McpConfig,
     /// What a message may do when its channel says nothing. `Read` is a conversation; `Act` is work.
     pub mode: crate::mode::Mode,
+    /// Whether a message has to be addressed to this surface before it becomes work. `Always` is the
+    /// default and the behaviour that existed before the key.
+    pub trigger: trigger::Trigger,
     /// Per-channel overrides, keyed by the channel id the surface reports. A channel can change what a
     /// message may do (a talk channel that cannot touch the filesystem) without a second surface.
     pub channels: std::collections::HashMap<String, Channel>,
@@ -98,6 +102,7 @@ pub struct Settings {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Channel {
     pub mode: Option<crate::mode::Mode>,
+    pub trigger: Option<trigger::Trigger>,
     pub policy: Option<String>,
     pub verify: Option<String>,
     pub root: Option<String>,
@@ -112,6 +117,7 @@ pub struct Effective {
     pub verify: String,
     pub root: String,
     pub model: String,
+    pub trigger: trigger::Trigger,
 }
 
 impl Settings {
@@ -126,6 +132,7 @@ impl Settings {
             verify: pick(|c| c.verify.clone(), &self.verify),
             root: pick(|c| c.root.clone(), &self.root),
             model: pick(|c| c.model.clone(), &self.model),
+            trigger: channel.and_then(|c| c.trigger).unwrap_or(self.trigger),
         }
     }
 }
@@ -391,6 +398,25 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         &format!("{name}.mode"),
     )?
     .unwrap_or(default_mode);
+    // A trigger is a surface's say over what counts as being addressed to it. Refusing an unknown word is
+    // the whole value of the key: a typo that fell back to `always` would be a filter that is not there.
+    let parse_trigger = |value: &Value, owner: &str| -> Result<Option<trigger::Trigger>, String> {
+        let Some(word) = value.as_str() else {
+            return if value.is_null() {
+                Ok(None)
+            } else {
+                Err(format!("{owner}: `trigger` must be a string"))
+            };
+        };
+        trigger::Trigger::parse(word)
+            .map(Some)
+            .ok_or_else(|| format!("{owner}: `trigger` is {word:?}; say always, mention or never"))
+    };
+    let trigger = parse_trigger(
+        section.get("trigger").unwrap_or(&Value::Null),
+        &format!("{name}.trigger"),
+    )?
+    .unwrap_or_default();
     let mut channels = std::collections::HashMap::new();
     if let Some(map) = section.get("channels") {
         let Some(map) = map.as_object() else {
@@ -404,7 +430,8 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
                 .as_object()
                 .ok_or_else(|| format!("{owner} must be an object"))?;
             for key in body.keys() {
-                if !["mode", "policy", "verify", "root", "model"].contains(&key.as_str()) {
+                if !["mode", "trigger", "policy", "verify", "root", "model"].contains(&key.as_str())
+                {
                     return Err(format!("{owner}: unknown key {key:?}"));
                 }
             }
@@ -422,6 +449,10 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
                     mode: parse_mode(
                         body.get("mode").unwrap_or(&Value::Null),
                         &format!("{owner}.mode"),
+                    )?,
+                    trigger: parse_trigger(
+                        body.get("trigger").unwrap_or(&Value::Null),
+                        &format!("{owner}.trigger"),
                     )?,
                     policy,
                     verify: text("verify"),
@@ -441,6 +472,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         heartbeat,
         mcp: crate::mcp::McpConfig::from_value(value.get("mcp"), path)?,
         mode,
+        trigger,
         channels,
         prompt,
         loading,
@@ -1489,6 +1521,23 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     if !settings.allowed.contains(&update.from) {
         return Ok(());
     }
+    // Before anything expensive: was this message addressed to this surface at all? A message that was not
+    // is dropped here, recorded by name, and costs neither a model call nor a daemon submit. A button press
+    // is an answer to a question this agent asked, so it is addressed by definition and is not filtered.
+    if update.callback.is_none() {
+        let verdict = trigger::classify(update, settings);
+        if verdict == trigger::Verdict::Ignore {
+            let resolved = trigger::resolved(settings, &update.chat);
+            let actor = format!("{}:{}", update.chat.surface_name(), update.chat.id());
+            crate::activity::trigger_ignored(
+                state,
+                &actor,
+                trigger::why_ignored(resolved)
+                    .unwrap_or("the message was not addressed to this surface"),
+            );
+            return Ok(());
+        }
+    }
     // One channel can be a conversation and another a workspace, on the same surface.
     let effective = settings.effective(&update.chat);
     if let Some(callback) = &update.callback {
@@ -2387,6 +2436,7 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             allowed: vec!["7".to_string()],
+            trigger: Default::default(),
             policy: "guarded".to_string(),
             verify: "true".to_string(),
             model: "none".to_string(),
@@ -2625,6 +2675,26 @@ mod tests {
         std::fs::write(&path, r#"{"model": "deepseek-v4.1-flash", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "channels": {"99": {"mode": "party"}}}}}}"#).expect("config");
         let said = settings_for(&path, "discord").expect_err("a made-up mode");
         assert!(said.contains("party"), "{said}");
+    }
+
+    /// A trigger word nobody defined must be refused by name, on the surface and in a channel entry: a
+    /// typo that parses as "answer everything" is the filter silently not existing.
+    #[test]
+    fn a_trigger_word_that_is_not_one_is_refused_by_name() {
+        let dir = scratch("badtrigger");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"model": "none", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "trigger": "mentionable"}}}}"#).expect("config");
+        let said = settings_for(&path, "discord")
+            .err()
+            .unwrap_or_else(|| "it was accepted".to_string());
+        assert!(said.contains("mentionable"), "{said}");
+
+        std::fs::write(&path, r#"{"model": "none", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "channels": {"99": {"trigger": "sometimes"}}}}}}"#).expect("config");
+        let said = settings_for(&path, "discord")
+            .err()
+            .unwrap_or_else(|| "it was accepted".to_string());
+        assert!(said.contains("sometimes"), "{said}");
+        assert!(said.contains("channels.99"), "the key is named: {said}");
     }
 
     #[test]

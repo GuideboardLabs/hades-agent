@@ -1022,6 +1022,7 @@ mod tests {
     fn settings(root: &Path) -> Settings {
         Settings {
             allowed: vec!["7".to_string()],
+            trigger: Default::default(),
             policy: "guarded".to_string(),
             verify: "true".to_string(),
             model: "deepseek-v4.1-flash".to_string(),

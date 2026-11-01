@@ -87,6 +87,25 @@ pub fn stop(state: &Path, actor: &str, action: &str, reason: &str, artifact: &st
     }
 }
 
+/// A message this surface was not addressed in, dropped before any work was done. One function so every
+/// surface writes the same word, and the reason names the setting that did it. The actor carries the
+/// surface and the channel in the same `surface:channel` shape every other line uses.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn trigger_ignored(state: &Path, actor: &str, reason: &str) {
+    let line = Line {
+        at: epoch(),
+        actor: actor.to_string(),
+        layer: "trigger".to_string(),
+        action: "trigger_ignored".to_string(),
+        decision: "ignore".to_string(),
+        reason: reason.to_string(),
+        artifact: String::new(),
+    };
+    if let Err(said) = record(state, &line) {
+        eprintln!("activity: could not record an ignored message: {said}");
+    }
+}
+
 fn epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

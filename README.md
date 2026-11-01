@@ -530,7 +530,9 @@ hades chat
 ```
 
 Provider keys belong in `~/.hades/.env`, never in `config.json`. The gateway additionally needs
-`HADES_TELEGRAM_TOKEN` and a non-empty `gateway.telegram.allowed_users` list.
+`HADES_TELEGRAM_TOKEN` and a non-empty `gateway.telegram.allowed_users` list. A surface answers every
+message from an allowed sender unless it names a narrower `trigger`; `hades connector channels <id>`
+prints the rule it will enforce.
 
 ### Setting a model per profile
 

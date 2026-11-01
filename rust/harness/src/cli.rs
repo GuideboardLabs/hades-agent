@@ -2551,9 +2551,10 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 crate::mode::Mode::Chat => "chat",
             };
             let mut text = format!(
-                "{id}: every channel not listed below is {} (policy {}, root {}, model {})\n",
+                "{id}: every channel not listed below is {} (policy {}, trigger {}, root {}, model {})\n",
                 word(settings.mode),
                 settings.policy,
+                settings.trigger.word(),
                 settings.root,
                 settings.model
             );
@@ -2578,6 +2579,9 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 }
                 if entry.policy.is_some() {
                     changed.push(format!("policy {}", effective.policy));
+                }
+                if entry.trigger.is_some() {
+                    changed.push(format!("trigger {}", effective.trigger.word()));
                 }
                 if entry.verify.is_some() {
                     changed.push(format!("verify {:?}", effective.verify));

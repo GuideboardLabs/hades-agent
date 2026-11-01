@@ -1,0 +1,283 @@
+//! The trigger: who a message has to be from, and what it has to say, before it becomes work.
+//!
+//! A surface that answers everything from an allowed sender pays a model call for every sentence a group
+//! says. This is the filter that decides, in code and before any model is reached, whether a message was
+//! addressed to this agent at all. The allowlist is still the first gate: a stranger is refused before
+//! this is asked, and a message that fails here is dropped, recorded and costs nothing.
+//!
+//! `Always` is the default and reproduces the behaviour that existed before the key: every message from an
+//! allowed sender is a request. A surface only gains a filter by naming one, so no existing config changes
+//! meaning when it is upgraded.
+
+/// What a surface does with a message that arrives without an explicit request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Trigger {
+    /// Answer anything from an allowed sender. Today's behaviour, and the default for a surface.
+    #[default]
+    Always,
+    /// Answer a direct message, or a group message that names this bot or replies to it.
+    MentionOnly,
+    /// Answer nothing. A surface parked without removing its token.
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// A person asked for something: submit it.
+    Requested,
+    /// Addressed at us but without a request: worth a model call to read it.
+    Candidate,
+    /// Not for us: drop, record, spend nothing.
+    Ignore,
+}
+
+impl Trigger {
+    /// The word a config file uses. One spelling per variant, so a refusal can name the words that work
+    /// and a printed setting can be pasted back in.
+    pub fn word(self) -> &'static str {
+        match self {
+            Trigger::Always => "always",
+            Trigger::MentionOnly => "mention",
+            Trigger::Never => "never",
+        }
+    }
+
+    /// `None` for anything else, so a caller refuses by name instead of guessing at a typo.
+    pub fn parse(text: &str) -> Option<Trigger> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(Trigger::Always),
+            "mention" => Some(Trigger::MentionOnly),
+            "never" => Some(Trigger::Never),
+            _ => None,
+        }
+    }
+}
+
+use super::{Chat, Settings, Update};
+
+/// The trigger a message is answered under: the channel's word, then the surface's, then the default.
+/// One function, so what is enforced and what is printed come from the same resolution.
+pub fn resolved(settings: &Settings, chat: &Chat) -> Trigger {
+    settings
+        .channels
+        .get(chat.id())
+        .and_then(|channel| channel.trigger)
+        .unwrap_or(settings.trigger)
+}
+
+/// Whether the text names this surface: a mention token anywhere in it, or a command at the start.
+///
+/// A *reply* to one of our own messages cannot be seen from here: `Update` carries the text, the sender
+/// and the chat, and the surface does not hand over what was replied to. So a reply that names nobody
+/// reads as unaddressed, and a surface set to `mention` will ignore it.
+fn addressed(text: &str) -> bool {
+    let text = text.trim();
+    if text.starts_with('/') {
+        return true;
+    }
+    text.split_whitespace().any(|word| {
+        word.strip_prefix('@')
+            .and_then(|name| name.chars().next())
+            .is_some_and(|first| first.is_alphanumeric() || first == '_')
+    })
+}
+
+/// One sentence for the ledger, naming the setting that dropped the message. `None` when this trigger
+/// cannot drop anything, so a caller never writes a reason that is not true.
+pub fn why_ignored(trigger: Trigger) -> Option<&'static str> {
+    match trigger {
+        Trigger::Never => Some("the channel is set to never answer"),
+        Trigger::MentionOnly => {
+            Some("the channel is set to mention and nothing in the message names this surface")
+        }
+        Trigger::Always => None,
+    }
+}
+
+/// What this message is, without asking a model. Pure: the same update and settings always classify the
+/// same way, which is what makes the filter testable and its refusals explainable.
+pub fn classify(update: &Update, settings: &Settings) -> Verdict {
+    let trigger = resolved(settings, &update.chat);
+    // A parked surface answers nothing, including the one-to-one chat and a command.
+    if trigger == Trigger::Never {
+        return Verdict::Ignore;
+    }
+    // A direct chat is addressed by existing: the sender wrote here and nowhere else.
+    if update.from == update.chat.id() {
+        return Verdict::Requested;
+    }
+    match trigger {
+        // The behaviour before the key existed: every message from an allowed sender is a request.
+        Trigger::Always => Verdict::Requested,
+        Trigger::MentionOnly if addressed(&update.text) => Verdict::Requested,
+        // A channel somebody listed on purpose is where an unaddressed sentence is still worth reading:
+        // the configuration already said this channel matters, and the model judges the rest.
+        Trigger::MentionOnly if settings.channels.contains_key(update.chat.id()) => {
+            Verdict::Candidate
+        }
+        _ => Verdict::Ignore,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Chat, Settings, Update};
+
+    /// The narrowest settings that can answer the question: one surface, no channels, no model.
+    fn settings(trigger: Trigger) -> Settings {
+        Settings {
+            allowed: vec!["7".to_string()],
+            trigger,
+            policy: "guarded".to_string(),
+            verify: "true".to_string(),
+            model: "none".to_string(),
+            root: "/work".to_string(),
+            vault: "/work/mneme".to_string(),
+            heartbeat: 900,
+            mcp: crate::mcp::McpConfig::default(),
+            mode: crate::mode::Mode::Act,
+            channels: std::collections::HashMap::new(),
+            prompt: None,
+            loading: None,
+            provider: None,
+            endpoints: Default::default(),
+            providers: Default::default(),
+            fallbacks: Default::default(),
+        }
+    }
+
+    /// A group chat has a negative id and a sender whose id is not the chat's; a direct chat has the same
+    /// id in both places, which is how every surface spells a one-to-one conversation.
+    fn update(from: i64, chat: i64, text: &str) -> Update {
+        Update {
+            id: 1,
+            from: from.to_string(),
+            chat: Chat::telegram(chat),
+            text: text.to_string(),
+            callback: None,
+            photo: None,
+        }
+    }
+
+    #[test]
+    fn a_group_message_that_names_nobody_is_ignored() {
+        let settings = settings(Trigger::MentionOnly);
+        let update = update(42, -100123, "the build broke again");
+        assert_eq!(classify(&update, &settings), Verdict::Ignore);
+    }
+
+    #[test]
+    fn the_same_message_in_a_direct_chat_is_a_request() {
+        let settings = settings(Trigger::MentionOnly);
+        let update = update(42, 42, "the build broke again");
+        assert_eq!(classify(&update, &settings), Verdict::Requested);
+    }
+
+    /// `Never` parks a surface without removing its token, so it holds even for a direct message and even
+    /// for a command. A parked surface that answers the one shape nobody can mistake is not parked.
+    #[test]
+    fn a_surface_set_to_never_ignores_a_direct_message_and_a_command() {
+        let settings = settings(Trigger::Never);
+        assert_eq!(
+            classify(&update(42, 42, "are you there"), &settings),
+            Verdict::Ignore
+        );
+        assert_eq!(
+            classify(&update(42, 42, "/run build it"), &settings),
+            Verdict::Ignore
+        );
+    }
+
+    /// Naming the surface is a request, whether the message says its name or starts with a command.
+    #[test]
+    fn a_group_message_that_names_the_surface_is_a_request() {
+        let settings = settings(Trigger::MentionOnly);
+        assert_eq!(
+            classify(&update(42, -100123, "@hades the build broke"), &settings),
+            Verdict::Requested
+        );
+        assert_eq!(
+            classify(&update(42, -100123, "/status"), &settings),
+            Verdict::Requested
+        );
+    }
+
+    /// A channel somebody listed on purpose is the one place an unaddressed sentence is worth reading:
+    /// the configuration already said this channel matters, and the model is asked to judge the rest.
+    #[test]
+    fn a_listed_channel_reads_an_unaddressed_message_but_an_unlisted_one_is_ignored() {
+        let mut settings = settings(Trigger::MentionOnly);
+        settings
+            .channels
+            .insert("99".to_string(), crate::gateway::Channel::default());
+        assert_eq!(
+            classify(&update(42, 99, "the build broke again"), &settings),
+            Verdict::Candidate
+        );
+        assert_eq!(
+            classify(&update(42, 98, "the build broke again"), &settings),
+            Verdict::Ignore
+        );
+    }
+
+    /// The default has to be exactly the behaviour that existed before the key, or an upgrade silently
+    /// stops answering people.
+    #[test]
+    fn always_answers_everything_from_an_allowed_sender_as_it_does_today() {
+        let settings = settings(Trigger::Always);
+        assert_eq!(
+            classify(&update(42, -100123, "the build broke again"), &settings),
+            Verdict::Requested
+        );
+        assert_eq!(
+            classify(&update(42, 42, "the build broke again"), &settings),
+            Verdict::Requested
+        );
+    }
+
+    /// A channel's word overrides the surface's in both directions: it can filter a surface that answers
+    /// everything, and it can open a channel on a surface that answers nothing.
+    #[test]
+    fn a_channels_trigger_beats_the_surfaces() {
+        let mut wide = settings(Trigger::Always);
+        wide.channels.insert(
+            "99".to_string(),
+            crate::gateway::Channel {
+                trigger: Some(Trigger::MentionOnly),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            classify(&update(42, 99, "the build broke again"), &wide),
+            Verdict::Candidate
+        );
+        assert_eq!(
+            classify(&update(42, 98, "the build broke again"), &wide),
+            Verdict::Requested
+        );
+
+        let mut narrow = settings(Trigger::Never);
+        narrow.channels.insert(
+            "99".to_string(),
+            crate::gateway::Channel {
+                trigger: Some(Trigger::Always),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            classify(&update(42, 99, "the build broke again"), &narrow),
+            Verdict::Requested
+        );
+    }
+
+    /// The words round-trip through the config, and a word nobody defined does not.
+    #[test]
+    fn a_trigger_has_one_word_and_an_unknown_one_is_refused() {
+        for trigger in [Trigger::Always, Trigger::MentionOnly, Trigger::Never] {
+            assert_eq!(Trigger::parse(trigger.word()), Some(trigger));
+        }
+        assert_eq!(Trigger::parse("mentionable"), None);
+        assert_eq!(Trigger::parse(""), None);
+    }
+}

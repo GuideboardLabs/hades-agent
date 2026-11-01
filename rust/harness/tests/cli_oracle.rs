@@ -78,6 +78,50 @@ fn log_lines(state: &Path, session: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The rule a person is about to rely on has to be printable, and printed from the same parse the
+/// gateway enforces: a filter that is documented in one place and enforced in another is how a surface
+/// stops answering people without anyone noticing.
+#[test]
+fn the_channels_command_prints_the_trigger_it_will_enforce() {
+    let dir = scratch("channels-trigger");
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "model": "some-model",
+            "root": dir.join("work").display().to_string(),
+            "vault": dir.join("mneme").display().to_string(),
+            "gateway": {"connectors": {"discord": {
+                "allowed_users": ["7"],
+                "trigger": "mention",
+                "channels": {"99": {"trigger": "always"}},
+            }}},
+        })
+        .to_string(),
+    )
+    .expect("config");
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let (code, output) = hades(&[
+        "connector",
+        "channels",
+        "discord",
+        "--state",
+        &state.display().to_string(),
+        "--config",
+        &config.display().to_string(),
+    ]);
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("trigger mention"),
+        "the surface's own word is printed: {output}"
+    );
+    assert!(
+        output.contains("trigger always"),
+        "a channel's override is printed: {output}"
+    );
+}
+
 #[test]
 fn the_help_lists_the_commands() {
     let (code, text) = hades(&["help"]);

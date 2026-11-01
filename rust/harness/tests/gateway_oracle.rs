@@ -186,6 +186,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
         read,
         Settings {
             allowed: vec!["7".to_string()],
+            trigger: Default::default(),
             policy: "open".to_string(),
             verify: "test -f out.txt".to_string(),
             model: "deepseek-v4.1-flash".to_string(),
@@ -205,11 +206,112 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
     );
 }
 
+/// A message nobody addressed is not work: the daemon is never asked to run it, and the drop is recorded
+/// by name. The proof is the absence of a connection, not a status code: a submit that failed and a submit
+/// that never happened look the same from the reply, so the socket is watched instead.
+#[test]
+fn an_ignored_message_never_reaches_the_daemon() {
+    use harness::gateway::trigger::Trigger;
+
+    let dir = scratch("trigger-ignore");
+    let socket = socket_under(&dir);
+    let listener = UnixListener::bind(&socket).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let (seen, watched) = std::sync::mpsc::channel::<String>();
+    let watcher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut line = String::new();
+                    let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"run": 1, "session": "s", "started": true, "finished": true, "code": 0})
+                    );
+                    let _ = seen.send(line.trim().to_string());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = seen.send(String::new());
+    });
+
+    let settings = Settings {
+        allowed: vec!["7".to_string()],
+        trigger: Default::default(),
+        policy: "open".to_string(),
+        verify: "true".to_string(),
+        // A model no build knows: if the message ever reaches the reply path the test fails here, fast
+        // and offline, instead of paying for a round trip on whatever endpoint this machine has.
+        model: "no-such-preset".to_string(),
+        root: "/work".to_string(),
+        vault: "/work/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
+        mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        channels: std::collections::HashMap::new(),
+        prompt: None,
+        loading: None,
+        provider: None,
+        endpoints: Default::default(),
+        providers: Default::default(),
+        fallbacks: Default::default(),
+    };
+    let settings = Settings {
+        trigger: Trigger::MentionOnly,
+        ..settings
+    };
+    let mut fake = Fake::default();
+    handle(
+        &message(7, -100123, "the build broke again"),
+        &settings,
+        &socket,
+        &dir,
+        &mut fake,
+    )
+    .expect("ignored, not run");
+
+    let heard = watched.recv_timeout(std::time::Duration::from_secs(5));
+    watcher.join().expect("the watcher");
+    assert!(
+        matches!(heard, Ok(ref line) if line.is_empty()),
+        "the daemon was asked to run it: {heard:?}"
+    );
+    assert_eq!(fake.typings(), 0, "no reply was started");
+    assert!(fake.sent().is_empty(), "nothing was said");
+    let recorded = harness::activity::read(&dir);
+    let ignored: Vec<_> = recorded
+        .iter()
+        .filter(|line| line.action == "trigger_ignored")
+        .collect();
+    assert_eq!(ignored.len(), 1, "{recorded:?}");
+    assert_eq!(ignored[0].decision, "ignore");
+    assert!(
+        ignored[0].reason.contains("mention"),
+        "{:?}",
+        ignored[0].reason
+    );
+    assert!(
+        ignored[0].actor.contains("-100123"),
+        "the channel is named: {:?}",
+        ignored[0].actor
+    );
+}
+
 #[test]
 fn an_unauthorized_sender_gets_nothing() {
     let dir = scratch("auth");
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "deepseek-v4.1-flash".to_string(),
@@ -245,6 +347,7 @@ fn a_channel_set_to_chat_cannot_start_work() {
     let dir = scratch("readonly");
     let mut settings = Settings {
         allowed: vec!["1".to_string()],
+        trigger: Default::default(),
         policy: "open".to_string(),
         verify: "true".to_string(),
         model: "deepseek-v4.1-flash".to_string(),
@@ -321,6 +424,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
 
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        trigger: Default::default(),
         policy: "open".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "deepseek-v4.1-flash".to_string(),
@@ -441,6 +545,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
 
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "deepseek-v4.1-flash".to_string(),
@@ -518,6 +623,7 @@ fn the_offset_advances_after_a_batch() {
     let dir = scratch("offset");
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
         model: "deepseek-v4.1-flash".to_string(),
@@ -577,6 +683,7 @@ fn the_offset_advances_after_a_batch() {
 fn settings_for(chat: i64) -> Settings {
     Settings {
         allowed: vec![chat.to_string()],
+        trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "true".to_string(),
         model: "none".to_string(),
