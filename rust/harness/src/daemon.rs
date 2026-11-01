@@ -699,6 +699,34 @@ impl Daemon {
         Ok((run, from))
     }
 
+    /// Let go of a session after its run reached its end.
+    ///
+    /// The lease and the stop flag go together, under the lease lock, and only for the run that still holds
+    /// the session. The earlier shape removed the lease, released the table and then removed the flag by
+    /// session id: a submit that took the session on in that gap lost its flag, a stop then found no live run
+    /// while one was running, and the watchdog had no way to reach it.
+    fn release(&self, session: &str, run: u64) -> Result<(), Fault> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| Fault::harness("the lease table was poisoned".to_string()))?;
+        let Some(held) = runs.get(session) else {
+            // The session is already free: a release that arrives twice has nothing to remove, and must not
+            // reach for a flag that now belongs to whoever took the session on next.
+            return Ok(());
+        };
+        if held.run != run {
+            // The session was released and taken on again before this release landed: that lease and that
+            // flag belong to the new run and are not this one's to remove.
+            return Ok(());
+        }
+        runs.remove(session);
+        if let Ok(mut cancels) = self.cancels.lock() {
+            cancels.remove(session);
+        }
+        Ok(())
+    }
+
     /// Take a run on. The lease is the whole concurrency story: two runs on one session id would be two
     /// writers on one log, and the log has no lock to stop them.
     fn submit(&self, request: &Value, stream: &mut UnixStream) -> Result<Value, Fault> {
@@ -821,13 +849,7 @@ impl Daemon {
         // The run reached its end, so the marker goes with the lease. A crash between here and the reply
         // leaves nothing behind to be read as an interruption of work that did finish.
         clear_inflight(&self.state, &session_id);
-        self.runs
-            .lock()
-            .map_err(|_| Fault::harness("the lease table was poisoned".to_string()))?
-            .remove(&session_id);
-        if let Ok(mut cancels) = self.cancels.lock() {
-            cancels.remove(&session_id);
-        }
+        self.release(&session_id, run)?;
 
         match walked {
             Ok(walked) => {
@@ -1438,6 +1460,91 @@ mod watchdog_tests {
             .cloned()
             .expect("a lease");
         assert_eq!(held.from, from, "the lease records the window it was given");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The defect this exists for: the release removed the lease and then, by session id and with no run
+    /// number, removed the stop flag. A submit that took the session on in that gap had its flag deleted,
+    /// so a stop found no live run while one was running and the watchdog had no way to reach it: a
+    /// five-call loop ran on unstopped.
+    #[test]
+    fn a_late_release_does_not_disarm_the_run_that_took_the_session() {
+        let state = scratch("lease-release-race");
+        let id = looping_run(&state, 5);
+        let (daemon, _finished) = holding(&state, &id, 0, None);
+        // Run 2 took the session on between the lease removal and the flag removal.
+        let live = Arc::new(AtomicBool::new(false));
+        let from = log_end(&state, &id);
+        daemon.runs.lock().expect("runs").insert(
+            id.clone(),
+            Lease {
+                run: 2,
+                since: SystemClock.now(),
+                from,
+                allowance: None,
+            },
+        );
+        daemon
+            .cancels
+            .lock()
+            .expect("cancels")
+            .insert(id.clone(), Arc::clone(&live));
+
+        // Run 1's release arrives late.
+        daemon.release(&id, 1).expect("release");
+
+        assert_eq!(
+            daemon
+                .runs
+                .lock()
+                .expect("runs")
+                .get(&id)
+                .map(|lease| lease.run),
+            Some(2),
+            "the live run's lease was deleted by a finished run's release"
+        );
+        assert!(
+            daemon.cancels.lock().expect("cancels").contains_key(&id),
+            "the live run's stop flag was deleted by a finished run's release"
+        );
+        let stopped = daemon
+            .stop(&json!({"session": id, "run": 2}))
+            .expect("a stop");
+        assert_eq!(
+            stopped["count"], 1,
+            "a stop found no live run while one was running: {stopped}"
+        );
+        assert!(
+            live.load(Ordering::SeqCst),
+            "the live run was not asked to stop"
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The other direction: a stop that reaches a run still holding the session finds it and asks it to
+    /// stop, and the release that follows leaves neither a lease nor a flag behind.
+    #[test]
+    fn a_stop_while_the_run_holds_the_session_finds_it_and_the_release_leaves_nothing() {
+        let state = scratch("lease-stop-live");
+        let id = looping_run(&state, 5);
+        let (daemon, flag) = holding(&state, &id, 0, None);
+
+        let stopped = daemon
+            .stop(&json!({"session": id, "run": 1}))
+            .expect("a stop");
+        assert_eq!(stopped["count"], 1, "{stopped}");
+        assert_eq!(stopped["stopping"][0]["run"], 1);
+        assert!(flag.load(Ordering::SeqCst), "the run was not asked to stop");
+
+        daemon.release(&id, 1).expect("release");
+        assert!(
+            daemon.runs.lock().expect("runs").is_empty(),
+            "the lease outlived the run"
+        );
+        assert!(
+            daemon.cancels.lock().expect("cancels").is_empty(),
+            "the stop flag outlived the run"
+        );
         let _ = std::fs::remove_dir_all(&state);
     }
 
