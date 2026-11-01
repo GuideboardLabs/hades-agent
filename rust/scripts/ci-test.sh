@@ -12,8 +12,17 @@ set -uo pipefail
 OUT=$(mktemp)
 trap 'rm -f "$OUT"' EXIT
 
-cargo test --workspace --no-fail-fast "$@" 2>&1 | tee "$OUT"
+# A test that parks is a harness defect that reads as a stalled job. Cargo has no per-test timeout and the
+# stub daemons in the gateway tests wait on a socket, so the suite carries a deadline of its own: a future
+# hang then fails the job with a name instead of holding it until something outside kills it. Override with
+# HADES_TEST_TIMEOUT for a slow machine; the job's own limit is the outer bound.
+LIMIT=${HADES_TEST_TIMEOUT:-1800}
+timeout --signal=TERM --kill-after=60 "$LIMIT" cargo test --workspace --no-fail-fast "$@" 2>&1 | tee "$OUT"
 status=${PIPESTATUS[0]}
+
+if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+  printf '::error title=the suite timed out::the workspace suite did not finish within %ss; a test is parked and cargo prints no name for a hang\n' "$LIMIT"
+fi
 
 # The count is a claim in four places (badge, table, prose, release notes), so the run that proves it should
 # produce the number rather than leaving a person to add up forty test-result lines by hand. A failed run

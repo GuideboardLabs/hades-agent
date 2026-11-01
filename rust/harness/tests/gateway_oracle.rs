@@ -121,6 +121,43 @@ fn socket_under(dir: &Path) -> PathBuf {
     dir.join("d.sock")
 }
 
+/// One stub daemon's half of the socket, bounded.
+///
+/// A test that blocks in `accept()` with no deadline cannot fail: cargo has no per-test timeout and neither
+/// gate script wraps the suite in one, so a gateway change that stops connecting parks the whole run and it
+/// is killed from outside as `exit 124` with processes left behind. A missing connection is an assertion, so
+/// it is raised as one, named after the connection the daemon was waiting for.
+fn accept_within(listener: &UnixListener, what: &str) -> std::os::unix::net::UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("a pollable socket in the stub daemon");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("a blocking connection");
+                // A peer that connects and then says nothing must also fail rather than park.
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .expect("a read deadline");
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "no {what} arrived within 10 s: the gateway never connected, so the stub daemon \
+                         has nothing to answer"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => panic!("waiting for {what}: {error}"),
+        }
+    }
+}
+
 fn message(from: i64, chat: i64, text: &str) -> Update {
     Update {
         id: 1,
@@ -462,8 +499,12 @@ fn a_mention_only_surface_still_answers_the_button_it_holds() {
 
     let socket = socket_under(&dir);
     let listener = UnixListener::bind(&socket).expect("bind");
+    // The join is bounded for the same reason the accept is: `join()` on a stub daemon whose connection never
+    // came would wait for the accept's own deadline and then report a panic from the thread. The channel makes
+    // the reason the assertion.
+    let (finished_tx, finished) = std::sync::mpsc::channel();
     let daemon = std::thread::spawn(move || {
-        let (mut answer, _) = listener.accept().expect("the answer connection");
+        let mut answer = accept_within(&listener, "the answer connection");
         let mut line = String::new();
         BufReader::new(answer.try_clone().unwrap())
             .read_line(&mut line)
@@ -472,6 +513,7 @@ fn a_mention_only_surface_still_answers_the_button_it_holds() {
         assert_eq!(request["op"], "answer");
         assert_eq!(request["decision"], "deny");
         writeln!(answer, "{}", json!({"ok": true})).expect("ok");
+        let _ = finished_tx.send(());
     });
 
     let settings = Settings {
@@ -517,6 +559,10 @@ fn a_mention_only_surface_still_answers_the_button_it_holds() {
         &mut fake,
     )
     .expect("a held approval is answered under mention");
+    finished.recv_timeout(std::time::Duration::from_secs(15)).expect(
+        "the stub daemon did not answer the held button within 15 s: it is parked on the socket, or it \
+         ended without a reply",
+    );
     daemon.join().expect("the daemon");
     assert_eq!(
         fake.acks(),
@@ -613,7 +659,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
     let socket = socket_under(&dir);
     let listener = UnixListener::bind(&socket).expect("bind");
     let daemon = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("one connection");
+        let mut stream = accept_within(&listener, "one connection");
         let mut line = String::new();
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
@@ -708,7 +754,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
 
     let daemon = std::thread::spawn(move || {
         // 1. The run starts, asks, and ends `awaiting`: a question outlives the run that asked it.
-        let (mut run, _) = listener.accept().expect("the run connection");
+        let mut run = accept_within(&listener, "the run connection");
         let mut line = String::new();
         BufReader::new(run.try_clone().unwrap())
             .read_line(&mut line)
@@ -738,7 +784,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
         drop(run);
 
         // 2. The answer arrives on its own connection, session-scoped so it outlives the run.
-        let (mut answer, _) = listener.accept().expect("the answer connection");
+        let mut answer = accept_within(&listener, "the answer connection");
         let mut line = String::new();
         BufReader::new(answer.try_clone().unwrap())
             .read_line(&mut line)
@@ -753,7 +799,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
         drop(answer);
 
         // 3. Allow resumes the same goal in the same session, and the standing answer lets it through.
-        let (mut resumed, _) = listener.accept().expect("the resumed run");
+        let mut resumed = accept_within(&listener, "the resumed run");
         let mut line = String::new();
         BufReader::new(resumed.try_clone().unwrap())
             .read_line(&mut line)
@@ -992,7 +1038,7 @@ fn a_stop_is_scoped_to_this_chat_and_names_what_it_stopped() {
     let socket = socket_under(&dir);
     let listener = UnixListener::bind(&socket).expect("bind");
     let daemon = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("one connection");
+        let mut stream = accept_within(&listener, "one connection");
         let mut line = String::new();
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
@@ -1085,7 +1131,7 @@ fn a_shutdown_stops_every_run_and_ends_the_poller() {
     let socket = socket_under(&dir);
     let listener = UnixListener::bind(&socket).expect("bind");
     let daemon = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("one connection");
+        let mut stream = accept_within(&listener, "one connection");
         let mut line = String::new();
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
