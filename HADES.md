@@ -388,9 +388,14 @@ is no such detection, and there a name counts when it is this surface's own: the
 names, or the surface's own name. Any other `@word` addresses somebody else. A channel entry may override
 it, and an unknown word is refused by name. A message the filter drops never reaches a model and is
 recorded as `trigger_ignored`; an unaddressed message in a channel somebody listed on purpose is read
-instead, recorded as `trigger_candidate`, and the channel's policy decides what may come of it. `never`
+instead, recorded as `trigger_candidate`, and the channel's policy decides what may come of it. A button
+press is an answer to a question this surface asked, so `always` and `mention` do not filter it: the run
+holding that question is waiting on the answer, and `mention` filters messages, not approvals. `never`
 drops `/stop` as well, so a run started before the surface was parked is stopped with `hades stop` at the
-CLI: the filter exempts nothing, and that is what parking a surface costs. The token is
+CLI, and a button from a question asked before it was parked is acknowledged and dropped, recorded as
+`trigger_ignored` with the surface named: the filter exempts nothing while the surface is parked, and that
+is what parking costs. A question left holding a parked surface is answered with `hades answer`, or by
+unparking it. The token is
 `HADES_TELEGRAM_TOKEN` in `~/.hades/.env` or the environment, never in the JSON, and it is never printed.
 
 A goal is session state, not a schedule. `hades goal set <text> --chat <id> --check <command>` records one

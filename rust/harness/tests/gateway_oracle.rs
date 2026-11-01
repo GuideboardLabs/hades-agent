@@ -310,6 +310,226 @@ fn an_ignored_message_never_reaches_the_daemon() {
     );
 }
 
+/// A button is an answer to a question this agent asked, so the trigger filter does not judge it. On a
+/// surface set to `never` that exemption was the defect: the filter parked the messages and let the one
+/// control a parked surface still receives through, so a pending Allow submitted the goal `/run` had put
+/// on hold. A parked surface acknowledges the press and drops it, the way it drops a message, and the goal
+/// stays on hold until somebody unparks the surface.
+#[test]
+fn a_parked_surface_acknowledges_and_drops_a_button() {
+    use harness::gateway::trigger::Trigger;
+
+    let dir = scratch("never-button");
+    let pending = dir.join("gateway").join("pending");
+    std::fs::create_dir_all(&pending).expect("the pending directory");
+    std::fs::write(
+        pending.join("42.json"),
+        json!({"goal": "make the stats file", "session": "tg-1"}).to_string(),
+    )
+    .expect("a held goal");
+
+    // The proof is the absence of a connection, not a status code: a submit that failed and a submit that
+    // never happened look the same from the reply, so the socket is watched instead.
+    let socket = socket_under(&dir);
+    let listener = UnixListener::bind(&socket).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let (seen, watched) = std::sync::mpsc::channel::<String>();
+    let watcher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let mut line = String::new();
+                    let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                    let _ = seen.send(line.trim().to_string());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = seen.send(String::new());
+    });
+
+    let settings = Settings {
+        allowed: vec!["1".to_string()],
+        trigger: Trigger::Never,
+        policy: "guarded".to_string(),
+        verify: "true".to_string(),
+        model: "no-such-preset".to_string(),
+        root: "/work".to_string(),
+        vault: "/work/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
+        mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        username: None,
+        channels: std::collections::HashMap::new(),
+        prompt: None,
+        loading: None,
+        provider: None,
+        endpoints: Default::default(),
+        providers: Default::default(),
+        fallbacks: Default::default(),
+    };
+
+    let mut fake = Fake::default();
+    let answer = handle(
+        &Update {
+            id: 2,
+            from: 1.to_string(),
+            chat: Chat::new("discord", "100"),
+            text: String::new(),
+            callback: Some(Callback {
+                id: "cb-1".to_string(),
+                data: "a:42:1".to_string(),
+            }),
+            photo: None,
+            mention: None,
+            direct: None,
+        },
+        &settings,
+        &socket,
+        &dir,
+        &mut fake,
+    );
+    assert!(
+        answer.is_ok(),
+        "a parked surface went to the daemon for a button: {answer:?}"
+    );
+    assert_eq!(
+        fake.acks(),
+        vec![(
+            "cb-1".to_string(),
+            "this surface is not answering".to_string()
+        )],
+        "the press has to be acknowledged or the surface spins on it"
+    );
+    assert!(
+        pending.join("42.json").exists(),
+        "a parked surface consumed the goal it was holding"
+    );
+    assert!(
+        fake.sent().is_empty(),
+        "a parked surface said something: {:?}",
+        fake.sent()
+    );
+
+    let heard = watched.recv_timeout(std::time::Duration::from_secs(5));
+    watcher.join().expect("the watcher");
+    assert!(
+        matches!(heard, Ok(ref line) if line.is_empty()),
+        "the daemon was asked to answer a parked surface: {heard:?}"
+    );
+
+    let recorded = harness::activity::read(&dir);
+    let ignored: Vec<_> = recorded
+        .iter()
+        .filter(|line| line.action == "trigger_ignored")
+        .collect();
+    assert_eq!(ignored.len(), 1, "{recorded:?}");
+    assert_eq!(ignored[0].decision, "ignore");
+    assert!(
+        ignored[0].reason.contains("never"),
+        "the reason names the setting: {:?}",
+        ignored[0].reason
+    );
+    assert!(
+        ignored[0].actor.contains("discord") && ignored[0].actor.contains("100"),
+        "the surface is named: {:?}",
+        ignored[0].actor
+    );
+}
+
+/// The other direction: `mention` filters messages, not approvals. A question this surface is already
+/// holding has to be answerable from the chat it was asked in, or the run stays parked with the buttons
+/// that were meant to release it.
+#[test]
+fn a_mention_only_surface_still_answers_the_button_it_holds() {
+    use harness::gateway::trigger::Trigger;
+
+    let dir = scratch("mention-button");
+    let pending = dir.join("gateway").join("pending");
+    std::fs::create_dir_all(&pending).expect("the pending directory");
+    std::fs::write(
+        pending.join("42.json"),
+        json!({"goal": "make the stats file", "session": "tg-1"}).to_string(),
+    )
+    .expect("a held goal");
+
+    let socket = socket_under(&dir);
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let daemon = std::thread::spawn(move || {
+        let (mut answer, _) = listener.accept().expect("the answer connection");
+        let mut line = String::new();
+        BufReader::new(answer.try_clone().unwrap())
+            .read_line(&mut line)
+            .expect("the answer");
+        let request: serde_json::Value = serde_json::from_str(line.trim()).expect("json");
+        assert_eq!(request["op"], "answer");
+        assert_eq!(request["decision"], "deny");
+        writeln!(answer, "{}", json!({"ok": true})).expect("ok");
+    });
+
+    let settings = Settings {
+        allowed: vec!["1".to_string()],
+        trigger: Trigger::MentionOnly,
+        policy: "guarded".to_string(),
+        verify: "true".to_string(),
+        model: "no-such-preset".to_string(),
+        root: "/work".to_string(),
+        vault: "/work/v".to_string(),
+        heartbeat: harness::gateway::goal::DEFAULT_HEARTBEAT_SECS,
+        mcp: harness::mcp::McpConfig::default(),
+        mode: harness::mode::Mode::Act,
+        username: None,
+        channels: std::collections::HashMap::new(),
+        prompt: None,
+        loading: None,
+        provider: None,
+        endpoints: Default::default(),
+        providers: Default::default(),
+        fallbacks: Default::default(),
+    };
+    let mut fake = Fake::default();
+    // A group chat whose message names nobody: under `mention` a message there is ignored, and the press is
+    // still an answer to the question this surface asked.
+    handle(
+        &Update {
+            id: 2,
+            from: 1.to_string(),
+            chat: Chat::new("telegram", "-100123"),
+            text: String::new(),
+            callback: Some(Callback {
+                id: "cb-1".to_string(),
+                data: "a:42:0".to_string(),
+            }),
+            photo: None,
+            mention: None,
+            direct: None,
+        },
+        &settings,
+        &socket,
+        &dir,
+        &mut fake,
+    )
+    .expect("a held approval is answered under mention");
+    daemon.join().expect("the daemon");
+    assert_eq!(
+        fake.acks(),
+        vec![("cb-1".to_string(), "denied".to_string())],
+        "{:?}",
+        fake.acks()
+    );
+    assert!(
+        !pending.join("42.json").exists(),
+        "an answered question is no longer pending"
+    );
+}
+
 #[test]
 fn an_unauthorized_sender_gets_nothing() {
     let dir = scratch("auth");

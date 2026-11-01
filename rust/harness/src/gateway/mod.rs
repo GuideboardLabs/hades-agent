@@ -1541,9 +1541,25 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     if !settings.allowed.contains(&update.from) {
         return Ok(());
     }
+    // A button press is an answer to a question this agent asked, so it is addressed by definition and the
+    // filter below does not judge it. `never` is the exception, and it is the one that matters: a parked
+    // surface still receives the buttons of the questions it asked before it was parked, and letting one
+    // through submits the goal `/run` had put on hold. So the press is acknowledged and dropped, recorded by
+    // surface the way an ignored message is. A question left holding a parked surface is answered with
+    // `hades answer`, or by unparking the surface.
+    if let Some(callback) = &update.callback
+        && trigger::resolved(settings, &update.chat) == trigger::Trigger::Never
+    {
+        crate::activity::trigger_ignored(
+            state,
+            &format!("{}:{}", update.chat.surface_name(), update.chat.id()),
+            "the surface is set to never answer, so a button on it is not answered either",
+        );
+        return transport.ack(&callback.id, "this surface is not answering");
+    }
     // Before anything expensive: was this message addressed to this surface at all? A message that was not
     // is dropped here, recorded by name, and costs neither a model call nor a daemon submit. A button press
-    // is an answer to a question this agent asked, so it is addressed by definition and is not filtered.
+    // has already been handled above: it is an answer to a question this agent asked.
     if update.callback.is_none() {
         let verdict = trigger::classify(update, settings);
         if verdict != trigger::Verdict::Requested {
