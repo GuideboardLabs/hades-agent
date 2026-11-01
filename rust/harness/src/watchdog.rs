@@ -25,7 +25,9 @@ use session_tree::{Entry, Kind};
 pub enum Did {
     /// It looked at something, or the log has no evidence that it changed a file and it is not one of the
     /// programs whose value is work on the tree. Reading is how a run rebuilds its working set after a trim,
-    /// so this is the state the stall rule exempts: a false stop costs more than a slow run.
+    /// so the first look at a thing is progress: a false stop costs more than a slow run. A look at something
+    /// this run has already looked at is not progress, which is `inspect`'s call rather than this one's,
+    /// because only the run's history knows what it has already seen.
     Read,
     /// It created or changed a file: an edit that landed, or a program that sends its output into one.
     Write,
@@ -79,7 +81,7 @@ pub enum Stall {
     /// The same normalised call, N times in a row. `tool` is the tool and the call as one key, so the
     /// sentence it renders reads `repeating shell: cargo test, 5 times`.
     Repeating { tool: String, times: usize },
-    /// K steps in a row that neither wrote a file nor looked at anything.
+    /// K steps in a row that neither wrote a file nor looked at anything it had not already looked at.
     NoProgress { steps: usize },
     /// The allowance is gone and nothing was written.
     SpentWithoutOutput { tokens: u64 },
@@ -91,7 +93,9 @@ impl Stall {
     pub fn sentence(&self) -> String {
         match self {
             Stall::Repeating { tool, times } => format!("repeating {tool}, {times} times"),
-            Stall::NoProgress { steps } => format!("{steps} steps with nothing written or read"),
+            Stall::NoProgress { steps } => {
+                format!("{steps} steps with nothing written and nothing new read")
+            }
             Stall::SpentWithoutOutput { tokens } => {
                 format!("{tokens} tokens spent with nothing written")
             }
@@ -130,6 +134,78 @@ fn is_check(step: &Step) -> bool {
     step.tool == crate::VERIFY
 }
 
+/// What a look looked at: the paths, URLs and subcommands it named, with the words that only shape the output
+/// taken out.
+///
+/// A read is progress when it tells the run something it did not have, and the only thing that can say so is
+/// what was read. `cat a.rs`, `head -20 a.rs` and `wc -l a.rs` are one file read three ways; `git log` and
+/// `git diff` are two questions about one tree. So the key is the operands (`sed`'s range included, because a
+/// different range is a different look), the pipes and redirections dropped because they shape the answer
+/// rather than choose it, and the program name dropped because two programs on one path ask about one path.
+///
+/// A program with no operand (`pwd`, `ls -la`, `git status`) is keyed by its own name for the same reason:
+/// asking it twice is one question. When the choice of key is wrong it is wrong in the safe direction, which
+/// is a run that is not stopped; the direction that costs a run its work is the one this rule was made for.
+fn read_key(tool: &str, arguments: &str) -> Option<String> {
+    if tool != crate::SHELL {
+        // A named reader's arguments already are what it was pointed at. The tool stays in the key because
+        // `search` and `read_file` on one path are different questions.
+        let collapsed = arguments.split_whitespace().collect::<Vec<_>>().join(" ");
+        return Some(format!("{tool} {collapsed}"));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for command in commands(arguments) {
+        let words: Vec<&str> = command.split_whitespace().collect();
+        let Some(program) = crate::floor::command_word(&words) else {
+            continue;
+        };
+        // Everything after the program that is not a flag. `command_word` has already walked past wrappers
+        // and assignments, so the program is the first word that is its own name.
+        let start = words
+            .iter()
+            .position(|word| word.rsplit('/').next() == Some(program))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let operands: Vec<&str> = words[start..]
+            .iter()
+            .copied()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        if operands.is_empty() {
+            parts.push(program.to_ascii_lowercase());
+        } else {
+            parts.push(operands.join(" "));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Order is not part of what was read: `a && b` and `b && a` look at the same two things.
+    parts.sort();
+    parts.dedup();
+    Some(parts.join("; "))
+}
+
+/// The commands in a program, one per thing looked at.
+///
+/// A pipeline is one command whose later stages shape the first one's output, so it is cut at the first `|`;
+/// `;`, `&&` and `||` join separate commands, and a newline starts one.
+fn commands(text: &str) -> Vec<String> {
+    text.replace("&&", ";")
+        .replace("||", ";")
+        .split(['\n', ';'])
+        .map(|command| {
+            command
+                .split('|')
+                .next()
+                .unwrap_or(command)
+                .trim()
+                .to_string()
+        })
+        .filter(|command| !command.is_empty())
+        .collect()
+}
+
 /// The verdict on a step history, or nothing when nothing is wrong.
 ///
 /// Only the tail is examined: the question is whether the run is stalled *now*, not whether it ever
@@ -137,14 +213,18 @@ fn is_check(step: &Step) -> bool {
 pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
     // The run's own steps. The check is written by the harness, after the step it checked: it is evidence
     // about the tree, not a call the run chose, so neither the repeat rule nor the stall rule may count it.
-    let run: Vec<&Step> = steps.iter().filter(|step| !is_check(step)).collect();
-    let last = run.last()?;
+    let run: Vec<(usize, &Step)> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| !is_check(step))
+        .collect();
+    let (_, last) = *run.last()?;
 
     let key = crate::agent::call_key(&last.tool, &last.arguments);
     let times = run
         .iter()
         .rev()
-        .take_while(|step| crate::agent::call_key(&step.tool, &step.arguments) == key)
+        .take_while(|(_, step)| crate::agent::call_key(&step.tool, &step.arguments) == key)
         .count();
     if times >= limits.repeats {
         return Some(Stall::Repeating { tool: key, times });
@@ -161,14 +241,45 @@ pub fn inspect(steps: &[Step], limits: &Limits) -> Option<Stall> {
     }
 
     // A step stands still when it neither wrote nor looked at anything. Reading is how a run rebuilds its
-    // working set after a trim, so counting reads as standing still would stop the runs that are recovering.
-    // "Reading" is a fact about the step, not the name of its tool: a daemon run logs every program as
-    // `shell`, and twelve `cat`/`grep` steps are one long look, not a stall.
-    let still = run
+    // working set after a trim, so a look counts as progress: the rule this replaced judged reads by the name
+    // of their program, and the list of names could never hold every program anyone runs.
+    //
+    // The other half is what a look is worth. A look at something the run has not looked at before tells it
+    // something it did not have; the same look again tells it nothing, and a run doing that is the most
+    // common shape of stuck work there is: one URL fetched again, one tree inspected again, one file catted
+    // again, each spelled a little differently so no loop counter sees it. The run's own history is the set:
+    // the first look at a key is progress, every later one is standing still. A file that was written is new
+    // again, so only looks are recorded here.
+    let keys: Vec<Option<String>> = steps
         .iter()
-        .rev()
-        .take_while(|step| step.did == Did::Nothing)
-        .count();
+        .map(|step| read_key(&step.tool, &step.arguments))
+        .collect();
+    let mut first: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, step) in steps.iter().enumerate() {
+        if step.did == Did::Read
+            && let Some(key) = keys[index].as_deref()
+        {
+            first.entry(key).or_insert(index);
+        }
+    }
+    let mut still = 0;
+    for (index, step) in run.iter().rev() {
+        let moved = match step.did {
+            Did::Write => true,
+            Did::Nothing => false,
+            // A look the key function cannot place is given the benefit of the doubt: a run is never stopped
+            // for what the reader could not read.
+            Did::Read => match keys[*index].as_deref() {
+                None => true,
+                Some(key) => first.get(key).is_none_or(|seen| *seen == *index),
+            },
+        };
+        if !moved {
+            still += 1;
+        } else {
+            break;
+        }
+    }
     if still >= limits.no_progress {
         return Some(Stall::NoProgress { steps: still });
     }
@@ -957,7 +1068,7 @@ mod tests {
         assert_eq!(stall.sentence(), "repeating shell: cargo test, 5 times");
         assert_eq!(
             Stall::NoProgress { steps: 12 }.sentence(),
-            "12 steps with nothing written or read"
+            "12 steps with nothing written and nothing new read"
         );
         assert_eq!(
             Stall::SpentWithoutOutput { tokens: 40_000 }.sentence(),

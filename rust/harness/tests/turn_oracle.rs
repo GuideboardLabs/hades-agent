@@ -921,6 +921,100 @@ fn a_run_that_alternates_a_build_with_a_new_read_is_not_repeating() {
     );
 }
 
+/// The rule the watchdog lost when the false stop was removed: a look is news the first time it is taken and
+/// nothing afterwards. Twelve *different* read-only programs each tell the run something it did not have, so
+/// a run of them is working and must not be stopped.
+#[test]
+fn twelve_distinct_reads_written_by_the_turn_are_not_a_stall() {
+    let programs: Vec<String> = [
+        "git log --oneline -3",
+        "git diff --stat",
+        "git show HEAD",
+        "git status --short",
+        "curl -s http://127.0.0.1:9/one",
+        "curl -s http://127.0.0.1:9/two",
+        "python3 -c 'print(1)'",
+        "kubectl get pods",
+        "kubectl get nodes",
+        "ls -la src",
+        "head -20 Cargo.toml",
+        "grep -rn watchdog src",
+    ]
+    .iter()
+    .map(|program| program.to_string())
+    .collect();
+    let steps = driven("distinct-reads", &programs);
+    let stall = harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default());
+    assert!(
+        stall.is_none(),
+        "twelve distinct reads stopped a run for looking: {stall:?}"
+    );
+}
+
+/// The other side, and the shape that was stuck on this box: one request issued again and again. It has to
+/// stop, and it has to stop as a loop rather than as an anonymous run of empty steps.
+#[test]
+fn the_same_curl_read_twelve_times_is_a_stall() {
+    let programs = vec!["curl -s http://127.0.0.1:9/status".to_string(); 12];
+    let steps = driven("same-read", &programs);
+    assert!(
+        matches!(
+            harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default()),
+            Some(harness::watchdog::Stall::Repeating { times: 12, .. })
+        ),
+        "{:?}",
+        harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default())
+    );
+}
+
+/// And the rule the loop counter cannot see: thirteen different commands, every one of them looking at the
+/// same file again. The first look told the run everything; the twelve after it told it nothing, which is
+/// what "no progress" means, and the bound is twelve of those.
+#[test]
+fn the_same_target_read_thirteen_ways_is_no_progress() {
+    let programs: Vec<String> = [
+        "cat note.txt",
+        "cat -n note.txt",
+        "cat -A note.txt",
+        "head -1 note.txt",
+        "head -3 note.txt",
+        "tail -1 note.txt",
+        "tail -3 note.txt",
+        "wc -l note.txt",
+        "wc -c note.txt",
+        "ls -l note.txt",
+        "ls -la note.txt",
+        "stat note.txt",
+        "file note.txt",
+    ]
+    .iter()
+    .map(|program| program.to_string())
+    .collect();
+    let steps = driven("same-target", &programs);
+    assert_eq!(
+        harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default()),
+        Some(harness::watchdog::Stall::NoProgress { steps: 12 }),
+        "a run that asked the same file thirteen times was not stopped, or was stopped at the wrong count"
+    );
+}
+
+/// A run that reads and then writes is working: the write is what proves it, and reading a file it just
+/// wrote is news again because the file changed.
+#[test]
+fn a_run_that_alternates_a_read_with_a_write_is_not_a_stall() {
+    let mut programs = Vec::new();
+    for n in 0..10 {
+        programs.push(format!("echo line-{n} > notes-{n}.md"));
+        programs.push(format!("cat notes-{n}.md"));
+    }
+    let steps = driven("read-write", &programs);
+    let stall = harness::watchdog::inspect(&steps, &harness::watchdog::Limits::default());
+    assert!(
+        stall.is_none(),
+        "a run that wrote and then read what it wrote was stopped: {stall:?}"
+    );
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:
