@@ -921,6 +921,81 @@ fn a_strict_submit_is_refused_before_a_session_exists() {
     run.stop();
 }
 
+/// The defect this exists for: five `?` returns sat between the lease and the cleanup. A failure in the
+/// pre-work after the acknowledgement (here: a session log that cannot be read) left the lease and the stop
+/// flag behind, so `status` reported the run as running for ever, the watchdog's `since` failed silently on
+/// every tick, and the session could never be taken on again.
+#[test]
+fn a_run_that_fails_before_it_starts_does_not_hold_its_lease() {
+    let state = scratch("lease-leak");
+    repo(&state);
+    // A directory where the log belongs: the lease is taken and the acknowledgement goes out, and opening
+    // the session then fails, which is the shape of a torn log without needing one.
+    let sessions = state.join("sessions");
+    std::fs::create_dir_all(sessions.join("leak.jsonl")).expect("a blocker");
+    let run = Running::start(&state);
+
+    let mut failed = Following::open(
+        &run.socket,
+        json!({
+            "op": "submit",
+            "goal": "make stats.sh exist",
+            "root": state.join("repo").display().to_string(),
+            "state": state.display().to_string(),
+            "session": "leak",
+            "program": ["touch stats.sh"],
+            "verify": "test -f stats.sh",
+            "policy": "open",
+            "attempts": 1,
+        }),
+    );
+    let started = failed.line();
+    assert_eq!(
+        started["started"],
+        json!(true),
+        "the run was not acknowledged, so the failure is not the one under test: {started}"
+    );
+    let refusal = failed.line();
+    assert_eq!(refusal["ok"], json!(false), "{refusal}");
+    assert!(
+        refusal["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("leak"),
+        "the refusal does not name the session: {refusal}"
+    );
+
+    // The blocker goes, so the session can be read the way it would be on any state directory, and the two
+    // things the leak was invisible in are read back.
+    std::fs::remove_dir_all(sessions.join("leak.jsonl")).expect("the blocker goes");
+    let status = ask(&run.socket, json!({"op": "status"})).expect("a status answer");
+    assert!(
+        !status.to_string().contains("running as run"),
+        "a run that never started is reported as running: {status}"
+    );
+    let ledger = std::fs::read_to_string(state.join("activity.jsonl")).unwrap_or_default();
+    assert!(
+        ledger.contains("lease_released"),
+        "the release was not recorded, so nobody can say why the run ended: {ledger}"
+    );
+    assert!(
+        ledger.contains("leak") && ledger.contains("opening the session"),
+        "the record does not say which step failed and on which session: {ledger}"
+    );
+
+    // And the session can be taken on again: a lease left behind refuses this with "already running".
+    let mut again = submit(&run, "leak", "touch stats.sh", "test -f stats.sh", "open");
+    let taken = again.line();
+    assert_eq!(
+        taken["started"],
+        json!(true),
+        "the lease outlived the run that never started: {taken}"
+    );
+    let finished = again.until_finished();
+    assert_eq!(finished["finished"], json!(true), "{finished}");
+    run.stop();
+}
+
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.
 ///
 /// The agent that runs these tests keeps its temp under the live install, and Hades refuses to write there:

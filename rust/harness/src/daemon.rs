@@ -63,6 +63,79 @@ struct Lease {
     allowance: Option<u64>,
 }
 
+/// A lease and its stop flag, held for the length of one submit and let go on every exit path.
+///
+/// The pre-work between the acknowledgement and the walk has five fallible steps, and each of them used to
+/// return through `?` with the lease still in the table. A failure there left a run that `status` reported as
+/// running for ever, that the watchdog could not judge (`since` failed on every tick), and that nothing could
+/// take on again, because the lease refused a second writer. A drop runs on every path out of the function,
+/// which is the one exit the code cannot forget to take.
+struct Held<'a> {
+    daemon: &'a Daemon,
+    session: String,
+    run: u64,
+    /// Why the run ended before it started. Empty while it is still going, and filled by the step that
+    /// failed, so the record says where it stopped and not only that it did.
+    why: String,
+    ended: bool,
+}
+
+impl<'a> Held<'a> {
+    fn new(daemon: &'a Daemon, session: &str, run: u64) -> Held<'a> {
+        Held {
+            daemon,
+            session: session.to_string(),
+            run,
+            why: String::new(),
+            ended: false,
+        }
+    }
+
+    /// One fallible step of the pre-work: the fault goes back to the client unchanged, and the reason it
+    /// ended stays here for the record a drop writes.
+    fn step<T>(&mut self, what: &str, result: Result<T, Fault>) -> Result<T, Fault> {
+        result.inspect_err(|fault| {
+            self.why = format!(
+                "the run ended before it started, while {what}: {}",
+                fault.detail()
+            );
+        })
+    }
+
+    /// The normal end: the marker and the lease go together, and the drop that follows finds nothing to do.
+    fn end(mut self) -> Result<(), Fault> {
+        self.ended = true;
+        clear_inflight(&self.daemon.state, &self.session);
+        self.daemon.release(&self.session, self.run)
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        clear_inflight(&self.daemon.state, &self.session);
+        if self.why.is_empty() {
+            self.why = "the run ended before it started".to_string();
+        }
+        let why = std::mem::take(&mut self.why);
+        // A release that cannot reach the table has nothing left to say: the lock is poisoned, which means a
+        // panic elsewhere already owns the record.
+        match self.daemon.release(&self.session, self.run) {
+            Ok(()) => crate::activity::lease_released(
+                &self.daemon.state,
+                &format!("run {} in {}", self.run, self.session),
+                &why,
+            ),
+            Err(said) => eprintln!(
+                "daemon: run {} in {} could not be released: {said}",
+                self.run, self.session
+            ),
+        }
+    }
+}
+
 /// What the daemon was told on the way up.
 pub struct Daemon {
     state: PathBuf,
@@ -701,6 +774,10 @@ impl Daemon {
     /// the session. The earlier shape removed the lease, released the table and then removed the flag by
     /// session id: a submit that took the session on in that gap lost its flag, a stop then found no live run
     /// while one was running, and the watchdog had no way to reach it.
+    ///
+    /// A submit calls this from `Held::end` on the normal path and from `Held`'s drop on every other one, so
+    /// a step that fails between the acknowledgement and the walk cannot leave a run that `status` reports as
+    /// running for ever.
     fn release(&self, session: &str, run: u64) -> Result<(), Fault> {
         let mut runs = self
             .runs
@@ -752,14 +829,21 @@ impl Daemon {
             Err(said) => return Ok(json!({"ok": false, "error": said})),
         };
 
+        // From here to the walk every step can fail, and every one of them used to leave the lease and its
+        // stop flag in the table. The guard is taken the moment the lease is and let go on every path out.
+        let mut held = Held::new(self, &session_id, run);
+
         // The acknowledgement goes out before any work, so a client knows the run is taken on and can follow
         // the log itself rather than waiting for a reply that arrives at the end.
-        writeln!(
-            stream,
-            "{}",
-            json!({"run": run, "session": session_id, "started": true})
-        )
-        .map_err(send_failed)?;
+        held.step(
+            "sending the acknowledgement",
+            writeln!(
+                stream,
+                "{}",
+                json!({"run": run, "session": session_id, "started": true})
+            )
+            .map_err(send_failed),
+        )?;
 
         // The log is followed by a thread of its own while the walk runs here, so an entry reaches a watching
         // client as soon as it is written rather than when the whole run is over. It follows from the same
@@ -774,19 +858,28 @@ impl Daemon {
         let follower = {
             let done = Arc::clone(&done);
             let stopping = Arc::clone(&self.stopping);
-            let mut watcher = stream.try_clone().map_err(|error| {
-                Fault::harness(format!("could not clone the connection: {error}"))
-            })?;
+            let mut watcher = held.step(
+                "cloning the connection",
+                stream.try_clone().map_err(|error| {
+                    Fault::harness(format!("could not clone the connection: {error}"))
+                }),
+            )?;
             thread::spawn(move || {
                 let _ = follow(&log, &mut watcher, from, &done, &stopping, &progress_rx);
             })
         };
 
-        let mut session = engine.session().map_err(Fault::harness)?;
+        let mut session = held.step(
+            "opening the session",
+            engine.session().map_err(Fault::harness),
+        )?;
         let before = session.len();
         // The same memory a command-line run gets: one recall for the walk, filed once if it is accepted.
         // A daemon that walks without it is a second-class entry point, and the seam exists so it is not.
-        let goal = crate::cli::goal(&flags).map_err(Fault::harness)?;
+        let goal = held.step(
+            "reading the goal",
+            crate::cli::goal(&flags).map_err(Fault::harness),
+        )?;
         // The marker lands once the goal is known, so an interrupted report can say what the run was doing.
         mark_inflight(&self.state, &session_id, run, &goal);
         let memo = crate::cli::remembered(
@@ -794,11 +887,17 @@ impl Daemon {
             &goal,
             (engine.profile().context_tokens / 10).min(2_000),
         );
-        let protect = crate::cli::protect_of(&flags, engine.root()).map_err(Fault::harness)?;
+        let protect = held.step(
+            "reading the protected paths",
+            crate::cli::protect_of(&flags, engine.root()).map_err(Fault::harness),
+        )?;
         let policy_name = engine.policy_name().to_string();
         let model_name = answerer.describe();
         let check = engine.profile().verify.clone();
-        let case_mode = crate::cli::case_mode(&flags).map_err(Fault::harness)?;
+        let case_mode = held.step(
+            "reading the case mode",
+            crate::cli::case_mode(&flags).map_err(Fault::harness),
+        )?;
         let walked = {
             let mut runner = crate::graph::Runner::new(
                 engine.parts(
@@ -812,7 +911,10 @@ impl Daemon {
             .with_bounds(bounds)
             .with_feed(&feed)
             .with_stop(cancel.as_ref())
-            .with_baseline(crate::cli::baseline_of(&flags).map_err(Fault::harness)?)
+            .with_baseline(held.step(
+                "reading the baseline",
+                crate::cli::baseline_of(&flags).map_err(Fault::harness),
+            )?)
             .with_protect(protect)
             .with_scoreboard(&self.state)
             .with_identity(model_name, policy_name)
@@ -844,8 +946,7 @@ impl Daemon {
         let _ = follower.join();
         // The run reached its end, so the marker goes with the lease. A crash between here and the reply
         // leaves nothing behind to be read as an interruption of work that did finish.
-        clear_inflight(&self.state, &session_id);
-        self.release(&session_id, run)?;
+        held.end()?;
 
         match walked {
             Ok(walked) => {

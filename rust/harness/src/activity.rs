@@ -147,6 +147,25 @@ pub fn watchdog_stopped(state: &Path, run: u64, session: &str, reason: &str) {
     }
 }
 
+/// A run's lease let go before the run could start. The lease table is in memory, so this line is the only
+/// durable answer to "why did that run stop being running": without it a lease that failed its pre-work
+/// looks exactly like a run that ended, and a session that cannot be taken on again has no record saying who
+/// still holds it.
+pub fn lease_released(state: &Path, actor: &str, reason: &str) {
+    let line = Line {
+        at: epoch(),
+        actor: actor.to_string(),
+        layer: "daemon".to_string(),
+        action: "lease_released".to_string(),
+        decision: "release".to_string(),
+        reason: reason.to_string(),
+        artifact: String::new(),
+    };
+    if let Err(said) = record(state, &line) {
+        eprintln!("activity: could not record a released lease: {said}");
+    }
+}
+
 fn epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
