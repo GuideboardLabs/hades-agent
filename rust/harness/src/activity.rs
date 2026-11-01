@@ -92,7 +92,6 @@ pub fn stop(state: &Path, actor: &str, action: &str, reason: &str, artifact: &st
 /// A message this surface was not addressed in, dropped before any work was done. One function so every
 /// surface writes the same word, and the reason names the setting that did it. The actor carries the
 /// surface and the channel in the same `surface:channel` shape every other line uses.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn trigger_ignored(state: &Path, actor: &str, reason: &str) {
     let line = Line {
         at: epoch(),
@@ -112,7 +111,6 @@ pub fn trigger_ignored(state: &Path, actor: &str, reason: &str) {
 /// said this place matters, so the model reads it and the policy decides what may come of it. Its own word,
 /// because the question it answers is "why was this read at all", which neither a request nor an ignore
 /// answers.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn trigger_candidate(state: &Path, actor: &str, reason: &str) {
     let line = Line {
         at: epoch(),
