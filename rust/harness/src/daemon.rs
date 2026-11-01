@@ -778,6 +778,14 @@ impl Daemon {
     /// A submit calls this from `Held::end` on the normal path and from `Held`'s drop on every other one, so
     /// a step that fails between the acknowledgement and the walk cannot leave a run that `status` reports as
     /// running for ever.
+    ///
+    /// **A poisoned stop table is a note, not a shape to recover from.** The lease goes first and the flag
+    /// after it, so a panic in another thread holding the stop table leaves a flag with no lease. `stop`
+    /// skips exactly that case on purpose (a flag without a lease is a run that has already finished), the
+    /// next lease for the session overwrites the flag, and every path that touches the poisoned table fails
+    /// with a named error rather than acting on half of it. No recovery is written for it: a state nothing
+    /// can reach is documented here, beside the release semantics, and not repaired by code no test can
+    /// drive.
     fn release(&self, session: &str, run: u64) -> Result<(), Fault> {
         let mut runs = self
             .runs
