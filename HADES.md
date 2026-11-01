@@ -350,17 +350,18 @@ have already ended, is not parsed, and on a session with twenty thousand entries
 between a tick of a fraction of a millisecond and one of three seconds. A run that issues one command five
 times in a row, or twelve steps in a row that neither wrote a file nor looked at anything, is stopped the
 same way `/stop` stops it, and the ledger records `watchdog_stopped: run {run} in {session}` with the
-finding in one sentence, so a session stopped twice is two records rather than one repeated line. A
-step is judged on what it did, not on the name of its tool: `turn` logs every program a run writes under
-`shell`, so the name of a `grep` step and the name of a build are the same word. The turn decides that
-judgement where the tool, its arguments and its result are all in hand, records it beside the call, and the
-watchdog reads the record rather than re-deriving it: a step wrote something when its program sends output
-into a file (`>`, `tee`, `sed -i`), copies, moves or removes one, or when an edit landed; it counts as
-standing still only when it runs a build or a test, whose writes the log cannot see; every other program is
-a look, including one this build has never heard of, because a run cannot be stopped for what the log merely
-does not recognise. A log written before that field existed is judged from its text alone, which recognises
-a look only when every command in it is a known reporter, so a read-only `git` step in an old log still
-counts toward a stall. Calls are
+finding in one sentence, so a session stopped twice is two records rather than one repeated line. The
+number is kept in `<state>/run-counter`, so a restart continues it instead of starting again at 1: a run
+number names one run for as long as the state directory exists. A step is judged on what it did, not on the
+name of its tool: `turn` logs every program a run writes under `shell`, so the name of a `grep` step and the
+name of a build are the same word. The turn decides that judgement where the tool, its arguments and its
+result are all in hand, records it beside the call, and the watchdog reads the record rather than
+re-deriving it: a step wrote something when its program sends output into a file (`>`, `tee`, `sed -i`),
+copies, moves or removes one, or when an edit landed; it counts as standing still only when it runs a build
+or a test, whose writes the log cannot see; every other program is a look, including one this build has
+never heard of, because a run cannot be stopped for what the log merely does not recognise. A log written
+before that field existed is judged from its text alone, which recognises a look only when every command in
+it is a known reporter, so a read-only `git` step in an old log still counts toward a stall. Calls are
 compared after normalisation, so a command rephrased only in its pipe is one call, and an allowance is spent
 by the run that declared it. A run that has finished is never recorded as stopped: its lease is read again,
 under the same lock a finishing run takes to release it, before anything is written, so the flag that

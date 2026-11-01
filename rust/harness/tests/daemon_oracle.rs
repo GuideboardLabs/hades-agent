@@ -422,8 +422,8 @@ fn a_kill_in_flight_is_survived_by_a_second_daemon_on_the_same_state_directory()
     let ack = resumed.line();
     assert_eq!(
         ack["run"],
-        json!(1),
-        "the second daemon counts its own runs: {ack}"
+        json!(2),
+        "the second daemon continued the numbering, so this run is not the one that was killed: {ack}"
     );
     let finished = resumed.until_finished();
     assert_eq!(finished["code"], json!(0), "{finished}");

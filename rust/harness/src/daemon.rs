@@ -171,6 +171,34 @@ fn inflight_path(state: &Path, session: &str) -> PathBuf {
     inflight_dir(state).join(format!("{safe}.json"))
 }
 
+/// Where this state records the last run number it handed out.
+///
+/// A run number names a run in the ledger (`stop: run {run} in {id}`, `watchdog_stopped: run {run} in {id}`),
+/// so it has to outlive the process that issued it: a counter in memory made every restart start again at 1,
+/// and two stops in two lifetimes then read the same number.
+fn run_counter_path(state: &Path) -> PathBuf {
+    state.join("run-counter")
+}
+
+/// The last run number this state has handed out, or zero when nothing has run here.
+///
+/// A record that cannot be read is zero: a state that cannot say has run nothing as far as numbering goes,
+/// which is what a first run needs, and the next lease overwrites whatever was unreadable.
+fn recorded_run(state: &Path) -> u64 {
+    fs::read_to_string(run_counter_path(state))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Write the number before the run it names starts, so a crash between the two leaves a gap in the numbering
+/// rather than a name used twice.
+fn record_run(state: &Path, run: u64) -> Result<(), String> {
+    let path = run_counter_path(state);
+    fs::write(&path, format!("{run}\n"))
+        .map_err(|error| format!("could not record run {run} in {}: {error}", path.display()))
+}
+
 /// Record that this session is running. Best effort by the same contract as the ledger: a marker that
 /// cannot be written must not stop the run.
 fn mark_inflight(state: &Path, session: &str, run: u64, goal: &str) {
@@ -260,13 +288,16 @@ impl Daemon {
             let _ = fs::remove_file(&socket);
         }
 
+        // A restart continues the numbering rather than starting it again: the ledger's run numbers are read
+        // back by a person, and a number that names two different runs names neither.
+        let next_run = recorded_run(&state);
         Ok(Daemon {
             state,
             socket,
             started: Instant::now(),
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             cancels: Arc::new(Mutex::new(BTreeMap::new())),
-            next_run: Arc::new(AtomicU64::new(0)),
+            next_run: Arc::new(AtomicU64::new(next_run)),
             stopping: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -750,6 +781,9 @@ impl Daemon {
         }
         let from = fs::metadata(log).map(|meta| meta.len()).unwrap_or(0);
         let run = self.next_run.fetch_add(1, Ordering::SeqCst) + 1;
+        // The number is written before the lease exists, so a crash here leaves a gap rather than a name the
+        // next lifetime will hand out again.
+        record_run(&self.state, run)?;
         runs.insert(
             session.to_string(),
             Lease {
@@ -1520,6 +1554,33 @@ mod watchdog_tests {
             .expect("cancels")
             .insert(id.to_string(), Arc::clone(&flag));
         (daemon, flag)
+    }
+
+    /// The defect this exists for: the run number lived in memory only, so a restart began again at 1. Two
+    /// stops in two lifetimes then both read `run 1 in <session>` in the ledger, and the record that exists to
+    /// tell two runs apart told them nothing.
+    #[test]
+    fn a_restart_does_not_restart_the_run_numbers() {
+        let state = scratch("run-counter");
+        let id = looping_run(&state, 1);
+        let log = store(&state).path_of(&SessionId::new(&id));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let first = Daemon::bind(&state, state.join("first.sock")).expect("bind");
+        let (run, _) = first.lease(&id, &log, &cancel, None).expect("run 1");
+        assert_eq!(run, 1, "a fresh state starts at run 1");
+        first.release(&id, 1).expect("release");
+        drop(first);
+
+        let second = Daemon::bind(&state, state.join("second.sock")).expect("bind again");
+        let (run, _) = second
+            .lease(&id, &log, &cancel, None)
+            .expect("the run after a restart");
+        assert_eq!(
+            run, 2,
+            "a restart restarted the numbering, so two stops in two lifetimes both read run 1"
+        );
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// The defect this exists for: `submit` read the log length before taking the runs lock. A run that
