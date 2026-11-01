@@ -71,26 +71,41 @@ fn commanded(text: &str) -> bool {
     text.trim().starts_with('/')
 }
 
-/// Whether the message names this surface: a mention token anywhere in it.
+/// The names a message can use for this surface: the `username` the config gives it, and the surface's own
+/// name. Compared without case because a Telegram username has none.
+fn names_us(name: &str, settings: &Settings, chat: &Chat) -> bool {
+    settings
+        .username
+        .as_deref()
+        .is_some_and(|configured| configured.eq_ignore_ascii_case(name))
+        || chat.surface_name().eq_ignore_ascii_case(name)
+}
+
+/// Whether the text names this surface: an `@` word that is one of its own names.
+///
+/// Any other `@` word is somebody else being named. "@alice the build broke again" in a group is a sentence
+/// about a person, and answering it spends the model call this filter exists to save.
 ///
 /// A *reply* to one of our own messages cannot be seen from here: `Update` carries the text, the sender
 /// and the chat, and the surface does not hand over what was replied to. A surface that can see a reply
 /// says so through `Update::mention`, which is why that field outranks this.
-fn text_mentions(text: &str) -> bool {
+fn text_mentions(text: &str, settings: &Settings, chat: &Chat) -> bool {
     text.split_whitespace().any(|word| {
-        word.strip_prefix('@')
-            .and_then(|name| name.chars().next())
-            .is_some_and(|first| first.is_alphanumeric() || first == '_')
+        word.strip_prefix('@').is_some_and(|name| {
+            // A name in a sentence carries the punctuation after it: "@hades, look" names hades.
+            let name = name.trim_end_matches(|ch: char| !(ch.is_alphanumeric() || ch == '_'));
+            !name.is_empty() && names_us(name, settings, chat)
+        })
     })
 }
 
 /// Whether this message names the surface, from the surface's own detection when it has one. A connector
 /// that recognises its mention tokens strips them before the update is built, and then no word in the text
 /// begins with `@`: reading the text alone would ignore every real mention on that surface.
-fn named(update: &Update) -> bool {
+fn named(update: &Update, settings: &Settings) -> bool {
     match update.mention {
         Some(seen) => seen,
-        None => text_mentions(&update.text),
+        None => text_mentions(&update.text, settings, &update.chat),
     }
 }
 
@@ -121,7 +136,9 @@ pub fn classify(update: &Update, settings: &Settings) -> Verdict {
     match trigger {
         // The behaviour before the key existed: every message from an allowed sender is a request.
         Trigger::Always => Verdict::Requested,
-        Trigger::MentionOnly if commanded(&update.text) || named(update) => Verdict::Requested,
+        Trigger::MentionOnly if commanded(&update.text) || named(update, settings) => {
+            Verdict::Requested
+        }
         // A channel somebody listed on purpose is where an unaddressed sentence is still worth reading:
         // the configuration already said this channel matters, and the model judges the rest.
         Trigger::MentionOnly if settings.channels.contains_key(update.chat.id()) => {
@@ -149,6 +166,7 @@ mod tests {
             heartbeat: 900,
             mcp: crate::mcp::McpConfig::default(),
             mode: crate::mode::Mode::Act,
+            username: None,
             channels: std::collections::HashMap::new(),
             prompt: None,
             loading: None,
@@ -205,7 +223,8 @@ mod tests {
     /// Naming the surface is a request, whether the message says its name or starts with a command.
     #[test]
     fn a_group_message_that_names_the_surface_is_a_request() {
-        let settings = settings(Trigger::MentionOnly);
+        let mut settings = settings(Trigger::MentionOnly);
+        settings.username = Some("hades".to_string());
         assert_eq!(
             classify(&update(42, -100123, "@hades the build broke"), &settings),
             Verdict::Requested
@@ -213,6 +232,44 @@ mod tests {
         assert_eq!(
             classify(&update(42, -100123, "/status"), &settings),
             Verdict::Requested
+        );
+    }
+
+    /// The defect this exists for: any `@word` counted as naming the surface, so "@alice the build broke
+    /// again" in a group was a request and spent the model call this filter exists to save. Only this
+    /// surface's own names count, and a surface whose username the config does not name still answers to
+    /// the name it is.
+    #[test]
+    fn a_message_that_names_somebody_else_is_not_addressed_to_us() {
+        let mut named = settings(Trigger::MentionOnly);
+        named.username = Some("hades_bot".to_string());
+        let bare = settings(Trigger::MentionOnly);
+        assert_eq!(
+            classify(&update(42, -100123, "@alice the build broke again"), &bare),
+            Verdict::Ignore
+        );
+        assert_eq!(
+            classify(
+                &update(42, -100123, "@telegram the build broke again"),
+                &bare
+            ),
+            Verdict::Requested,
+            "a surface answers to its own name"
+        );
+        assert_eq!(
+            classify(&update(42, -100123, "@hades_bot, the build broke"), &named),
+            Verdict::Requested,
+            "the comma after a name is punctuation, not part of it"
+        );
+        assert_eq!(
+            classify(&update(42, -100123, "@Hades_Bot look"), &named),
+            Verdict::Requested,
+            "a Telegram username has no case"
+        );
+        assert_eq!(
+            classify(&update(42, -100123, "@hades_bot2 look"), &named),
+            Verdict::Ignore,
+            "a longer name is a different name"
         );
     }
 

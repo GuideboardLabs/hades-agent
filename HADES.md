@@ -376,7 +376,9 @@ may also name `trigger`: `always`, the default, answers every message from an al
 answers a direct message, and a group message only when it names the surface or starts with a command;
 `never` parks it. A mention is recognised by the surface's own detection where the surface has one, because
 Discord spells one `<@id>` and strips it before the message reaches the gateway; the text is read only where
-there is no such detection. A channel entry may override it, an unknown word is refused by name, and a
+there is no such detection, and there a name counts when it is this surface's own: the `username` the
+section names, or the surface's own name. Any other `@word` addresses somebody else. A channel entry may
+override it, an unknown word is refused by name, and a
 message that fails the filter is dropped before any model call and recorded as `trigger_ignored`. `never`
 drops `/stop` as well, so a run started before the surface was parked is stopped with `hades stop` at the
 CLI: the filter exempts nothing, and that is what parking a surface costs. The token is

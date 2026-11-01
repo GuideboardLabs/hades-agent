@@ -76,6 +76,9 @@ pub struct Settings {
     /// Whether a message has to be addressed to this surface before it becomes work. `Always` is the
     /// default and the behaviour that existed before the key.
     pub trigger: trigger::Trigger,
+    /// The name this surface answers to in text, when the config names one: a Telegram bot's `@username`.
+    /// Without it, `@name` in a message is only recognised when it matches the surface's own name.
+    pub username: Option<String>,
     /// Per-channel overrides, keyed by the channel id the surface reports. A channel can change what a
     /// message may do (a talk channel that cannot touch the filesystem) without a second surface.
     pub channels: std::collections::HashMap<String, Channel>,
@@ -417,6 +420,13 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         &format!("{name}.trigger"),
     )?
     .unwrap_or_default();
+    // The name a person types to address this surface. Absent is not a refusal: a surface that does not
+    // know its username still answers to its own name.
+    let username = match section.get("username") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) if !name.trim().is_empty() => Some(name.trim().to_string()),
+        Some(_) => return Err(format!("{name}.username must be a non-empty string")),
+    };
     let mut channels = std::collections::HashMap::new();
     if let Some(map) = section.get("channels") {
         let Some(map) = map.as_object() else {
@@ -473,6 +483,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
         mcp: crate::mcp::McpConfig::from_value(value.get("mcp"), path)?,
         mode,
         trigger,
+        username,
         channels,
         prompt,
         loading,
@@ -2449,6 +2460,7 @@ mod tests {
             heartbeat: goal::DEFAULT_HEARTBEAT_SECS,
             mcp: crate::mcp::McpConfig::default(),
             mode: crate::mode::Mode::Act,
+            username: None,
             channels: std::collections::HashMap::new(),
             prompt: None,
             loading: None,
@@ -2699,6 +2711,24 @@ mod tests {
             .unwrap_or_else(|| "it was accepted".to_string());
         assert!(said.contains("sometimes"), "{said}");
         assert!(said.contains("channels.99"), "the key is named: {said}");
+    }
+
+    /// The name a person types to address a surface is a setting, because a Telegram username is not the
+    /// surface's name: `@hades_bot` has to be recognised where the text is the only evidence. A blank name
+    /// is a typo, and a name nobody can type addresses nobody.
+    #[test]
+    fn a_surface_can_name_the_username_it_answers_to() {
+        let dir = scratch("username");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"model": "none", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "username": "hades_bot"}}}}"#).expect("config");
+        let settings = settings_for(&path, "discord").expect("a named username");
+        assert_eq!(settings.username.as_deref(), Some("hades_bot"));
+
+        std::fs::write(&path, r#"{"model": "none", "root": "/tmp", "vault": "/tmp", "gateway": {"connectors": {"discord": {"allowed_users": ["7"], "verify": "true", "username": " "}}}}"#).expect("config");
+        let said = settings_for(&path, "discord")
+            .err()
+            .unwrap_or_else(|| "a blank username was accepted".to_string());
+        assert!(said.contains("username"), "{said}");
     }
 
     #[test]

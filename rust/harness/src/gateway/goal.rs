@@ -1031,6 +1031,7 @@ mod tests {
             heartbeat: DEFAULT_HEARTBEAT_SECS,
             mcp: crate::mcp::McpConfig::default(),
             mode: crate::mode::Mode::Act,
+            username: None,
             channels: std::collections::HashMap::new(),
             prompt: None,
             loading: None,
