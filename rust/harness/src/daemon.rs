@@ -2123,6 +2123,26 @@ mod watchdog_tests {
             "the build wrote no file, so the second run has nothing of the first one's to read"
         );
 
+        // The verdict itself, on the history this run wrote and nothing before it: five identical calls is
+        // `Repeating` at exactly five. Without this, "run 1 reached Repeating" rides on the ledger sentence,
+        // and that sentence is written by the same tick: a tick that stopped the run on some other ground and
+        // named a repeat would read identically. The step count is asserted too, because a verdict reached
+        // over the wrong window would still be a verdict.
+        let history = store(&state)
+            .since(&SessionId::new(building), from)
+            .expect("run 1's history");
+        let steps = crate::watchdog::steps(&history);
+        assert_eq!(
+            crate::watchdog::inspect(&steps, &crate::watchdog::Limits::default()),
+            Some(crate::watchdog::Stall::Repeating {
+                tool: "shell: cargo build --quiet".to_string(),
+                times: 5,
+            }),
+            "run 1's own history is not the stall the tick is supposed to find: {} steps, {:?}",
+            steps.len(),
+            steps
+        );
+
         // The tick with only run 1 held: five identical calls is the repeat rule's five, so this is a stop.
         let count = daemon.watchdog();
         assert_eq!(
