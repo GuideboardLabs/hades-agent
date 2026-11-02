@@ -2078,7 +2078,8 @@ mod watchdog_tests {
     /// fallback, while a real run's history is the one the writer produces. So this test drives the real
     /// seams: `Seams::turn` writes five identical builds, each with the classification the producer decided,
     /// under the lease a submit takes. The same tick then has to stop that run, name it in the ledger, and
-    /// leave the second run alone, which is a live run re-reading the file the first one wrote.
+    /// leave the next run alone: the same session taken on again, which reads the file the first one wrote
+    /// and then builds once.
     #[test]
     fn the_tick_stops_a_run_real_turns_wrote_and_leaves_the_next_run_alone() {
         // A build whose output is the file the second run reads. The redirect is what puts the artifact on
@@ -2097,7 +2098,7 @@ mod watchdog_tests {
             .expect("a session");
         let path = store(&state).path_of(&SessionId::new(building));
         let first = Arc::new(AtomicBool::new(false));
-        let (run, _from) = daemon
+        let (run, from) = daemon
             .lease(building, &path, &first, None)
             .expect("run 1 is taken on");
         assert_eq!(run, 1, "a fresh state names its first run 1");
@@ -2122,29 +2123,7 @@ mod watchdog_tests {
             "the build wrote no file, so the second run has nothing of the first one's to read"
         );
 
-        // Run 2 is a different session, because one session takes one run at a time. It re-reads the file run
-        // 1 wrote: three looks at one artifact, which is the commonest stuck shape there is, and the tick
-        // must leave it alone. It is the shape the read rule was made for, and the tick answers it from the
-        // run's own window.
-        let reading = "reading";
-        let mut reread = Session::create(store(&state), SystemClock, SessionId::new(reading))
-            .expect("a second session");
-        let reread_path = store(&state).path_of(&SessionId::new(reading));
-        let second = Arc::new(AtomicBool::new(false));
-        let (run, _) = daemon
-            .lease(reading, &reread_path, &second, None)
-            .expect("run 2 is taken on");
-        assert_eq!(run, 2, "the second lease is run 2");
-        let reader = ScriptedModel::new(["cat build.log"; 3]);
-        for _ in 0..3 {
-            Seams::new(
-                &task, &profile, &policy, &context, &reader, &shell, &verifier,
-            )
-            .turn(&mut reread)
-            .expect("a turn that reads");
-        }
-        drop(reread);
-
+        // The tick with only run 1 held: five identical calls is the repeat rule's five, so this is a stop.
         let count = daemon.watchdog();
         assert_eq!(
             count,
@@ -2156,9 +2135,57 @@ mod watchdog_tests {
             first.load(Ordering::SeqCst),
             "the run that wrote the repeated history was never asked to stop"
         );
+
+        // Run 2 is the same session taken on again, which is how a session is resumed: a submit releases the
+        // lease when its run exits, and the next run on that log is a new run with a window of its own. It
+        // makes the one call it is entitled to make, the same build once more.
+        //
+        // One build, and not three looks followed by a build, because that is the shape that discriminates.
+        // The repeat rule counts the trailing run of identical calls, so a look between the two builds would
+        // break the run and the assertion would hold whichever window the tick read. A look is no better:
+        // its first occurrence is progress in both windows, so the stall count is the same in both. If the
+        // tick judged the whole log instead of this run's own steps, run 1's five builds and this one would
+        // be six identical calls, the repeat rule stops a run at five, and run 2 would be stopped for the
+        // calls the run before it made. The shape this replaced (a separate session, three looks, a
+        // twelve-step bound) could not fail for the reason it claimed: a separate session has no earlier
+        // prefix to ignore, and nothing in it could have reached a bound of any size.
+        daemon
+            .release(building, run)
+            .expect("run 1's lease goes when its run exits");
+        let mut reread = Session::load(store(&state), SystemClock, SessionId::new(building))
+            .expect("the session run 1 left");
+        let second = Arc::new(AtomicBool::new(false));
+        let (again, at) = daemon
+            .lease(building, &path, &second, None)
+            .expect("run 2 is taken on");
+        assert_eq!(again, 2, "the second lease is run 2");
+        assert!(
+            at > from,
+            "run 2's window starts at {at}, which is not past the {from} where run 1's entries begin"
+        );
+        let reader = ScriptedModel::new([BUILD]);
+        let turn = Seams::new(
+            &task, &profile, &policy, &context, &reader, &shell, &verifier,
+        )
+        .turn(&mut reread)
+        .expect("a turn of run 2");
+        assert!(
+            matches!(turn.outcome, Outcome::Ran { .. }),
+            "run 2 did not run the program: {:?}",
+            turn.outcome
+        );
+        drop(reread);
+
+        let count = daemon.watchdog();
+        assert_eq!(
+            count,
+            0,
+            "the tick stopped {count} runs on the second pass: {:?}",
+            stopped(&state)
+        );
         assert!(
             !second.load(Ordering::SeqCst),
-            "the run reading what the stopped one wrote was stopped for it"
+            "the second run was stopped for the calls the run before it made"
         );
 
         let lines = stopped(&state);
@@ -2178,7 +2205,7 @@ mod watchdog_tests {
             lines[0].action
         );
         assert!(
-            !lines[0].action.contains(reading),
+            !lines[0].action.contains("run 2"),
             "the record names the run that was left alone: {:?}",
             lines[0].action
         );
