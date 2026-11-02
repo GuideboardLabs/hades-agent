@@ -2078,8 +2078,10 @@ mod watchdog_tests {
     /// fallback, while a real run's history is the one the writer produces. So this test drives the real
     /// seams: `Seams::turn` writes five identical builds, each with the classification the producer decided,
     /// under the lease a submit takes. The same tick then has to stop that run, name it in the ledger, and
-    /// leave the next run alone: the same session taken on again, which reads the file the first one wrote
-    /// and then builds once.
+    /// leave the next run alone: the same session taken on again, which builds once and stops there. That
+    /// second run carries no look on purpose: a look is progress in either window, so a look would make the
+    /// assertion pass whether or not the lease's offset is honoured. The read shape is held elsewhere, by
+    /// `a_write_does_not_erase_what_the_run_has_already_read` and the twelve-look oracle.
     #[test]
     fn the_tick_stops_a_run_real_turns_wrote_and_leaves_the_next_run_alone() {
         // A build whose output is the file the second run reads. The redirect is what puts the artifact on
