@@ -16,8 +16,18 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+/// A unix socket path holds 107 bytes and then the terminating NUL, and `sun_path` is where the kernel
+/// checks that. A state directory this suite names under `CARGO_TARGET_DIR` can reach the limit with a long
+/// enough build directory, and a bind past it is refused with nothing bound: the failure then reads as a
+/// daemon that will not start rather than a path that cannot be bound.
+const SUN_PATH: usize = 108;
+
 fn scratch(name: &str) -> PathBuf {
-    let dir = scratch_base().join(format!("hades-daemon-{name}-{}", std::process::id()));
+    // Short on purpose, because the socket path has to fit in `sun_path`: the pid is already in the parent
+    // (`harness::scratch::root()` is `<target>/scratch/process-<pid>`), so it is not repeated here, and the
+    // prefix is two bytes rather than thirteen. At `<target>` of 39 bytes the longest fixture in this file
+    // lands at 82 bytes instead of 108, which is the difference between a green suite and a timeout.
+    let dir = scratch_base().join(format!("hd-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
@@ -43,6 +53,17 @@ struct Running {
 impl Running {
     fn start(state: &Path) -> Running {
         let socket = state.join("daemon.sock");
+        // The check a timeout cannot make: a bind past `sun_path` is refused with nothing bound, the child
+        // exits, and the only symptom is the ping below that nobody answers. Name the size and the limit
+        // here, before a process is started, so the failure says what to shorten.
+        let bytes = socket.as_os_str().len();
+        assert!(
+            bytes < SUN_PATH,
+            "the socket {} is {bytes} bytes, past the {SUN_PATH} bytes a unix socket path holds including its \
+             terminating NUL (sun_path). Nothing would bind and this test would wait twenty seconds for a \
+             ping that cannot come: use a shorter state directory or a shorter CARGO_TARGET_DIR.",
+            socket.display()
+        );
         let child = Command::new(binary())
             .args(["daemon", "--state"])
             .arg(state)
@@ -875,6 +896,22 @@ fn a_submitted_budget_reads_the_strings_the_cli_sends() {
     );
 
     run.stop();
+}
+
+/// The fixture's own name is the difference between a named failure and a twenty-second timeout.
+///
+/// A unix socket path holds 107 bytes and then the terminating NUL. This suite's state lives under
+/// `CARGO_TARGET_DIR`, so a long build directory pushes `<state>/daemon.sock` past that: `bind` is refused
+/// with nothing bound, the daemon exits, and the only symptom is a ping nobody ever answered. The budget
+/// fixture reported "the daemon never answered a ping" for exactly that, which reads as a broken binary. The
+/// fixture keeps its own name short for that reason, and this is the other half of the bargain: a path that
+/// cannot be bound is refused by name, before a process is started.
+#[test]
+#[should_panic(expected = "sun_path")]
+fn a_state_directory_too_long_for_sun_path_is_named_rather_than_timed_out() {
+    let state = scratch_base().join("w".repeat(70));
+    std::fs::create_dir_all(&state).expect("a long state directory");
+    let _ = Running::start(&state);
 }
 
 #[test]
