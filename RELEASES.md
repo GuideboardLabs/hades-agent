@@ -3,6 +3,47 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.3.0
+
+### The Gatekeeper Release: a message nobody addressed costs nothing, and a run that is stuck is stopped
+
+Two behaviours that were previously the user's problem become the runtime's.
+
+- **A trigger filter, decided in code before any model call.** `trigger` on a surface, and on any channel
+  entry, is `always`, `mention` or `never`. `always` is the default and is exactly the behaviour that
+  existed before the key, so no existing config changes meaning. `mention` answers a direct message, or a
+  group message that names this surface or starts with a command; `never` parks a surface without
+  removing its token. An unaddressed message in a `mention` surface is dropped, recorded once as
+  `trigger_ignored` naming the surface, the channel and the reason, and costs neither a model call nor a
+  daemon run. An unknown word is refused by name rather than falling back to answering everything, which
+  is the failure that would otherwise arrive as a bill.
+- **What text cannot tell, the surface does.** Two shapes are undetectable from message text: a Discord
+  direct message, whose chat id is the DM channel's own snowflake and not the sender's, and a Discord
+  mention, which the connector strips to a bare command before the runtime sees it. `Update` now carries
+  `direct` and `mention`, set by the transport from what it already knew, with the old Telegram reading
+  (`from == chat.id`) kept as the fallback for a surface that says nothing.
+- **A watchdog for the run that is alive and going nowhere.** One pure function judges a step history and
+  returns a stall or nothing: one normalised call repeated N times, K steps in a row that neither wrote
+  nor read anything new, or an allowance spent with nothing written. It shares its normalisation with the
+  repeat guard, so a command rephrased in its tail is one call. The judgement is scoped to the run's own
+  byte window from its lease, so a new run is never stopped by the calls the run before it made, and the
+  daemon asks the question once a second from the loop it already runs, with no extra thread. A stop
+  writes one `watchdog_stopped` line naming the session, the run and the finding.
+- **A read is progress only when it tells the run something new.** Classifying a step by the name of its
+  program was wrong in both directions: it stopped a run for reading twelve different things, and after
+  the first fix it stopped nothing at all. The producer now records what each step did, the seen-set is
+  per run, and the rule counts a read as progress only when the operand is new.
+- **Two limits worth stating.** A loop that rewrites its own operand each step reads as news and will not
+  be stopped by this rule. The text fallback, used only for logs written before the record existed, still
+  cannot tell a read-only program from a no-op, so an old log can produce a false stall.
+
+The gate also changed shape in this release, and that matters more than either feature: `scripts/gate.sh`
+now runs `check-claims.sh`, so a green local run and the claim the release makes are checked by the same
+thing. It previously was not, and a README count drifted two rounds behind the suite while every local
+gate stayed green.
+
+1243 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.2.0
 
 ### The Charon Release: nothing crosses unchecked
