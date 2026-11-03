@@ -3,6 +3,22 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.3
+
+### A row of skulls with one crossbones walking across it
+
+The loader could only bounce one glyph across five spaces, because the animation was a glyph and a span. What
+a person asked for is five skulls in a row with one different mark that travels and starts again, which reads
+as work rather than as a blinking light.
+
+`loading` now takes `cells` and `mark`: `{"cells": "💀", "mark": "☠️", "span": 5, "step_ms": 2000}` draws five
+bodies and puts the mark in one of them, moving left to right and wrapping, one hop every two seconds. With no
+`mark` the older single-glyph ping-pong stays, so nothing that shipped before changes shape. The connector's own
+manifest carries the new animation, and `hades connector channels` prints the row it will draw instead of only
+the glyph.
+
+1288 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.2
 
 ### Only an operator may do more than talk

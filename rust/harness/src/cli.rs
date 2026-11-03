@@ -2741,9 +2741,17 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 None => "the shared prompt alone".to_string(),
             };
             let loading = settings.loading.clone().unwrap_or_default();
+            // The row is what a person will see, so the row is what this prints: a mark that walks across a
+            // row of bodies reads differently from one glyph bouncing, and the difference is checkable.
+            let shape = match (&loading.cells, &loading.mark) {
+                (Some(cells), Some(mark)) => {
+                    format!("{mark} walking a row of {cells} x{}", loading.span)
+                }
+                _ => format!("{} across {} step(s)", loading.glyph, loading.span),
+            };
             text.push_str(&format!(
-                "   opening: {opening}; loading: {} across {} step(s) of {} ms\n",
-                loading.glyph, loading.span, loading.step_ms
+                "   opening: {opening}; loading: {shape} of {} ms\n",
+                loading.step_ms
             ));
             let mut ids: Vec<&String> = settings.channels.keys().collect();
             ids.sort();

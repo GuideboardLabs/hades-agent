@@ -107,7 +107,7 @@ def main() -> int:
         "platform": "linux-x86_64",
         "entrypoint": "bin/hades-connector-discord",
         "prompt": "prompt.md",
-        "loading": {"glyph": "💀", "span": 5, "step_ms": 240},
+        "loading": {"cells": "💀", "mark": "☠️", "span": 5, "step_ms": 2000, "glyph": "💀"},
         "config_schema": {
             "allowed_users": {"type": "array<string>", "required": True},
             "allowed_guilds": {"type": "array<string>", "default": []},
@@ -123,7 +123,7 @@ def main() -> int:
                 "note": "not needed to install: the gateway's provider is used unless this is set",
             },
             "prompt": {"type": "string", "note": "replaces the pack's prompt.md"},
-            "loading": {"type": "object", "note": "glyph, span, step_ms"},
+            "loading": {"type": "object", "note": "cells, mark, span, step_ms, glyph"},
             "channels": {"type": "object", "note": "per-channel mode/policy/root/model"},
         },
         "signature": None,

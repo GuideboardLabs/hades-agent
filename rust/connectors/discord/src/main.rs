@@ -79,6 +79,16 @@ fn run(args: &[String]) -> Result<(), String> {
                             .and_then(|span| span.as_u64())
                             .unwrap_or(5)
                             .clamp(1, 20) as usize,
+                        cells: loading
+                            .get("cells")
+                            .and_then(|cells| cells.as_str())
+                            .map(|cells| cells.trim().to_string())
+                            .filter(|cells| !cells.is_empty()),
+                        mark: loading
+                            .get("mark")
+                            .and_then(|mark| mark.as_str())
+                            .map(|mark| mark.trim().to_string())
+                            .filter(|mark| !mark.is_empty()),
                         step_ms: loading
                             .get("step_ms")
                             .and_then(|step| step.as_u64())
@@ -98,9 +108,15 @@ fn run(args: &[String]) -> Result<(), String> {
         None => "shared prompt only".to_string(),
     };
     let loading = settings.loading.clone().unwrap_or_default();
+    // Print the shape a person will actually see, not the glyph it is built from: the row and the walking
+    // mark are the animation, and a startup line that says only "💀" cannot be checked against the channel.
+    let shape = match (&loading.cells, &loading.mark) {
+        (Some(cells), Some(mark)) => format!("{mark} walking a row of {cells} x{}", loading.span),
+        _ => format!("{} across {} step(s)", loading.glyph, loading.span),
+    };
     eprintln!(
-        "discord: opening {opening}; loading {} across {} step(s) of {} ms; model {}",
-        loading.glyph, loading.span, loading.step_ms, settings.model
+        "discord: opening {opening}; loading {shape} of {} ms; model {}",
+        loading.step_ms, settings.model
     );
     let socket = harness::daemon::live(&state).ok_or_else(|| {
         format!(

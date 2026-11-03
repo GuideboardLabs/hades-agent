@@ -400,6 +400,16 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             .and_then(Value::as_u64)
             .unwrap_or(240)
             .clamp(40, 5_000),
+        cells: loading
+            .get("cells")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
+        mark: loading
+            .get("mark")
+            .and_then(Value::as_str)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()),
     });
     let provider = section
         .get("provider")
@@ -1321,16 +1331,40 @@ fn save_chat(state: &Path, chat: &Chat, messages: &[Value]) {
 /// an answer to read. The live view shows the tail of a long answer, because the newest words are the ones
 /// a person is waiting for; the finished answer is split into messages instead of being cut.
 fn render_status(loading: &Loading, seconds: f64, limit: usize) -> String {
-    // A ping-pong, not a transcript. Streaming the model's scratchpad into the message is how
-    // escaped tags end up in a Discord channel; an animation says "alive" without saying anything.
+    // An animation, not a transcript. Streaming the model's scratchpad into the message is how escaped tags
+    // end up in a Discord channel; a moving mark says "alive" without saying anything.
     let span = loading.span.clamp(1, 20);
     let step = (seconds * 1000.0 / loading.step_ms.max(40) as f64).floor() as i64;
-    let cycle = step % (span as i64 * 2);
-    let at = if cycle <= span as i64 {
-        cycle
-    } else {
-        span as i64 * 2 - cycle
-    } as usize;
+    // A row of bodies with one different mark travelling across it: the mark walks left to right and starts
+    // again, which is what makes it read as work rather than as a bounce. With no mark configured the older
+    // shape stays, one glyph moving out and back across the same span.
+    let (at, row) = match (&loading.cells, &loading.mark) {
+        (Some(cells), Some(mark)) if span > 1 => {
+            let at = (step.rem_euclid(span as i64)) as usize;
+            let mut row = String::new();
+            for slot in 0..span {
+                if slot > 0 {
+                    row.push('\u{00a0}');
+                }
+                row.push_str(if slot == at { mark } else { cells });
+            }
+            (at, Some(row))
+        }
+        _ => {
+            let cycle = step % (span as i64 * 2);
+            let at = if cycle <= span as i64 {
+                cycle
+            } else {
+                span as i64 * 2 - cycle
+            } as usize;
+            (at, None)
+        }
+    };
+    if let Some(row) = row {
+        // Every slot is filled, so there is nothing for Discord's edge trimming to collapse, but the
+        // separator is still a non-breaking space: an ordinary one after an emoji is a rendering coin toss.
+        return clip(&row, limit);
+    }
     // Non-breaking spaces: Discord trims and collapses ordinary runs at the edges, which would
     // freeze the animation on the first frame.
     let pad = "\u{00a0}".repeat(at);
@@ -1346,6 +1380,12 @@ pub struct Loading {
     pub glyph: String,
     pub span: usize,
     pub step_ms: u64,
+    /// The body repeated across the row: five skulls, say. With `mark` absent this is unused and the
+    /// single `glyph` moves instead, so a pack that says nothing keeps the older animation.
+    pub cells: Option<String>,
+    /// The one cell that looks different and travels across the row, so the animation reads as progress
+    /// rather than as a blinking light.
+    pub mark: Option<String>,
 }
 
 impl Default for Loading {
@@ -1354,6 +1394,8 @@ impl Default for Loading {
             glyph: "💀".to_string(),
             span: 5,
             step_ms: 240,
+            cells: None,
+            mark: None,
         }
     }
 }
@@ -2836,6 +2878,34 @@ mod tests {
         assert_eq!(effective.model, "deepseek-v4.1-flash");
         assert!(client_for(&settings, &effective.model, None).is_ok());
         assert!(settings.provider.is_none() && settings.endpoints.is_empty());
+    }
+
+    /// Five bodies in a row with one different mark travelling across them: the shape a person asked for,
+    /// pinned so a later edit cannot quietly turn it back into a bouncing single glyph.
+    #[test]
+    fn a_row_of_bodies_has_one_mark_that_walks_and_starts_again() {
+        let face = Loading {
+            glyph: "💀".to_string(),
+            span: 5,
+            step_ms: 1_000,
+            cells: Some("💀".to_string()),
+            mark: Some("☠️".to_string()),
+        };
+        let at = |seconds: f64| render_status(&face, seconds, 2_000).replace('\u{00a0}', " ");
+
+        assert_eq!(at(0.0), "☠️ 💀 💀 💀 💀");
+        assert_eq!(at(1.0), "💀 ☠️ 💀 💀 💀");
+        assert_eq!(at(2.0), "💀 💀 ☠️ 💀 💀");
+        assert_eq!(at(4.0), "💀 💀 💀 💀 ☠️");
+        assert_eq!(
+            at(5.0),
+            "☠️ 💀 💀 💀 💀",
+            "it wraps rather than bouncing back"
+        );
+
+        let row = at(2.0);
+        assert_eq!(row.matches('☠').count(), 1, "exactly one mark: {row}");
+        assert_eq!(row.matches('💀').count(), 4, "four bodies beside it: {row}");
     }
 
     /// A surface answers on a provider the config names, without naming one of its own.
