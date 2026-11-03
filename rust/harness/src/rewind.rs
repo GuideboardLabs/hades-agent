@@ -109,6 +109,33 @@ impl Report {
     pub fn touched(&self) -> usize {
         self.restored.len() + self.removed.len()
     }
+
+    /// The exit status and the line that says why, for a caller that has to report to a script as well as to
+    /// a person.
+    ///
+    /// Three outcomes, because two of them used to be reported as success. `0` is everything the plan named
+    /// was put back. `2` is a partial undo: some paths were written and some were skipped, which is a real
+    /// answer and a different one. `1` is nothing recoverable touched at all, which is the failure mode a
+    /// recovery tool must never print as success.
+    pub fn status(&self) -> (i32, String) {
+        let touched = self.touched();
+        let skipped = self.skipped.len();
+        match (touched, skipped) {
+            (_, 0) => (0, String::new()),
+            (0, skipped) => (
+                1,
+                format!(
+                    "nothing recoverable was put back: {skipped} path(s) skipped, 0 restored, 0 removed\n"
+                ),
+            ),
+            (touched, skipped) => (
+                2,
+                format!(
+                    "partial undo: {touched} path(s) put back, {skipped} skipped, and the skipped ones are named above with why\n"
+                ),
+            ),
+        }
+    }
 }
 
 /// Decide what a rewind would do. Reads the journal and hashes the tree; writes nothing.

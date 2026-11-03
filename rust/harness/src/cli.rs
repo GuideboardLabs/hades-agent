@@ -78,7 +78,9 @@ hades — the harness, one turn or a whole graph
       put the files back. Every path is hashed as it stands now and compared with the digest
       the run recorded as what it left; a path that changed since is refused by name with both
       digests, and --force is the deliberate override. --to <step> leaves the tree as it stood
-      after that step. --dry-run prints the plan and writes nothing
+      after that step. --dry-run prints the plan and writes nothing. The status says what
+      happened: 0 when everything it named was put back, 2 when part of it was, and 1 when
+      nothing could be, so a script cannot mistake a skipped path for an undone one
 
   hades route <goal>
       which profile the rules pick for a goal, and why
@@ -1258,7 +1260,16 @@ fn rewind_cmd(args: &[String]) -> Result<(String, i32), String> {
         return Ok((crate::rewind::render(&plan, None, true), 0));
     }
     match crate::rewind::apply(&journal, &plan, options.force) {
-        Ok(report) => Ok((crate::rewind::render(&plan, Some(&report), false), 0)),
+        Ok(report) => {
+            let (code, said) = report.status();
+            Ok((
+                format!(
+                    "{}{said}",
+                    crate::rewind::render(&plan, Some(&report), false)
+                ),
+                code,
+            ))
+        }
         Err(refused) => Ok((
             format!("{}\n{}", crate::rewind::render(&plan, None, false), refused),
             1,
@@ -8268,11 +8279,11 @@ mod journal_cli_tests {
 
     /// A run's history built by the real writer: the patch tool, with a real capture. Never a hand
     /// written journal line, because a hand written one proves the reader and nothing else.
-    fn history(dir: &Path, run_name: &str, file: &str, old: &str, new: &str) -> String {
+    fn patched(dir: &Path, run_name: &str, file: &str, old: &str, new: &str, step: u64) -> String {
         let journal = crate::journal::Journal::at(dir, run_name);
         let path = dir.join(file);
         std::fs::write(&path, old).expect("the file to patch");
-        let capture = crate::journal::Capture::new(&journal, 0, "patch");
+        let capture = crate::journal::Capture::new(&journal, step, "patch");
         let said = crate::patch::tool(
             &serde_json::json!({"path": file, "edits": [{"old": old, "new": new}]}),
             &crate::path::PathPolicy::for_root(dir),
@@ -8281,6 +8292,10 @@ mod journal_cli_tests {
         assert!(said.contains("patched"), "{said}");
         std::fs::read(dir.join(file)).expect("the patched file");
         path.display().to_string()
+    }
+
+    fn history(dir: &Path, run_name: &str, file: &str, old: &str, new: &str) -> String {
+        patched(dir, run_name, file, old, new, 0)
     }
 
     #[test]
@@ -8364,6 +8379,45 @@ mod journal_cli_tests {
         assert_eq!(
             std::fs::read_to_string(&path).expect("the restored file"),
             "beta\n"
+        );
+    }
+
+    /// The failure A4 names, at the exit status: every entry in the run was unrecoverable, so nothing was
+    /// written and the command must not say it succeeded. A script that checked only the status would
+    /// otherwise believe a refused 9 MB capture had been undone.
+    #[test]
+    fn a_rewind_that_could_put_nothing_back_exits_non_zero_and_says_so() {
+        let dir = scratch("cli-rewind-nothing");
+        // A name the journal records without its bytes: the path is named, sized, and never opened.
+        patched(&dir, "s4", ".env", "TOKEN=one\n", "TOKEN=two\n", 0);
+
+        let (text, code) = run(&["rewind", "s4", "--state", &dir.display().to_string()]);
+        assert_ne!(
+            code, 0,
+            "a rewind that put nothing back reported success: {text}"
+        );
+        assert!(text.contains("0 restored"), "{text}");
+        assert!(text.contains("1 skipped"), "{text}");
+        assert!(text.contains("nothing recoverable"), "{text}");
+    }
+
+    /// Half a run can be undone and half cannot, and the two are not the same answer. The status is its own
+    /// one, and the counts are both in the output.
+    #[test]
+    fn a_partial_rewind_exits_with_its_own_status_and_names_both_counts() {
+        let dir = scratch("cli-rewind-partial");
+        let path = patched(&dir, "s5", "note.txt", "beta\n", "BETA\n", 0);
+        patched(&dir, "s5", ".env", "TOKEN=one\n", "TOKEN=two\n", 1);
+
+        let (text, code) = run(&["rewind", "s5", "--state", &dir.display().to_string()]);
+        assert_eq!(code, 2, "not the partial status: {text}");
+        assert!(text.contains("1 restored"), "{text}");
+        assert!(text.contains("1 skipped"), "{text}");
+        assert!(text.contains("partial"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the restored file"),
+            "beta\n",
+            "the recoverable path is still put back"
         );
     }
 
