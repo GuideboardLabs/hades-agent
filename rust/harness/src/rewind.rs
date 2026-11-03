@@ -63,8 +63,11 @@ pub struct Planned {
     pub step: u64,
     pub tool: String,
     pub action: Action,
-    /// The digest the entry recorded as what the run left.
+    /// The digest the entry recorded as what the run left, from the *last* capture of the path.
     pub expected: String,
+    /// The step that digest came from. Carried so a refusal quotes the digest beside its own step rather
+    /// than beside the step whose bytes are being put back.
+    pub expected_step: u64,
     /// The digest the path has now, or empty when it is not there.
     pub found: String,
     /// Whether those two differ, which is the whole reason this command can refuse.
@@ -200,6 +203,7 @@ pub fn plan(journal: &Journal, options: &Options) -> Plan {
                 },
             },
             expected: last.after.clone(),
+            expected_step: last.step,
             found,
             drifted,
         });
@@ -222,7 +226,7 @@ pub fn apply(journal: &Journal, plan: &Plan, force: bool) -> Result<Report, Stri
             said.push_str(&format!(
                 "  {}\n    recorded at step {}: {}\n    found now:          {}\n",
                 step.path,
-                step.step,
+                step.expected_step,
                 digest(&step.expected),
                 digest(&step.found)
             ));
@@ -687,6 +691,39 @@ mod tests {
             std::fs::read_to_string(&lost).expect("lost"),
             "lost after\n",
             "a path with no bytes left is named, not blanked"
+        );
+    }
+
+    /// The refusal is about the digest the run left, and that digest came from the last capture of the path,
+    /// not the first. Quoting it beside the first capture's step attributes a step-1 digest to step 0, which
+    /// is the wrong line in the bug report a person pastes.
+    #[test]
+    fn a_refusal_names_the_step_the_digest_it_compared_came_from() {
+        let dir = scratch("rewind-drift-step");
+        let journal = Journal::at(&dir, "run-drift-step");
+        let path = dir.join("note.txt");
+        write(&journal, &path, "v1\n", "v2\n", 0);
+        write(&journal, &path, "v2\n", "v3\n", 1);
+        std::fs::write(&path, "a person wrote this\n").expect("a newer edit");
+
+        let planned = plan_of(&journal, Options::default());
+        assert_eq!(planned.steps.len(), 1, "{planned:?}");
+        assert_eq!(
+            planned.steps[0].step, 0,
+            "the restore is still the oldest capture's"
+        );
+        assert_eq!(
+            planned.steps[0].expected_step, 1,
+            "the digest compared is the last capture's"
+        );
+        let refused = apply(&journal, &planned, false).expect_err("a refusal");
+        assert!(
+            refused.contains("recorded at step 1"),
+            "the digest it compared is step 1's: {refused}"
+        );
+        assert!(
+            !refused.contains("recorded at step 0"),
+            "the first capture's step is beside a digest the last capture recorded: {refused}"
         );
     }
 
