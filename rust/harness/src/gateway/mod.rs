@@ -124,6 +124,16 @@ pub struct Effective {
 }
 
 impl Settings {
+    /// Whether a message from this sender may be answered at all.
+    ///
+    /// `"*"` in `allowed_users` means any sender on this surface, which is how a channel is opened to
+    /// everyone in it without listing ids. It is not "no boundary": the surface still only receives the
+    /// guilds and channels it is configured for, so the wildcard widens the person, not the place. An
+    /// empty list stays a load-time refusal, because an empty list is not everyone.
+    pub fn permits(&self, sender: &str) -> bool {
+        self.allowed.iter().any(|allowed| allowed == "*" || allowed == sender)
+    }
+
     pub fn effective(&self, chat: &Chat) -> Effective {
         let channel = self.channels.get(chat.id());
         let pick = |field: fn(&Channel) -> Option<String>, base: &str| {
@@ -1538,7 +1548,7 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     signals: &Signals,
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<(), String> {
-    if !settings.allowed.contains(&update.from) {
+    if !settings.permits(&update.from) {
         return Ok(());
     }
     // A button press is an answer to a question this agent asked, so it is addressed by definition and the
@@ -2340,7 +2350,7 @@ impl Runtime {
             let updates = transport.updates(offset, 50)?;
             for update in &updates {
                 offset = Some(offset.map_or(update.id + 1, |held| held.max(update.id + 1)));
-                if !settings.allowed.contains(&update.from) {
+                if !settings.permits(&update.from) {
                     continue;
                 }
                 let (name, goal) = command(&update.text);
@@ -2477,6 +2487,20 @@ pub fn serve<T: Transport + Clone + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel opened to everyone is opened by `"*"`, not by a blank list, and the wildcard must admit
+    /// a sender the config never names while still refusing nobody by accident.
+    #[test]
+    fn a_star_allowlist_admits_any_sender_and_a_named_one_admits_only_itself() {
+        let mut open = settings();
+        open.allowed = vec!["*".to_string()];
+        assert!(open.permits("123"), "a star allowlist must admit an id it does not name");
+        assert!(open.permits("anything-at-all"));
+
+        let named = settings();
+        assert!(named.permits("7"));
+        assert!(!named.permits("8"), "a named allowlist must still refuse a stranger");
+    }
 
     fn settings() -> Settings {
         Settings {
