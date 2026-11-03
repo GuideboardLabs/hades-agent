@@ -65,6 +65,7 @@ pub mod graph;
 pub mod harness_files;
 pub mod http;
 pub mod httpd;
+pub mod journal;
 pub mod judge;
 pub mod library;
 pub mod mcp;

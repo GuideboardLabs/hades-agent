@@ -740,7 +740,7 @@ pub fn chat_allows(name: &str) -> bool {
     )
 }
 
-fn mutating(name: &str) -> bool {
+pub(crate) fn mutating(name: &str) -> bool {
     matches!(
         name,
         "shell"

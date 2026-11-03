@@ -131,7 +131,9 @@ impl Settings {
     /// guilds and channels it is configured for, so the wildcard widens the person, not the place. An
     /// empty list stays a load-time refusal, because an empty list is not everyone.
     pub fn permits(&self, sender: &str) -> bool {
-        self.allowed.iter().any(|allowed| allowed == "*" || allowed == sender)
+        self.allowed
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == sender)
     }
 
     pub fn effective(&self, chat: &Chat) -> Effective {
@@ -2494,12 +2496,18 @@ mod tests {
     fn a_star_allowlist_admits_any_sender_and_a_named_one_admits_only_itself() {
         let mut open = settings();
         open.allowed = vec!["*".to_string()];
-        assert!(open.permits("123"), "a star allowlist must admit an id it does not name");
+        assert!(
+            open.permits("123"),
+            "a star allowlist must admit an id it does not name"
+        );
         assert!(open.permits("anything-at-all"));
 
         let named = settings();
         assert!(named.permits("7"));
-        assert!(!named.permits("8"), "a named allowlist must still refuse a stranger");
+        assert!(
+            !named.permits("8"),
+            "a named allowlist must still refuse a stranger"
+        );
     }
 
     fn settings() -> Settings {
