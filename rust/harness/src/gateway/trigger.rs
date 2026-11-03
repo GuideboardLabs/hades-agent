@@ -164,6 +164,7 @@ mod tests {
     fn settings(trigger: Trigger) -> Settings {
         Settings {
             allowed: vec!["7".to_string()],
+            reasoning: None,
             trigger,
             policy: "guarded".to_string(),
             verify: "true".to_string(),

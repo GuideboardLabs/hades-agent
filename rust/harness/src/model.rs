@@ -215,6 +215,11 @@ pub struct OpenAi {
     /// none, because a model that thinks before it writes a one-line program spends the whole answer
     /// thinking and leaves the program empty.
     thinking: Option<bool>,
+    /// How much thinking to ask a cloud endpoint for: `off`, `low`, `medium` or `high`. Separate from
+    /// `thinking` because they are different fields on the wire: a local template reads
+    /// `chat_template_kwargs.enable_thinking`, while Ollama Cloud ignores that and honours `think: false`
+    /// or `reasoning_effort`, measured against the live endpoint at 284 / 101 / 91 completion tokens.
+    reasoning: Option<String>,
     /// The transport this endpoint speaks. Only the tool-calling loop requires chat completions; a plain
     /// call works in any of the three.
     mode: crate::provider::ApiMode,
@@ -334,6 +339,7 @@ impl OpenAi {
             context: 8192,
             usage_log: None,
             thinking: None,
+            reasoning: None,
             mode: crate::provider::ApiMode::ChatCompletions,
             extra_headers: Vec::new(),
             fallbacks: Vec::new(),
@@ -365,6 +371,12 @@ impl OpenAi {
 
     /// Ask the endpoint's chat template for thinking, or for none. Only an endpoint whose template knows
     /// `enable_thinking` should be sent this; a cloud endpoint that does not will refuse the request.
+    /// Ask a cloud endpoint for less deliberation, or for none.
+    pub fn with_reasoning(mut self, reasoning: &str) -> Self {
+        self.reasoning = Some(reasoning.to_string());
+        self
+    }
+
     pub fn with_thinking(mut self, thinking: bool) -> Self {
         self.thinking = Some(thinking);
         self
@@ -532,6 +544,14 @@ impl OpenAi {
         });
         if let Some(thinking) = self.thinking {
             request["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": thinking });
+        }
+        // A cloud endpoint that honours effort does not read the template flag above, and `off` is a
+        // different field again rather than a small number. Sending the one the endpoint reads is the whole
+        // point of the setting, so neither is inferred from the other.
+        match self.reasoning.as_deref() {
+            Some("off") => request["think"] = serde_json::json!(false),
+            Some(effort) => request["reasoning_effort"] = serde_json::json!(effort),
+            None => {}
         }
         request.to_string()
     }
@@ -1897,6 +1917,46 @@ mod tests {
     fn prose_with_no_program_comes_back_empty_rather_than_as_prose() {
         assert_eq!(extract("   "), "");
         assert_eq!(extract("\n\n"), "");
+    }
+
+    /// The setting has to reach the wire as the field the endpoint reads. `off` is `think: false` on Ollama
+    /// Cloud, not `reasoning_effort: "off"`, and a request that sends the wrong one looks like a setting that
+    /// silently does nothing.
+    #[test]
+    fn less_thinking_is_asked_for_with_the_field_the_endpoint_reads() {
+        let task = crate::task::TaskSpec::new("say hello", "/tmp/here");
+        let bundle = Bundle::new(vec![], vec![], 0);
+        let budget = Budget::new(4096);
+        let body_of = |reasoning: Option<&str>| {
+            let mut model = OpenAi::new(
+                "https://ollama.com/v1/chat/completions",
+                "deepseek-v4.1-flash",
+            );
+            if let Some(word) = reasoning {
+                model = model.with_reasoning(word);
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_str(&model.body(&task, &bundle, &budget, false))
+                    .expect("valid JSON");
+            parsed
+        };
+
+        let asked = body_of(Some("low"));
+        assert_eq!(asked["reasoning_effort"], "low");
+        assert!(
+            asked.get("think").is_none(),
+            "low is an effort, not a switch"
+        );
+
+        let off = body_of(Some("off"));
+        assert_eq!(off["think"], false);
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off is a different field, not a small effort"
+        );
+
+        let silent = body_of(None);
+        assert!(silent.get("reasoning_effort").is_none() && silent.get("think").is_none());
     }
 
     #[test]

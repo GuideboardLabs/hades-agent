@@ -73,6 +73,9 @@ pub struct Settings {
     pub mcp: crate::mcp::McpConfig,
     /// What a message may do when its channel says nothing. `Read` is a conversation; `Act` is work.
     pub mode: crate::mode::Mode,
+    /// How much of the model's thinking to ask for, when a channel says nothing: `off`, `low`, `medium` or
+    /// `high`. Absent sends no field at all, which is what an endpoint whose behaviour is unknown wants.
+    pub reasoning: Option<String>,
     /// Whether a message has to be addressed to this surface before it becomes work. `Always` is the
     /// default and the behaviour that existed before the key.
     pub trigger: trigger::Trigger,
@@ -110,6 +113,30 @@ pub struct Channel {
     pub verify: Option<String>,
     pub root: Option<String>,
     pub model: Option<String>,
+    /// How much of the model's thinking to ask for: `off`, `low`, `medium` or `high`. Folded into the
+    /// request body as `reasoning_effort`, and as `think: false` for `off` because Ollama Cloud ignores the
+    /// template field and honours this one. Measured rather than assumed: on one prompt, default 284
+    /// completion tokens, `low` 101, `off` 91.
+    pub reasoning: Option<String>,
+}
+
+/// How much of a model's thinking to ask for.
+///
+/// Four words, and the reason each is a word rather than a number: `reasoning_effort` is a string field on the
+/// OpenAI shape, and `off` is not a small number but a different field (`think: false`) on Ollama Cloud, which
+/// ignores the template flag this build sends for local models. Anything else is refused at load, because a
+/// typo that reads as "send nothing" would look exactly like a setting that works.
+fn parse_reasoning(value: &Value, owner: &str) -> Result<Option<String>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(word) => match word.as_str() {
+            "off" | "low" | "medium" | "high" => Ok(Some(word.clone())),
+            other => Err(format!(
+                "{owner} is {other:?}; say off, low, medium or high"
+            )),
+        },
+        other => Err(format!("{owner} is {other}; it is a string")),
+    }
 }
 
 /// The settings one message is answered under, after its channel has had its say.
@@ -121,6 +148,7 @@ pub struct Effective {
     pub root: String,
     pub model: String,
     pub trigger: trigger::Trigger,
+    pub reasoning: Option<String>,
 }
 
 impl Settings {
@@ -148,6 +176,9 @@ impl Settings {
             root: pick(|c| c.root.clone(), &self.root),
             model: pick(|c| c.model.clone(), &self.model),
             trigger: channel.and_then(|c| c.trigger).unwrap_or(self.trigger),
+            reasoning: channel
+                .and_then(|c| c.reasoning.clone())
+                .or_else(|| self.reasoning.clone()),
         }
     }
 }
@@ -215,6 +246,10 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
             path.display()
         ));
     }
+    let reasoning = parse_reasoning(
+        section.get("reasoning").unwrap_or(&Value::Null),
+        &format!("{name}.reasoning"),
+    )?;
     let verify = section
         .get("verify")
         .and_then(Value::as_str)
@@ -452,12 +487,25 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
                 .as_object()
                 .ok_or_else(|| format!("{owner} must be an object"))?;
             for key in body.keys() {
-                if !["mode", "trigger", "policy", "verify", "root", "model"].contains(&key.as_str())
+                if ![
+                    "mode",
+                    "trigger",
+                    "policy",
+                    "verify",
+                    "root",
+                    "model",
+                    "reasoning",
+                ]
+                .contains(&key.as_str())
                 {
                     return Err(format!("{owner}: unknown key {key:?}"));
                 }
             }
             let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+            let reasoning = parse_reasoning(
+                body.get("reasoning").unwrap_or(&Value::Null),
+                &format!("{owner}.reasoning"),
+            )?;
             let policy = text("policy");
             if let Some(policy) = &policy
                 && policy != "guarded"
@@ -480,11 +528,13 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
                     verify: text("verify"),
                     root: text("root"),
                     model: text("model"),
+                    reasoning,
                 },
             );
         }
     }
     Ok(Settings {
+        reasoning,
         allowed,
         policy,
         verify,
@@ -1248,14 +1298,22 @@ impl Default for Loading {
 /// A name to a client: the surface's own provider, then the machine's endpoints, then a shipped
 /// preset. In that order, because the narrower claim wins and a local server is a fact about this
 /// machine rather than about Hades.
-fn client_for(settings: &Settings, name: &str) -> Result<crate::model::OpenAi, String> {
-    let client = one_client(settings, name)?;
+fn client_for(
+    settings: &Settings,
+    name: &str,
+    reasoning: Option<&str>,
+) -> Result<crate::model::OpenAi, String> {
+    let ask = |client: crate::model::OpenAi| match reasoning {
+        Some(word) => client.with_reasoning(word),
+        None => client,
+    };
+    let client = ask(one_client(settings, name)?);
     let mut chain = Vec::new();
     for fallback in &settings.fallbacks {
         if fallback == name {
             continue;
         }
-        chain.push(one_client(settings, fallback)?);
+        chain.push(ask(one_client(settings, fallback)?));
     }
     Ok(client.with_fallbacks(chain))
 }
@@ -1289,7 +1347,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<(), String> {
     let _ = state;
-    let client = client_for(settings, &effective.model)?;
+    let client = client_for(settings, &effective.model, effective.reasoning.as_deref())?;
     let mut history = load_chat(state, &update.chat);
     let workspace = PathBuf::from(&effective.root);
     let mut world = world_for(
@@ -2142,7 +2200,7 @@ fn scheduled(
     step: &crate::retry::Step,
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<String, String> {
-    let client = client_for(settings, &settings.model)?;
+    let client = client_for(settings, &settings.model, settings.reasoning.as_deref())?;
     let workspace = PathBuf::from(&settings.root);
     let world = world_for(
         settings,
@@ -2493,6 +2551,55 @@ mod tests {
     /// A channel opened to everyone is opened by `"*"`, not by a blank list, and the wildcard must admit
     /// a sender the config never names while still refusing nobody by accident.
     #[test]
+    fn a_reasoning_word_is_one_of_four_and_a_channel_can_override_the_surface() {
+        use serde_json::json;
+        assert_eq!(
+            parse_reasoning(&json!("low"), "x"),
+            Ok(Some("low".to_string()))
+        );
+        assert_eq!(
+            parse_reasoning(&json!("off"), "x"),
+            Ok(Some("off".to_string()))
+        );
+        assert_eq!(parse_reasoning(&json!(null), "x"), Ok(None));
+        let refused =
+            parse_reasoning(&json!("lw"), "x").expect_err("a typo is refused, not ignored");
+        assert!(
+            refused.contains("say off, low, medium or high"),
+            "{refused}"
+        );
+
+        let mut surface = settings();
+        surface.reasoning = Some("medium".to_string());
+        let mut channel = Channel {
+            mode: None,
+            trigger: None,
+            policy: None,
+            verify: None,
+            root: None,
+            model: None,
+            reasoning: Some("off".to_string()),
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("99".to_string(), channel.clone());
+        surface.channels = map;
+        let heard = surface.effective(&Chat::new("discord", "99"));
+        assert_eq!(
+            heard.reasoning.as_deref(),
+            Some("off"),
+            "the channel's word wins"
+        );
+        channel.reasoning = None;
+        surface.channels.insert("99".to_string(), channel);
+        let heard = surface.effective(&Chat::new("discord", "99"));
+        assert_eq!(
+            heard.reasoning.as_deref(),
+            Some("medium"),
+            "then the surface's"
+        );
+    }
+
+    #[test]
     fn a_star_allowlist_admits_any_sender_and_a_named_one_admits_only_itself() {
         let mut open = settings();
         open.allowed = vec!["*".to_string()];
@@ -2513,6 +2620,7 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             allowed: vec!["7".to_string()],
+            reasoning: None,
             trigger: Default::default(),
             policy: "guarded".to_string(),
             verify: "true".to_string(),
@@ -2604,7 +2712,7 @@ mod tests {
         assert!(settings.verify.is_empty());
         let effective = settings.effective(&Chat::new("discord", "7"));
         assert_eq!(effective.model, "deepseek-v4.1-flash");
-        assert!(client_for(&settings, &effective.model).is_ok());
+        assert!(client_for(&settings, &effective.model, None).is_ok());
         assert!(settings.provider.is_none() && settings.endpoints.is_empty());
     }
 
@@ -2623,9 +2731,9 @@ mod tests {
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
         assert_eq!(settings.model, "groq/llama-3.3-70b");
-        assert!(client_for(&settings, &settings.model).is_ok());
-        assert!(client_for(&settings, "llama-3.3-70b").is_ok());
-        let refused = client_for(&settings, "nope/nope").expect_err("unknown");
+        assert!(client_for(&settings, &settings.model, None).is_ok());
+        assert!(client_for(&settings, "llama-3.3-70b", None).is_ok());
+        let refused = client_for(&settings, "nope/nope", None).expect_err("unknown");
         assert!(refused.contains("nope/nope"), "{refused}");
     }
 
@@ -2646,8 +2754,8 @@ mod tests {
         .expect("config");
         let settings = settings_for(&path, "discord").expect("settings");
         assert!(settings.endpoints.contains_key("local-9b"));
-        assert!(client_for(&settings, "local-9b").is_ok());
-        let refused = client_for(&settings, "not-here").expect_err("unknown");
+        assert!(client_for(&settings, "local-9b", None).is_ok());
+        let refused = client_for(&settings, "not-here", None).expect_err("unknown");
         assert!(refused.contains("not-here"), "{refused}");
         // Nothing local is compiled in, so a build without the endpoint cannot reach it.
         assert!(crate::model::preset("local-9b").is_none());

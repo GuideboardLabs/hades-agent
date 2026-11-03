@@ -41,7 +41,7 @@ than a broader false one:
   days of retention. Retention and the configurable deny list land with the shell work; today a path named by
   the deny list is recorded as a secret with no bytes kept, so `hades journal` can tell you it cannot be rewound.
 
-1282 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+1284 tests, 13 ignored. Twelve of the ignored are the live browser suite.
 
 ## 0.3.0
 

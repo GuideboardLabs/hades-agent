@@ -225,6 +225,7 @@ fn a_missing_or_empty_allowlist_is_a_refusal() {
         read,
         Settings {
             allowed: vec!["7".to_string()],
+            reasoning: None,
             trigger: Default::default(),
             policy: "open".to_string(),
             verify: "test -f out.txt".to_string(),
@@ -286,6 +287,7 @@ fn an_ignored_message_never_reaches_the_daemon() {
 
     let settings = Settings {
         allowed: vec!["7".to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "open".to_string(),
         verify: "true".to_string(),
@@ -394,6 +396,7 @@ fn a_parked_surface_acknowledges_and_drops_a_button() {
 
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Trigger::Never,
         policy: "guarded".to_string(),
         verify: "true".to_string(),
@@ -518,6 +521,7 @@ fn a_mention_only_surface_still_answers_the_button_it_holds() {
 
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Trigger::MentionOnly,
         policy: "guarded".to_string(),
         verify: "true".to_string(),
@@ -581,6 +585,7 @@ fn an_unauthorized_sender_gets_nothing() {
     let dir = scratch("auth");
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
@@ -618,6 +623,7 @@ fn a_channel_set_to_chat_cannot_start_work() {
     let dir = scratch("readonly");
     let mut settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "open".to_string(),
         verify: "true".to_string(),
@@ -696,6 +702,7 @@ fn a_submit_is_relayed_from_started_to_the_end() {
 
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "open".to_string(),
         verify: "test -f out.txt".to_string(),
@@ -818,6 +825,7 @@ fn a_question_is_a_button_and_an_allow_continues_the_same_goal() {
 
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
@@ -899,6 +907,7 @@ fn the_offset_advances_after_a_batch() {
     let dir = scratch("offset");
     let settings = Settings {
         allowed: vec!["1".to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "test -f out.txt".to_string(),
@@ -1012,6 +1021,7 @@ fn an_unaddressed_message_in_a_listed_channel_is_read_and_recorded() {
 fn settings_for(chat: i64) -> Settings {
     Settings {
         allowed: vec![chat.to_string()],
+        reasoning: None,
         trigger: Default::default(),
         policy: "guarded".to_string(),
         verify: "true".to_string(),

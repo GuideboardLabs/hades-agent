@@ -1022,6 +1022,7 @@ mod tests {
     fn settings(root: &Path) -> Settings {
         Settings {
             allowed: vec!["7".to_string()],
+            reasoning: None,
             trigger: Default::default(),
             policy: "guarded".to_string(),
             verify: "true".to_string(),
