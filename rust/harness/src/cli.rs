@@ -1184,10 +1184,16 @@ fn journal_cmd(args: &[String]) -> Result<(String, i32), String> {
         text.push('\n');
         return Ok((text, 0));
     }
+    let distinct: std::collections::BTreeSet<&str> = scan
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
     let mut text = format!(
-        "run {}: {} captured path(s), {} line(s) that would not parse\n",
+        "run {}: {} captured entry(s), {} distinct path(s), {} line(s) that would not parse\n",
         journal.run(),
         scan.entries.len(),
+        distinct.len(),
         scan.skipped
     );
     for entry in &scan.entries {
@@ -8425,6 +8431,24 @@ mod journal_cli_tests {
             std::fs::read_to_string(&path).expect("the restored file"),
             "beta\n",
             "the recoverable path is still put back"
+        );
+    }
+
+    /// A run that writes one path three times holds three entries and one path. The header counted
+    /// entries and called them paths, so one file rewritten three times read as three files, which
+    /// overstates what a rewind touches and hides a run that kept changing the same file.
+    #[test]
+    fn the_journal_verb_counts_entries_and_distinct_paths_apart() {
+        let dir = scratch("cli-journal-paths");
+        patched(&dir, "s7", "note.txt", "one\n", "two\n", 0);
+        patched(&dir, "s7", "note.txt", "two\n", "three\n", 1);
+        patched(&dir, "s7", "note.txt", "three\n", "four\n", 2);
+
+        let (text, code) = run(&["journal", "s7", "--state", &dir.display().to_string()]);
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains("3 captured entry(s), 1 distinct path(s)"),
+            "entries and paths are counted apart: {text}"
         );
     }
 
