@@ -3,6 +3,26 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.2
+
+### Only an operator may do more than talk
+
+A surface that lets a room in also let the room run work: `mode: work` was a property of the channel, and
+nothing asked who was typing. Watching the bot answer people who were not talking to it, in a room with
+someone else in it, and describe what it could reach, made the gap concrete.
+
+- **`operators` names the people who may do more than talk.** A room set to `mode: work` is work only for an
+  operator; everybody else the surface admits may converse, and the tools a conversation is handed are the
+  allowlist plus the executor's refusal, not a sentence in a prompt. A wildcard is refused at load, because
+  `"*"` in `allowed_users` exists so a room can speak and the same token must not also hand it the shell.
+
+- **The shared room is a conversation.** `mode: chat` on the surface and on the channel that had the shell,
+  `policy: guarded` on both, and a five line prompt that says what must never be printed: paths outside the
+  workspace, environment values, keys, hostnames, IPs, service names, config contents. A prompt is guidance;
+  the allowlist and the executor are the enforcement, and they are what a conversation now gets.
+
+1287 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.1
 
 ### Less thinking on a cloud surface, and a connector that reads the config it is given
@@ -28,11 +48,6 @@ A third defect, found by watching the bot answer people who were not talking to 
 config was treated as a listening channel, so an unaddressed sentence there became a candidate worth a model
 call. An entry that names its own `trigger` no longer falls into that rule, so `mode: work` plus
 `trigger: mention` now means what it says instead of answering everything in the room.
-
-- **`operators` names the people who may do more than talk.** A room set to `mode: work` is work only for an
-  operator; everybody else the surface admits may converse, and the tools a conversation is handed are the
-  allowlist plus the executor's refusal, not a sentence in a prompt. A wildcard is refused at load, because
-  `"*"` in `allowed_users` exists so a room can speak and the same token must not also hand it the shell.
 
 1287 tests, 13 ignored. Twelve of the ignored are the live browser suite.
 
