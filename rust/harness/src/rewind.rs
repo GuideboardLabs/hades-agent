@@ -222,11 +222,17 @@ pub fn plan(journal: &Journal, options: &Options) -> Plan {
 
 /// Carry out a plan. Refuses, naming every drifted path with both digests, unless `force` was asked for.
 ///
-/// The check happens in [`plan`]; this repeats it as a guard because a caller can build a `Plan` by hand
-/// and the cost of refusing twice is nothing next to restoring over somebody's edit.
+/// `Err` means exactly one thing: the refusal, and nothing was written. A path that cannot be put back
+/// while the loop runs — a missing blob, bytes that no longer hash to their name, a directory that will
+/// not take the write — is a skip in the report, because a failure on the third path is not a reason to
+/// lose the first two. Reporting such a failure as a refusal printed "would restore" beside a file the
+/// command had already restored. That is why [`run`] returns a report and cannot fail.
+///
+/// The drift check happens in [`plan`]; this repeats it as a guard because a caller can build a `Plan` by
+/// hand and the cost of refusing twice is nothing next to restoring over somebody's edit.
 pub fn apply(journal: &Journal, plan: &Plan, force: bool) -> Result<Report, String> {
     if force {
-        return run(journal, plan);
+        return Ok(run(journal, plan));
     }
     if plan.blocked() {
         let mut said = String::from("refused: the run's work cannot be verified as it was left:\n");
@@ -254,10 +260,14 @@ pub fn apply(journal: &Journal, plan: &Plan, force: bool) -> Result<Report, Stri
         );
         return Err(said);
     }
-    run(journal, plan)
+    Ok(run(journal, plan))
 }
 
-fn run(journal: &Journal, plan: &Plan) -> Result<Report, String> {
+/// Do the undo, path by path. It cannot fail as a whole: a path that will not go back is named in the
+/// report with its reason and the loop carries on, because the entries beside it are still recoverable and
+/// a person running a recovery command needs everything the command could get back, not the prefix of it
+/// before the first permission error.
+fn run(journal: &Journal, plan: &Plan) -> Report {
     let mut report = Report {
         skipped: plan.skipped.clone(),
         ..Report::default()
@@ -296,8 +306,16 @@ fn run(journal: &Journal, plan: &Plan) -> Result<Report, String> {
                     });
                     continue;
                 }
-                restore(Path::new(&step.path), &bytes)?;
-                report.restored.push(step.path.clone());
+                match restore(Path::new(&step.path), &bytes) {
+                    Ok(()) => report.restored.push(step.path.clone()),
+                    // One path that will not take the write is that path's problem. The undo says which
+                    // one, says why, and puts back everything else it can.
+                    Err(said) => report.skipped.push(Skipped {
+                        path: step.path.clone(),
+                        step: step.step,
+                        reason: said,
+                    }),
+                }
             }
             Action::Remove => {
                 match std::fs::remove_file(&step.path) {
@@ -305,14 +323,16 @@ fn run(journal: &Journal, plan: &Plan) -> Result<Report, String> {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         // Nothing to undo: the path the run created is already gone.
                     }
-                    Err(error) => {
-                        return Err(format!("could not remove {}: {error}", step.path));
-                    }
+                    Err(error) => report.skipped.push(Skipped {
+                        path: step.path.clone(),
+                        step: step.step,
+                        reason: format!("could not remove {}: {error}", step.path),
+                    }),
                 }
             }
         }
     }
-    Ok(report)
+    report
 }
 
 /// Write the bytes beside the path and rename, so a reader sees the old file or the whole new one.

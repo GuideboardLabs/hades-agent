@@ -3608,3 +3608,80 @@ fn a_state_symlink_into_a_vault_is_refused() {
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("notes vault"), "{text}");
 }
+
+// A rewind that fails after it has already written something must say so. It used to print "would
+// restore" beside a file it had restored and exit 1, which is a recovery command reporting the opposite
+// of what it did. The status is partial (2), the write that landed is in the counts, and the path that
+// did not is named with its reason.
+#[test]
+fn a_rewind_that_fails_midway_says_what_it_wrote_and_exits_partial() {
+    use harness::journal::{Capture, Journal};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let state = scratch("rewind-partial-state");
+    let root = scratch("rewind-partial-root");
+    let first = root.join("aaa").join("note.txt");
+    let second = root.join("zzz").join("note.txt");
+    for path in [&first, &second] {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+        std::fs::write(path, "alpha\n").expect("the bytes before the run");
+    }
+    let journal = Journal::at(&state, "run-partial");
+    for (step, path) in [&first, &second].into_iter().enumerate() {
+        Capture::new(&journal, step as u64, "write_file")
+            .write::<std::io::Error, _>(path, b"beta\n", || std::fs::write(path, "beta\n"))
+            .expect("a captured write");
+    }
+    // The second path's directory will not take a new name, so the loop restores the first and fails on
+    // the second. The fixture proves it refuses a write before the command is run: as root it would not,
+    // and the test would be asserting about a write that could not fail.
+    let locked = root.join("zzz");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+        .expect("a directory that will not take a write");
+    assert!(
+        std::fs::write(locked.join("probe"), b"x").is_err(),
+        "the fixture needs a directory that refuses a write"
+    );
+
+    let (code, output) = hades(&[
+        "rewind",
+        "run-partial",
+        "--state",
+        state.to_str().expect("utf8"),
+    ]);
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("the first file"),
+        "alpha\n",
+        "the write that landed is real: {output}"
+    );
+    assert_eq!(
+        code, 2,
+        "a partial undo is its own status, not a refusal: {output}"
+    );
+    assert!(
+        output.contains("1 restored, 0 removed, 1 skipped"),
+        "the counts name what was written: {output}"
+    );
+    assert!(
+        output.contains("partial undo: 1 path(s) put back, 1 skipped"),
+        "the sentence says it was partial: {output}"
+    );
+    assert!(
+        output.contains(&format!("skip     {}: ", second.display())),
+        "the path that was not written is named: {output}"
+    );
+    assert!(
+        output.contains("Permission denied"),
+        "the reason is printed: {output}"
+    );
+    assert!(
+        !output.contains("would    restore"),
+        "nothing about this run is hypothetical: {output}"
+    );
+    assert!(
+        !output.contains("Nothing was written"),
+        "a path was written: {output}"
+    );
+}

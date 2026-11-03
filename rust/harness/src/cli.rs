@@ -1279,6 +1279,9 @@ fn rewind_cmd(args: &[String]) -> Result<(String, i32), String> {
                 code,
             ))
         }
+        // The one error `apply` can return is the refusal, and a refusal wrote nothing: that is why the
+        // plan is rendered in the conditional here. A path that would not go back mid-loop is not an
+        // error, it is a skip in the report above, because a partial undo has to say what it did.
         Err(refused) => Ok((
             format!(
                 "{}\n{}",
