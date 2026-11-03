@@ -3,6 +3,46 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.0
+
+### The Rewind Release: every write the harness makes can be put back
+
+Approvals gate what a run may do and the floor and the cage gate where it may do it. Nothing gated undoing, so
+a run that overwrote a file left nothing behind but a ledger line saying the write was allowed. This release
+adds the third gate.
+
+- **A run journal.** Every `write_file` and every file in a `patch` plan is captured before it is written: the
+  previous bytes, content addressed by digest and stored once, plus one append-only index line per capture with
+  the digests before and after, the tool, the step and the path. A governed turn and a branch candidate are
+  captured on the same terms, each under the session that wrote it.
+- **`hades journal <session>`** lists what a run touched, with digests, entries and distinct paths counted
+  apart. A torn tail line from a kill mid-append is skipped and counted, never a panic.
+- **`hades rewind <session>`** puts the bytes back, whole or `--to <step>`, with `--path`, `--dry-run` and
+  `--force`. It hashes the kept bytes before writing them and refuses a blob that does not match its digest; it
+  refuses when the file has changed since the run, naming the digest the run left and the one it found now; it
+  reports complete (0), nothing recoverable (1) and partial (2) as separate outcomes, names every path it could
+  not put back and why, and counts a removal that was already in the wanted state instead of leaving it out.
+
+The guarantee, stated as narrowly as the verifier would allow, because a narrower true sentence is worth more
+than a broader false one:
+
+> Every `write_file` and `patch` the harness performs, a governed turn's and a branch candidate's included, each
+> filed under the session that wrote it and, when a candidate's edit is the one the run kept, under the run as
+> well, is journaled with the bytes it replaced: `hades journal <session>` lists them, `hades rewind <session>`
+> puts them back and names every path it could not put back together with the reason, and exits 2 when it put
+> back only part of the run; a command the harness runs with `--program` is not captured, so a program's writes
+> are outside this guarantee, a branch candidate that lost is recorded only under its own session, and a run
+> whose copy of the winner's record cannot be written ends in a harness fault.
+
+- **Not covered, and named rather than implied:** a shell command's writes. The manifest diff that would capture
+  them is the next release; until then `hades turn --program` and any other shell step are outside the sentence
+  above, and the code says so where it is read.
+- **Limits:** 8 MiB per captured file, 512 MiB for the store, 20,000 entries for a future manifest walk, and 14
+  days of retention. Retention and the configurable deny list land with the shell work; today a path named by
+  the deny list is recorded as a secret with no bytes kept, so `hades journal` can tell you it cannot be rewound.
+
+1282 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.3.0
 
 ### The Gatekeeper Release: a message nobody addressed costs nothing, and a run that is stuck is stopped
@@ -42,7 +82,7 @@ now runs `check-claims.sh`, so a green local run and the claim the release makes
 thing. It previously was not, and a README count drifted two rounds behind the suite while every local
 gate stayed green.
 
-1281 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+1243 tests, 13 ignored. Twelve of the ignored are the live browser suite.
 
 ## 0.2.0
 
