@@ -195,8 +195,15 @@ impl Journal {
             return Err("a blob needs a digest".to_string());
         }
         let blobs = self.root.join(BLOBS);
+        // Which names this call is about to create. A capture into a run that already exists owes no
+        // directory sync, because the names were made durable by the capture that created them.
+        let fresh_run = !self.root.is_dir();
+        let fresh_blobs = !blobs.is_dir();
         crate::scratch::state_dir(&blobs)
             .map_err(|error| format!("{}: {error}", blobs.display()))?;
+        if fresh_run || fresh_blobs {
+            self.sync_created(fresh_run, fresh_blobs)?;
+        }
         let blob = self.blob(digest);
         if blob.is_file() {
             // The bytes are already there, but the name still has to be durable before an index line can
@@ -237,6 +244,8 @@ impl Journal {
 
     /// Append one line. Never rewrites the file, so a reader that opened it earlier still sees a prefix.
     pub fn append(&self, entry: &Entry) -> Result<(), String> {
+        let fresh_run = !self.root.is_dir();
+        let fresh_index = !self.index().is_file();
         crate::scratch::state_dir(&self.root)
             .map_err(|error| format!("{}: {error}", self.root.display()))?;
         let mut text = serde_json::to_string(entry)
@@ -256,8 +265,41 @@ impl Journal {
         // which is why this is one sync per append and not a batch.
         file.sync_all()
             .map_err(|error| format!("{}: {error}", self.index().display()))?;
+        // The line's bytes are on the disk; its name and the names above it are separate directory
+        // entries. The first capture of a run creates `<state>/journal/<run>`, `<run>/blobs` and
+        // `<run>/index.jsonl`; until those names are durable, the order this module promises can be
+        // undone by a power loss. Ordered after the file's own sync, so the entry never becomes durable
+        // before the line it names.
+        if fresh_run || fresh_index {
+            self.sync_created(fresh_run, fresh_index)?;
+        }
         #[cfg(test)]
         syncs::note_index();
+        Ok(())
+    }
+
+    /// Make the names a capture created durable.
+    ///
+    /// `sync_blobs` makes a blob's name durable inside `blobs/`, and a file's `sync_all` covers only its
+    /// own bytes. The directories above them are separate names: `<state>/journal/<run>` lives inside
+    /// `<state>/journal`, and `blobs/` and `index.jsonl` live inside the run directory. A capture that
+    /// creates them is the one that owes the sync, which is why the caller says which were new: a run that
+    /// already exists pays nothing here.
+    fn sync_created(&self, fresh_run: bool, fresh_inside: bool) -> Result<(), String> {
+        if fresh_run && let Some(holder) = self.root.parent() {
+            std::fs::File::open(holder)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("could not sync {}: {error}", holder.display()))?;
+            #[cfg(test)]
+            syncs::note_holder_dir();
+        }
+        if fresh_run || fresh_inside {
+            std::fs::File::open(&self.root)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("could not sync {}: {error}", self.root.display()))?;
+            #[cfg(test)]
+            syncs::note_run_dir();
+        }
         Ok(())
     }
 
@@ -497,11 +539,17 @@ pub(crate) mod syncs {
     thread_local! {
         static BLOBS_DIR: Cell<u64> = const { Cell::new(0) };
         static INDEX: Cell<u64> = const { Cell::new(0) };
+        /// `<state>/journal`: the directory the run's own name lives in.
+        static HOLDER_DIR: Cell<u64> = const { Cell::new(0) };
+        /// `<state>/journal/<run>`: the directory `blobs/` and `index.jsonl` live in.
+        static RUN_DIR: Cell<u64> = const { Cell::new(0) };
     }
 
     pub fn reset() {
         BLOBS_DIR.with(|cell| cell.set(0));
         INDEX.with(|cell| cell.set(0));
+        HOLDER_DIR.with(|cell| cell.set(0));
+        RUN_DIR.with(|cell| cell.set(0));
     }
 
     pub fn blobs_dir() -> u64 {
@@ -512,12 +560,28 @@ pub(crate) mod syncs {
         INDEX.with(|cell| cell.get())
     }
 
+    pub fn holder_dir() -> u64 {
+        HOLDER_DIR.with(|cell| cell.get())
+    }
+
+    pub fn run_dir() -> u64 {
+        RUN_DIR.with(|cell| cell.get())
+    }
+
     pub fn note_blobs_dir() {
         BLOBS_DIR.with(|cell| cell.set(cell.get() + 1));
     }
 
     pub fn note_index() {
         INDEX.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub fn note_holder_dir() {
+        HOLDER_DIR.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub fn note_run_dir() {
+        RUN_DIR.with(|cell| cell.set(cell.get() + 1));
     }
 }
 
@@ -724,6 +788,55 @@ mod tests {
             syncs::index(),
             1,
             "the index append is synced before the capture reports success"
+        );
+    }
+
+    /// The first capture in a brand-new run directory creates three names that must survive a power loss
+    /// before the index line depends on them: the run directory inside `<state>/journal`, and then `blobs/`
+    /// and `index.jsonl` inside the run directory. Syncing the blob file, the blob directory and the index
+    /// file says nothing about those names, so the order the module claims (blob bytes, blob name, index
+    /// line) did not hold for the first capture of a run. A run that already exists pays nothing for this.
+    #[test]
+    fn the_first_capture_in_a_new_run_syncs_the_directories_it_created() {
+        syncs::reset();
+        let dir = scratch("journal-sync-dirs");
+        let journal = Journal::at(&dir, "run-sync-dirs");
+        let path = dir.join("note.txt");
+        std::fs::write(&path, "before\n").expect("a file the capture will read");
+
+        Capture::new(&journal, 0, "write_file")
+            .write::<std::io::Error, _>(&path, b"after\n", || std::fs::write(&path, "after\n"))
+            .expect("the write");
+
+        assert!(dir.join("journal").is_dir(), "the run's directory exists");
+        assert_eq!(
+            syncs::holder_dir(),
+            1,
+            "`<state>/journal` is synced after the run directory is created, or the run's own name is \
+             not durable"
+        );
+        assert!(
+            syncs::run_dir() >= 1,
+            "the run directory is synced after `blobs/` and `index.jsonl` are created, or their names are \
+             not durable"
+        );
+        let (holder, run) = (syncs::holder_dir(), syncs::run_dir());
+
+        // A second capture into a run that exists makes no new names, so it owes no new directory sync:
+        // the cost of this fix lands once per run, not once per capture.
+        std::fs::write(&path, "again\n").expect("a file");
+        Capture::new(&journal, 1, "write_file")
+            .write::<std::io::Error, _>(&path, b"later\n", || std::fs::write(&path, "later\n"))
+            .expect("the second write");
+        assert_eq!(
+            syncs::holder_dir(),
+            holder,
+            "a second capture re-syncs the state directory"
+        );
+        assert_eq!(
+            syncs::run_dir(),
+            run,
+            "a second capture re-syncs the run directory"
         );
     }
 
