@@ -21,8 +21,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUST = ROOT / "rust"
 CRATE = RUST / "connectors" / "discord"
-VERSION = "0.1.1"
 ID = "discord"
+
+
+def crate_version(manifest: Path) -> str:
+    """Read the version from the crate itself.
+
+    Hardcoding it here is how the pack stayed at 0.1.1 while the harness shipped 0.3.0, which left the
+    release installed nowhere. One source of truth: the manifest cargo builds from.
+    """
+    for line in manifest.read_text().splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "version":
+            return value.strip().strip('"')
+    raise SystemExit(f"connector-pack: no version in {manifest}")
 
 
 def digest(path: Path) -> str:
@@ -31,6 +43,9 @@ def digest(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             sha.update(block)
     return sha.hexdigest()
+
+
+VERSION = crate_version(CRATE / "Cargo.toml")
 
 
 def main() -> int:

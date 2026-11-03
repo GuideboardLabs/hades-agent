@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "hades-connector-discord"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "harness",
  "serde_json",
