@@ -1257,7 +1257,10 @@ fn rewind_cmd(args: &[String]) -> Result<(String, i32), String> {
     let plan = crate::rewind::plan(&journal, &options);
     if options.dry_run {
         // The dry run is the plan and nothing else: no write, no delete, and the line that says so.
-        return Ok((crate::rewind::render(&plan, None, true), 0));
+        return Ok((
+            crate::rewind::render(&plan, None, crate::rewind::Mode::DryRun),
+            0,
+        ));
     }
     match crate::rewind::apply(&journal, &plan, options.force) {
         Ok(report) => {
@@ -1265,13 +1268,17 @@ fn rewind_cmd(args: &[String]) -> Result<(String, i32), String> {
             Ok((
                 format!(
                     "{}{said}",
-                    crate::rewind::render(&plan, Some(&report), false)
+                    crate::rewind::render(&plan, Some(&report), crate::rewind::Mode::Applied)
                 ),
                 code,
             ))
         }
         Err(refused) => Ok((
-            format!("{}\n{}", crate::rewind::render(&plan, None, false), refused),
+            format!(
+                "{}\n{}",
+                crate::rewind::render(&plan, None, crate::rewind::Mode::Refused),
+                refused
+            ),
             1,
         )),
     }
@@ -8419,6 +8426,29 @@ mod journal_cli_tests {
             "beta\n",
             "the recoverable path is still put back"
         );
+    }
+
+    /// A refused plan is a plan: every line in it is something the command did not do. Rendered in the
+    /// present tense, "restore <path>" sitting above "Nothing was written" describes a write that the
+    /// command explicitly refused to make.
+    #[test]
+    fn a_refused_rewind_renders_every_line_as_something_it_would_have_done() {
+        let dir = scratch("cli-rewind-refused-would");
+        let path = history(&dir, "s6", "note.txt", "beta\n", "BETA\n");
+        std::fs::write(&path, "a newer edit\n").expect("an edit after the run");
+
+        let (text, code) = run(&["rewind", "s6", "--state", &dir.display().to_string()]);
+        assert_eq!(code, 1, "{text}");
+        let planned = text
+            .lines()
+            .find(|line| line.contains(&path))
+            .expect("the path in the plan");
+        assert!(
+            planned.starts_with("would"),
+            "a refused plan is in the conditional: {text}"
+        );
+        assert!(planned.contains("restore"), "{text}");
+        assert!(text.contains("Nothing was written"), "{text}");
     }
 
     #[test]

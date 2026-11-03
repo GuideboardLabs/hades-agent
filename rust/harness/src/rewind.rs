@@ -413,8 +413,22 @@ fn glob(pattern: &[char], text: &[char]) -> bool {
     }
 }
 
+/// How a plan is being shown to a person.
+///
+/// A plan is always what the command would do; only [`Mode::Applied`] describes what it did. Keeping the
+/// two apart is what stops a refusal from printing "restore <path>" directly above "Nothing was written".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// A dry run: the plan with the conditional, and the line that says nothing was written.
+    DryRun,
+    /// A refusal: the plan with the conditional, because none of it happened.
+    Refused,
+    /// What the command did, with the report's own counts.
+    Applied,
+}
+
 /// The plan as a person reads it, before or after it ran.
-pub fn render(plan: &Plan, report: Option<&Report>, dry_run: bool) -> String {
+pub fn render(plan: &Plan, report: Option<&Report>, mode: Mode) -> String {
     let mut text = String::new();
     if plan.steps.is_empty() && plan.skipped.is_empty() {
         text.push_str(&format!(
@@ -423,11 +437,12 @@ pub fn render(plan: &Plan, report: Option<&Report>, dry_run: bool) -> String {
         ));
         return text;
     }
+    let would = !matches!(mode, Mode::Applied);
     for step in &plan.steps {
         let mark = if step.drifted { " (changed since)" } else { "" };
         text.push_str(&format!(
             "{:<9}{:<8} {} (step {}, {}){mark}\n",
-            if dry_run { "would" } else { "" },
+            if would { "would" } else { "" },
             step.action.verb(),
             step.path,
             step.step,
@@ -444,7 +459,7 @@ pub fn render(plan: &Plan, report: Option<&Report>, dry_run: bool) -> String {
             report.removed.len(),
             report.skipped.len()
         )),
-        None if dry_run => text.push_str("nothing was written (--dry-run)\n"),
+        None if mode == Mode::DryRun => text.push_str("nothing was written (--dry-run)\n"),
         None => {}
     }
     text
@@ -600,7 +615,7 @@ mod tests {
             },
         );
         assert!(nothing.steps.is_empty(), "{nothing:?}");
-        assert!(render(&nothing, None, false).contains("nothing to rewind"));
+        assert!(render(&nothing, None, Mode::Applied).contains("nothing to rewind"));
     }
 
     /// A pattern picks the paths it names and leaves the rest alone.
@@ -651,7 +666,7 @@ mod tests {
         assert!(planned.steps.is_empty(), "{planned:?}");
         assert_eq!(planned.skipped.len(), 1, "{planned:?}");
         assert!(planned.skipped[0].reason.contains("secret"), "{planned:?}");
-        let text = render(&planned, None, false);
+        let text = render(&planned, None, Mode::Applied);
         assert!(text.contains("cannot be rewound"), "{text}");
     }
 
