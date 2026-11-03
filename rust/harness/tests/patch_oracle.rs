@@ -28,14 +28,15 @@ fn policy_at(dir: &Path) -> PathPolicy {
     PathPolicy::for_root(&std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
 }
 
-/// The oracle drives the tool directly, so nothing it writes is journaled: the journal is proven by the
-/// agent module's own tests, which go through the real dispatch with a known step. The one thing this
-/// function must never grow is a second write path.
+/// The oracle drives the tool directly, so its writes go to a journal at the same root the policy allows:
+/// a captured writer with no journal is no longer a shape the type permits. The one thing this function
+/// must never grow is a second write path.
 fn tool(args: &serde_json::Value, policy: &PathPolicy) -> String {
+    let journal = harness::journal::Journal::at(&policy.write_roots[0], "oracle");
     harness::patch::tool(
         args,
         policy,
-        &harness::journal::Capture::off("the patch oracle drives the tool directly"),
+        &harness::journal::Capture::new(&journal, 0, "patch"),
     )
 }
 
@@ -46,9 +47,9 @@ fn edit(old: &str, new: &str) -> Edit {
     }
 }
 
-/// A capture that keeps nothing, for the calls that reach the low level functions directly.
-fn unjournaled() -> harness::journal::Capture<'static> {
-    harness::journal::Capture::off("the patch oracle drives the tool directly")
+/// The capture for the calls that reach the low level functions directly, at a journal beside the files.
+fn capture<'a>(journal: &'a harness::journal::Journal) -> harness::journal::Capture<'a> {
+    harness::journal::Capture::new(journal, 0, "patch")
 }
 
 fn read(path: &Path) -> String {
@@ -274,8 +275,9 @@ fn apply_refuses_an_empty_edit_list() {
     let dir = scratch("none");
     let file = dir.join("note.txt");
     std::fs::write(&file, "alpha\n").expect("a file");
-    assert!(apply(&file, &[], &unjournaled()).is_err());
-    assert!(apply(&file, &[edit("alpha", "beta")], &unjournaled()).is_ok());
+    let journal = harness::journal::Journal::at(&dir, "oracle");
+    assert!(apply(&file, &[], &capture(&journal)).is_err());
+    assert!(apply(&file, &[edit("alpha", "beta")], &capture(&journal)).is_ok());
 }
 
 #[test]
@@ -342,7 +344,8 @@ fn two_files_are_planned_then_written_once_each() {
     )
     .expect("both plan");
     assert_eq!(plans.len(), 2);
-    let report = write_all(&plans, &unjournaled()).expect("both write");
+    let journal = harness::journal::Journal::at(&dir, "oracle");
+    let report = write_all(&plans, &capture(&journal)).expect("both write");
     assert!(report.contains("2 file(s)"), "{report}");
     assert_eq!(read(&dir.join("a.txt")), "ALPHA\n");
     assert_eq!(read(&dir.join("b.txt")), "BETA\n");
@@ -360,6 +363,7 @@ fn one_path_spelled_two_ways_is_one_file_with_both_edits_in_order() {
     .expect("one file");
     assert_eq!(plans.len(), 1, "the two spellings resolve to one file");
     assert_eq!(plans[0].hunks.len(), 2);
-    write_all(&plans, &unjournaled()).expect("written");
+    let journal = harness::journal::Journal::at(&dir, "oracle");
+    write_all(&plans, &capture(&journal)).expect("written");
     assert_eq!(read(&dir.join("a.txt")), "ONE TWO\n");
 }

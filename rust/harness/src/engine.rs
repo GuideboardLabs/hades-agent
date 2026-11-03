@@ -118,6 +118,9 @@ pub struct Engine {
     cache_path: PathBuf,
     root: PathBuf,
     state: PathBuf,
+    /// The journal this engine's writes go to, one per session, handed to every seam it builds. Owned here
+    /// so a caller cannot build a turn without one.
+    journal: crate::journal::Journal,
     /// Recorded in a new session's first Meta entry. `None` means the caller did not name a prompt.
     prompt: Option<crate::harness_files::PromptFact>,
 }
@@ -202,6 +205,7 @@ impl Engine {
             policy_name: spec.policy_name,
             reason: spec.reason,
             session_id: SessionId::new(&spec.session_id),
+            journal: crate::journal::Journal::at(&spec.state, &spec.session_id),
             store: FileStore::new(spec.state.join("sessions")),
             shell,
             verifier,
@@ -317,6 +321,7 @@ impl Engine {
             model,
             &self.shell,
             self.verifier.as_ref(),
+            &self.journal,
         )
         .brokering(&self.broker)
         .checkpointing(&*self.checkpointer)
@@ -339,6 +344,7 @@ impl Engine {
             broker: Some(&self.broker as &dyn ApprovalBroker),
             checkpointer: Some(&*self.checkpointer),
             evaluator,
+            journal: &self.journal,
             cache: &mut self.cache,
             reason: self.reason.clone(),
         }
@@ -441,6 +447,67 @@ mod tests {
         drop(session);
         let resumed = engine.session().expect("a resumed session");
         assert_eq!(recorded(&resumed).len(), 1);
+    }
+
+    /// A governed turn writes files, so it has to record them the way every other writer does. The answer
+    /// is a scripted edit rather than a hand written journal line: what this holds is the seam from the
+    /// turn to the journal, and a fixture would prove only that the reader reads.
+    #[test]
+    fn a_governed_turn_that_edits_leaves_an_entry_and_a_rewind_puts_it_back() {
+        let state = scratch("turn-journal");
+        let path = state.join("note.txt");
+        std::fs::write(&path, "before\n").expect("the file the turn will edit");
+
+        let mut spec = assembly(&state, None);
+        // The check is not what this test is about, and a real one would build a project to run it.
+        spec.profile.verify = "true".to_string();
+        spec.profile.judge = false;
+        let engine = Engine::open(spec).expect("engine");
+        let mut engine = engine;
+        let context = engine.context().expect("a bundle");
+        let mut session = engine.session().expect("a session");
+        let model = crate::model::Scripted::answers([crate::task::ModelAnswer::editing(vec![
+            crate::patch::FileEdit {
+                path: "note.txt".to_string(),
+                old: "before\n".to_string(),
+                new: "after\n".to_string(),
+            },
+        ])]);
+
+        let turn = engine
+            .seams(&context, &model)
+            .turn(&mut session)
+            .expect("the turn");
+        assert!(
+            matches!(turn.outcome, crate::turn::Outcome::Ran { .. }),
+            "the turn did not write: {:?}",
+            turn.outcome
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the edited file"),
+            "after\n",
+            "the edit did not land, so the journal has nothing to record"
+        );
+
+        let journal = crate::journal::Journal::at(&state, "engine-test");
+        let entries = journal.entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the governed turn wrote a file the journal never saw: {entries:?}"
+        );
+        assert_eq!(entries[0].path, path.display().to_string());
+        assert_eq!(entries[0].before, mneme::sha256::hex(b"before\n"));
+
+        let plan = crate::rewind::plan(&journal, &crate::rewind::Options::default());
+        assert_eq!(plan.steps.len(), 1, "{plan:?}");
+        let report = crate::rewind::apply(&journal, &plan, false).expect("a rewind");
+        assert_eq!(report.restored, vec![path.display().to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the restored file"),
+            "before\n",
+            "a rewind of a governed turn did not put the file back"
+        );
     }
 
     #[test]

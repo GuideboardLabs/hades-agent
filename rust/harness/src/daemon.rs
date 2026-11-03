@@ -2108,7 +2108,14 @@ mod watchdog_tests {
         let model = ScriptedModel::new([BUILD; 5]);
         for n in 0..5 {
             let turn = Seams::new(
-                &task, &profile, &policy, &context, &model, &shell, &verifier,
+                &task,
+                &profile,
+                &policy,
+                &context,
+                &model,
+                &shell,
+                &verifier,
+                &crate::journal::Journal::at(&state, building),
             )
             .turn(&mut log)
             .unwrap_or_else(|fault| panic!("turn {}: {}", n + 1, fault.detail()));
@@ -2187,7 +2194,14 @@ mod watchdog_tests {
         );
         let reader = ScriptedModel::new([BUILD]);
         let turn = Seams::new(
-            &task, &profile, &policy, &context, &reader, &shell, &verifier,
+            &task,
+            &profile,
+            &policy,
+            &context,
+            &reader,
+            &shell,
+            &verifier,
+            &crate::journal::Journal::at(&state, building),
         )
         .turn(&mut reread)
         .expect("a turn of run 2");
@@ -2265,7 +2279,14 @@ mod watchdog_tests {
         let model = ScriptedModel::new(programs);
         for _ in 0..12 {
             let turn = Seams::new(
-                &task, &profile, &policy, &context, &model, &shell, &verifier,
+                &task,
+                &profile,
+                &policy,
+                &context,
+                &model,
+                &shell,
+                &verifier,
+                &crate::journal::Journal::at(&state, looking),
             )
             .turn(&mut log)
             .expect("a turn that looks");

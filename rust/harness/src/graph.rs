@@ -796,6 +796,9 @@ pub struct Parts<'a> {
     pub checkpointer: Option<&'a dyn Checkpointer>,
     /// The judge, when the profile asks for one and the caller has one to lend.
     pub evaluator: Option<&'a dyn crate::judge::Evaluator>,
+    /// Where an attempt's writes are recorded. Required: a walker that writes without one is the hole
+    /// the governed turn used to be.
+    pub journal: &'a crate::journal::Journal,
     /// The map's scan, held by whoever owns this walker. A walk that reaches the map without it pays the
     /// cold scan on every attempt, which is the cost this field exists to stop paying.
     pub cache: &'a mut Cache,
@@ -819,6 +822,7 @@ where
     broker: Option<&'a dyn ApprovalBroker>,
     checkpointer: Option<&'a dyn Checkpointer>,
     evaluator: Option<&'a dyn crate::judge::Evaluator>,
+    journal: &'a crate::journal::Journal,
     cache: &'a mut Cache,
     reason: RoutingReason,
     memory: Option<Remembering<'a>>,
@@ -898,6 +902,7 @@ where
             broker: parts.broker,
             checkpointer: parts.checkpointer,
             evaluator: parts.evaluator,
+            journal: parts.journal,
             cache: parts.cache,
             reason: parts.reason,
             memory: None,
@@ -1689,6 +1694,7 @@ where
             // candidate would copy the tree again for no new guarantee, so the branch pays for one copy.
             checkpointer: None,
             evaluator: self.evaluator,
+            journal: self.journal,
             cache: self.cache,
             reason: self.reason.clone(),
         };
@@ -2002,6 +2008,7 @@ where
             self.model,
             self.tool,
             self.verifier,
+            self.journal,
         )
         .because(self.reason.clone());
         let seams = match self.feed {

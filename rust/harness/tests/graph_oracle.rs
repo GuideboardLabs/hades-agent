@@ -81,6 +81,7 @@ struct Rig {
     verifier: CommandVerifier,
     model: ScriptedModel,
     shadows: Shadows,
+    journal: harness::journal::Journal,
 }
 
 impl Rig {
@@ -89,6 +90,7 @@ impl Rig {
         let root = scratch(name);
         let shadows = Shadows::new(root.with_extension("shadows"));
         Rig {
+            journal: harness::journal::Journal::at(&root, "oracle"),
             task: TaskSpec::new("make made.txt exist", root.clone()),
             shell: Shell::new(root.clone(), LIMIT),
             verifier: CommandVerifier::new(LIMIT),
@@ -115,6 +117,7 @@ impl Rig {
             broker,
             checkpointer: None,
             evaluator: None,
+            journal: &self.journal,
             cache,
             reason: RoutingReason::chosen("the test"),
         }

@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
   <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1262%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1263%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -62,7 +62,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1262 passing, 13 ignored (12 live browser) |
+| **Tests** | 1263 passing, 13 ignored (12 live browser) |
 
 ---
 
@@ -795,7 +795,7 @@ which is where the deadline lives: 1800 seconds, `HADES_TEST_TIMEOUT` to overrid
 timeout, so a test that parks would otherwise hold the command until something outside killed it, and a
 hang prints no test name; under the deadline the run ends with a `the suite timed out` line instead.
 
-Current state: **1262 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
+Current state: **1263 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

@@ -76,6 +76,12 @@ fn context(task: &TaskSpec) -> Budgeted {
     Budgeted::new(vec![Section::new("goal", task.goal())])
 }
 
+/// Where a turn's writes would be recorded. A turn now requires a journal, and these tests are about the
+/// turn: the journal is a temporary beside it, at the same root the task and the shell use.
+fn journal(root: &Path) -> harness::journal::Journal {
+    harness::journal::Journal::at(root, "oracle")
+}
+
 #[test]
 fn a_turn_that_passes_runs_the_program_and_logs_it_in_order() {
     let root = scratch("pass");
@@ -89,10 +95,19 @@ fn a_turn_that_passes_runs_the_program_and_logs_it_in_order() {
     let builder = context(&task);
 
     let mut log = session(&root, "pass");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .judging(&judge)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .judging(&judge)
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Ran {
@@ -154,9 +169,18 @@ fn a_check_that_fails_is_a_result_and_not_a_fault() {
     let builder = context(&task);
 
     let mut log = session(&root, "fail");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("the turn completed: a failing check is data");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("the turn completed: a failing check is data");
 
     match &turn.outcome {
         Outcome::Ran {
@@ -187,9 +211,18 @@ fn a_check_that_cannot_run_is_not_a_pass() {
     let builder = context(&task);
 
     let mut log = session(&root, "nocheck");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     let Outcome::Ran { verification, .. } = &turn.outcome else {
         panic!("expected a run")
@@ -214,9 +247,18 @@ fn a_model_fault_is_the_models_and_the_half_turn_stays() {
     let builder = context(&task);
 
     let mut log = session(&root, "model");
-    let error = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect_err("no answer, so no turn");
+    let error = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect_err("no answer, so no turn");
 
     assert_eq!(error.class(), Class::Model);
     assert!(error.class().counts_against_the_model());
@@ -245,9 +287,18 @@ fn a_denied_action_does_not_run_anything() {
     let builder = context(&task);
 
     let mut log = session(&root, "deny");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a refusal is a turn that ended, not a fault");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a refusal is a turn that ended, not a fault");
 
     // Evidence, not a counter: the program would have created this file.
     assert!(!root.join("ran").exists(), "nothing ran");
@@ -284,10 +335,19 @@ fn a_question_policy_raises_is_pending_rather_than_guessed() {
     let broker = InMemory::new();
 
     let mut log = session(&root, "ask");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .brokering(&broker)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&broker)
+    .turn(&mut log)
+    .expect("a turn");
 
     let Outcome::Awaiting { question } = &turn.outcome else {
         panic!("expected a question, got {:?}", turn.outcome)
@@ -347,10 +407,19 @@ fn a_standing_answer_lets_the_next_turn_run_without_asking() {
     let mut log = session(&root, "standing");
 
     let asking = ScriptedModel::one("echo first");
-    let turn = Seams::new(&task, &work, &policy, &builder, &asking, &shell, &verifier)
-        .brokering(&broker)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &asking,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&broker)
+    .turn(&mut log)
+    .expect("a turn");
     let Outcome::Awaiting { question } = &turn.outcome else {
         panic!("expected a question, got {:?}", turn.outcome)
     };
@@ -364,10 +433,19 @@ fn a_standing_answer_lets_the_next_turn_run_without_asking() {
 
     // And the next turn runs, recording what let it.
     let next = ScriptedModel::one("echo second");
-    let turn = Seams::new(&task, &work, &policy, &builder, &next, &shell, &verifier)
-        .brokering(&other)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &next,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&other)
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Ran {
@@ -405,10 +483,19 @@ fn a_standing_no_refuses_the_next_turn_without_asking_again() {
     let mut log = session(&root, "standingno");
 
     let asking = ScriptedModel::one("touch ran");
-    let turn = Seams::new(&task, &work, &policy, &builder, &asking, &shell, &verifier)
-        .brokering(&broker)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &asking,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&broker)
+    .turn(&mut log)
+    .expect("a turn");
     let Outcome::Awaiting { question } = &turn.outcome else {
         panic!("expected a question")
     };
@@ -417,10 +504,19 @@ fn a_standing_no_refuses_the_next_turn_without_asking_again() {
         .expect("answered");
 
     let next = ScriptedModel::one("touch ran");
-    let turn = Seams::new(&task, &work, &policy, &builder, &next, &shell, &verifier)
-        .brokering(&broker)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &next,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&broker)
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Refused { reason } => {
@@ -453,10 +549,19 @@ fn an_answer_for_one_question_only_asks_again() {
     let mut log = session(&root, "once");
 
     let first = ScriptedModel::one("echo one");
-    let turn = Seams::new(&task, &work, &policy, &builder, &first, &shell, &verifier)
-        .brokering(&broker)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &first,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&broker)
+    .turn(&mut log)
+    .expect("a turn");
     let Outcome::Awaiting { question } = &turn.outcome else {
         panic!("expected a question")
     };
@@ -465,10 +570,19 @@ fn an_answer_for_one_question_only_asks_again() {
         .expect("answered");
 
     let second = ScriptedModel::one("echo two");
-    let turn = Seams::new(&task, &work, &policy, &builder, &second, &shell, &verifier)
-        .brokering(&broker)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &second,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .brokering(&broker)
+    .turn(&mut log)
+    .expect("a turn");
 
     assert!(
         matches!(turn.outcome, Outcome::Awaiting { .. }),
@@ -494,9 +608,18 @@ fn a_question_with_nobody_to_ask_refuses_rather_than_allows() {
     let builder = context(&task);
 
     let mut log = session(&root, "nobroker");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Refused { reason } => {
@@ -521,10 +644,19 @@ fn a_profile_that_asks_for_no_judge_is_recorded_as_unjudged() {
     let judge = harness::judge::Scripted::always(Verdict::Met);
 
     let mut log = session(&root, "unjudged");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .judging(&judge)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .judging(&judge)
+    .turn(&mut log)
+    .expect("a turn");
 
     let Outcome::Ran { verdict, .. } = &turn.outcome else {
         panic!("expected a run")
@@ -551,9 +683,18 @@ fn a_judge_that_is_asked_for_and_absent_says_so() {
     let builder = context(&task);
 
     let mut log = session(&root, "nojudge");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     let Outcome::Ran { verdict, .. } = &turn.outcome else {
         panic!("expected a run")
@@ -582,9 +723,18 @@ fn a_section_that_does_not_fit_is_dropped_whole_and_named_in_the_log() {
     ]);
 
     let mut log = session(&root, "dropped");
-    Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     assert_eq!(log.entries()[1].payload["dropped"][0], "huge");
     assert_eq!(log.entries()[1].payload["context_tokens"], 1);
@@ -602,9 +752,18 @@ fn a_tool_that_cannot_run_is_a_harness_fault_and_says_what_it_tried() {
     let builder = context(&task);
 
     let mut log = session(&root, "tool");
-    let error = Seams::new(&task, &work, &policy, &builder, &model, &broken, &verifier)
-        .turn(&mut log)
-        .expect_err("the tool would not run");
+    let error = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &broken,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect_err("the tool would not run");
 
     assert_eq!(error.class(), Class::Harness);
     assert!(!error.class().counts_against_the_model());
@@ -645,9 +804,18 @@ fn a_long_output_is_cut_at_both_ends_and_the_cut_is_recorded() {
     let builder = context(&task);
 
     let mut log = session(&root, "cut");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     let Outcome::Ran { run, .. } = &turn.outcome else {
         panic!("expected a run")
@@ -672,18 +840,36 @@ fn a_second_turn_resumes_the_log_and_hangs_off_the_first() {
     let mut log = Session::create(store.clone(), FixedClock, id.clone()).expect("a session");
 
     let first = ScriptedModel::one("echo one");
-    Seams::new(&task, &work, &policy, &builder, &first, &shell, &verifier)
-        .turn(&mut log)
-        .expect("the first turn");
+    Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &first,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("the first turn");
     assert_eq!(log.len(), 7);
 
     // Resume is a read: the second turn continues off the head of what is on disk.
     let mut log = Session::load(store.clone(), FixedClock, id).expect("a reload");
     let head = log.head().expect("a head");
     let second = ScriptedModel::one("echo two");
-    Seams::new(&task, &work, &policy, &builder, &second, &shell, &verifier)
-        .turn(&mut log)
-        .expect("the second turn");
+    Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &second,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("the second turn");
 
     assert_eq!(log.entries()[7].parent, Some(head));
     assert_eq!(
@@ -734,9 +920,18 @@ fn the_log_says_what_the_tool_was_allowed_to_do() {
     let model = ScriptedModel::one("echo hello");
     let mut log = session(&root, "sandbox");
 
-    Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     let call = log
         .entries()
@@ -753,9 +948,18 @@ fn the_log_says_what_the_tool_was_allowed_to_do() {
     let open = Shell::new(&root, LIMIT);
     let mut log = session(&root, "sandbox-open");
     let model = ScriptedModel::one("echo hello");
-    Seams::new(&task, &work, &policy, &builder, &model, &open, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &open,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
     let call = log
         .entries()
         .iter()
@@ -798,9 +1002,18 @@ fn the_watchdog_reads_what_the_turn_recorded_and_a_run_of_git_reads_is_not_stopp
     let model = ScriptedModel::answers(programs.iter().map(|program| ModelAnswer::new(*program)));
     let mut log = session(&root, "did-seam");
     for _ in &programs {
-        Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-            .turn(&mut log)
-            .expect("a turn");
+        Seams::new(
+            &task,
+            &work,
+            &policy,
+            &builder,
+            &model,
+            &shell,
+            &verifier,
+            &journal(&root),
+        )
+        .turn(&mut log)
+        .expect("a turn");
     }
 
     let call = log
@@ -865,9 +1078,18 @@ fn driven(name: &str, programs: &[String]) -> Vec<harness::watchdog::Step> {
     let model = ScriptedModel::new(programs.iter().cloned());
     let mut log = session(&root, name);
     for _ in programs {
-        Seams::new(&task, &work, &policy, &builder, &model, &tool, &verifier)
-            .turn(&mut log)
-            .expect("a turn");
+        Seams::new(
+            &task,
+            &work,
+            &policy,
+            &builder,
+            &model,
+            &tool,
+            &verifier,
+            &journal(&root),
+        )
+        .turn(&mut log)
+        .expect("a turn");
     }
     harness::watchdog::steps(log.entries())
 }
@@ -1046,9 +1268,18 @@ fn an_edit_answer_writes_the_file_and_is_logged_as_a_patch() {
     let builder = context(&task);
 
     let mut log = session(&root, "edit");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Ran {
@@ -1112,9 +1343,18 @@ fn a_refused_edit_writes_nothing_and_runs_no_check() {
     let builder = context(&task);
 
     let mut log = session(&root, "refused-edit");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Unwritten { reason } => assert!(reason.contains("not found"), "{reason}"),
@@ -1155,9 +1395,18 @@ fn an_answer_that_could_not_be_read_is_recorded_and_writes_nothing() {
     let builder = context(&task);
 
     let mut log = session(&root, "unreadable");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Unwritten { reason } => assert!(reason.contains("could not be read"), "{reason}"),
@@ -1191,9 +1440,18 @@ fn a_plan_first_turn_records_the_plan_before_the_program() {
     let builder = context(&task);
 
     let mut log = session(&root, "plan-first");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     assert!(
         matches!(turn.outcome, Outcome::Ran { .. }),
@@ -1235,9 +1493,18 @@ fn an_empty_plan_writes_nothing_and_runs_nothing() {
     let builder = context(&task);
 
     let mut log = session(&root, "plan-empty");
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
     match &turn.outcome {
         Outcome::Unwritten { reason } => {
             assert!(reason.contains("plan came back empty"), "{reason}")
@@ -1261,9 +1528,18 @@ fn a_plan_survives_a_compaction_and_comes_back_in_the_prompt() {
     let builder = context(&task);
     let mut log = session(&root, "plan-compacted");
 
-    Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("the first turn");
+    Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("the first turn");
     log.compact(None, "compacted").expect("a cut");
 
     let learned = harness::context::Learned::from_log(&log);
@@ -1304,6 +1580,7 @@ fn a_second_turn_on_the_same_session_does_not_plan_again() {
         &first_model,
         &shell,
         &verifier,
+        &journal(&root),
     )
     .turn(&mut log)
     .expect("the first turn");
@@ -1319,6 +1596,7 @@ fn a_second_turn_on_the_same_session_does_not_plan_again() {
         &second_model,
         &shell,
         &verifier,
+        &journal(&root),
     )
     .turn(&mut log)
     .expect("the second turn");
@@ -1356,6 +1634,7 @@ fn a_reused_session_plans_again_for_a_different_goal() {
         &first_model,
         &shell,
         &verifier,
+        &journal(&root),
     )
     .turn(&mut log)
     .expect("the first turn");
@@ -1372,6 +1651,7 @@ fn a_reused_session_plans_again_for_a_different_goal() {
         &second_model,
         &shell,
         &verifier,
+        &journal(&root),
     )
     .turn(&mut log)
     .expect("the second turn");
@@ -1409,9 +1689,18 @@ fn a_profile_that_accepts_programs_only_refuses_an_edit_before_writing() {
     let builder = context(&task);
     let mut log = session(&root, "edit-refused");
 
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     match &turn.outcome {
         Outcome::Unwritten { reason } => {
@@ -1472,10 +1761,19 @@ fn a_judged_turn_carries_the_judge_call_in_its_usage() {
     let builder = context(&task);
     let mut log = session(&root, "judge-usage");
 
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .judging(&Costly)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .judging(&Costly)
+    .turn(&mut log)
+    .expect("a turn");
 
     let usage = turn.usage.expect("the turn reports its spend");
     assert_eq!(
@@ -1508,9 +1806,18 @@ fn an_unwritten_turn_carries_the_call_it_paid_for() {
     let builder = context(&task);
     let mut log = session(&root, "unwritten-usage");
 
-    let turn = Seams::new(&task, &work, &policy, &builder, &model, &shell, &verifier)
-        .turn(&mut log)
-        .expect("a turn");
+    let turn = Seams::new(
+        &task,
+        &work,
+        &policy,
+        &builder,
+        &model,
+        &shell,
+        &verifier,
+        &journal(&root),
+    )
+    .turn(&mut log)
+    .expect("a turn");
 
     assert!(matches!(turn.outcome, Outcome::Unwritten { .. }));
     let usage = turn

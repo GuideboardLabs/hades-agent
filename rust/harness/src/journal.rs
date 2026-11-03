@@ -255,9 +255,10 @@ impl Journal {
     }
 }
 
-/// One write, captured. Both mutating file tools go through this, so a path cannot be written by one of
-/// them without its previous bytes being kept, and a third tool that forgets is a registration missing
-/// from [`CAPTURE`] rather than a rewrite.
+/// One write, captured. Both mutating file tools go through this, and so does the governed turn, so a
+/// path cannot be written by any of them without its previous bytes being kept. There is no uncaptured
+/// variant: a writer that has no journal has no `Capture` to hand, which is why the type is a reference
+/// rather than an option.
 ///
 /// The order is the guarantee: read the previous bytes, store the blob, then write. A blob that cannot be
 /// stored stops the capture before the index line is written, so the index never names a path whose bytes
@@ -265,7 +266,7 @@ impl Journal {
 /// because a state directory that cannot be written is not a reason to refuse all work — but it is
 /// counted in [`gaps`] and said on stderr, so a run whose record has holes in it says so.
 pub struct Capture<'a> {
-    journal: Option<&'a Journal>,
+    journal: &'a Journal,
     step: u64,
     tool: &'a str,
 }
@@ -273,22 +274,9 @@ pub struct Capture<'a> {
 impl<'a> Capture<'a> {
     pub fn new(journal: &'a Journal, step: u64, tool: &'a str) -> Capture<'a> {
         Capture {
-            journal: Some(journal),
+            journal,
             step,
             tool,
-        }
-    }
-
-    /// A capture that keeps nothing, for a writer the journal does not cover.
-    ///
-    /// The reason is required and never read: it exists so that every uncovered writer is a line a search
-    /// for `Capture::off` finds, with the argument for it beside it.
-    pub fn off(reason: &'static str) -> Capture<'static> {
-        let _ = reason;
-        Capture {
-            journal: None,
-            step: 0,
-            tool: "",
         }
     }
 
@@ -301,9 +289,7 @@ impl<'a> Capture<'a> {
     where
         F: FnOnce() -> Result<(), E>,
     {
-        let Some(journal) = self.journal else {
-            return write();
-        };
+        let journal = self.journal;
         let found = match read_before(path) {
             Ok(found) => found,
             Err(said) => {

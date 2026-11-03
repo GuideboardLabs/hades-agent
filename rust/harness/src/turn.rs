@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::approval::{ApprovalBroker, ApprovalRequest};
 use crate::context::{Bundle, Context};
 use crate::fault::Fault;
+use crate::journal::Journal;
 use crate::judge::{Evaluator, Judgement, Report, Verdict};
 use crate::model::FeedFn;
 use crate::model::Harness;
@@ -60,6 +61,9 @@ pub struct Seams<'a> {
     harness: &'a dyn Harness,
     tool: &'a dyn Tool,
     verifier: &'a dyn Verifier,
+    /// Where this turn's writes are recorded. Required, not optional: a turn writes files, so a turn with
+    /// nowhere to journal them is a writer the rewind cannot see.
+    journal: &'a Journal,
     evaluator: Option<&'a dyn Evaluator>,
     broker: Option<&'a dyn ApprovalBroker>,
     checkpointer: Option<&'a dyn Checkpointer>,
@@ -72,8 +76,12 @@ pub struct Seams<'a> {
 }
 
 impl<'a> Seams<'a> {
-    /// The seven a turn cannot run without. The judge and the broker are added afterwards, because a turn
-    /// without them is a real turn and a turn without a tool is not.
+    /// The seven a turn cannot run without, plus the journal its writes go to. The judge and the broker are
+    /// added afterwards, because a turn without them is a real turn and a turn without a tool is not.
+    ///
+    /// Eight arguments rather than a builder for the required ones: a builder can be forgotten, and a turn
+    /// built without a journal is the hole this parameter exists to close.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         task: &'a TaskSpec,
         profile: &'a Profile,
@@ -82,6 +90,7 @@ impl<'a> Seams<'a> {
         harness: &'a dyn Harness,
         tool: &'a dyn Tool,
         verifier: &'a dyn Verifier,
+        journal: &'a Journal,
     ) -> Self {
         Seams {
             task,
@@ -91,6 +100,7 @@ impl<'a> Seams<'a> {
             harness,
             tool,
             verifier,
+            journal,
             evaluator: None,
             broker: None,
             checkpointer: None,
@@ -193,6 +203,14 @@ impl<'a> Seams<'a> {
     {
         let mut entries = Vec::new();
         let budget = self.profile.budget();
+        // The step this turn's captures are recorded under: the turn's place in the session, which is the
+        // same number `hades rewind --to <step>` names. A run that made three turns can be rewound to the
+        // end of the first one, because each turn's writes carry its own number.
+        let step = session
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == Kind::User)
+            .count() as u64;
 
         // 1. Context, under a budget, and the record of what was asked for. The request is logged before
         //    anything can refuse it: a turn that never ran is still a turn that was asked for.
@@ -464,10 +482,9 @@ impl<'a> Seams<'a> {
                 entries.push(session.append(Kind::ToolCall, serde_json::Value::Object(payload))?);
                 let run = match crate::patch::write_all(
                     &plans,
-                    // A governed turn carries a task and a root, not a state directory, so there is
-                    // nowhere to put a journal. Said here rather than left to be discovered: this is the
-                    // one writer the run journal does not cover, and a search for `Capture::off` finds it.
-                    &crate::journal::Capture::off("the governed turn has no state directory"),
+                    // The turn's writes go to the same journal the TUI's tool loop writes to, under the
+                    // session this turn belongs to, so `hades rewind <session>` covers both surfaces.
+                    &crate::journal::Capture::new(self.journal, step, "patch"),
                 ) {
                     Ok(report) => crate::command::Run {
                         status: 0,
