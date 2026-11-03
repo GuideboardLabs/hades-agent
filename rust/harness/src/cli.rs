@@ -2721,8 +2721,15 @@ fn connector_cmd(args: &[String]) -> Result<(String, i32), String> {
                 crate::mode::Mode::Read => "read",
                 crate::mode::Mode::Chat => "chat",
             };
+            // The rule this repo keeps: a setting is only real when it is folded into the settings AND
+            // printed. A reasoning word that changes the wire but not this line is a setting a person cannot
+            // check without reading the config file.
+            let effort = match settings.reasoning.as_deref() {
+                Some(word) => format!(", reasoning {word}"),
+                None => String::new(),
+            };
             let mut text = format!(
-                "{id}: every channel not listed below is {} (policy {}, trigger {}, root {}, model {})\n",
+                "{id}: every channel not listed below is {} (policy {}, trigger {}, root {}, model {}{effort})\n",
                 word(settings.mode),
                 settings.policy,
                 settings.trigger.word(),
