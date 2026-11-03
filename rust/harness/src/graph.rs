@@ -1682,6 +1682,12 @@ where
     /// single attempt. Reusing the walk is the point: a candidate has exactly the semantics of a turn, its
     /// log is a session, and its check is the same check.
     fn branch_once(&mut self, fork: &mut Session<S, C>, minutes: u64) -> Result<Run, Fault> {
+        // The candidate's writes belong to the candidate's run. Handing it the parent's journal filed a
+        // losing candidate's entry beside the parent's own, where the rollback could not take it back:
+        // the parent's rewind then refused a file nobody had edited, and `hades journal <candidate>` had
+        // nothing to say about the session that wrote.
+        let session_id = fork.id().to_string();
+        let journal = self.journal.sibling(&session_id);
         let parts = Parts {
             task: self.task,
             profile: self.profile,
@@ -1694,7 +1700,7 @@ where
             // candidate would copy the tree again for no new guarantee, so the branch pays for one copy.
             checkpointer: None,
             evaluator: self.evaluator,
-            journal: self.journal,
+            journal: &journal,
             cache: self.cache,
             reason: self.reason.clone(),
         };

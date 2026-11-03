@@ -890,6 +890,72 @@ fn a_branch_with_no_pass_leaves_the_tree_as_it_found_it() {
     assert!(!rig.root.join("made.txt").exists());
 }
 
+/// A candidate is a session of its own, so its writes belong in its own run directory. Filing them under
+/// the parent's journal made a rolled-back candidate poison the parent's rewind: the losing candidate's
+/// entry named a file the rollback had already put back, so a rewind of the parent refused a tree nobody
+/// had edited and left the intact work unrewound. It also made the candidate's own run name useless:
+/// `hades journal <candidate>` had nothing to show the run that actually wrote.
+#[test]
+fn a_branch_candidate_journals_under_its_own_session_not_the_parents() {
+    let mut rig = Rig::new(
+        "branch-journal",
+        "grep -q good note.txt",
+        open(),
+        ScriptedModel::answers([
+            ModelAnswer::editing(vec![FileEdit {
+                path: "extra.txt".to_string(),
+                old: "alpha".to_string(),
+                new: "candidate one\n".to_string(),
+            }]),
+            ModelAnswer::editing(vec![FileEdit {
+                path: "note.txt".to_string(),
+                old: "alpha".to_string(),
+                new: "good\n".to_string(),
+            }]),
+        ]),
+    );
+    std::fs::write(rig.root.join("note.txt"), "alpha\n").expect("a file");
+    std::fs::write(rig.root.join("extra.txt"), "alpha\n").expect("a second file");
+    // The state directory is outside the tree, as it is for `hades run --state`: inside the tree the
+    // rollback would copy the journal back too, and the test would be measuring the shadow.
+    let state = scratch("branch-journal-state");
+    rig.journal = harness::journal::Journal::at(&state, "oracle");
+
+    // The session store is outside the tree too, for the same reason: a rollback that copied back the
+    // losing candidate's log would let the next fork reuse its id.
+    let store = FileStore::new(state.join("sessions"));
+    let mut session =
+        Session::create(store, FixedClock, SessionId::new("branch-journal")).expect("a session");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts_shadowed(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(2, 10).with_width(2));
+    let walked = runner.run().expect("a walk");
+
+    assert_eq!(walked.branches.len(), 2, "{:?}", walked.branches);
+    assert!(!walked.branches[0].passed, "{:?}", walked.branches[0]);
+    assert!(walked.branches[1].passed, "{:?}", walked.branches[1]);
+    assert_eq!(
+        std::fs::read_to_string(rig.root.join("extra.txt")).expect("extra.txt"),
+        "alpha\n",
+        "the losing candidate was rolled back"
+    );
+
+    let parent = rig.journal.entries();
+    assert!(
+        parent.is_empty(),
+        "the parent wrote nothing, so its journal holds nothing; a candidate's entry is not the parent's: \
+         {parent:?}"
+    );
+    let losing = harness::journal::Journal::at(&state, &walked.branches[0].session);
+    let written = losing.entries();
+    assert_eq!(
+        written.len(),
+        1,
+        "the run that wrote holds its own entry: {written:?}"
+    );
+    assert!(written[0].path.ends_with("extra.txt"), "{written:?}");
+}
+
 #[test]
 fn branch_width_cannot_outrun_the_attempt_budget() {
     let rig = Rig::new(

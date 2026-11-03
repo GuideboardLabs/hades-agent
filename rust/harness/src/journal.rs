@@ -159,6 +159,23 @@ impl Journal {
         &self.run
     }
 
+    /// The journal for another run in the same state directory as this one.
+    ///
+    /// A branch candidate is a session of its own, so its writes belong in its own run directory. Filing
+    /// them under the parent made a losing candidate's entry outlive the rollback that put its file back:
+    /// the parent's rewind then refused a tree nobody had edited, and the session that actually wrote had
+    /// no journal to show. The run name is resolved in one place, [`safe_run`], so a sibling cannot land
+    /// outside the state directory this journal lives in.
+    pub fn sibling(&self, run: &str) -> Journal {
+        let run = safe_run(run);
+        // `<state>/journal/<run>` → `<state>/journal`, which is where a sibling's directory belongs.
+        let holder = self.root.parent().unwrap_or(&self.root);
+        Journal {
+            root: holder.join(&run),
+            run,
+        }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.root
     }
