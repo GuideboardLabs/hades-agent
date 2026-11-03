@@ -146,9 +146,19 @@ pub fn classify(update: &Update, settings: &Settings) -> Verdict {
         Trigger::MentionOnly if commanded(&update.text) || named(update, settings) => {
             Verdict::Requested
         }
-        // A channel somebody listed on purpose is where an unaddressed sentence is still worth reading:
-        // the configuration already said this channel matters, and the model judges the rest.
-        Trigger::MentionOnly if settings.channels.contains_key(update.chat.id()) => {
+        // A channel somebody listed on purpose is where an unaddressed sentence is still worth reading: the
+        // configuration already said this channel matters, and the model judges the rest. That stops applying
+        // the moment the entry says what it wants for itself: a channel entry carrying its own `trigger` has
+        // been answered already, so listing it for `mode: work` must not quietly turn it into a listening
+        // channel that answers everything anybody says. Without this, the only way to get strict mentions was
+        // to stop listing the channel at all, which also took `/run` away from it.
+        Trigger::MentionOnly
+            if settings.channels.contains_key(update.chat.id())
+                && settings
+                    .channels
+                    .get(update.chat.id())
+                    .is_some_and(|channel| channel.trigger.is_none()) =>
+        {
             Verdict::Candidate
         }
         _ => Verdict::Ignore,
@@ -379,6 +389,32 @@ mod tests {
         );
     }
 
+    /// Listing a channel for work must not answer everything anyone says there, as long as the entry also
+    /// says how it is addressed. The alternative was to stop listing the channel, which took `/run` away too.
+    #[test]
+    fn a_channel_that_names_its_own_trigger_is_not_a_listening_channel() {
+        let mut settings = settings(Trigger::MentionOnly);
+        settings.channels.insert(
+            "99".to_string(),
+            crate::gateway::Channel {
+                trigger: Some(Trigger::MentionOnly),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            classify(&update(42, 99, "the build broke again"), &settings),
+            Verdict::Ignore,
+            "an explicit mention trigger on the channel must beat the listed-channel rule"
+        );
+        let mut named = update(42, 99, "the build broke again");
+        named.mention = Some(true); // what the connector reports once it has stripped its own mention token
+        assert_eq!(
+            classify(&named, &settings),
+            Verdict::Requested,
+            "a real mention still reaches it"
+        );
+    }
+
     /// The default has to be exactly the behaviour that existed before the key, or an upgrade silently
     /// stops answering people.
     #[test]
@@ -408,7 +444,8 @@ mod tests {
         );
         assert_eq!(
             classify(&update(42, 99, "the build broke again"), &wide),
-            Verdict::Candidate
+            Verdict::Ignore,
+            "the channel said mention, so a sentence that names nobody is not a request"
         );
         assert_eq!(
             classify(&update(42, 98, "the build broke again"), &wide),
