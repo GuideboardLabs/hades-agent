@@ -802,7 +802,7 @@ pub fn answer_stoppable(
         ("fetch", 60),
         ("shell", 120),
     ];
-    for _ in 0..steps {
+    for step in 0..steps {
         if stopped() {
             return Ok(None);
         }
@@ -946,8 +946,15 @@ pub fn answer_stoppable(
                 activity(Activity::End, &label);
                 continue;
             }
-            let result =
-                execute_with_stop(&call.name, &call.arguments, world, client, activity, stop);
+            let result = execute_with_stop(
+                &call.name,
+                &call.arguments,
+                world,
+                client,
+                activity,
+                stop,
+                step as u64,
+            );
             let result = cap_tool_output(result);
             messages.push(json!({
                 "role": "tool",
@@ -1241,7 +1248,7 @@ fn execute(
     client: &OpenAi,
     activity: &dyn Fn(Activity, &str),
 ) -> String {
-    execute_with_stop(name, arguments, world, client, activity, None)
+    execute_with_stop(name, arguments, world, client, activity, None, 0)
 }
 
 fn execute_with_stop(
@@ -1251,6 +1258,7 @@ fn execute_with_stop(
     client: &OpenAi,
     activity: &dyn Fn(Activity, &str),
     stop: Option<&AtomicBool>,
+    step: u64,
 ) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let what = crate::activity::action(name, &args);
@@ -1386,11 +1394,15 @@ fn execute_with_stop(
         return format!("Refused: {said}. A pre-tool hook stopped this call.");
     }
     decided(world, "surface", &what, "allow", "", &artifact);
+    // One capture per call, from the surface's own state directory and session. A tool that writes gets
+    // it as an argument, so a writer cannot be added without deciding what happens to the previous bytes.
+    let journal = crate::journal::Journal::at(&world.state, &world.session);
+    let capture = crate::journal::Capture::new(&journal, step, name);
     match name {
         "shell" => shell(&args, world),
         "read_file" => read_file(&args, world),
-        "write_file" => write_file(&args, world),
-        "patch" => crate::patch::tool(&args, &world.policy()),
+        "write_file" => write_file(&args, world, &capture),
+        "patch" => crate::patch::tool(&args, &world.policy(), &capture),
         "list_dir" => list_dir(&args, world),
         "search" => search(&args, world),
         "recall" => recall(&args, world),
@@ -2458,7 +2470,7 @@ fn read_file(args: &Value, world: &World) -> String {
     }
 }
 
-fn write_file(args: &Value, world: &World) -> String {
+fn write_file(args: &Value, world: &World, capture: &crate::journal::Capture<'_>) -> String {
     let policy = world.policy();
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     let content = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -2474,7 +2486,9 @@ fn write_file(args: &Value, world: &World) -> String {
     {
         return format!("could not create {}: {error}", parent.display());
     }
-    match std::fs::write(&path, content) {
+    // The only write in this tool, and it goes through the capture: the bytes it is about to replace are
+    // kept first, so the write itself cannot be the thing that loses them.
+    match capture.write(&path, content.as_bytes(), || std::fs::write(&path, content)) {
         Ok(()) => format!("wrote {} ({} bytes)", path.display(), content.len()),
         Err(error) => format!("could not write {}: {error}", path.display()),
     }
@@ -3870,6 +3884,140 @@ mod tests {
             questions: None,
             react: None,
         }
+    }
+
+    /// A write_file call, run through the real dispatch at a named step. The fixture is built by the
+    /// writer itself, never by hand: a hand written journal line proves the reader and nothing else.
+    fn write_at(world: &World, path: &str, content: &str, step: u64) -> String {
+        let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+        let arguments = json!({"path": path, "content": content}).to_string();
+        execute_with_stop(
+            "write_file",
+            &arguments,
+            world,
+            &client,
+            &|_, _| {},
+            None,
+            step,
+        )
+    }
+
+    fn patched_at(world: &World, path: &str, old: &str, new: &str, step: u64) -> String {
+        let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+        let arguments = json!({
+            "path": path,
+            "edits": [{"old": old, "new": new}],
+        })
+        .to_string();
+        execute_with_stop("patch", &arguments, world, &client, &|_, _| {}, None, step)
+    }
+
+    /// The whole point, in one test: after a write, the bytes that were there are still available, under
+    /// the name the journal gives them, and what a rewind has to do is copy them back.
+    #[test]
+    fn a_write_keeps_the_previous_bytes_and_the_journal_holds_them() {
+        let dir = crate::scratch::root().join("agent-journal-write");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).expect("a state directory");
+        let path = dir.join("note.txt");
+        std::fs::write(&path, "the bytes before\n").expect("a file to overwrite");
+        let before = mneme::sha256::hex(b"the bytes before\n");
+        let after = mneme::sha256::hex(b"the bytes after\n");
+
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let said = write_at(&world, "note.txt", "the bytes after\n", 3);
+        assert!(said.contains("wrote"), "{said}");
+
+        let journal = crate::journal::Journal::at(&dir.join("state"), &world.session);
+        let entries = journal.entries();
+        assert_eq!(entries.len(), 1, "one write, one entry: {entries:?}");
+        let entry = &entries[0];
+        assert_eq!(entry.tool, "write_file");
+        assert_eq!(entry.step, 3);
+        assert_eq!(
+            entry.path,
+            std::fs::canonicalize(&path)
+                .expect("the written path")
+                .display()
+                .to_string(),
+            "the resolved path, which is the one that was written"
+        );
+        assert_eq!(entry.kind, crate::journal::Kind::File);
+        assert_eq!(entry.bytes, 17, "the size of the bytes that were captured");
+        assert_eq!(
+            entry.before, before,
+            "the recorded before has to be the pre write digest"
+        );
+        assert_eq!(entry.after, after, "and after is what the write left");
+
+        // What a rewind reads: the blob the entry names, which is the file as it was.
+        let blob = std::fs::read(journal.blob(&entry.before)).expect("the previous bytes");
+        assert_eq!(blob, b"the bytes before\n");
+        std::fs::write(&path, &blob).expect("a restore");
+        assert_eq!(
+            mneme::sha256::hex(&std::fs::read(&path).expect("the restored file")),
+            before,
+            "bytes come back identical"
+        );
+    }
+
+    /// An empty file and a file that should not exist are different outcomes. A step that creates a file
+    /// has nothing to restore, so the entry says `absent` and no blob is kept for it; a rewind removes the
+    /// file rather than blanking it.
+    #[test]
+    fn a_new_file_is_recorded_as_absent_rather_than_empty() {
+        let dir = crate::scratch::root().join("agent-journal-absent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).expect("a state directory");
+
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let said = write_at(&world, "fresh.txt", "brand new\n", 0);
+        assert!(said.contains("wrote"), "{said}");
+
+        let journal = crate::journal::Journal::at(&dir.join("state"), &world.session);
+        let entries = journal.entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].kind, crate::journal::Kind::Absent);
+        assert_eq!(entries[0].before, "", "there were no previous bytes");
+        assert_eq!(entries[0].bytes, 0);
+        assert_eq!(
+            entries[0].after,
+            mneme::sha256::hex(b"brand new\n"),
+            "the line still knows what was created"
+        );
+        assert!(
+            !journal.blob(&mneme::sha256::hex(b"")).exists(),
+            "an absent path has no blob, not an empty one"
+        );
+    }
+
+    /// The patch path keeps the same promise, and the chain holds: the second edit's `before` is the
+    /// first edit's `after`, because that is what was on disk when the second call captured it.
+    #[test]
+    fn a_patch_keeps_the_previous_bytes_and_the_next_edit_sees_the_last() {
+        let dir = crate::scratch::root().join("agent-journal-patch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).expect("a state directory");
+        std::fs::write(dir.join("note.txt"), "alpha\nbeta\n").expect("a file to patch");
+
+        let world = world_at(&dir, Mode::Act, "chat:7");
+        let said = patched_at(&world, "note.txt", "beta", "BETA", 1);
+        assert!(said.contains("patched"), "{said}");
+        let said = patched_at(&world, "note.txt", "alpha", "ALPHA", 2);
+        assert!(said.contains("patched"), "{said}");
+
+        let journal = crate::journal::Journal::at(&dir.join("state"), &world.session);
+        let entries = journal.entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].before, mneme::sha256::hex(b"alpha\nbeta\n"));
+        assert_eq!(entries[0].after, mneme::sha256::hex(b"alpha\nBETA\n"));
+        assert_eq!(entries[1].step, 2);
+        assert_eq!(
+            entries[1].before, entries[0].after,
+            "the second capture saw what the first write left"
+        );
+        let blob = std::fs::read(journal.blob(&entries[1].before)).expect("the middle bytes");
+        assert_eq!(blob, b"alpha\nBETA\n");
     }
 
     /// The tags are machinery. A channel shows the answer, and it shows all of it.

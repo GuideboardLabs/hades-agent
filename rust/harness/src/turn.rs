@@ -462,7 +462,13 @@ impl<'a> Seams<'a> {
                 };
                 self.snapshot(session, &mut payload)?;
                 entries.push(session.append(Kind::ToolCall, serde_json::Value::Object(payload))?);
-                let run = match crate::patch::write_all(&plans) {
+                let run = match crate::patch::write_all(
+                    &plans,
+                    // A governed turn carries a task and a root, not a state directory, so there is
+                    // nowhere to put a journal. Said here rather than left to be discovered: this is the
+                    // one writer the run journal does not cover, and a search for `Capture::off` finds it.
+                    &crate::journal::Capture::off("the governed turn has no state directory"),
+                ) {
                     Ok(report) => crate::command::Run {
                         status: 0,
                         output: report,

@@ -9,7 +9,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use harness::patch::{Edit, FileEdit, apply, plan_all, tool, write_all};
+use harness::patch::{Edit, FileEdit, apply, plan_all, write_all};
 use harness::path::PathPolicy;
 
 fn scratch(name: &str) -> PathBuf {
@@ -28,11 +28,27 @@ fn policy_at(dir: &Path) -> PathPolicy {
     PathPolicy::for_root(&std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
 }
 
+/// The oracle drives the tool directly, so nothing it writes is journaled: the journal is proven by the
+/// agent module's own tests, which go through the real dispatch with a known step. The one thing this
+/// function must never grow is a second write path.
+fn tool(args: &serde_json::Value, policy: &PathPolicy) -> String {
+    harness::patch::tool(
+        args,
+        policy,
+        &harness::journal::Capture::off("the patch oracle drives the tool directly"),
+    )
+}
+
 fn edit(old: &str, new: &str) -> Edit {
     Edit {
         old: old.to_string(),
         new: new.to_string(),
     }
+}
+
+/// A capture that keeps nothing, for the calls that reach the low level functions directly.
+fn unjournaled() -> harness::journal::Capture<'static> {
+    harness::journal::Capture::off("the patch oracle drives the tool directly")
 }
 
 fn read(path: &Path) -> String {
@@ -258,8 +274,8 @@ fn apply_refuses_an_empty_edit_list() {
     let dir = scratch("none");
     let file = dir.join("note.txt");
     std::fs::write(&file, "alpha\n").expect("a file");
-    assert!(apply(&file, &[]).is_err());
-    assert!(apply(&file, &[edit("alpha", "beta")]).is_ok());
+    assert!(apply(&file, &[], &unjournaled()).is_err());
+    assert!(apply(&file, &[edit("alpha", "beta")], &unjournaled()).is_ok());
 }
 
 #[test]
@@ -326,7 +342,7 @@ fn two_files_are_planned_then_written_once_each() {
     )
     .expect("both plan");
     assert_eq!(plans.len(), 2);
-    let report = write_all(&plans).expect("both write");
+    let report = write_all(&plans, &unjournaled()).expect("both write");
     assert!(report.contains("2 file(s)"), "{report}");
     assert_eq!(read(&dir.join("a.txt")), "ALPHA\n");
     assert_eq!(read(&dir.join("b.txt")), "BETA\n");
@@ -344,6 +360,6 @@ fn one_path_spelled_two_ways_is_one_file_with_both_edits_in_order() {
     .expect("one file");
     assert_eq!(plans.len(), 1, "the two spellings resolve to one file");
     assert_eq!(plans[0].hunks.len(), 2);
-    write_all(&plans).expect("written");
+    write_all(&plans, &unjournaled()).expect("written");
     assert_eq!(read(&dir.join("a.txt")), "ONE TWO\n");
 }

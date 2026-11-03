@@ -24,6 +24,7 @@
 //! file still race between the read and the rename, narrower than `write_file`'s last-writer-wins but not
 //! gone, because the file has no lock.
 
+use crate::journal::Capture;
 use crate::path::PathPolicy;
 use serde_json::Value;
 use std::io::Write;
@@ -297,10 +298,10 @@ pub fn plan_all(policy: &PathPolicy, edits: &[FileEdit]) -> Result<Vec<Plan>, St
 }
 
 /// Write every planned file, naming what landed if one fails. Returns the report the model reads.
-pub fn write_all(plans: &[Plan]) -> Result<String, String> {
+pub fn write_all(plans: &[Plan], capture: &Capture<'_>) -> Result<String, String> {
     let mut written: Vec<String> = Vec::new();
     for plan in plans {
-        if let Err(said) = write_atomic(&plan.path, &plan.text) {
+        if let Err(said) = write_atomic(&plan.path, &plan.text, capture) {
             return Err(if written.is_empty() {
                 format!("nothing was written: {said}")
             } else {
@@ -332,9 +333,9 @@ pub fn write_all(plans: &[Plan]) -> Result<String, String> {
 }
 
 /// Apply every edit to one file, or none. Kept as the one-file verb the tests and the chat tool use.
-pub fn apply(path: &Path, edits: &[Edit]) -> Result<Applied, String> {
+pub fn apply(path: &Path, edits: &[Edit], capture: &Capture<'_>) -> Result<Applied, String> {
     let plan = plan_at(path, edits)?;
-    write_atomic(&plan.path, &plan.text)?;
+    write_atomic(&plan.path, &plan.text, capture)?;
     Ok(Applied {
         before: plan.before,
         after: plan.after,
@@ -387,7 +388,7 @@ fn lines(text: &str) -> usize {
 
 /// Write once, through a temp file in the same directory, keeping the mode and syncing both the file and
 /// the directory entry.
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+fn write_atomic(path: &Path, text: &str, capture: &Capture<'_>) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no directory to write in", path.display()))?;
@@ -407,7 +408,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
             .unwrap_or(0)
     ));
 
-    let result = (|| -> Result<(), String> {
+    let attempt = || -> Result<(), String> {
         let mut file = std::fs::File::create(&temp).map_err(|error| {
             format!(
                 "could not create a temporary file in {}: {error}. A patch is atomic and needs a \
@@ -432,8 +433,11 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
             .sync_all()
             .map_err(|error| format!("could not sync {}: {error}", parent.display()))?;
         Ok(())
-    })();
+    };
 
+    // The capture runs the write, so the previous bytes are read and kept before the rename that loses
+    // them, and the temporary file is cleaned up whether the write or the capture refused.
+    let result = capture.write(path, text.as_bytes(), attempt);
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -444,7 +448,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 ///
 /// Public because the integration oracle drives it directly; `agent::execute` is private. The policy
 /// comes from the world the tool runs in, and the path it may touch is the path the policy returns.
-pub fn tool(args: &Value, policy: &PathPolicy) -> String {
+pub fn tool(args: &Value, policy: &PathPolicy, capture: &Capture<'_>) -> String {
     let path = args.get("path").and_then(Value::as_str).unwrap_or("");
     if path.is_empty() {
         return "no path given".to_string();
@@ -482,7 +486,7 @@ pub fn tool(args: &Value, policy: &PathPolicy) -> String {
     match plan(policy, path, &edits) {
         Ok(plan) => {
             let sent = plan.sent;
-            match write_all(std::slice::from_ref(&plan)) {
+            match write_all(std::slice::from_ref(&plan), capture) {
                 Ok(_) => {
                     let mut text = format!(
                         "patched {}: {} edit(s), {} -> {} bytes; {} bytes sent",
