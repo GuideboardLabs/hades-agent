@@ -42,7 +42,7 @@ now runs `check-claims.sh`, so a green local run and the claim the release makes
 thing. It previously was not, and a README count drifted two rounds behind the suite while every local
 gate stayed green.
 
-1263 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+1265 tests, 13 ignored. Twelve of the ignored are the live browser suite.
 
 ## 0.2.0
 

@@ -218,13 +218,36 @@ fn run(journal: &Journal, plan: &Plan) -> Result<Report, String> {
         match &step.action {
             Action::Restore { digest } => {
                 let blob = journal.blob(digest);
-                let bytes = std::fs::read(&blob).map_err(|error| {
-                    format!(
-                        "could not read the recorded bytes for {} (blob {}): {error}",
-                        step.path,
-                        blob.display()
-                    )
-                })?;
+                let bytes = match std::fs::read(&blob) {
+                    Ok(bytes) => bytes,
+                    // A blob that is gone is one path's problem, not the undo's: the entries beside it can
+                    // still be put back, and the reason says which path was lost and where it was looked for.
+                    Err(error) => {
+                        report.skipped.push(Skipped {
+                            path: step.path.clone(),
+                            step: step.step,
+                            reason: format!(
+                                "the kept bytes are not readable at {}: {error}",
+                                blob.display()
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                // The name of a blob is the digest of its bytes, so a blob that does not hash to the digest
+                // the entry names is not the file that was captured. Writing it would be a restore the
+                // journal cannot account for, which is the one thing this command exists not to do.
+                let hashed = mneme::sha256::hex(&bytes);
+                if hashed != *digest {
+                    report.skipped.push(Skipped {
+                        path: step.path.clone(),
+                        step: step.step,
+                        reason: format!(
+                            "the stored bytes do not hash to the digest the entry names: {digest} kept, {hashed} stored"
+                        ),
+                    });
+                    continue;
+                }
                 restore(Path::new(&step.path), &bytes)?;
                 report.restored.push(step.path.clone());
             }
@@ -565,6 +588,79 @@ mod tests {
         assert!(planned.skipped[0].reason.contains("secret"), "{planned:?}");
         let text = render(&planned, None, false);
         assert!(text.contains("cannot be rewound"), "{text}");
+    }
+
+    /// A blob is named by the digest of the bytes it holds. If the bytes no longer hash to that name, the
+    /// journal's content addressing is broken and writing them over a good file would be a restore nobody
+    /// could prove. The path is named and skipped instead.
+    #[test]
+    fn a_blob_that_does_not_hash_to_its_name_is_never_written_over_the_file() {
+        let dir = scratch("rewind-corrupt");
+        let journal = Journal::at(&dir, "run-corrupt");
+        let path = dir.join("note.txt");
+        write(
+            &journal,
+            &path,
+            "the run left this\n",
+            "the run's bytes\n",
+            0,
+        );
+        let blob = journal.blob(&mneme::sha256::hex(b"the run left this\n"));
+        let mut bytes = std::fs::read(&blob).expect("the stored bytes");
+        bytes.extend_from_slice(b"and some junk on the end");
+        std::fs::write(&blob, &bytes).expect("a blob that no longer matches its name");
+
+        let planned = plan_of(&journal, Options::default());
+        assert_eq!(planned.steps.len(), 1, "{planned:?}");
+        let report = apply(&journal, &planned, false)
+            .expect("a rewind that will not write bytes it cannot account for");
+        assert!(
+            report.restored.is_empty(),
+            "it reported a restore it did not make: {report:?}"
+        );
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(
+            report.skipped[0]
+                .reason
+                .contains("do not hash to the digest the entry names"),
+            "{}",
+            report.skipped[0].reason
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file the run left"),
+            "the run's bytes\n",
+            "the corrupt bytes were written over the run's file"
+        );
+    }
+
+    /// A blob that is not there at all is a skip with a reason, not a failure that takes the rest of the
+    /// undo with it: one lost blob does not mean the other paths cannot be put back.
+    #[test]
+    fn a_missing_blob_skips_its_path_and_the_rest_still_rewinds() {
+        let dir = scratch("rewind-missing-blob");
+        let journal = Journal::at(&dir, "run-missing");
+        let kept = dir.join("kept.txt");
+        let lost = dir.join("lost.txt");
+        write(&journal, &kept, "kept before\n", "kept after\n", 0);
+        write(&journal, &lost, "lost before\n", "lost after\n", 1);
+        std::fs::remove_file(journal.blob(&mneme::sha256::hex(b"lost before\n")))
+            .expect("a blob that went missing");
+
+        let planned = plan_of(&journal, Options::default());
+        let report = apply(&journal, &planned, false).expect("the paths it can account for");
+        assert_eq!(report.restored, vec![kept.display().to_string()]);
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.skipped[0].path, lost.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&kept).expect("kept"),
+            "kept before\n",
+            "the path with bytes was restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lost).expect("lost"),
+            "lost after\n",
+            "a path with no bytes left is named, not blanked"
+        );
     }
 
     /// The pattern matcher, on the two shapes a person types.
