@@ -69,6 +69,17 @@ hades — the harness, one turn or a whole graph
       puts those files back. A generation captured under a different floor, policy
       or set of profile defaults is refused
 
+  hades journal <run> [--json] [--state <dir>]
+      what one run changed: every path it captured, the digest the path held, the digest the
+      step left behind, and whether the bytes were kept. The run is the session id the writes
+      came from. --json prints it as an object for a script
+
+  hades rewind <run> [--to <step>] [--path <glob>] [--dry-run] [--force] [--state <dir>]
+      put the files back. Every path is hashed as it stands now and compared with the digest
+      the run recorded as what it left; a path that changed since is refused by name with both
+      digests, and --force is the deliberate override. --to <step> leaves the tree as it stood
+      after that step. --dry-run prints the plan and writes nothing
+
   hades route <goal>
       which profile the rules pick for a goal, and why
 
@@ -519,6 +530,8 @@ fn dispatch(
         "jobs" => jobs(rest),
         "goal" => goal_cmd(rest),
         "activity" => activity(rest),
+        "journal" => journal_cmd(rest),
+        "rewind" => rewind_cmd(rest),
         "stop" => stop(rest),
         "cancel" => cancel(rest),
         "shutdown" => shutdown(rest),
@@ -1135,6 +1148,137 @@ fn activity(args: &[String]) -> Result<(String, i32), String> {
         text.push('\n');
     }
     Ok((text, 0))
+}
+
+/// What one run changed, read from its journal.
+///
+/// The run is the session id the writes came from, because that is what the journal directory is named
+/// after and what a person has in hand when they ask. The listing names the digest a path held, the
+/// digest the step left, and whether the bytes are there to put back, so a path that cannot be rewound is
+/// visible here rather than discovered by a command that fails later.
+fn journal_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state"], &["json"])?;
+    let state = state_of(&flags)?;
+    let run = run_of(&flags, "journal")?;
+    let journal = crate::journal::Journal::at(&state, &run);
+    if !journal.index().is_file() {
+        return Ok((
+            format!(
+                "no journal for run `{run}` under {}: the run name is the session its writes came from\n",
+                journal.dir().display()
+            ),
+            1,
+        ));
+    }
+    let scan = journal.scan();
+    if switched(&flags, "json") {
+        let body = serde_json::json!({
+            "run": journal.run(),
+            "entries": scan.entries,
+            "skipped": scan.skipped,
+        });
+        let mut text = serde_json::to_string_pretty(&body)
+            .map_err(|error| format!("could not write the journal as json: {error}"))?;
+        text.push('\n');
+        return Ok((text, 0));
+    }
+    let mut text = format!(
+        "run {}: {} captured path(s), {} line(s) that would not parse\n",
+        journal.run(),
+        scan.entries.len(),
+        scan.skipped
+    );
+    for entry in &scan.entries {
+        text.push_str(&format!(
+            "{} step {:<3} {:<10} {:<8} {}\n",
+            stamp(entry.at),
+            entry.step,
+            entry.tool,
+            entry.kind.name(),
+            entry.path
+        ));
+        if entry.before.is_empty() {
+            text.push_str(&format!(
+                "                             kept no bytes ({})\n",
+                entry.bytes
+            ));
+        } else {
+            text.push_str(&format!(
+                "                             before {} after {}\n",
+                short_digest(&entry.before),
+                short_digest(&entry.after)
+            ));
+        }
+    }
+    if !scan.entries.is_empty() {
+        text.push_str("\nthe bytes are under ");
+        text.push_str(
+            &journal
+                .dir()
+                .join(crate::journal::BLOBS)
+                .display()
+                .to_string(),
+        );
+        text.push('\n');
+    }
+    Ok((text, 0))
+}
+
+/// Put a run's writes back, or say exactly why not.
+fn rewind_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(args, &["state", "to", "path"], &["dry-run", "force"])?;
+    let state = state_of(&flags)?;
+    let run = run_of(&flags, "rewind")?;
+    let to = match flags.named.get("to") {
+        Some(text) => Some(
+            text.parse::<u64>()
+                .map_err(|_| format!("`--to {text}` is not a step number"))?,
+        ),
+        None => None,
+    };
+    let options = crate::rewind::Options {
+        to,
+        path: flags.named.get("path").cloned(),
+        force: switched(&flags, "force"),
+        dry_run: switched(&flags, "dry-run"),
+    };
+    let journal = crate::journal::Journal::at(&state, &run);
+    if !journal.index().is_file() {
+        return Ok((
+            format!(
+                "no journal for run `{run}` under {}: the run name is the session its writes came from\n",
+                journal.dir().display()
+            ),
+            1,
+        ));
+    }
+    let plan = crate::rewind::plan(&journal, &options);
+    if options.dry_run {
+        // The dry run is the plan and nothing else: no write, no delete, and the line that says so.
+        return Ok((crate::rewind::render(&plan, None, true), 0));
+    }
+    match crate::rewind::apply(&journal, &plan, options.force) {
+        Ok(report) => Ok((crate::rewind::render(&plan, Some(&report), false), 0)),
+        Err(refused) => Ok((
+            format!("{}\n{}", crate::rewind::render(&plan, None, false), refused),
+            1,
+        )),
+    }
+}
+
+/// The run a journal command is about: the one positional argument, named when it is missing.
+fn run_of(flags: &Flags, command: &str) -> Result<String, String> {
+    flags.positional.first().cloned().ok_or_else(|| {
+        format!("`hades {command}` needs a run: the session id the writes came from")
+    })
+}
+
+/// A digest short enough to compare by eye in a listing. The full one is in `--json`.
+fn short_digest(digest: &str) -> String {
+    if digest.is_empty() {
+        return "(none)".to_string();
+    }
+    digest.chars().take(12).collect()
 }
 
 /// Stop running work. One verb with a scope: a session, a numbered run, or every run. It never ends the
@@ -8102,5 +8246,134 @@ mod profile_model_tests {
             effective_model(Some(&second), &verify),
             Some("deepseek-v4.1-flash")
         );
+    }
+}
+
+#[cfg(test)]
+mod journal_cli_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        crate::scratch::unique(name)
+    }
+
+    /// Run one CLI invocation with no interactive input, the way `main` does.
+    fn run(args: &[&str]) -> (String, i32) {
+        let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let mut input: &[u8] = b"";
+        let code = run_with(&owned, &mut out, &mut input);
+        (String::from_utf8_lossy(&out).to_string(), code)
+    }
+
+    /// A run's history built by the real writer: the patch tool, with a real capture. Never a hand
+    /// written journal line, because a hand written one proves the reader and nothing else.
+    fn history(dir: &Path, run_name: &str, file: &str, old: &str, new: &str) -> String {
+        let journal = crate::journal::Journal::at(dir, run_name);
+        let path = dir.join(file);
+        std::fs::write(&path, old).expect("the file to patch");
+        let capture = crate::journal::Capture::new(&journal, 0, "patch");
+        let said = crate::patch::tool(
+            &serde_json::json!({"path": file, "edits": [{"old": old, "new": new}]}),
+            &crate::path::PathPolicy::for_root(dir),
+            &capture,
+        );
+        assert!(said.contains("patched"), "{said}");
+        std::fs::read(dir.join(file)).expect("the patched file");
+        path.display().to_string()
+    }
+
+    #[test]
+    fn the_journal_verb_lists_what_a_run_captured_and_json_parses() {
+        let dir = scratch("cli-journal");
+        let path = history(&dir, "s1", "note.txt", "beta\n", "BETA\n");
+
+        let (text, code) = run(&["journal", "s1", "--state", &dir.display().to_string()]);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains(&path), "{text}");
+        assert!(text.contains("patch"), "{text}");
+        assert!(text.contains("step 0"), "{text}");
+
+        let (text, code) = run(&[
+            "journal",
+            "s1",
+            "--state",
+            &dir.display().to_string(),
+            "--json",
+        ]);
+        assert_eq!(code, 0, "{text}");
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(body["run"], "s1");
+        assert_eq!(body["entries"][0]["path"], path);
+        assert_eq!(
+            body["entries"][0]["before"],
+            mneme::sha256::hex(b"beta\n"),
+            "the digest the path held before the step"
+        );
+        assert_eq!(body["skipped"], 0);
+    }
+
+    /// The acceptance case a person reads: edit after the run, ask for a rewind, and be told both digests
+    /// with the newer edit still on disk.
+    #[test]
+    fn the_rewind_verb_refuses_a_file_that_moved_on_and_names_both_digests() {
+        let dir = scratch("cli-rewind");
+        let path = history(&dir, "s2", "note.txt", "beta\n", "BETA\n");
+        let recorded = mneme::sha256::hex(b"BETA\n");
+        std::fs::write(&path, "a newer edit\n").expect("an edit after the run");
+        let newer = mneme::sha256::hex(b"a newer edit\n");
+
+        let (text, code) = run(&["rewind", "s2", "--state", &dir.display().to_string()]);
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains(&recorded), "both digests: {text}");
+        assert!(text.contains(&newer), "both digests: {text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the newer edit"),
+            "a newer edit\n",
+            "nothing was written"
+        );
+
+        // A dry run plans and writes nothing, and says so.
+        let (text, code) = run(&[
+            "rewind",
+            "s2",
+            "--state",
+            &dir.display().to_string(),
+            "--dry-run",
+            "--force",
+        ]);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("would"), "{text}");
+        assert!(text.contains("nothing was written"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the newer edit"),
+            "a newer edit\n",
+            "a dry run wrote nothing"
+        );
+
+        // The deliberate override puts the run's predecessor back.
+        let (text, code) = run(&[
+            "rewind",
+            "s2",
+            "--state",
+            &dir.display().to_string(),
+            "--force",
+        ]);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("restore"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the restored file"),
+            "beta\n"
+        );
+    }
+
+    #[test]
+    fn a_rewind_with_no_journal_names_the_run_it_could_not_find() {
+        let dir = scratch("cli-no-journal");
+        let (text, code) = run(&["rewind", "nobody", "--state", &dir.display().to_string()]);
+        assert_eq!(code, 1, "{text}");
+        assert!(text.contains("no journal for run `nobody`"), "{text}");
+        assert!(text.contains("journal"), "{text}");
+        assert!(!text.contains("hades tui"), "not a usage dump: {text}");
     }
 }

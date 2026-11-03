@@ -1,0 +1,584 @@
+//! Putting a run's writes back.
+//!
+//! The journal records what was there before a step changed it. This module reads that record, decides
+//! what putting it back means for each path, and refuses when doing so would destroy newer work.
+//!
+//! The refusal is the feature, not a safety rail on it. A rewind that trusted the journal alone would
+//! silently overwrite anything a person wrote after the run, and "undo" would be a command that costs work
+//! it was asked to save. So every path is hashed as it stands now and compared with the digest the entry
+//! recorded as what the write left. Equal means the file is exactly what the run made, and undoing it
+//! loses nothing. Different means somebody edited it since, and the command names the path and both
+//! digests and stops. `--force` is the deliberate override, and it is spelled out because it is a
+//! different decision.
+//!
+//! Two things are deliberately not here. A rewind is a person's command, so it never runs inside a turn.
+//! And the journal is not written to while rewinding: undoing is not a run, and a run journal that
+//! recorded its own undo would need a second journal to undo that.
+
+use crate::journal::{Journal, Kind};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::Path;
+
+/// What a rewind was asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Leave the tree as it stood after this step: every change captured at a later step is undone, and
+    /// the changes the run made at or before it are kept. `--to 0` therefore undoes everything the run did
+    /// after its first step, which is what a person means by "put it back to the beginning".
+    pub to: Option<u64>,
+    /// Only paths matching this glob. Matched against the whole path and against any suffix that starts
+    /// after a `/`, so `--path '*.md'` and `--path notes/*.md` both do what a person means.
+    pub path: Option<String>,
+    /// Put the recorded bytes back even when the file moved on since the run.
+    pub force: bool,
+    /// Print the plan and write nothing.
+    pub dry_run: bool,
+}
+
+/// What putting one path back means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Write the blob the entry names over the path.
+    Restore { digest: String },
+    /// The path did not exist before the step, so putting it back removes it. An empty file and a file
+    /// that should not exist are different outcomes.
+    Remove,
+}
+
+impl Action {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Action::Restore { .. } => "restore",
+            Action::Remove => "remove",
+        }
+    }
+}
+
+/// One path the rewind will touch, with the evidence for touching it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    pub path: String,
+    /// The step whose capture is being undone: the oldest entry the filters allowed for this path.
+    pub step: u64,
+    pub tool: String,
+    pub action: Action,
+    /// The digest the entry recorded as what the run left.
+    pub expected: String,
+    /// The digest the path has now, or empty when it is not there.
+    pub found: String,
+    /// Whether those two differ, which is the whole reason this command can refuse.
+    pub drifted: bool,
+}
+
+/// A path the journal names but cannot put back, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub path: String,
+    pub step: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub run: String,
+    pub steps: Vec<Planned>,
+    pub skipped: Vec<Skipped>,
+}
+
+impl Plan {
+    /// The paths that moved on since the run.
+    pub fn drifted(&self) -> Vec<&Planned> {
+        self.steps.iter().filter(|step| step.drifted).collect()
+    }
+
+    /// Whether this plan can be carried out without `--force`.
+    pub fn blocked(&self) -> bool {
+        self.steps.iter().any(|step| step.drifted)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub restored: Vec<String>,
+    pub removed: Vec<String>,
+    pub skipped: Vec<Skipped>,
+}
+
+impl Report {
+    pub fn touched(&self) -> usize {
+        self.restored.len() + self.removed.len()
+    }
+}
+
+/// Decide what a rewind would do. Reads the journal and hashes the tree; writes nothing.
+///
+/// Two entries per path matter, and they are not the same one. The *first* capture says what to restore:
+/// undoing a run means returning the path to the state it was in before the run touched it, so a path
+/// written twice comes back as its oldest recorded `before` rather than as the middle version. The *last*
+/// capture says what to compare against: the question the refusal asks is whether anything changed after
+/// the run finished with that path, and the run's final `after` is the only digest that answers it. Using
+/// one entry for both would refuse every path a run wrote more than once.
+pub fn plan(journal: &Journal, options: &Options) -> Plan {
+    let mut planned = Plan {
+        run: journal.run().to_string(),
+        ..Plan::default()
+    };
+    // Sorted by path, so a plan reads the same way twice and a partial failure is reproducible.
+    let entries = journal.entries();
+    // (first capture, last capture) for each path, in path order.
+    let mut spans: BTreeMap<&str, (&crate::journal::Entry, &crate::journal::Entry)> =
+        BTreeMap::new();
+    for entry in entries.iter() {
+        if let Some(to) = options.to
+            && entry.step <= to
+        {
+            continue;
+        }
+        if let Some(pattern) = &options.path
+            && !matches(pattern, &entry.path)
+        {
+            continue;
+        }
+        spans
+            .entry(entry.path.as_str())
+            .and_modify(|(_, last)| *last = entry)
+            .or_insert((entry, entry));
+    }
+    for (first, last) in spans.into_values() {
+        if !first.kind.recoverable() {
+            planned.skipped.push(Skipped {
+                path: first.path.clone(),
+                step: first.step,
+                reason: format!(
+                    "recorded as {} at step {}: no bytes were kept, so this path cannot be rewound",
+                    first.kind.name(),
+                    first.step
+                ),
+            });
+            continue;
+        }
+        let found = digest_at(Path::new(&first.path)).unwrap_or_default();
+        // The whole reason this command can refuse: the path is hashed as it stands now and compared with
+        // the digest the run recorded as what it left. Anything else is somebody's newer work.
+        let drifted = found != last.after;
+        planned.steps.push(Planned {
+            path: first.path.clone(),
+            step: first.step,
+            tool: first.tool.clone(),
+            action: match first.kind {
+                Kind::Absent => Action::Remove,
+                _ => Action::Restore {
+                    digest: first.before.clone(),
+                },
+            },
+            expected: last.after.clone(),
+            found,
+            drifted,
+        });
+    }
+    planned
+}
+
+/// Carry out a plan. Refuses, naming every drifted path with both digests, unless `force` was asked for.
+///
+/// The check happens in [`plan`]; this repeats it as a guard because a caller can build a `Plan` by hand
+/// and the cost of refusing twice is nothing next to restoring over somebody's edit.
+pub fn apply(journal: &Journal, plan: &Plan, force: bool) -> Result<Report, String> {
+    if force {
+        return run(journal, plan);
+    }
+    if plan.blocked() {
+        let mut said =
+            String::from("refused: the run's work has been changed since it was written:\n");
+        for step in plan.drifted() {
+            said.push_str(&format!(
+                "  {}\n    recorded at step {}: {}\n    found now:          {}\n",
+                step.path,
+                step.step,
+                digest(&step.expected),
+                digest(&step.found)
+            ));
+        }
+        said.push_str(
+            "Nothing was written. Put these bytes back anyway with --force, or rewind a path at a time \
+             with --path.",
+        );
+        return Err(said);
+    }
+    run(journal, plan)
+}
+
+fn run(journal: &Journal, plan: &Plan) -> Result<Report, String> {
+    let mut report = Report {
+        skipped: plan.skipped.clone(),
+        ..Report::default()
+    };
+    for step in &plan.steps {
+        match &step.action {
+            Action::Restore { digest } => {
+                let blob = journal.blob(digest);
+                let bytes = std::fs::read(&blob).map_err(|error| {
+                    format!(
+                        "could not read the recorded bytes for {} (blob {}): {error}",
+                        step.path,
+                        blob.display()
+                    )
+                })?;
+                restore(Path::new(&step.path), &bytes)?;
+                report.restored.push(step.path.clone());
+            }
+            Action::Remove => {
+                match std::fs::remove_file(&step.path) {
+                    Ok(()) => report.removed.push(step.path.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Nothing to undo: the path the run created is already gone.
+                    }
+                    Err(error) => {
+                        return Err(format!("could not remove {}: {error}", step.path));
+                    }
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Write the bytes beside the path and rename, so a reader sees the old file or the whole new one.
+fn restore(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no directory to write in", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let temp = parent.join(format!(
+        ".{name}.hades-rewind-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&temp, bytes)
+        .and_then(|()| std::fs::rename(&temp, path))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            format!("could not restore {}: {error}", path.display())
+        })
+}
+
+/// The digest of a file as it stands, or `None` when it is not there.
+///
+/// Streamed rather than read whole: a file a run wrote can be large, and the check only needs the bytes
+/// once through the hasher.
+pub fn digest_at(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut digest = mneme::sha256::Digest::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => digest.update(&buffer[..read]),
+            Err(_) => return None,
+        }
+    }
+    Some(digest.finish())
+}
+
+/// A digest for a person to read: short enough to compare by eye, or a word when there is none.
+fn digest(value: &str) -> String {
+    if value.is_empty() {
+        return "(nothing recorded)".to_string();
+    }
+    value.to_string()
+}
+
+/// Whether a path matches a glob: the whole path, or any suffix starting after a `/`.
+pub fn matches(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    if glob(&pattern, &path.chars().collect::<Vec<char>>()) {
+        return true;
+    }
+    for (index, _) in path.match_indices('/') {
+        if glob(&pattern, &path[index + 1..].chars().collect::<Vec<char>>()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn glob(pattern: &[char], text: &[char]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some(('*', rest)) => {
+            let mut tail = text;
+            loop {
+                if glob(rest, tail) {
+                    return true;
+                }
+                if tail.is_empty() {
+                    return false;
+                }
+                tail = &tail[1..];
+            }
+        }
+        Some(('?', rest)) => !text.is_empty() && glob(rest, &text[1..]),
+        Some((first, rest)) => {
+            text.first() == Some(first) && glob(rest, text.get(1..).unwrap_or(&[]))
+        }
+    }
+}
+
+/// The plan as a person reads it, before or after it ran.
+pub fn render(plan: &Plan, report: Option<&Report>, dry_run: bool) -> String {
+    let mut text = String::new();
+    if plan.steps.is_empty() && plan.skipped.is_empty() {
+        text.push_str(&format!(
+            "run {}: the journal records nothing to rewind\n",
+            plan.run
+        ));
+        return text;
+    }
+    for step in &plan.steps {
+        let mark = if step.drifted { " (changed since)" } else { "" };
+        text.push_str(&format!(
+            "{:<9}{:<8} {} (step {}, {}){mark}\n",
+            if dry_run { "would" } else { "" },
+            step.action.verb(),
+            step.path,
+            step.step,
+            step.tool
+        ));
+    }
+    for skip in &plan.skipped {
+        text.push_str(&format!("skip     {}: {}\n", skip.path, skip.reason));
+    }
+    match report {
+        Some(report) => text.push_str(&format!(
+            "{} restored, {} removed, {} skipped\n",
+            report.restored.len(),
+            report.removed.len(),
+            report.skipped.len()
+        )),
+        None if dry_run => text.push_str("nothing was written (--dry-run)\n"),
+        None => {}
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::{Capture, Journal};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        crate::scratch::unique(name)
+    }
+
+    /// A write through the real capture, which is the door both mutating tools use. The fixture is never
+    /// a hand written journal line: a hand written line proves the reader and nothing else.
+    fn write(journal: &Journal, path: &Path, before: &str, after: &str, step: u64) {
+        std::fs::write(path, before).expect("the bytes before");
+        Capture::new(journal, step, "write_file")
+            .write::<std::io::Error, _>(path, after.as_bytes(), || std::fs::write(path, after))
+            .expect("the write");
+    }
+
+    /// A path a run created, through the same capture.
+    fn create(journal: &Journal, path: &Path, content: &str, step: u64) {
+        Capture::new(journal, step, "write_file")
+            .write::<std::io::Error, _>(path, content.as_bytes(), || std::fs::write(path, content))
+            .expect("the write");
+    }
+
+    fn plan_of(journal: &Journal, options: Options) -> Plan {
+        plan(journal, &options)
+    }
+
+    /// The refusal is the feature. A rewind that trusted the journal would overwrite whatever a person
+    /// wrote after the run, so this names the path and both digests and writes nothing.
+    #[test]
+    fn a_rewind_refuses_when_the_file_changed_after_the_run() {
+        let dir = scratch("rewind-drift");
+        let journal = Journal::at(&dir, "run-drift");
+        let path = dir.join("note.txt");
+        write(
+            &journal,
+            &path,
+            "the run left this\n",
+            "the run's own bytes\n",
+            0,
+        );
+        let recorded = digest_at(&path).expect("the file the run left");
+        std::fs::write(&path, "a person wrote this after\n").expect("a newer edit");
+
+        let planned = plan_of(
+            &journal,
+            Options {
+                ..Options::default()
+            },
+        );
+        assert_eq!(planned.steps.len(), 1, "{planned:?}");
+        assert!(
+            planned.steps[0].drifted,
+            "the file does not hold what the run left: {planned:?}"
+        );
+        assert_eq!(planned.steps[0].expected, recorded);
+
+        let refused = apply(&journal, &planned, false).expect_err("a refusal");
+        let now = mneme::sha256::hex(b"a person wrote this after\n");
+        assert!(refused.contains(&recorded), "both digests: {refused}");
+        assert!(refused.contains(&now), "both digests: {refused}");
+        assert!(refused.contains("note.txt"), "the path: {refused}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the newer edit"),
+            "a person wrote this after\n",
+            "nothing was written"
+        );
+
+        // The deliberate override, and it puts the run's predecessor back.
+        let report = apply(&journal, &planned, true).expect("forced");
+        assert_eq!(report.restored.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the restored file"),
+            "the run left this\n"
+        );
+    }
+
+    /// Bytes come back identical, and a file the run created is removed rather than left empty.
+    #[test]
+    fn a_rewind_restores_the_bytes_and_removes_what_the_run_created() {
+        let dir = scratch("rewind-restore");
+        let journal = Journal::at(&dir, "run-restore");
+        let kept = dir.join("kept.txt");
+        let made = dir.join("made.txt");
+        std::fs::write(&kept, "the original bytes\n").expect("a file");
+        let before = digest_at(&kept).expect("a digest");
+        write(&journal, &kept, "the original bytes\n", "rewritten\n", 0);
+        create(&journal, &made, "created by the run\n", 1);
+
+        let planned = plan_of(&journal, Options::default());
+        assert_eq!(planned.steps.len(), 2, "{planned:?}");
+        let report = apply(&journal, &planned, false).expect("a rewind");
+
+        assert_eq!(report.restored, vec![kept.display().to_string()]);
+        assert_eq!(report.removed, vec![made.display().to_string()]);
+        assert_eq!(digest_at(&kept), Some(before), "bytes come back identical");
+        assert!(!made.exists(), "a created file is removed, not blanked");
+    }
+
+    /// `--to` leaves the tree as it stood after that step, which for a path written twice is the middle
+    /// version rather than the first or the last.
+    #[test]
+    fn a_rewind_to_a_step_leaves_the_tree_as_it_stood_then() {
+        let dir = scratch("rewind-to");
+        let journal = Journal::at(&dir, "run-to");
+        let path = dir.join("note.txt");
+        write(&journal, &path, "v1\n", "v2\n", 0);
+        write(&journal, &path, "v2\n", "v3\n", 1);
+
+        let all = plan_of(&journal, Options::default());
+        apply(&journal, &all, false).expect("a full rewind");
+        assert_eq!(std::fs::read_to_string(&path).expect("v1"), "v1\n");
+
+        write(&journal, &path, "v2\n", "v3\n", 1);
+        assert_eq!(std::fs::read_to_string(&path).expect("v3"), "v3\n");
+        let middle = plan_of(
+            &journal,
+            Options {
+                to: Some(0),
+                ..Options::default()
+            },
+        );
+        assert_eq!(middle.steps.len(), 1, "{middle:?}");
+        assert_eq!(middle.steps[0].step, 1);
+        apply(&journal, &middle, false).expect("a rewind to step 0");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("v2"),
+            "v2\n",
+            "the state after step 0, not the beginning"
+        );
+
+        // Past the last step there is nothing to undo, which is a fact worth saying rather than an error.
+        let nothing = plan_of(
+            &journal,
+            Options {
+                to: Some(9),
+                ..Options::default()
+            },
+        );
+        assert!(nothing.steps.is_empty(), "{nothing:?}");
+        assert!(render(&nothing, None, false).contains("nothing to rewind"));
+    }
+
+    /// A pattern picks the paths it names and leaves the rest alone.
+    #[test]
+    fn a_path_glob_rewinds_only_what_it_matches() {
+        let dir = scratch("rewind-glob");
+        let journal = Journal::at(&dir, "run-glob");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).expect("a directory");
+        let one = notes.join("one.md");
+        let two = notes.join("two.txt");
+        write(&journal, &one, "one before\n", "one after\n", 0);
+        write(&journal, &two, "two before\n", "two after\n", 1);
+
+        let planned = plan_of(
+            &journal,
+            Options {
+                path: Some("*.md".to_string()),
+                ..Options::default()
+            },
+        );
+        assert_eq!(planned.steps.len(), 1, "{planned:?}");
+        assert_eq!(planned.steps[0].path, one.display().to_string());
+        apply(&journal, &planned, false).expect("a rewind");
+        assert_eq!(std::fs::read_to_string(&one).expect("one"), "one before\n");
+        assert_eq!(
+            std::fs::read_to_string(&two).expect("two"),
+            "two after\n",
+            "a path outside the pattern is untouched"
+        );
+    }
+
+    /// A capture with no bytes behind it is named, not quietly skipped: a rewind that reported success
+    /// having restored nothing is worse than one that refuses.
+    #[test]
+    fn a_path_with_no_kept_bytes_is_named_and_not_restored() {
+        let dir = scratch("rewind-secret");
+        let journal = Journal::at(&dir, "run-secret");
+        let path = dir.join(".env");
+        std::fs::write(&path, "TOKEN=one\n").expect("a file that looks like a key");
+        Capture::new(&journal, 0, "write_file")
+            .write::<std::io::Error, _>(&path, b"TOKEN=two\n", || {
+                std::fs::write(&path, "TOKEN=two\n")
+            })
+            .expect("the write");
+
+        let planned = plan_of(&journal, Options::default());
+        assert!(planned.steps.is_empty(), "{planned:?}");
+        assert_eq!(planned.skipped.len(), 1, "{planned:?}");
+        assert!(planned.skipped[0].reason.contains("secret"), "{planned:?}");
+        let text = render(&planned, None, false);
+        assert!(text.contains("cannot be rewound"), "{text}");
+    }
+
+    /// The pattern matcher, on the two shapes a person types.
+    #[test]
+    fn a_pattern_matches_a_whole_path_or_a_trailing_run_of_components() {
+        assert!(matches("*.md", "/work/notes/one.md"));
+        assert!(matches("notes/*.md", "/work/notes/one.md"));
+        assert!(matches("/work/*/one.md", "/work/notes/one.md"));
+        assert!(!matches("*.txt", "/work/notes/one.md"));
+        assert!(
+            matches("notes/*.md", "/work/other/notes/one.md"),
+            "a relative pattern matches at any directory boundary, which is what a person typing one means"
+        );
+        assert!(matches("one.md", "/work/notes/one.md"));
+        assert!(matches("note?.md", "/work/notes/note1.md"));
+    }
+}

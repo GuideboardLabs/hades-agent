@@ -75,7 +75,8 @@ pub struct Entry {
     pub at: i64,
     /// Which run this belongs to, as the journal directory spells it.
     pub run: String,
-    /// Which step of the run. `--to <step>` rewinds everything at or before this number.
+    /// Which step of the run captured this. `hades rewind --to <step>` leaves the tree as it stood after
+    /// that step, so the entries it undoes are the ones at a later step.
     pub step: u64,
     /// The tool that asked to write.
     pub tool: String,
