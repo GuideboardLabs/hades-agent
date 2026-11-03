@@ -70,6 +70,9 @@ pub struct Planned {
     pub expected_step: u64,
     /// The digest the path has now, or empty when it is not there.
     pub found: String,
+    /// Why the path could not be hashed now, when there is something there that cannot be read. Kept apart
+    /// from `found` so "I could not look" is never reported as "there is nothing".
+    pub unreadable: Option<String>,
     /// Whether those two differ, which is the whole reason this command can refuse.
     pub drifted: bool,
 }
@@ -188,10 +191,15 @@ pub fn plan(journal: &Journal, options: &Options) -> Plan {
             });
             continue;
         }
-        let found = digest_at(Path::new(&first.path)).unwrap_or_default();
+        let (found, unreadable) = match digest_at(Path::new(&first.path)) {
+            Ok(Some(found)) => (found, None),
+            Ok(None) => (String::new(), None),
+            Err(said) => (String::new(), Some(said)),
+        };
         // The whole reason this command can refuse: the path is hashed as it stands now and compared with
-        // the digest the run recorded as what it left. Anything else is somebody's newer work.
-        let drifted = found != last.after;
+        // the digest the run recorded as what it left. Anything else is somebody's newer work, or something
+        // that cannot be checked at all, and both are reasons not to write over it.
+        let drifted = unreadable.is_some() || found != last.after;
         planned.steps.push(Planned {
             path: first.path.clone(),
             step: first.step,
@@ -205,6 +213,7 @@ pub fn plan(journal: &Journal, options: &Options) -> Plan {
             expected: last.after.clone(),
             expected_step: last.step,
             found,
+            unreadable,
             drifted,
         });
     }
@@ -220,16 +229,24 @@ pub fn apply(journal: &Journal, plan: &Plan, force: bool) -> Result<Report, Stri
         return run(journal, plan);
     }
     if plan.blocked() {
-        let mut said =
-            String::from("refused: the run's work has been changed since it was written:\n");
+        let mut said = String::from("refused: the run's work cannot be verified as it was left:\n");
         for step in plan.drifted() {
             said.push_str(&format!(
-                "  {}\n    recorded at step {}: {}\n    found now:          {}\n",
+                "  {}\n    recorded at step {}: {}\n",
                 step.path,
                 step.expected_step,
-                digest(&step.expected),
-                digest(&step.found)
+                digest(&step.expected)
             ));
+            // Which of the two findings it is, said plainly: a file that cannot be looked at is not a file
+            // that is gone, and the difference decides whether the person goes looking for an edit or for a
+            // permission.
+            match &step.unreadable {
+                Some(why) => said.push_str(&format!("    could not be read now: {why}\n")),
+                None => said.push_str(&format!(
+                    "    found now:          {}\n",
+                    digest(&step.found)
+                )),
+            }
         }
         said.push_str(
             "Nothing was written. Put these bytes back anyway with --force, or rewind a path at a time \
@@ -325,22 +342,31 @@ fn restore(path: &Path, bytes: &[u8]) -> Result<(), String> {
         })
 }
 
-/// The digest of a file as it stands, or `None` when it is not there.
+/// The digest of a file as it stands.
+///
+/// `Ok(None)` is "nothing is there", which is a fact about the tree. `Err` is "there is something there and
+/// it could not be read", which is a different fact: reporting the second as the first turns a broken file
+/// into a deleted one, and sends the person reading the refusal looking for the wrong thing.
 ///
 /// Streamed rather than read whole: a file a run wrote can be large, and the check only needs the bytes
 /// once through the hasher.
-pub fn digest_at(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+pub fn digest_at(path: &Path) -> Result<Option<String>, String> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        // Only "not found" is absence. A permission refusal is not an absent file either.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut digest = mneme::sha256::Digest::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => digest.update(&buffer[..read]),
-            Err(_) => return None,
+            Err(error) => return Err(error.to_string()),
         }
     }
-    Some(digest.finish())
+    Ok(Some(digest.finish()))
 }
 
 /// A digest for a person to read: short enough to compare by eye, or a word when there is none.
@@ -467,7 +493,9 @@ mod tests {
             "the run's own bytes\n",
             0,
         );
-        let recorded = digest_at(&path).expect("the file the run left");
+        let recorded = digest_at(&path)
+            .expect("the file can be read")
+            .expect("the file the run left");
         std::fs::write(&path, "a person wrote this after\n").expect("a newer edit");
 
         let planned = plan_of(
@@ -511,7 +539,9 @@ mod tests {
         let kept = dir.join("kept.txt");
         let made = dir.join("made.txt");
         std::fs::write(&kept, "the original bytes\n").expect("a file");
-        let before = digest_at(&kept).expect("a digest");
+        let before = digest_at(&kept)
+            .expect("a readable file")
+            .expect("a digest");
         write(&journal, &kept, "the original bytes\n", "rewritten\n", 0);
         create(&journal, &made, "created by the run\n", 1);
 
@@ -521,7 +551,11 @@ mod tests {
 
         assert_eq!(report.restored, vec![kept.display().to_string()]);
         assert_eq!(report.removed, vec![made.display().to_string()]);
-        assert_eq!(digest_at(&kept), Some(before), "bytes come back identical");
+        assert_eq!(
+            digest_at(&kept).expect("a readable file"),
+            Some(before),
+            "bytes come back identical"
+        );
         assert!(!made.exists(), "a created file is removed, not blanked");
     }
 
@@ -724,6 +758,35 @@ mod tests {
         assert!(
             !refused.contains("recorded at step 0"),
             "the first capture's step is beside a digest the last capture recorded: {refused}"
+        );
+    }
+
+    /// "Could not read it" and "it is not there" are different findings, and a refusal that reported the
+    /// first as the second would send a person looking for a deleted file instead of a broken one.
+    #[test]
+    fn a_path_that_cannot_be_read_now_is_refused_as_unreadable_not_as_absent() {
+        let dir = scratch("rewind-unreadable");
+        let journal = Journal::at(&dir, "run-unreadable");
+        let path = dir.join("note.txt");
+        write(&journal, &path, "before\n", "after\n", 0);
+        std::fs::remove_file(&path).expect("the file the run wrote");
+        // Something that is there and cannot be hashed as a file: a directory where the file was.
+        std::fs::create_dir(&path).expect("a directory in the file's place");
+
+        let planned = plan_of(&journal, Options::default());
+        assert_eq!(planned.steps.len(), 1, "{planned:?}");
+        assert!(
+            planned.steps[0].drifted,
+            "an unverifiable path is not put back: {planned:?}"
+        );
+        let refused = apply(&journal, &planned, false).expect_err("a refusal");
+        assert!(
+            refused.contains("could not be read now"),
+            "the refusal says why it could not check: {refused}"
+        );
+        assert!(
+            !refused.contains("(nothing recorded)"),
+            "an unreadable path is not an absent one: {refused}"
         );
     }
 
