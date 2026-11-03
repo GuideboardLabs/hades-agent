@@ -438,10 +438,25 @@ pub fn render(plan: &Plan, report: Option<&Report>, mode: Mode) -> String {
         return text;
     }
     let would = !matches!(mode, Mode::Applied);
+    // What the undo actually wrote, when there is a report to ask. A step the report does not name was
+    // not written, and a line that reads "restore <path>" beside "1 skipped" is the same lie as a status
+    // that says the undo worked.
+    let written: Option<std::collections::BTreeSet<&str>> = report.map(|report| {
+        report
+            .restored
+            .iter()
+            .chain(report.removed.iter())
+            .map(String::as_str)
+            .collect()
+    });
     for step in &plan.steps {
         let mark = if step.drifted { " (changed since)" } else { "" };
+        let unwritten = match &written {
+            Some(written) if !written.contains(step.path.as_str()) => " (not written)",
+            _ => "",
+        };
         text.push_str(&format!(
-            "{:<9}{:<8} {} (step {}, {}){mark}\n",
+            "{:<9}{:<8} {} (step {}, {}){mark}{unwritten}\n",
             if would { "would" } else { "" },
             step.action.verb(),
             step.path,
@@ -449,7 +464,14 @@ pub fn render(plan: &Plan, report: Option<&Report>, mode: Mode) -> String {
             step.tool
         ));
     }
-    for skip in &plan.skipped {
+    // The skips the undo is responsible for, not only the ones the plan found: a blob that went missing
+    // between planning and writing is discovered while the loop runs, and its reason is the thing a person
+    // needs at 2 a.m. `Report` starts from the plan's skips, so this prints each one once.
+    let skipped: &[Skipped] = match report {
+        Some(report) => &report.skipped,
+        None => &plan.skipped,
+    };
+    for skip in skipped {
         text.push_str(&format!("skip     {}: {}\n", skip.path, skip.reason));
     }
     match report {
@@ -802,6 +824,43 @@ mod tests {
         assert!(
             !refused.contains("(nothing recorded)"),
             "an unreadable path is not an absent one: {refused}"
+        );
+    }
+
+    /// A skip found while the undo runs — a blob that is gone, or bytes that no longer hash to the name
+    /// the entry gives them — is printed with its reason, not only counted. The partial sentence tells the
+    /// reader "the skipped ones are named above with why", so a skip that is counted and not named makes
+    /// that sentence a lie, and at 2 a.m. the reason is the only thing the reader needs.
+    #[test]
+    fn a_skip_found_during_the_undo_is_printed_with_its_reason() {
+        let dir = scratch("rewind-apply-skip-reason");
+        let journal = Journal::at(&dir, "run-apply-skip");
+        let kept = dir.join("kept.txt");
+        let lost = dir.join("lost.txt");
+        write(&journal, &kept, "kept before\n", "kept after\n", 0);
+        write(&journal, &lost, "lost before\n", "lost after\n", 1);
+        std::fs::remove_file(journal.blob(&mneme::sha256::hex(b"lost before\n")))
+            .expect("a blob that went missing");
+
+        let planned = plan_of(&journal, Options::default());
+        let report = apply(&journal, &planned, false).expect("the paths it can account for");
+        let (code, said) = report.status();
+        assert_eq!(
+            code, 2,
+            "one path put back and one skipped is a partial undo"
+        );
+        let text = format!("{}{said}", render(&planned, Some(&report), Mode::Applied));
+        assert!(
+            text.contains("lost.txt"),
+            "the skipped path is named: {text}"
+        );
+        assert!(
+            text.contains("kept bytes are not readable"),
+            "the reason it was skipped is printed, not just counted: {text}"
+        );
+        assert!(
+            text.contains("named above with why"),
+            "the sentence the report ends with still describes what was printed: {text}"
         );
     }
 
