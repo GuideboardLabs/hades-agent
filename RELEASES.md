@@ -29,7 +29,12 @@ config was treated as a listening channel, so an unaddressed sentence there beca
 call. An entry that names its own `trigger` no longer falls into that rule, so `mode: work` plus
 `trigger: mention` now means what it says instead of answering everything in the room.
 
-1285 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+- **`operators` names the people who may do more than talk.** A room set to `mode: work` is work only for an
+  operator; everybody else the surface admits may converse, and the tools a conversation is handed are the
+  allowlist plus the executor's refusal, not a sentence in a prompt. A wildcard is refused at load, because
+  `"*"` in `allowed_users` exists so a room can speak and the same token must not also hand it the shell.
+
+1287 tests, 13 ignored. Twelve of the ignored are the live browser suite.
 
 ## 0.4.0
 

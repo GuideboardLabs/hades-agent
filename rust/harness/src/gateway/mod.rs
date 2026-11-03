@@ -76,6 +76,10 @@ pub struct Settings {
     /// How much of the model's thinking to ask for, when a channel says nothing: `off`, `low`, `medium` or
     /// `high`. Absent sends no field at all, which is what an endpoint whose behaviour is unknown wants.
     pub reasoning: Option<String>,
+    /// The people allowed to do anything a conversation cannot: run work, write files, spend a shell, change
+    /// a channel. Everyone the surface admits may still talk. Named ids only: a wildcard here would be the
+    /// same as having no list, which is the state this key exists to leave.
+    pub operators: Vec<String>,
     /// Whether a message has to be addressed to this surface before it becomes work. `Always` is the
     /// default and the behaviour that existed before the key.
     pub trigger: trigger::Trigger,
@@ -120,6 +124,35 @@ pub struct Channel {
     pub reasoning: Option<String>,
 }
 
+/// The people allowed to do more than talk, named one by one.
+///
+/// A wildcard is refused rather than ignored: `"*"` in `allowed_users` lets a room speak, and a key that
+/// guards writing and shell must not accept the same token, or the guard is the thing that opens it.
+fn parse_operators(value: &Value, owner: &str) -> Result<Vec<String>, String> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(items) => {
+            let mut named = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return Err(format!("{owner} holds something that is not a user id"));
+                };
+                if id.trim() == "*" {
+                    return Err(format!(
+                        "{owner} cannot be a wildcard: name the people who may act, one id each"
+                    ));
+                }
+                if id.trim().is_empty() {
+                    return Err(format!("{owner} holds an empty id"));
+                }
+                named.push(id.trim().to_string());
+            }
+            Ok(named)
+        }
+        other => Err(format!("{owner} is {other}; it is a list of user ids")),
+    }
+}
+
 /// How much of a model's thinking to ask for.
 ///
 /// Four words, and the reason each is a word rather than a number: `reasoning_effort` is a string field on the
@@ -152,6 +185,31 @@ pub struct Effective {
 }
 
 impl Settings {
+    /// Whether this sender may do anything beyond talking.
+    ///
+    /// A surface with no `operators` keeps the older reading, in which a named `allowed_users` entry was
+    /// implicitly trusted with everything; a wildcard allowlist grants nobody that, because `"*"` was added to
+    /// let people talk and not to hand a room the shell.
+    pub fn is_operator(&self, sender: &str) -> bool {
+        if !self.operators.is_empty() {
+            return self.operators.iter().any(|named| named == sender);
+        }
+        self.allowed
+            .iter()
+            .any(|named| named != "*" && named == sender)
+    }
+
+    /// The settings a message is answered under, with a sender who is not an operator held to a conversation.
+    /// The downgrade is here rather than in every caller because a channel cannot be trusted to know who is
+    /// typing: `mode: work` describes the room, and this decides whether this person may use it.
+    pub fn effective_for(&self, chat: &Chat, sender: &str) -> Effective {
+        let mut effective = self.effective(chat);
+        if !self.is_operator(sender) {
+            effective.mode = crate::mode::Mode::Chat;
+        }
+        effective
+    }
+
     /// Whether a message from this sender may be answered at all.
     ///
     /// `"*"` in `allowed_users` means any sender on this surface, which is how a channel is opened to
@@ -249,6 +307,10 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     let reasoning = parse_reasoning(
         section.get("reasoning").unwrap_or(&Value::Null),
         &format!("{name}.reasoning"),
+    )?;
+    let operators = parse_operators(
+        section.get("operators").unwrap_or(&Value::Null),
+        &format!("{name}.operators"),
     )?;
     let verify = section
         .get("verify")
@@ -535,6 +597,7 @@ pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     }
     Ok(Settings {
         reasoning,
+        operators,
         allowed,
         policy,
         verify,
@@ -1653,8 +1716,9 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
             );
         }
     }
-    // One channel can be a conversation and another a workspace, on the same surface.
-    let effective = settings.effective(&update.chat);
+    // One channel can be a conversation and another a workspace, on the same surface, and the person typing
+    // decides which of those they get: a room set to work is still only work for an operator.
+    let effective = settings.effective_for(&update.chat, &update.from);
     if let Some(callback) = &update.callback {
         let by = format!("{}:{}", update.chat.surface_name(), update.from);
         let parts: Vec<&str> = callback.data.split(':').collect();
@@ -2550,6 +2614,63 @@ mod tests {
 
     /// A channel opened to everyone is opened by `"*"`, not by a blank list, and the wildcard must admit
     /// a sender the config never names while still refusing nobody by accident.
+    /// A room set to work is only work for the people named as operators. Everyone else in it may talk and
+    /// nothing more, whatever the channel says, because the channel describes the room and this decides
+    /// whether the person typing may use it.
+    #[test]
+    fn a_channel_set_to_work_is_a_conversation_for_anyone_who_is_not_an_operator() {
+        let mut settings = settings();
+        settings.mode = crate::mode::Mode::Act;
+        settings.channels.insert(
+            "99".to_string(),
+            Channel {
+                mode: Some(crate::mode::Mode::Act),
+                ..Default::default()
+            },
+        );
+        settings.operators = vec!["7".to_string()];
+        let chat = Chat::telegram(99);
+        assert_eq!(
+            settings.effective_for(&chat, "7").mode,
+            crate::mode::Mode::Act
+        );
+
+        settings.operators.clear();
+        settings.allowed = vec!["7".to_string(), "*".to_string()];
+        assert_eq!(
+            settings.effective_for(&chat, "8").mode,
+            crate::mode::Mode::Chat,
+            "a stranger in a work channel is a conversation"
+        );
+        assert_eq!(
+            settings.effective_for(&chat, "7").mode,
+            crate::mode::Mode::Act,
+            "a named allowlist entry is still an operator when no operators are listed"
+        );
+        let wildcard_only = Settings {
+            allowed: vec!["*".to_string()],
+            ..settings
+        };
+        assert!(
+            !wildcard_only.is_operator("8"),
+            "a wildcard lets a room talk; it must not hand it the shell"
+        );
+    }
+
+    /// A wildcard in the operators key is refused at load rather than ignored, because the key exists to
+    /// narrow what a room may do and the wildcard is the token that widens it.
+    #[test]
+    fn the_operators_key_refuses_a_wildcard_and_an_empty_id() {
+        let refused = parse_operators(&json!(["*"]), "discord.operators")
+            .expect_err("a wildcard is not a list of people");
+        assert!(refused.contains("cannot be a wildcard"), "{refused}");
+        assert!(parse_operators(&json!([""]), "x").is_err());
+        assert_eq!(
+            parse_operators(&json!(["7", "8"]), "x"),
+            Ok(vec!["7".to_string(), "8".to_string()])
+        );
+    }
+
     #[test]
     fn a_reasoning_word_is_one_of_four_and_a_channel_can_override_the_surface() {
         use serde_json::json;
@@ -2621,6 +2742,7 @@ mod tests {
         Settings {
             allowed: vec!["7".to_string()],
             reasoning: None,
+            operators: Vec::new(),
             trigger: Default::default(),
             policy: "guarded".to_string(),
             verify: "true".to_string(),

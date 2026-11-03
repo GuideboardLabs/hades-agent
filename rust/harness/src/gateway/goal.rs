@@ -1023,6 +1023,7 @@ mod tests {
         Settings {
             allowed: vec!["7".to_string()],
             reasoning: None,
+            operators: Vec::new(),
             trigger: Default::default(),
             policy: "guarded".to_string(),
             verify: "true".to_string(),
