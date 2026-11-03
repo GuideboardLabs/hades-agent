@@ -108,10 +108,15 @@ impl Plan {
 pub struct Report {
     pub restored: Vec<String>,
     pub removed: Vec<String>,
+    /// Remove steps whose path was already gone. The undo wanted it absent and it is: not a write, and
+    /// not a failure. Counted apart from `removed` so the totals account for every entry the plan named
+    /// without claiming a delete the command did not make.
+    pub already_absent: Vec<String>,
     pub skipped: Vec<Skipped>,
 }
 
 impl Report {
+    /// The paths the undo itself changed.
     pub fn touched(&self) -> usize {
         self.restored.len() + self.removed.len()
     }
@@ -125,9 +130,20 @@ impl Report {
     /// recovery tool must never print as success.
     pub fn status(&self) -> (i32, String) {
         let touched = self.touched();
+        let absent = self.already_absent.len();
         let skipped = self.skipped.len();
         match (touched, skipped) {
             (_, 0) => (0, String::new()),
+            // A path that was already gone is not a path this command failed on: the state the undo was
+            // asked for holds. With skips beside it the undo is still partial, and the sentence says
+            // nothing was written rather than counting an already absent path as a restore.
+            (0, skipped) if absent > 0 => (
+                2,
+                format!(
+                    "partial undo: nothing written, {absent} path(s) already in the state the undo \
+                     wanted, {skipped} skipped, and the skipped ones are named above with why\n"
+                ),
+            ),
             (0, skipped) => (
                 1,
                 format!(
@@ -321,7 +337,10 @@ fn run(journal: &Journal, plan: &Plan) -> Report {
                 match std::fs::remove_file(&step.path) {
                     Ok(()) => report.removed.push(step.path.clone()),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        // Nothing to undo: the path the run created is already gone.
+                        // Nothing to undo: the path the run created is already gone. That is the state the
+                        // step wanted, so it is counted as already absent rather than dropped: a step in
+                        // neither count reads as an undo that did not finish.
+                        report.already_absent.push(step.path.clone());
                     }
                     Err(error) => report.skipped.push(Skipped {
                         path: step.path.clone(),
@@ -469,10 +488,16 @@ pub fn render(plan: &Plan, report: Option<&Report>, mode: Mode) -> String {
             .map(String::as_str)
             .collect()
     });
+    // A remove step whose path was already gone is in neither list above: the command wrote nothing, and
+    // the state the step wanted holds. Marking it "(not written)" made a finished undo read as an
+    // unfinished one, so it gets its own marker and its own count.
+    let absent: Option<std::collections::BTreeSet<&str>> =
+        report.map(|report| report.already_absent.iter().map(String::as_str).collect());
     for step in &plan.steps {
         let mark = if step.drifted { " (changed since)" } else { "" };
-        let unwritten = match &written {
-            Some(written) if !written.contains(step.path.as_str()) => " (not written)",
+        let unwritten = match (&written, &absent) {
+            (_, Some(absent)) if absent.contains(step.path.as_str()) => " (already absent)",
+            (Some(written), _) if !written.contains(step.path.as_str()) => " (not written)",
             _ => "",
         };
         text.push_str(&format!(
@@ -495,6 +520,15 @@ pub fn render(plan: &Plan, report: Option<&Report>, mode: Mode) -> String {
         text.push_str(&format!("skip     {}: {}\n", skip.path, skip.reason));
     }
     match report {
+        // The counts are what the command did, and a path that was already as the undo wanted it is a
+        // count of its own: three numbers that do not add up to the entries read as a step that vanished.
+        Some(report) if !report.already_absent.is_empty() => text.push_str(&format!(
+            "{} restored, {} removed, {} already absent, {} skipped\n",
+            report.restored.len(),
+            report.removed.len(),
+            report.already_absent.len(),
+            report.skipped.len()
+        )),
         Some(report) => text.push_str(&format!(
             "{} restored, {} removed, {} skipped\n",
             report.restored.len(),
@@ -881,6 +915,40 @@ mod tests {
         assert!(
             text.contains("named above with why"),
             "the sentence the report ends with still describes what was printed: {text}"
+        );
+    }
+
+    /// A path that is already gone is settled, not written, and settled is not the same as skipped. When it
+    /// is the only path the counts say so on their own; when a skip sits beside it the undo is partial and
+    /// the sentence must not claim a write it did not make.
+    #[test]
+    fn an_already_absent_path_beside_a_skip_is_partial_and_claims_no_write() {
+        let report = Report {
+            already_absent: vec!["gone.txt".to_string()],
+            skipped: vec![Skipped {
+                path: "locked.txt".to_string(),
+                step: 1,
+                reason: "Permission denied (os error 13)".to_string(),
+            }],
+            ..Report::default()
+        };
+        let (code, said) = report.status();
+        assert_eq!(
+            code, 2,
+            "one path settled and one skipped is partial: {said}"
+        );
+        assert!(
+            said.contains("nothing written"),
+            "the undo wrote nothing, and the sentence says so: {said}"
+        );
+        assert!(
+            said.contains("1 path(s) already in the state the undo wanted"),
+            "the settled path is counted: {said}"
+        );
+        assert_eq!(
+            report.touched(),
+            0,
+            "an already absent path is not a path this command changed"
         );
     }
 

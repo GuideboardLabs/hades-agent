@@ -3609,6 +3609,51 @@ fn a_state_symlink_into_a_vault_is_refused() {
     assert!(text.contains("notes vault"), "{text}");
 }
 
+// A removal a person already made is not an incomplete undo: the state the run is being put back to (the
+// path is gone) is the state it is in. The step used to land in neither count, so `rewind gone --force`
+// printed "0 restored, 0 removed, 0 skipped" beside a "(not written)" marker, which reads as a failure to
+// undo what had in fact already been undone.
+#[test]
+fn a_rewind_of_a_path_that_is_already_gone_counts_it_as_already_absent() {
+    use harness::journal::{Capture, Journal};
+
+    let state = scratch("rewind-gone-state");
+    let root = scratch("rewind-gone-root");
+    let gone = root.join("gone.txt");
+    let journal = Journal::at(&state, "run-gone");
+    Capture::new(&journal, 0, "write_file")
+        .write::<std::io::Error, _>(&gone, b"made by the run\n", || {
+            std::fs::write(&gone, "made by the run\n")
+        })
+        .expect("a captured create");
+    std::fs::remove_file(&gone).expect("a person removed it after the run");
+
+    let (code, output) = hades(&[
+        "rewind",
+        "run-gone",
+        "--force",
+        "--state",
+        state.to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(
+        code, 0,
+        "the wanted state holds, so the undo is not a failure: {output}"
+    );
+    assert!(
+        output.contains("(already absent)"),
+        "the step says what it found: {output}"
+    );
+    assert!(
+        output.contains("0 restored, 0 removed, 1 already absent, 0 skipped"),
+        "the totals account for the entry: {output}"
+    );
+    assert!(
+        !output.contains("(not written)"),
+        "a step whose wanted state already holds was not left undone: {output}"
+    );
+}
+
 // A rewind that fails after it has already written something must say so. It used to print "would
 // restore" beside a file it had restored and exit 1, which is a recovery command reporting the opposite
 // of what it did. The status is partial (2), the write that landed is in the counts, and the path that
