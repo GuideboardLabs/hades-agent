@@ -209,6 +209,12 @@ impl Journal {
     /// they name, into the parent journal with the run field rewritten to the directory they now live in.
     /// Blobs are content addressed, so a path the parent already captured costs no second copy.
     ///
+    /// The copy is a record of the whole run or of no run. Every blob an entry names is staged first, and
+    /// only then are the lines published, so a failure on the last entry cannot leave the first ones in
+    /// the parent index: a parent holding half a run made `hades rewind <run>` report a complete undo of
+    /// half a run while the uncopied path kept the winner's bytes. A record that is absent is a clean "no
+    /// journal for run"; a record that is a silent prefix is a recovery tool lying about what it undid.
+    ///
     /// Returns how many entries were adopted. Empty input is a no-op, and so is a journal adopting itself:
     /// appending a journal's own lines back to it would duplicate every entry.
     pub fn absorb(&self, other: &Journal) -> Result<usize, String> {
@@ -216,6 +222,12 @@ impl Journal {
             return Ok(0);
         }
         let entries = other.entries();
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        // Stage, then publish. A staged blob is invisible to a reader until an index line names it, so a
+        // blob that is staged into a record the publish never makes costs a file and no correctness.
+        let mut staged = Vec::with_capacity(entries.len());
         for entry in &entries {
             if !entry.before.is_empty() {
                 let kept = other.blob(&entry.before);
@@ -228,12 +240,86 @@ impl Journal {
                 })?;
                 self.put_blob(&entry.before, &bytes)?;
             }
-            self.append(&Entry {
+            staged.push(Entry {
                 run: self.run.clone(),
                 ..entry.clone()
-            })?;
+            });
         }
-        Ok(entries.len())
+        self.publish(&staged)?;
+        Ok(staged.len())
+    }
+
+    /// Publish every staged line to the index at once.
+    ///
+    /// A capture appends one synced line at a time, and that is fine because one capture is one entry.
+    /// Adopting another run's record is a batch, and a sequence of appends cannot be all-or-nothing: the
+    /// file is therefore written whole beside the old one, synced, and renamed into place. A reader sees
+    /// the old record or the new one, never a prefix of the new one, and a write that fails leaves the old
+    /// record exactly as it was.
+    fn publish(&self, entries: &[Entry]) -> Result<(), String> {
+        let holder = self.root.parent();
+        let fresh_holder = holder.is_some_and(|holder| !holder.is_dir());
+        let fresh_run = !self.root.is_dir();
+        let fresh_index = !self.index().is_file();
+        crate::scratch::state_dir(&self.root)
+            .map_err(|error| format!("{}: {error}", self.root.display()))?;
+        // The lines already filed stay: this publishes a longer record, not a different one. A torn tail
+        // an earlier kill left behind is carried through byte for byte, so the reader still counts it.
+        let mut bytes = match std::fs::read(self.index()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(format!("{}: {error}", self.index().display())),
+        };
+        for entry in entries {
+            serde_json::to_writer(&mut bytes, entry)
+                .map_err(|error| format!("could not write a journal line: {error}"))?;
+            bytes.push(b'\n');
+        }
+        // The same rule a blob is stored under: a name nobody else can pick, then a rename.
+        let temp = self.root.join(format!(
+            ".{INDEX}.{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let write = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!(
+                "could not write {}: {error}",
+                self.index().display()
+            ));
+        }
+        if let Err(error) = std::fs::rename(&temp, self.index()) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!(
+                "could not publish {}: {error}",
+                self.index().display()
+            ));
+        }
+        #[cfg(test)]
+        syncs::note_index();
+        // The rename replaced a name inside the run directory, so that directory has to reach the disk
+        // before the record is reported. A run this call created has its directory synced by
+        // `sync_created`; a run that already existed still needs the sync here, because its index name
+        // was replaced rather than appended to.
+        if fresh_holder || fresh_run {
+            self.sync_created(fresh_holder, fresh_run, fresh_index)?;
+        } else {
+            std::fs::File::open(&self.root)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("could not sync {}: {error}", self.root.display()))?;
+            #[cfg(test)]
+            syncs::note_run_dir();
+        }
+        Ok(())
     }
 
     pub fn index(&self) -> PathBuf {

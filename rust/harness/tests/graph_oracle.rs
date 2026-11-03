@@ -1033,6 +1033,96 @@ fn a_branch_winners_write_is_in_the_parent_journal_so_the_run_rewinds_it() {
     );
 }
 
+/// The parent's record of a winner is a record of a whole run or of no run. The copy used to be per
+/// entry: with the parent's blob path for the second entry planted as a directory, the first entry was
+/// already in the parent index when the second failed. The run faulted after the tree had kept the
+/// winner's edits, and `hades rewind <run>` then reported a complete undo of half the run while the
+/// other path kept the winner's bytes. An absent record is a clean "no journal for run"; a record that
+/// silently holds half a run is a recovery tool lying about what it undid.
+#[test]
+fn a_branch_winners_record_is_whole_or_absent_when_a_blob_cannot_be_staged() {
+    let mut rig = Rig::new(
+        "branch-absorb-atomic",
+        "grep -q good note.txt",
+        open(),
+        ScriptedModel::answers([
+            ModelAnswer::editing(vec![FileEdit {
+                path: "decoy.txt".to_string(),
+                old: "alpha".to_string(),
+                new: "candidate one\n".to_string(),
+            }]),
+            ModelAnswer::editing(vec![
+                FileEdit {
+                    path: "note.txt".to_string(),
+                    old: "alpha".to_string(),
+                    new: "good".to_string(),
+                },
+                FileEdit {
+                    path: "extra.txt".to_string(),
+                    old: "beta".to_string(),
+                    new: "kept".to_string(),
+                },
+            ]),
+        ]),
+    );
+    std::fs::write(rig.root.join("note.txt"), "alpha\n").expect("a file");
+    std::fs::write(rig.root.join("extra.txt"), "beta\n").expect("a second file");
+    std::fs::write(rig.root.join("decoy.txt"), "alpha\n").expect("a third file");
+    let state = scratch("branch-absorb-atomic-state");
+    rig.journal = harness::journal::Journal::at(&state, "oracle");
+
+    // The parent's own store path for the second entry's bytes is a directory, so that blob cannot be
+    // staged. The first entry can be, which is what made the record partial.
+    let blocked = rig.journal.blob(&mneme::sha256::hex(b"beta\n"));
+    std::fs::create_dir_all(&blocked).expect("a directory where a blob belongs");
+
+    let store = FileStore::new(state.join("sessions"));
+    let mut session = Session::create(store, FixedClock, SessionId::new("branch-absorb-atomic"))
+        .expect("a session");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts_shadowed(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(2, 10).with_width(2));
+    let fault = runner
+        .run()
+        .expect_err("the copy cannot be staged, so the run says so instead of filing half of it");
+    let said = fault.to_string();
+    assert!(
+        said.contains("could not be filed under `oracle`"),
+        "the fault names the run whose record is missing: {said}"
+    );
+
+    // The accept does not depend on the copy: the winner's edits are the tree's.
+    assert_eq!(
+        std::fs::read_to_string(rig.root.join("note.txt")).expect("note.txt"),
+        "good\n",
+        "the run kept the winner's edit even though its record could not be filed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(rig.root.join("extra.txt")).expect("extra.txt"),
+        "kept\n",
+        "the second kept edit is in the tree too"
+    );
+
+    // What `hades rewind oracle` reads. Before the fix the index held the first entry of two, and a
+    // rewind of it reported a complete undo of half the run.
+    let parent = rig.journal.entries();
+    assert!(
+        parent.is_empty(),
+        "the parent index holds {} of 2 entries after the copy failed; it must hold neither or both: \
+         {parent:?}",
+        parent.len()
+    );
+    assert!(
+        !rig.journal.index().exists(),
+        "no index file exists, so `rewind` says there is no journal rather than undoing half the run"
+    );
+    let plan = harness::rewind::plan(&rig.journal, &Default::default());
+    assert!(
+        plan.steps.is_empty(),
+        "an absent record plans no steps: {plan:?}"
+    );
+}
+
 #[test]
 fn branch_width_cannot_outrun_the_attempt_budget() {
     let rig = Rig::new(
