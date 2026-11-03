@@ -3,6 +3,34 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.1
+
+### Less thinking on a cloud surface, and a connector that reads the config it is given
+
+Two defects, both found by using the thing rather than by reading it.
+
+- **A surface configured for a cloud model could not ask for less deliberation.** The only
+  control was `thinking`, which sends `chat_template_kwargs.enable_thinking`, and Ollama Cloud
+  ignores that field. Measured against the live endpoint on one prompt: default 284 completion
+  tokens, `reasoning_effort: low` 101, `think: false` 91, and the template flag unchanged from
+  the default. `reasoning: off | low | medium | high` now sits on a surface or on any channel,
+  folds into the effective settings the way `model` and `policy` do, is refused at load when the
+  word is not one of the four, and goes on the wire as `think: false` for `off` and
+  `reasoning_effort` for the rest, because those are different fields rather than a scale.
+  `hades connector channels` prints it, so the setting can be read back instead of inferred.
+- **A connector built against the previous harness silently dropped every message once the config
+  gained a key it did not know.** A connector embeds the harness, so a new key in a surface's
+  section is a pack rebuild, not a config edit: the old binary refused the whole section, passed
+  nothing to the daemon, and logged nothing, which reads exactly like a bot that is offline. The
+  pack now ships 0.4.0 with the base, and its version comes from the crate.
+
+A third defect, found by watching the bot answer people who were not talking to it: a channel listed in the
+config was treated as a listening channel, so an unaddressed sentence there became a candidate worth a model
+call. An entry that names its own `trigger` no longer falls into that rule, so `mode: work` plus
+`trigger: mention` now means what it says instead of answering everything in the room.
+
+1285 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.0
 
 ### The Rewind Release: every write the harness makes can be put back
@@ -41,7 +69,7 @@ than a broader false one:
   days of retention. Retention and the configurable deny list land with the shell work; today a path named by
   the deny list is recorded as a secret with no bytes kept, so `hades journal` can tell you it cannot be rewound.
 
-1284 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+1282 tests, 13 ignored. Twelve of the ignored are the live browser suite.
 
 ## 0.3.0
 
