@@ -261,6 +261,9 @@ impl Journal {
         let fresh_holder = holder.is_some_and(|holder| !holder.is_dir());
         let fresh_run = !self.root.is_dir();
         let fresh_index = !self.index().is_file();
+        let fresh_state = holder
+            .and_then(|holder| holder.parent())
+            .is_some_and(|state| !state.is_dir());
         crate::scratch::state_dir(&self.root)
             .map_err(|error| format!("{}: {error}", self.root.display()))?;
         // The lines already filed stay: this publishes a longer record, not a different one. A torn tail
@@ -310,8 +313,8 @@ impl Journal {
         // before the record is reported. A run this call created has its directory synced by
         // `sync_created`; a run that already existed still needs the sync here, because its index name
         // was replaced rather than appended to.
-        if fresh_holder || fresh_run {
-            self.sync_created(fresh_holder, fresh_run, fresh_index)?;
+        if fresh_holder || fresh_run || fresh_state {
+            self.sync_created(fresh_holder, fresh_run, fresh_index, fresh_state)?;
         } else {
             std::fs::File::open(&self.root)
                 .and_then(|dir| dir.sync_all())
@@ -343,10 +346,16 @@ impl Journal {
         let fresh_holder = holder.is_some_and(|holder| !holder.is_dir());
         let fresh_run = !self.root.is_dir();
         let fresh_blobs = !blobs.is_dir();
+        // `<state>` is a name in its own parent, and `--state` can name a path that did not exist: the
+        // first capture then creates `<state>` itself, and the sync of `<state>` covers its contents but
+        // not the name it lives under.
+        let fresh_state = holder
+            .and_then(|holder| holder.parent())
+            .is_some_and(|state| !state.is_dir());
         crate::scratch::state_dir(&blobs)
             .map_err(|error| format!("{}: {error}", blobs.display()))?;
-        if fresh_holder || fresh_run || fresh_blobs {
-            self.sync_created(fresh_holder, fresh_run, fresh_blobs)?;
+        if fresh_holder || fresh_run || fresh_blobs || fresh_state {
+            self.sync_created(fresh_holder, fresh_run, fresh_blobs, fresh_state)?;
         }
         let blob = self.blob(digest);
         if blob.is_file() {
@@ -392,6 +401,9 @@ impl Journal {
         let fresh_holder = holder.is_some_and(|holder| !holder.is_dir());
         let fresh_run = !self.root.is_dir();
         let fresh_index = !self.index().is_file();
+        let fresh_state = holder
+            .and_then(|holder| holder.parent())
+            .is_some_and(|state| !state.is_dir());
         crate::scratch::state_dir(&self.root)
             .map_err(|error| format!("{}: {error}", self.root.display()))?;
         let mut text = serde_json::to_string(entry)
@@ -416,8 +428,8 @@ impl Journal {
         // `<run>/index.jsonl`; until those names are durable, the order this module promises can be
         // undone by a power loss. Ordered after the file's own sync, so the entry never becomes durable
         // before the line it names.
-        if fresh_run || fresh_index {
-            self.sync_created(fresh_holder, fresh_run, fresh_index)?;
+        if fresh_run || fresh_index || fresh_state {
+            self.sync_created(fresh_holder, fresh_run, fresh_index, fresh_state)?;
         }
         #[cfg(test)]
         syncs::note_index();
@@ -428,17 +440,33 @@ impl Journal {
     ///
     /// `sync_blobs` makes a blob's name durable inside `blobs/`, and a file's `sync_all` covers only its
     /// own bytes. The directories above them are separate names: `<state>/journal/<run>` lives inside
-    /// `<state>/journal`, `blobs/` and `index.jsonl` live inside the run directory, and `<state>/journal`
-    /// itself lives inside `<state>`. A capture that creates them is the one that owes the sync, which is
-    /// why the caller says which were new: a run that already exists pays nothing here. The first capture
-    /// of a run in a state directory that has never held a journal paid nothing for `<state>`, so the run's
-    /// own name was reachable only through a directory the filesystem had never been told about.
+    /// `<state>/journal`, `blobs/` and `index.jsonl` live inside the run directory, `<state>/journal`
+    /// itself lives inside `<state>`, and `<state>` lives inside its own parent. A capture that creates
+    /// them is the one that owes the sync, which is why the caller says which were new: a run that already
+    /// exists pays nothing here. The first capture of a run in a state directory that has never held a
+    /// journal paid nothing for `<state>`, so the run's own name was reachable only through a directory the
+    /// filesystem had never been told about; and when `--state` names a path that did not exist, that same
+    /// capture creates `<state>` as a name in *its* parent, which needs the same sync one level up.
     fn sync_created(
         &self,
         fresh_holder: bool,
         fresh_run: bool,
         fresh_inside: bool,
+        fresh_state: bool,
     ) -> Result<(), String> {
+        if fresh_state
+            && let Some(above) = self
+                .root
+                .parent()
+                .and_then(|holder| holder.parent())
+                .and_then(|state| state.parent())
+        {
+            std::fs::File::open(above)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| format!("could not sync {}: {error}", above.display()))?;
+            #[cfg(test)]
+            syncs::note_state_parent_dir();
+        }
         if fresh_holder && let Some(state) = self.root.parent().and_then(|holder| holder.parent()) {
             std::fs::File::open(state)
                 .and_then(|dir| dir.sync_all())
@@ -705,6 +733,8 @@ pub(crate) mod syncs {
         static RUN_DIR: Cell<u64> = const { Cell::new(0) };
         /// `<state>`: the directory `<state>/journal` lives in.
         static STATE_DIR: Cell<u64> = const { Cell::new(0) };
+        /// The directory `<state>`'s own name lives in.
+        static STATE_PARENT: Cell<u64> = const { Cell::new(0) };
     }
 
     pub fn reset() {
@@ -713,6 +743,7 @@ pub(crate) mod syncs {
         HOLDER_DIR.with(|cell| cell.set(0));
         RUN_DIR.with(|cell| cell.set(0));
         STATE_DIR.with(|cell| cell.set(0));
+        STATE_PARENT.with(|cell| cell.set(0));
     }
 
     pub fn blobs_dir() -> u64 {
@@ -735,8 +766,16 @@ pub(crate) mod syncs {
         STATE_DIR.with(|cell| cell.get())
     }
 
+    pub fn state_parent() -> u64 {
+        STATE_PARENT.with(|cell| cell.get())
+    }
+
     pub fn note_blobs_dir() {
         BLOBS_DIR.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub fn note_state_parent_dir() {
+        STATE_PARENT.with(|cell| cell.set(cell.get() + 1));
     }
 
     pub fn note_index() {
@@ -1069,14 +1108,20 @@ mod tests {
 
     /// `<state>/journal` is a name too, and the run's directory is reachable only through it. The first
     /// capture creates it, and nothing synced `<state>`, so on a power cut the whole tree could vanish even
-    /// though the run directory, the blobs and the index inside it were all synced. One sync on the fresh
-    /// path, and a run in a state directory that already exists pays nothing.
+    /// though the run directory, the blobs and the index inside it were all synced. `<state>` is a name in
+    /// *its* parent, and `--state` may name a path that did not exist at all: then the first
+    /// capture creates `<state>` too, and syncing `<state>` makes its contents durable without making
+    /// `<state>`'s own name durable. One sync per fresh level, and a run in a state directory that
+    /// already exists pays nothing.
     #[test]
-    fn the_first_capture_in_a_new_state_syncs_the_state_directory() {
+    fn the_first_capture_in_a_new_state_syncs_the_state_directory_and_its_name() {
         syncs::reset();
-        let dir = scratch("journal-sync-state");
+        let base = scratch("journal-sync-state");
+        // `<state>` itself does not exist, and neither does its parent: `--state` named a path where
+        // nothing was, which is the case where `<state>`'s own name has a directory above it to pay for.
+        let dir = base.join("nested").join("state");
         let journal = Journal::at(&dir, "run-sync-state");
-        let path = dir.join("note.txt");
+        let path = base.join("note.txt");
         std::fs::write(&path, "before\n").expect("a file the capture will read");
 
         Capture::new(&journal, 0, "write_file")
@@ -1089,7 +1134,13 @@ mod tests {
             "`<state>` is synced once, after `<state>/journal` is created, or the journal's own name is \
              not durable"
         );
-        let synced = syncs::state_dir();
+        assert_eq!(
+            syncs::state_parent(),
+            1,
+            "`<state>`'s own name is synced into its parent, or the state directory a first capture \
+             created is reachable only through a name the filesystem was never told about"
+        );
+        let (synced, named) = (syncs::state_dir(), syncs::state_parent());
         std::fs::write(&path, "again\n").expect("a file");
         Capture::new(&journal, 1, "write_file")
             .write::<std::io::Error, _>(&path, b"later\n", || std::fs::write(&path, "later\n"))
@@ -1098,6 +1149,11 @@ mod tests {
             syncs::state_dir(),
             synced,
             "a state directory that already holds the journal is not re-synced by every capture"
+        );
+        assert_eq!(
+            syncs::state_parent(),
+            named,
+            "a state directory whose name already exists pays nothing on a later capture"
         );
     }
 
