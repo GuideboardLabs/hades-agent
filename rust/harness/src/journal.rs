@@ -38,6 +38,11 @@ pub const BLOBS: &str = "blobs";
 /// and no bytes are kept: a journal that fills the disk it is protecting is a second outage.
 pub const MAX_BLOB: u64 = 8 * 1024 * 1024;
 
+/// The longest run name the journal uses as a directory name verbatim. A run name is a session id, so it
+/// is free text and can exceed this; past it the name is bounded by a digest instead of cut, because a cut
+/// makes `<run>` and `<run>-fork-2` the same directory.
+pub const MAX_RUN: usize = 96;
+
 /// What the capture found at the path before the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,9 +111,17 @@ pub struct Scan {
 /// A run is a session id, and a session id is free text: it can carry a slash, a colon or a `..`. This is
 /// the one place that decides what a run is called on disk, so the answer cannot drift between the writer
 /// and the reader.
+///
+/// A name that fits in [`MAX_RUN`] is used as it maps. A longer one keeps a readable prefix and is told
+/// apart by a 96-bit digest of the *whole* mapped name: cutting it at the limit made the parent run
+/// `<run>` and its branch candidate `<run>-fork-2` the same 96 characters, so the parent and both
+/// candidates shared one directory. The digest is of the mapped name rather than the raw one, so the
+/// separator rule above decides the answer for every name, long or short. The one way two runs can still
+/// share a directory is a session deliberately named exactly the derived name of another; that needs the
+/// digest of a name it does not have, and the alternative was refusing a legal session id.
 pub fn safe_run(run: &str) -> String {
-    let mut out = String::with_capacity(run.len().min(96));
-    for ch in run.chars().take(96) {
+    let mut out = String::with_capacity(run.len().min(MAX_RUN));
+    for ch in run.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
             out.push(ch);
         } else {
@@ -118,7 +131,15 @@ pub fn safe_run(run: &str) -> String {
     if out.is_empty() || out == "." || out == ".." {
         return "run".to_string();
     }
-    out
+    if out.len() <= MAX_RUN {
+        return out;
+    }
+    const DIGEST: usize = 24;
+    let digest = mneme::sha256::hex(out.as_bytes());
+    let mut bounded: String = out.chars().take(MAX_RUN - 1 - DIGEST).collect();
+    bounded.push('-');
+    bounded.push_str(&digest[..DIGEST]);
+    bounded
 }
 
 /// A path that looks like a credential, by name. The runtime already refuses to read some of these into a
@@ -729,6 +750,62 @@ mod tests {
             journal.dir().starts_with(dir.join("journal")),
             "{}",
             journal.dir().display()
+        );
+    }
+
+    /// A run name is free text and can be longer than a directory name the journal uses verbatim. Cutting
+    /// it at the limit made `<run>` and `<run>-fork-2` the same 96 characters, so the parent and both branch
+    /// candidates resolved to one directory: the parent's rewind then refused on a path nobody had edited.
+    /// The name is bounded by a hash of the whole thing instead, and the reader resolves a name through the
+    /// same function, so `hades journal <run>` still finds it by the name a person has in hand.
+    #[test]
+    fn a_run_name_too_long_for_a_directory_is_bounded_by_its_hash() {
+        let dir = scratch("journal-long-run");
+        let run: String = "a".repeat(100);
+        let fork = format!("{run}-fork-2");
+        assert_ne!(
+            safe_run(&run),
+            safe_run(&fork),
+            "a fork of a long session must not land in the parent's own directory"
+        );
+        // Two names that agree for the whole verbatim limit and differ after it are still two runs.
+        let left = format!("{}x", "b".repeat(96));
+        let right = format!("{}y", "b".repeat(96));
+        assert_ne!(
+            safe_run(&left),
+            safe_run(&right),
+            "the tail past the limit is what tells two long runs apart"
+        );
+        let name = safe_run(&run);
+        assert!(
+            name.len() <= MAX_RUN,
+            "the directory name is bounded: {} bytes",
+            name.len()
+        );
+        assert!(
+            !name.contains('/') && name != "." && name != "..",
+            "one filesystem-safe component: {name}"
+        );
+        assert_eq!(
+            name,
+            safe_run(&run),
+            "the same run name resolves to the same directory for the reader"
+        );
+
+        // The reader resolves by name, so an entry written under a long run name is readable under it.
+        let journal = Journal::at(&dir, &run);
+        assert_ne!(
+            journal.dir(),
+            Journal::at(&dir, &fork).dir(),
+            "the parent and its candidate cannot share one journal"
+        );
+        journal
+            .append(&entry(&name, 0, &dir.join("note.txt")))
+            .expect("a journal line");
+        assert_eq!(
+            Journal::at(&dir, &run).entries().len(),
+            1,
+            "the name in a person's hand finds the run that wrote"
         );
     }
 
