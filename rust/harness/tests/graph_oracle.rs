@@ -894,7 +894,8 @@ fn a_branch_with_no_pass_leaves_the_tree_as_it_found_it() {
 /// the parent's journal made a rolled-back candidate poison the parent's rewind: the losing candidate's
 /// entry named a file the rollback had already put back, so a rewind of the parent refused a tree nobody
 /// had edited and left the intact work unrewound. It also made the candidate's own run name useless:
-/// `hades journal <candidate>` had nothing to show the run that actually wrote.
+/// `hades journal <candidate>` had nothing to show the run that actually wrote. The winner's write is the
+/// one exception, and it is filed under the parent as well, because the run kept it.
 #[test]
 fn a_branch_candidate_journals_under_its_own_session_not_the_parents() {
     let mut rig = Rig::new(
@@ -941,10 +942,18 @@ fn a_branch_candidate_journals_under_its_own_session_not_the_parents() {
     );
 
     let parent = rig.journal.entries();
+    assert_eq!(
+        parent.len(),
+        1,
+        "the parent keeps the write the run kept, and nothing else: {parent:?}"
+    );
     assert!(
-        parent.is_empty(),
-        "the parent wrote nothing, so its journal holds nothing; a candidate's entry is not the parent's: \
-         {parent:?}"
+        parent[0].path.ends_with("note.txt"),
+        "the winning candidate's write is the run's write: {parent:?}"
+    );
+    assert!(
+        !parent.iter().any(|entry| entry.path.ends_with("extra.txt")),
+        "a losing candidate's entry is not the parent's: {parent:?}"
     );
     let losing = harness::journal::Journal::at(&state, &walked.branches[0].session);
     let written = losing.entries();
@@ -954,6 +963,74 @@ fn a_branch_candidate_journals_under_its_own_session_not_the_parents() {
         "the run that wrote holds its own entry: {written:?}"
     );
     assert!(written[0].path.ends_with("extra.txt"), "{written:?}");
+}
+
+/// A write the run kept has to be a write the run can undo. The winner's entry used to be journaled only
+/// under the fork session, so `hades rewind <run>` answered "no journal for run" while the file still held
+/// the winner's bytes: the run's own recovery command did not cover the edit the run had kept. The
+/// candidate's entry is filed under the parent too, and this reads it the way `rewind <run>` does.
+#[test]
+fn a_branch_winners_write_is_in_the_parent_journal_so_the_run_rewinds_it() {
+    let mut rig = Rig::new(
+        "branch-winner-parent",
+        "grep -q good note.txt",
+        open(),
+        ScriptedModel::answers([
+            ModelAnswer::editing(vec![FileEdit {
+                path: "extra.txt".to_string(),
+                old: "alpha".to_string(),
+                new: "candidate one\n".to_string(),
+            }]),
+            ModelAnswer::editing(vec![FileEdit {
+                path: "note.txt".to_string(),
+                old: "alpha".to_string(),
+                new: "good".to_string(),
+            }]),
+        ]),
+    );
+    std::fs::write(rig.root.join("note.txt"), "alpha\n").expect("a file");
+    std::fs::write(rig.root.join("extra.txt"), "alpha\n").expect("a second file");
+    let state = scratch("branch-winner-parent-state");
+    rig.journal = harness::journal::Journal::at(&state, "oracle");
+
+    let store = FileStore::new(state.join("sessions"));
+    let mut session =
+        Session::create(store, FixedClock, SessionId::new("branch-winner")).expect("a session");
+    let mut cache = Cache::new();
+    let mut runner = Runner::new(rig.parts_shadowed(None, &mut cache), &mut session)
+        .with_bounds(Bounds::new(2, 10).with_width(2));
+    let walked = runner.run().expect("a walk");
+    assert!(walked.branches[1].passed, "{:?}", walked.branches);
+    assert_eq!(
+        std::fs::read_to_string(rig.root.join("note.txt")).expect("note.txt"),
+        "good\n",
+        "the run kept the winner's edit"
+    );
+
+    // What `hades rewind oracle` reads. Before the fix this plan was empty and the command answered
+    // "no journal for run `oracle`" while note.txt still held the winner's bytes.
+    let plan = harness::rewind::plan(&rig.journal, &Default::default());
+    assert_eq!(
+        plan.steps.len(),
+        1,
+        "the run's own journal holds the one write it kept: {plan:?}"
+    );
+    assert_eq!(
+        plan.steps[0].path,
+        rig.root.join("note.txt").display().to_string()
+    );
+    assert!(
+        !plan.blocked(),
+        "the file is exactly what the run left, so no override is needed: {plan:?}"
+    );
+    let report = harness::rewind::apply(&rig.journal, &plan, false)
+        .expect("the run's own undo is not refused");
+    assert_eq!(report.restored.len(), 1, "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(rig.root.join("note.txt")).expect("note.txt"),
+        "alpha\n",
+        "rewind <run> put back a write the run kept"
+    );
 }
 
 #[test]

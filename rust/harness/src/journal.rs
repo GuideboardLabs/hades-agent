@@ -201,6 +201,41 @@ impl Journal {
         &self.root
     }
 
+    /// Copy another run's captures into this journal, as this run's entries.
+    ///
+    /// A branch candidate journals under its own session because a losing candidate's entry must not
+    /// outlive the rollback that put its file back. A winner's writes are kept by the parent run, though,
+    /// so the run's own `rewind <run>` has to cover them: this copies the winner's entries, and the bytes
+    /// they name, into the parent journal with the run field rewritten to the directory they now live in.
+    /// Blobs are content addressed, so a path the parent already captured costs no second copy.
+    ///
+    /// Returns how many entries were adopted. Empty input is a no-op, and so is a journal adopting itself:
+    /// appending a journal's own lines back to it would duplicate every entry.
+    pub fn absorb(&self, other: &Journal) -> Result<usize, String> {
+        if other.dir() == self.dir() {
+            return Ok(0);
+        }
+        let entries = other.entries();
+        for entry in &entries {
+            if !entry.before.is_empty() {
+                let kept = other.blob(&entry.before);
+                let bytes = std::fs::read(&kept).map_err(|error| {
+                    format!(
+                        "could not read the bytes {} names at {}: {error}",
+                        entry.path,
+                        kept.display()
+                    )
+                })?;
+                self.put_blob(&entry.before, &bytes)?;
+            }
+            self.append(&Entry {
+                run: self.run.clone(),
+                ..entry.clone()
+            })?;
+        }
+        Ok(entries.len())
+    }
+
     pub fn index(&self) -> PathBuf {
         self.root.join(INDEX)
     }

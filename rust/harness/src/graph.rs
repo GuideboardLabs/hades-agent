@@ -1862,7 +1862,7 @@ where
                 self.last_verdict = Some(verdict);
             }
             branches.push(Candidate {
-                session: session_id,
+                session: session_id.clone(),
                 condition: condition.clone(),
                 passed,
                 program: program.clone(),
@@ -1874,6 +1874,18 @@ where
             });
 
             if passed {
+                // The run keeps this candidate's edit, so the run's own journal has to keep the bytes it
+                // replaced: `hades rewind <run>` is the command a person has in hand, and it has to undo a
+                // write the run kept. The losing candidates stay out of the parent, so a path a rollback
+                // already put back never makes the parent's rewind refuse.
+                self.journal
+                    .absorb(&self.journal.sibling(&session_id))
+                    .map_err(|error| {
+                        Fault::harness(format!(
+                            "the winning candidate's journal could not be filed under `{}`: {error}",
+                            self.journal.run()
+                        ))
+                    })?;
                 self.session.append(
                     session_tree::Kind::Checkpoint,
                     json!({
