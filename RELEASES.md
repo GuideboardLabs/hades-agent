@@ -3,6 +3,49 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.5
+
+### A shell command's writes are in the journal, and a stale shelf stops answering
+
+Two gaps, both of the kind where the product said something narrower than it wanted to.
+
+**Shell capture.** `write_file` and `patch` keep the bytes of the path they are about to replace. A shell
+command has no such path: it can truncate a file with a redirection, rewrite a dozen through a build, or
+delete one with `rm`. It was therefore outside the rewind guarantee and said so. Now the step is bracketed
+by a tree scan: the scan before it keeps the bytes that are about to change, the scan after it says what
+actually moved, and one journal entry is written per path that moved, in the same shape a `write_file`
+leaves. A file the command created is recorded as absent before, so a rewind removes it; a file it
+truncated is recorded with its old bytes, so a rewind puts it back. `hades rewind` needed no change at all,
+which is the test that the shape was right.
+
+The scan is bounded on purpose and the bounds are said out loud: 8 MiB per file, 64 MiB per step, 4,000
+files, with `.git`, `target`, `node_modules`, `.venv`, `__pycache__`, `dist` and the state directory never
+walked. A path past a bound is counted and reported as outside the journal's caps. It is not silently
+treated as covered, which was the failure this release exists to prevent.
+
+**The stale shelf.** `hades pack find` read `~/.hades/packs/INDEX.json` with no age check, so a cache
+written on 2026-10-26 was still answering with `discord 0.1.1` on a binary whose own shelf said `0.4.0` and
+whose remote index said `0.4.1`. Nothing ever read that file again. A cached shelf now answers only while it
+is younger than a day; past that the live index is fetched, and a failed fetch falls back to the copy the
+build ships with a line saying so.
+
+The guarantee, stated as narrowly as it can be defended:
+
+> Every `write_file` and `patch` the harness performs, and every file a shell step it runs changes or
+> creates, each filed under the session that wrote it and, when a candidate's edit is the one the run kept,
+> under the run as well, is journaled with the bytes it replaced: `hades journal <session>` lists them,
+> `hades rewind <session>` puts them back and names every path it could not put back together with the
+> reason, and exits 2 when it put back only part of the run. Outside this: a path past the scan caps, which
+> is counted rather than implied covered; a `--program` run, which goes through the CLI's own runner and not
+> the shell tool; a branch candidate that lost, recorded only under its own session; and a run whose copy of
+> the winner's record cannot be written, which ends in a harness fault.
+
+- **Limits:** 8 MiB per captured file, 8 MiB per file and 64 MiB per shell step, 512 MiB for the store, 14
+  days of retention. Retention and the configurable deny list are still open; today a path named by the deny
+  list is recorded as a secret with no bytes kept, so `hades journal` can tell you it cannot be rewound.
+
+1284 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.4
 
 ### A surface leaves the runtime, and the runtime keeps the contract

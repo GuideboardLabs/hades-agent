@@ -1399,7 +1399,7 @@ fn execute_with_stop(
     let journal = crate::journal::Journal::at(&world.state, &world.session);
     let capture = crate::journal::Capture::new(&journal, step, name);
     match name {
-        "shell" => shell(&args, world),
+        "shell" => shell(&args, world, &capture),
         "read_file" => read_file(&args, world),
         "write_file" => write_file(&args, world, &capture),
         "patch" => crate::patch::tool(&args, &world.policy(), &capture),
@@ -2402,7 +2402,7 @@ fn argument(args: &Value, key: &str) -> Option<String> {
 /// while a background child holds its output open still ends at the deadline, and everything the program
 /// started dies with it. Wrapping the program in `timeout` looked equivalent and was not: that command
 /// supervises only what it launches, while this process keeps reading the pipes the child inherited.
-fn shell(args: &Value, world: &World) -> String {
+fn shell(args: &Value, world: &World, capture: &crate::journal::Capture<'_>) -> String {
     let command = args.get("command").and_then(Value::as_str).unwrap_or("");
     if command.trim().is_empty() {
         return "no command given".to_string();
@@ -2425,14 +2425,19 @@ fn shell(args: &Value, world: &World) -> String {
         // cannot be found by the skills tool, so the install step has to be able to write it.
         .also_writable(skills);
     let deadline = Some(std::time::Duration::from_secs(seconds));
-    match crate::command::run_within_in(
-        command,
-        &world.root,
-        6000,
-        Some(&cage),
-        Some(&scratch),
-        deadline,
-    ) {
+    // The command is run inside the capture, so what it changed is recorded against what was there
+    // before it started. `shell` has no path to protect: the scan is what stands in for one.
+    let outcome = capture.shell(&world.root, &crate::journal::Caps::default(), || {
+        crate::command::run_within_in(
+            command,
+            &world.root,
+            6000,
+            Some(&cage),
+            Some(&scratch),
+            deadline,
+        )
+    });
+    match outcome {
         Ok(run) => {
             let mut text = run.output;
             if run.timed_out {
@@ -3849,10 +3854,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a workspace");
         let world = world_at(&dir, Mode::Act, "chat:7");
 
+        let journal = crate::journal::Journal::at(&dir.join("state"), "run-shell-deadline");
+        let capture = crate::journal::Capture::new(&journal, 0, "shell");
         let started = std::time::Instant::now();
         let said = shell(
             &serde_json::json!({ "command": "sleep 30 &", "timeout_s": 1 }),
             &world,
+            &capture,
         );
         let elapsed = started.elapsed();
 

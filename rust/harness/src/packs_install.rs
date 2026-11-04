@@ -69,6 +69,22 @@ pub fn cached_age(state: &Path) -> Option<u64> {
     Some(now.saturating_sub(at))
 }
 
+/// How long a fetched shelf may answer without being read again.
+///
+/// The cache had no age at all, and a stale one silently outranked both the live shelf and the copy the
+/// binary ships: a cache written on 2026-10-26 was still answering `pack find discord` with 0.1.1 on a
+/// 0.4.4 binary, and nothing ever read it again. A day is short enough that a published pack shows up
+/// without a new release and long enough that a search loop does not refetch on every call.
+pub const CACHE_TTL_SECS: u64 = 24 * 3600;
+
+/// The cache, but only while it is young enough to be believed.
+pub fn fresh_cached(state: &Path) -> Option<Vec<Row>> {
+    match cached_age(state) {
+        Some(age) if age <= CACHE_TTL_SECS => cached(state),
+        _ => None,
+    }
+}
+
 pub fn cached(state: &Path) -> Option<Vec<Row>> {
     let text = fs::read_to_string(cache_dir(state).join("INDEX.json")).ok()?;
     packs_menu::parse(&text).ok()
@@ -81,6 +97,7 @@ pub fn rows(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
     if !refresh
         && let Ok(text) = fs::read_to_string(&path)
         && let Ok(rows) = packs_menu::parse(&text)
+        && fresh_cached(state).is_some()
     {
         return Ok(rows);
     }

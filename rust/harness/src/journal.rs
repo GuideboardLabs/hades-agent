@@ -588,6 +588,202 @@ impl<'a> Capture<'a> {
     }
 }
 
+impl Capture<'_> {
+    /// Cover a step whose writes cannot be predicted: scan, run, scan again, record what moved.
+    ///
+    /// The alternative was to guess which paths a command would touch, which cannot be done for a
+    /// redirection, an editor, or a build. What this keeps is the bytes each changed path held *before* the
+    /// command ran, so a rewind restores them exactly as it restores a `write_file`. What it cannot keep,
+    /// past [`Caps`], is counted in [`gaps`] rather than left to look covered.
+    pub fn shell<T, E, F>(&self, root: &Path, caps: &Caps, run: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        let journal = self.journal;
+        let before = scan_tree(root, caps, Some(journal));
+        let outcome = run();
+        let after = scan_tree(root, caps, None);
+        let at = epoch();
+        let note =
+            |path: &str, kind: Kind, before: String, after: String, bytes: u64, step: u64| {
+                let entry = Entry {
+                    at,
+                    run: journal.run().to_string(),
+                    step,
+                    tool: self.tool.to_string(),
+                    path: path.to_string(),
+                    before,
+                    after,
+                    kind,
+                    bytes,
+                };
+                if let Err(said) = journal.append(&entry) {
+                    note_gap(&said);
+                }
+            };
+        // A path that was there and is now different or gone: recoverable, with its old bytes kept.
+        for (path, (digest, bytes)) in &before.files {
+            let now = after
+                .files
+                .get(path)
+                .map(|(digest, _)| digest.clone())
+                .unwrap_or_default();
+            if &now == digest {
+                continue;
+            }
+            note(path, Kind::File, digest.clone(), now, *bytes, self.step);
+        }
+        // A path the command created. The journal says it was absent, so a rewind removes it.
+        for (path, (digest, _)) in &after.files {
+            if before.files.contains_key(path) {
+                continue;
+            }
+            note(
+                path,
+                Kind::Absent,
+                String::new(),
+                digest.clone(),
+                0,
+                self.step,
+            );
+        }
+        let uncovered = before.uncovered() + after.uncovered();
+        if uncovered > 0 {
+            note_gap(&format!(
+                "a shell step at step {} left {uncovered} path(s) outside the journal's caps (over {} bytes \
+                 each, {} bytes total, or {} files); those paths cannot be rewound",
+                self.step, caps.max_file, caps.max_total, caps.max_files
+            ));
+        }
+        outcome
+    }
+}
+
+/// What a tree scan will keep, and what it will refuse to keep.
+///
+/// A shell step has no path to capture, so the only honest way to cover it is to look at the tree on both
+/// sides of the step and keep the bytes that are about to change. That means reading files a command might
+/// never touch, so the scan is bounded and the bounds are visible: past them a path is counted in
+/// [`gaps`], never quietly left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    /// Largest single file kept. Past this the path is named in the gap count and not stored.
+    pub max_file: u64,
+    /// Ceiling on all bytes kept for one shell step.
+    pub max_total: u64,
+    /// Ceiling on how many files one scan will look at.
+    pub max_files: usize,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Caps {
+            max_file: 8 * 1024 * 1024,
+            max_total: 64 * 1024 * 1024,
+            max_files: 4_000,
+        }
+    }
+}
+
+/// Directory names a tree scan never enters. The first three are the ones that make a scan useless if
+/// included; state is skipped because the journal must never capture its own blobs.
+const SKIP_DIRS: [&str; 7] = [
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".hades",
+    "dist",
+];
+
+/// One scan of a tree: what it kept, and what it refused to keep and why.
+#[derive(Debug, Default, Clone)]
+pub struct TreeScan {
+    /// Path as written, to (digest, bytes).
+    pub files: std::collections::BTreeMap<String, (String, u64)>,
+    pub too_large: usize,
+    pub secret: usize,
+    pub over_budget: usize,
+    pub over_count: usize,
+}
+
+impl TreeScan {
+    /// Every path this scan could not cover, which a rewind of a shell step has to report as a limit.
+    pub fn uncovered(&self) -> usize {
+        self.too_large + self.secret + self.over_budget + self.over_count
+    }
+}
+
+/// Walk `root` and record what is there, keeping the bytes when a journal is given.
+///
+/// Keeping the bytes is the difference between "we know this file changed" and "we can put it back", and
+/// it is why the pre-scan is handed the journal and the post-scan is not.
+pub fn scan_tree(root: &Path, caps: &Caps, keep: Option<&Journal>) -> TreeScan {
+    let mut scan = TreeScan::default();
+    let mut spent: u64 = 0;
+    walk(root, caps, keep, &mut scan, &mut spent);
+    scan
+}
+
+fn walk(dir: &Path, caps: &Caps, keep: Option<&Journal>, scan: &mut TreeScan, spent: &mut u64) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            if SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            walk(&path, caps, keep, scan, spent);
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        if scan.files.len() >= caps.max_files {
+            scan.over_count += 1;
+            continue;
+        }
+        if is_secret_name(&path) {
+            scan.secret += 1;
+            continue;
+        }
+        if metadata.len() > caps.max_file {
+            scan.too_large += 1;
+            continue;
+        }
+        if *spent + metadata.len() > caps.max_total {
+            scan.over_budget += 1;
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let digest = mneme::sha256::hex(&bytes);
+        if let Some(journal) = keep
+            && journal.put_blob(&digest, &bytes).is_err()
+        {
+            // The bytes could not be kept, so the index must not claim they were.
+            scan.over_budget += 1;
+            continue;
+        }
+        *spent += metadata.len();
+        // Absolute, because that is what a `write_file` entry records and what a rewind resolves.
+        scan.files
+            .insert(path.display().to_string(), (digest, metadata.len()));
+    }
+}
+
 /// What was at the path before the write.
 struct Before {
     kind: Kind,
@@ -675,18 +871,19 @@ static GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// The tools whose file writes go through [`Capture`]. Kept here, beside [`NOT_CAPTURED`], because the
 /// question "which writers are covered" has to have one answer that a test can hold against the dispatch
 /// table.
-pub const CAPTURE: [&str; 2] = ["write_file", "patch"];
+pub const CAPTURE: [&str; 3] = ["write_file", "patch", "shell"];
 
 /// The tools the runtime dispatches that do not put bytes through this journal, and what covers them
 /// instead. Every name in [`crate::agent::TOOLS`] must appear in exactly one of these two lists: a tool
 /// added to the dispatch table without a decision here fails the suite, which is the difference between a
 /// writer that is uncovered on purpose and one that escaped by being forgotten.
 ///
-/// `shell` is the one that matters: it can truncate a file with a redirection, and it is covered by the
-/// manifest diff around the step rather than by a per-write capture. Until that lands, a shell step is
-/// recorded in the journal as nothing at all.
-pub const NOT_CAPTURED: [&str; 23] = [
-    "shell",
+/// `shell` is captured differently from the other two, which is why it is named in this comment rather
+/// than left to be guessed at: a command can write through a redirection, an editor, or a build, so there
+/// is no "the path this tool writes". [`Capture::shell`] scans the tree before the step and after it, keeps
+/// the bytes that are about to change, and records one entry per path that actually moved. The caps on that
+/// scan are in [`Caps`], and a file past them is counted as a gap rather than left silently uncovered.
+pub const NOT_CAPTURED: [&str; 22] = [
     "read_file",
     "list_dir",
     "search",
@@ -815,6 +1012,133 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         crate::scratch::unique(name)
+    }
+
+    #[test]
+    fn a_shell_step_keeps_the_bytes_it_is_about_to_overwrite() {
+        let dir = scratch("journal-shell-truncate");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("a root");
+        let path = root.join("notes.txt");
+        std::fs::write(&path, "the state before the command\n").expect("a file to lose");
+        let journal = Journal::at(&dir.join("state"), "run-shell");
+        let capture = Capture::new(&journal, 3, "shell");
+
+        // The command, as the capture sees it: it only has to be a closure that changes the tree.
+        capture
+            .shell::<(), String, _>(&root, &Caps::default(), || {
+                std::fs::write(&path, "").map_err(|error| error.to_string())
+            })
+            .expect("the command ran");
+
+        let entries = journal.entries();
+        let found = entries
+            .iter()
+            .find(|entry| entry.path == path.display().to_string())
+            .unwrap_or_else(|| panic!("no entry for {}, {entries:#?}", path.display()));
+        assert_eq!(found.kind, Kind::File);
+        assert_eq!(
+            found.before,
+            mneme::sha256::hex(b"the state before the command\n")
+        );
+        assert_eq!(found.after, mneme::sha256::hex(b""));
+        assert_eq!(
+            found.tool, "shell",
+            "the journal names the tool that did it"
+        );
+        let kept = std::fs::read(journal.blob(&found.before)).expect("the previous bytes");
+        assert_eq!(kept, b"the state before the command\n");
+    }
+
+    #[test]
+    fn a_file_a_shell_step_created_is_recorded_as_absent_before_so_a_rewind_removes_it() {
+        let dir = scratch("journal-shell-create");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("a root");
+        let made = root.join("built.bin");
+        let journal = Journal::at(&dir.join("state"), "run-shell-create");
+        let capture = Capture::new(&journal, 1, "shell");
+
+        capture
+            .shell::<(), String, _>(&root, &Caps::default(), || {
+                std::fs::write(&made, b"compiled").map_err(|error| error.to_string())
+            })
+            .expect("the command ran");
+
+        let found = journal
+            .entries()
+            .into_iter()
+            .find(|entry| entry.path == made.display().to_string())
+            .expect("an entry for the file the command created");
+        assert_eq!(
+            found.kind,
+            Kind::Absent,
+            "nothing was there before the step"
+        );
+        assert_eq!(found.before, "");
+        assert_eq!(found.after, mneme::sha256::hex(b"compiled"));
+
+        // And a rewind carries that out: the journal said absent, so the path goes away.
+        let plan = crate::rewind::plan(&journal, &crate::rewind::Options::default());
+        crate::rewind::apply(&journal, &plan, false).expect("the undo");
+        assert!(!made.exists(), "the run created it, so the undo removes it");
+    }
+
+    #[test]
+    fn the_journal_puts_back_what_a_shell_step_truncated() {
+        let dir = scratch("journal-shell-rewind");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("a root");
+        let path = root.join("data.csv");
+        std::fs::write(&path, "a,b,c\n1,2,3\n").expect("a file to truncate");
+        let journal = Journal::at(&dir.join("state"), "run-shell-rewind");
+        let capture = Capture::new(&journal, 2, "shell");
+        capture
+            .shell::<(), String, _>(&root, &Caps::default(), || {
+                std::fs::write(&path, "").map_err(|error| error.to_string())
+            })
+            .expect("the command ran");
+        assert_eq!(std::fs::read_to_string(&path).expect("the damage"), "");
+
+        let plan = crate::rewind::plan(&journal, &crate::rewind::Options::default());
+        crate::rewind::apply(&journal, &plan, false).expect("the undo");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file again"),
+            "a,b,c\n1,2,3\n"
+        );
+    }
+
+    #[test]
+    fn a_file_past_the_cap_is_named_as_uncovered_instead_of_being_called_covered() {
+        let dir = scratch("journal-shell-caps");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("a root");
+        std::fs::write(root.join("small.txt"), "tiny").expect("a small file");
+        std::fs::write(root.join("big.bin"), vec![7u8; 4096]).expect("a big file");
+        let caps = Caps {
+            max_file: 1_024,
+            ..Caps::default()
+        };
+        let scan = scan_tree(&root, &caps, None);
+        assert!(scan.files.keys().any(|path| path.ends_with("small.txt")));
+        assert!(!scan.files.keys().any(|path| path.ends_with("big.bin")));
+        assert_eq!(scan.too_large, 1, "the cap is counted, not hidden");
+        assert_eq!(scan.uncovered(), 1);
+    }
+
+    #[test]
+    fn a_run_name_directory_does_not_capture_its_own_blobs() {
+        let dir = scratch("journal-shell-self");
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join(".hades/journal")).expect("a state tree under the root");
+        std::fs::write(root.join(".hades/journal/index.jsonl"), "{}").expect("state");
+        std::fs::write(root.join(".git/HEAD"), "ref").ok();
+        let scan = scan_tree(&root, &Caps::default(), None);
+        assert!(
+            scan.files.is_empty(),
+            "a scan that walks its own blobs keeps nothing: {:#?}",
+            scan.files.keys().collect::<Vec<_>>()
+        );
     }
 
     fn entry(run: &str, step: u64, path: &Path) -> Entry {

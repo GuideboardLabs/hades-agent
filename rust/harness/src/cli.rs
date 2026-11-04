@@ -3260,10 +3260,18 @@ fn pack_find(args: &[String]) -> Result<(String, i32), String> {
             ),
         }
     } else {
-        (
-            crate::packs_install::cached(&state).unwrap_or(crate::packs_menu::shipped()?),
-            String::new(),
-        )
+        // A cache older than the freshness window is not evidence about anything, so this reads the live
+        // shelf instead and says so when that read fails.
+        match crate::packs_install::rows(&state, false) {
+            Ok(rows) => (rows, String::new()),
+            Err(error) => (
+                crate::packs_menu::shipped()?,
+                format!(
+                    "\n(the live shelf could not be read, so this search used the copy the build ships: \
+                     {error})\n"
+                ),
+            ),
+        }
     };
     let found = crate::packs_menu::find(&rows, query);
     if switched(&flags, "json") {
