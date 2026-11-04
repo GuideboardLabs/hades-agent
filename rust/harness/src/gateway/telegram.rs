@@ -118,6 +118,12 @@ impl Transport for Telegram {
         self.call("editMessageText", &body, 20).map(|_| ())
     }
 
+    /// A Telegram typing indicator expires after about five seconds, so the claim has to be made inside
+    /// that window or the chat looks idle while the model works. Four seconds leaves a second of margin.
+    fn typing_every(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(4)
+    }
+
     fn typing(&mut self, chat: &Chat) -> Result<(), String> {
         self.call(
             "sendChatAction",

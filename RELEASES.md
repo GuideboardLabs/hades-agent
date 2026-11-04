@@ -3,6 +3,23 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.7
+
+### The typing interval belongs to the surface, not to the release
+
+0.4.6 fixed a real flood by giving the typing claim one clock. It then made the same mistake in a smaller
+way: it used one constant for two surfaces that disagree about what a claim is worth. Discord rate-limits
+typing at about one claim per ten seconds per channel, so eight seconds is right there. A Telegram indicator
+expires after about five, so eight seconds leaves the chat visibly idle for three seconds of every eight
+while the model is working. Fixing one surface by degrading the other is not a fix.
+
+`typing_every()` is a `Transport` method now, with an eight-second default for a rate-limited surface, and
+Telegram overrides it to four. Both run paths ask the transport instead of reading a constant, and a test
+holds the two numbers against each other: the default is inside Discord's window, and Telegram's is under
+its five-second expiry.
+
+1286 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.6
 
 ### Typing is a rate-limited claim, so it gets its own clock

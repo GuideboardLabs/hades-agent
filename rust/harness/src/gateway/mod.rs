@@ -261,12 +261,13 @@ pub fn settings(path: &Path) -> Result<Settings, String> {
     settings_for(path, "tg")
 }
 
-/// How often a surface is told the run is still alive.
+/// How often a surface is told the run is still alive when it does not say.
 ///
-/// Discord allows about one typing claim per ten seconds per channel and answers 429 for the rest. The
-/// in-process ticker used to call `typing` on every 40 ms loop iteration, which is 25 claims a second: the
-/// run looked alive in the journal as a wall of rate limits and the chat looked stuck, because a 429 is a
-/// claim that never became an indicator. Eight seconds keeps the claim fresh and stays under the limiter.
+/// The number has to come from the surface, because the two surfaces disagree about what a claim is worth.
+/// Discord allows about one typing claim per ten seconds per channel and answers 429 for the rest, so a
+/// claim slower than that lasts the whole ten. Telegram's indicator dies after about five seconds, so a
+/// claim slower than that leaves the chat visibly idle while the model is working. One constant cannot be
+/// right for both, and using one anyway is how a fix for one surface became a regression in the other.
 pub const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 
 /// Whether enough time has passed to make another typing claim.
@@ -691,6 +692,12 @@ pub trait Transport {
         buttons: &[Button],
     ) -> Result<(), String>;
     fn typing(&mut self, chat: &Chat) -> Result<(), String>;
+
+    /// How often this surface wants the claim repeated. The default suits a surface that rate-limits
+    /// typing at about one per ten seconds; a surface whose indicator expires sooner says so here.
+    fn typing_every(&self) -> Duration {
+        TYPING_INTERVAL
+    }
     fn ack(&mut self, callback: &str, text: &str) -> Result<(), String>;
     /// The most characters this surface accepts in one message. The gateway chunks an answer to fit
     /// rather than cutting it, because a surface with a smaller budget than Telegram's would otherwise
@@ -1074,13 +1081,14 @@ fn follow<T: Transport + Clone + Send + 'static>(
         // A run that thinks for a minute has to keep making the claim, or the chat looks dead exactly
         // when the model is doing the most work. How often is [`TYPING_INTERVAL`], not a second opinion.
         let mut beat = transport.clone();
+        let every = transport.typing_every();
         let stop = stop.clone();
         let chat = chat.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 let _ = beat.typing(&chat);
                 let woke = Instant::now();
-                while woke.elapsed() < TYPING_INTERVAL {
+                while woke.elapsed() < every {
                     if stop.load(Ordering::SeqCst) {
                         return;
                     }
@@ -1572,6 +1580,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
         let chat_id = update.chat.clone();
         let started = Instant::now();
         let beat_ms = loading.step_ms.max(40);
+        let every = transport.typing_every();
         let loading = loading.clone();
         std::thread::spawn(move || {
             let mut last: Option<Instant> = None;
@@ -1579,7 +1588,7 @@ fn chat<T: Transport + Clone + Send + 'static>(
             while !stop.load(Ordering::SeqCst) {
                 // The claim and the animation run on different clocks on purpose: the skull row is redrawn
                 // every step, while telling the surface "still alive" is rate limited and must not be.
-                if typing_due(last_typing, Instant::now(), TYPING_INTERVAL) {
+                if typing_due(last_typing, Instant::now(), every) {
                     let _ = beat.typing(&chat_id);
                     last_typing = Some(Instant::now());
                 }
@@ -2902,6 +2911,27 @@ mod tests {
 
     /// Five bodies in a row with one different mark travelling across them: the shape a person asked for,
     /// pinned so a later edit cannot quietly turn it back into a bouncing single glyph.
+    #[test]
+    fn each_surface_says_how_long_its_typing_claim_lasts() {
+        // The regression this holds shut: one 8s constant was right for Discord, which rate-limits typing
+        // at about one per ten seconds, and wrong for Telegram, whose indicator expires after five. Claiming
+        // every eight seconds left a Telegram chat visibly idle for three seconds of every eight while the
+        // model was working: fixing one surface by breaking the other. The number is a property of the
+        // surface now, and this asserts both halves of that.
+        use crate::gateway::Transport as _;
+        assert!(
+            TYPING_INTERVAL < std::time::Duration::from_secs(10),
+            "a claim slower than Discord's window would let the indicator lapse"
+        );
+        let telegram = crate::gateway::telegram::Telegram::new("test-token");
+        assert_eq!(
+            telegram.typing_every(),
+            std::time::Duration::from_secs(4),
+            "a telegram indicator dies after about five seconds"
+        );
+        assert!(telegram.typing_every() < TYPING_INTERVAL);
+    }
+
     #[test]
     fn a_typing_claim_is_made_on_its_own_clock_not_the_animation_s_clock() {
         // The bug this holds shut: the ticker called `typing` on every 40 ms iteration while only the
