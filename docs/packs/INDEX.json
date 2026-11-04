@@ -4,7 +4,7 @@
   "packs": [
     {
       "archive": "dist/hades-connector-discord-0.4.0-linux-x86_64.tar.gz",
-      "bytes": 4035265,
+      "bytes": 4035203,
       "capabilities": {
         "code": true,
         "network": true,
@@ -35,7 +35,7 @@
       "license": "MIT",
       "platform": "linux-x86_64",
       "requires_hades": ">=0.4.3,<0.5",
-      "sha256": "b08cc69e8913e26e23bb4032e5005454f64a66038373183880f52119188defdf",
+      "sha256": "2093badec0063c4a99fb7f8da7e92fdb0581e88ee6ae9e4bff44963696ed8781",
       "summary": "Run Hades inside a Discord server: mention it or reply to one of its messages and it answers there. Chat channels cannot write; a work channel runs goals, and only an operator may go past talking. It inherits the gateway's model and provider, ships its own prompt and working animation, and can react instead of replying when a reply would add nothing.",
       "title": "Discord connector",
       "version": "0.4.0"
