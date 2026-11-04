@@ -261,6 +261,19 @@ pub fn settings(path: &Path) -> Result<Settings, String> {
     settings_for(path, "tg")
 }
 
+/// How often a surface is told the run is still alive.
+///
+/// Discord allows about one typing claim per ten seconds per channel and answers 429 for the rest. The
+/// in-process ticker used to call `typing` on every 40 ms loop iteration, which is 25 claims a second: the
+/// run looked alive in the journal as a wall of rate limits and the chat looked stuck, because a 429 is a
+/// claim that never became an indicator. Eight seconds keeps the claim fresh and stays under the limiter.
+pub const TYPING_INTERVAL: Duration = Duration::from_secs(8);
+
+/// Whether enough time has passed to make another typing claim.
+pub fn typing_due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
+    last.is_none_or(|when| now.saturating_duration_since(when) >= every)
+}
+
 pub fn settings_for(path: &Path, surface: &str) -> Result<Settings, String> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -1058,15 +1071,16 @@ fn follow<T: Transport + Clone + Send + 'static>(
     let mut asked = false;
     let stop = Arc::new(AtomicBool::new(false));
     let heartbeat = {
-        // Typing is a five-second claim; a run that thinks for a minute has to keep making it, or the
-        // chat looks dead exactly when the model is doing the most work.
+        // A run that thinks for a minute has to keep making the claim, or the chat looks dead exactly
+        // when the model is doing the most work. How often is [`TYPING_INTERVAL`], not a second opinion.
         let mut beat = transport.clone();
         let stop = stop.clone();
         let chat = chat.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 let _ = beat.typing(&chat);
-                for _ in 0..40 {
+                let woke = Instant::now();
+                while woke.elapsed() < TYPING_INTERVAL {
                     if stop.load(Ordering::SeqCst) {
                         return;
                     }
@@ -1561,8 +1575,14 @@ fn chat<T: Transport + Clone + Send + 'static>(
         let loading = loading.clone();
         std::thread::spawn(move || {
             let mut last: Option<Instant> = None;
+            let mut last_typing: Option<Instant> = None;
             while !stop.load(Ordering::SeqCst) {
-                let _ = beat.typing(&chat_id);
+                // The claim and the animation run on different clocks on purpose: the skull row is redrawn
+                // every step, while telling the surface "still alive" is rate limited and must not be.
+                if typing_due(last_typing, Instant::now(), TYPING_INTERVAL) {
+                    let _ = beat.typing(&chat_id);
+                    last_typing = Some(Instant::now());
+                }
                 let due = last.is_none_or(|when| when.elapsed().as_millis() as u64 >= beat_ms);
                 if due && let Some(message) = id {
                     let text = render_status(&loading, started.elapsed().as_secs_f64(), limit);
@@ -2882,6 +2902,30 @@ mod tests {
 
     /// Five bodies in a row with one different mark travelling across them: the shape a person asked for,
     /// pinned so a later edit cannot quietly turn it back into a bouncing single glyph.
+    #[test]
+    fn a_typing_claim_is_made_on_its_own_clock_not_the_animation_s_clock() {
+        // The bug this holds shut: the ticker called `typing` on every 40 ms iteration while only the
+        // animation respected `step_ms`, so a two minute run made about three thousand claims and Discord
+        // answered 429 to almost all of them. A run looked stuck at exactly the moment it was working.
+        let start = std::time::Instant::now();
+        assert!(
+            super::typing_due(None, start, super::TYPING_INTERVAL),
+            "the first claim"
+        );
+        assert!(
+            !super::typing_due(Some(start), start, super::TYPING_INTERVAL),
+            "no second claim in the same instant"
+        );
+        let almost = start + super::TYPING_INTERVAL - std::time::Duration::from_millis(1);
+        assert!(!super::typing_due(
+            Some(start),
+            almost,
+            super::TYPING_INTERVAL
+        ));
+        let due = start + super::TYPING_INTERVAL;
+        assert!(super::typing_due(Some(start), due, super::TYPING_INTERVAL));
+    }
+
     #[test]
     fn a_row_of_bodies_has_one_mark_that_walks_and_starts_again() {
         let face = Loading {

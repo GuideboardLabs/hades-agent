@@ -3,6 +3,23 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.6
+
+### Typing is a rate-limited claim, so it gets its own clock
+
+The in-process ticker called `transport.typing` on every iteration of a 40 ms loop while only the loading
+animation respected `step_ms`. That is 25 claims a second against an endpoint that allows about one per ten
+seconds, so Discord answered 429 to nearly all of them. The effect in the chat was the opposite of the
+intent: a run looked stuck, because a rate-limited claim never becomes an indicator, and the only evidence
+was the journal filling with `POST /channels/.../typing: HTTP 429`.
+
+One `TYPING_INTERVAL` (8 seconds) now governs the claim on both run paths, separate from the animation's
+clock: the skull row is redrawn every step, and telling the surface "still alive" is a request. The daemon
+heartbeat's ad hoc four-second loop is gone with it, so the number has one home instead of two. A test pins
+the rule at the boundary, one millisecond before the interval and exactly at it.
+
+1285 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.5
 
 ### A shell command's writes are in the journal, and a stale shelf stops answering
