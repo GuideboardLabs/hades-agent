@@ -190,8 +190,22 @@ judgement and the check that a person still has to make.
 A `.hadepack` is how a skill, a harness and a pinned case travel together. It is a `tar.gz` with exactly
 three root shapes: `pack.json`, `SHA256SUMS`, and `files/`. The manifest is strict JSON: format 1, a pack
 id and version, title and summary, a license and a `derivatives` word, the Hades range it needs, the roles
-and tools it asks for, and one entry per item. An unknown key is an error, and `capabilities.code` is
-always false; a pack carries prompts and cases, not programs.
+and tools it asks for, and one entry per item. An unknown key is an error.
+
+**Where a feature lives.** This repository is the system: the agent loop, the journal and rewind, the
+gateway, the policy and the pack contract. An integration is a pack, and its source lives in
+`hades-agent-packs`, not here. A surface that talks to another service, a bundle of skills and tools, a
+serving recipe: all packs. Discord is the worked example. Its crate, its prompt and its packer used to sit
+in this tree; they live in the packs repository now, and what stayed behind is the contract they build
+against.
+
+Base changes to accommodate a pack are fine and expected, and they should be small: a field a surface
+needs in `Loading`, a config key a pack must be able to set, a trait signature. Anything larger is a sign
+the thing being built belongs in the pack instead. A pack depends on base by release tag, so the order is
+always the same: base ships the seam, the pack bumps its tag and its `requires.hades` in one commit.
+
+`capabilities.code` is true only for a connector pack, the one kind that ships a compiled binary for a
+named platform triple. A skill pack carries prompts and cases, and its `code` is false.
 
 The writer is deterministic. Every directory is set to 0755, every file keeps its mode (a case tree's
 executable bit is part of its digest), tar is run with sorted names, mtime zero, owner and group zero,

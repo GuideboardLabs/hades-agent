@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.3-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1288%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.4-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1279%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.4.3 |
+| **Version** | 0.4.4 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -62,7 +62,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1288 passing, 13 ignored (12 live browser) |
+| **Tests** | 1279 passing, 13 ignored (12 live browser) |
 
 ---
 
@@ -755,11 +755,16 @@ build ships unless this machine has cached a live one, and says how old a cached
 it again. `HADES_PACKS_URL` points the
 shelf at a mirror, and `HADES_PACKS_ALLOW_PRIVATE=1` is what lets that mirror be a local address.
 
-The catalog is generated from a packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`
-from the pack directories) and copied into `docs/packs/` at release. That shelf publishes three skills and
-the Discord connector. A connector row is the one kind that ships code: it names its platform triple, installs
-through the connector path with a digest per file, and `pack add` requires `--yes` for it where a skill is
-planned and applied.
+The catalog is generated in the packs repository (`tools/build.py` there writes `MENU.md` and `INDEX.json`
+from the pack directories) and copied into `docs/packs/` at release, which is what the binary compiles in.
+That shelf publishes three skills and the Discord connector.
+
+Two repositories, one rule. This one is the system and owns the contract; `hades-agent-packs` owns every
+integration built on it, including the source of the Discord connector. A connector pack is the one kind
+that ships code: it names its platform triple, installs through the connector path with a digest per file,
+and `pack add` requires `--yes` for it where a skill is planned and applied. A pack pins a base release by
+tag, and `rust/scripts/pack-contract.sh` builds the packs repository against a checkout of this one so a
+seam that breaks is caught here rather than after a tag.
 
 A pack's licence is its own: this runtime is MIT, and that does not reach a pack installed into it. A
 commercial pack is a pack whose manifest says so (`license` and `derivatives: forbidden`), and its bytes
@@ -795,7 +800,7 @@ which is where the deadline lives: 1800 seconds, `HADES_TEST_TIMEOUT` to overrid
 timeout, so a test that parks would otherwise hold the command until something outside killed it, and a
 hang prints no test name; under the deadline the run ends with a `the suite timed out` line instead.
 
-Current state: **1288 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
+Current state: **1279 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

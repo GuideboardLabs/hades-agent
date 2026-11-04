@@ -3,6 +3,32 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.4
+
+### A surface leaves the runtime, and the runtime keeps the contract
+
+The Discord connector had been living in this repository: its crate, its prompt and the script that packed
+it. That is backwards. A surface is a pack, and a pack's source belongs in `hades-agent-packs`, which is the
+repository that publishes it. The pack in that repository was three minor versions behind the code in this
+one and demanded a runtime older than `0.3`, which this runtime refuses outright, so the shipped shelf was
+advertising something nobody could install.
+
+The crate, `prompt.md` and `connector-pack.py` are gone from this tree. What stayed is what a pack builds
+against: the gateway types, the manifest schema, the installer, and the shelf in `docs/packs/INDEX.json`
+that is compiled into the binary. The shelf now lists discord 0.4.0 requiring `>=0.4.3,<0.5`.
+
+A pack depends on a release tag, never on a path into a checkout, so base ships the seam first and the pack
+bumps its tag and its `requires.hades` in the same commit. That ordering has a cost, and the first attempt
+collected it: pinned to `v0.4.2`, the connector failed with four `E0560`s because `Loading` gained `cells`
+and `mark` in `v0.4.3`. The seam worked as designed.
+
+`rust/scripts/pack-contract.sh` and `.github/workflows/pack-contract.yml` build the packs repository against
+this checkout with only the `harness` dependency rewritten, so a change here that breaks a pack fails here
+instead of after a tag.
+
+1279 tests, 13 ignored. The nine that left are the connector's, and they now run in the repository that
+owns it.
+
 ## 0.4.3
 
 ### A row of skulls with one crossbones walking across it
