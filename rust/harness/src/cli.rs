@@ -69,15 +69,17 @@ hades — the harness, one turn or a whole graph
       puts those files back. A generation captured under a different floor, policy
       or set of profile defaults is refused
 
-  hades journal <run> [--json] [--state <dir>]
+  hades journal <run> [--pin | --unpin] [--json] [--state <dir>]
       what one run changed: every path it captured, the digest the path held, the digest the
       step left behind, and whether the bytes were kept. The run is the session id the writes
       came from. --json prints it as an object for a script. `hades prune` is what reclaims
-      the space these journals hold
+      the space these journals hold. --pin writes a marker inside the run's own directory, so
+      no prune removes it and a run copied or restored keeps the pin with it
 
   hades prune [--keep-runs <n>] [--keep-days <d>] [--max-bytes <size>] [--dry-run] [--json]
       reclaim journal space by removing whole runs, oldest first. The newest run is never
-      removed, even when it alone is over the byte cap: that is reported instead. --max-bytes
+      removed, even when it alone is over the byte cap, and neither is a pinned run: that is
+      reported instead. --max-bytes
       takes 64M, 2G or a plain byte count. --dry-run prints the plan and writes nothing. The
       flags compose and the stricter wins, so --keep-days 30 --keep-runs 5 keeps the five
       newest runs that are also under thirty days old. A pruned run can no longer be rewound,
@@ -1232,6 +1234,13 @@ fn prune_cmd(args: &[String]) -> Result<(String, i32), String> {
     if report.removed.is_empty() {
         text.push_str("  nothing was over the cap\n");
     }
+    if !report.held.is_empty() {
+        text.push_str(&format!(
+            "{} run(s) kept by a pin: {}\n",
+            report.held.len(),
+            report.held.join(", ")
+        ));
+    }
     text.push_str(&format!("{} run(s) kept:\n", report.kept.len()));
     for (name, bytes) in report.kept.iter().take(10) {
         text.push_str(&format!("  {name} ({bytes} byte(s))\n"));
@@ -1278,10 +1287,13 @@ fn size_of(value: &str) -> Result<u64, String> {
 /// digest the step left, and whether the bytes are there to put back, so a path that cannot be rewound is
 /// visible here rather than discovered by a command that fails later.
 fn journal_cmd(args: &[String]) -> Result<(String, i32), String> {
-    let flags = parse_with(args, &["state"], &["json"])?;
+    let flags = parse_with(args, &["state"], &["json", "pin", "unpin"])?;
     let state = state_of(&flags)?;
     let run = run_of(&flags, "journal")?;
     let journal = crate::journal::Journal::at(&state, &run);
+    if switched(&flags, "pin") && switched(&flags, "unpin") {
+        return Err("--pin and --unpin contradict each other".to_string());
+    }
     if !journal.index().is_file() {
         return Ok((
             format!(
@@ -1290,6 +1302,24 @@ fn journal_cmd(args: &[String]) -> Result<(String, i32), String> {
             ),
             1,
         ));
+    }
+    if switched(&flags, "pin") || switched(&flags, "unpin") {
+        let on = switched(&flags, "pin");
+        let now = journal.pin(on)?;
+        let marker = journal.dir().join(crate::journal::PINNED);
+        let text = if now {
+            format!(
+                "pinned run `{}`: no prune will remove it, whatever the caps say ({})\n",
+                journal.run(),
+                marker.display()
+            )
+        } else {
+            format!(
+                "unpinned run `{}`: the caps apply to it again\n",
+                journal.run()
+            )
+        };
+        return Ok((text, 0));
     }
     let scan = journal.scan();
     if switched(&flags, "json") {

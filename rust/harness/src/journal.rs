@@ -34,6 +34,13 @@ pub const INDEX: &str = "index.jsonl";
 /// The directory inside a run's directory that holds captured bytes.
 pub const BLOBS: &str = "blobs";
 
+/// A file inside a run's directory that says: this run is kept, whatever the caps say.
+///
+/// The marker lives with the run rather than in an index or a config file, so a run copied, moved or restored
+/// from a backup keeps its pin without anything else being carried alongside it. Its presence is the whole
+/// fact; the contents are ignored.
+pub const PINNED: &str = "pinned";
+
 /// The largest file whose previous bytes are stored. Above this the path is named as [`Kind::TooLarge`]
 /// and no bytes are kept: a journal that fills the disk it is protecting is a second outage.
 pub const MAX_BLOB: u64 = 8 * 1024 * 1024;
@@ -395,6 +402,34 @@ impl Journal {
         Ok(())
     }
 
+    /// Whether this run is pinned against a prune.
+    pub fn pinned(&self) -> bool {
+        self.root.join(PINNED).is_file()
+    }
+
+    /// Pin this run, or unpin it, and report the state afterwards.
+    ///
+    /// A pin is refused for a run with no index: there is nothing to protect, and a marker in a directory
+    /// that holds no entries would read as a kept run to anything that later listed the journal.
+    pub fn pin(&self, on: bool) -> Result<bool, String> {
+        if !self.index().is_file() {
+            return Err(format!(
+                "run `{}` has no journal at {}: there is nothing to pin",
+                self.run,
+                self.index().display()
+            ));
+        }
+        let marker = self.root.join(PINNED);
+        if on {
+            std::fs::write(&marker, b"kept\n")
+                .map_err(|error| format!("{}: {error}", marker.display()))?;
+        } else if marker.is_file() {
+            std::fs::remove_file(&marker)
+                .map_err(|error| format!("{}: {error}", marker.display()))?;
+        }
+        Ok(on)
+    }
+
     /// Append one line. Never rewrites the file, so a reader that opened it earlier still sees a prefix.
     pub fn append(&self, entry: &Entry) -> Result<(), String> {
         let holder = self.root.parent();
@@ -544,7 +579,9 @@ pub struct Pruned {
     pub kept: Vec<(String, u64)>,
     /// Bytes the removed runs held.
     pub freed: u64,
-    /// Set when the byte cap could not be met without removing the newest run.
+    /// Runs kept back because they carry a pin, which no cap may override.
+    pub held: Vec<String>,
+    /// Set when the byte cap could not be met without removing the newest run or a pinned one.
     pub blocked: Option<String>,
 }
 
@@ -554,6 +591,7 @@ struct Held {
     at: i64,
     bytes: u64,
     dir: PathBuf,
+    pinned: bool,
 }
 
 /// Reclaim journal space by removing runs.
@@ -591,6 +629,7 @@ pub fn prune(state: &Path, keep: &Keep, now: i64, dry: bool) -> Result<Pruned, S
                 at,
                 bytes: held_bytes(&dir),
                 dir,
+                pinned: journal.pinned(),
             });
         }
     }
@@ -600,6 +639,13 @@ pub fn prune(state: &Path, keep: &Keep, now: i64, dry: bool) -> Result<Pruned, S
     let mut report = Pruned::default();
     let mut removed: Vec<usize> = Vec::new();
     for (index, run) in held.iter().enumerate() {
+        if run.pinned {
+            // A pin is the one exemption the caps may not override, and it is checked before the index so a
+            // pinned run also does not consume a slot counted by --keep-runs: keeping five runs means five
+            // runs plus whatever is pinned, which is what a person means by pinning.
+            report.held.push(run.name.clone());
+            continue;
+        }
         if index == 0 {
             continue; // the newest run is never a candidate
         }
@@ -622,16 +668,33 @@ pub fn prune(state: &Path, keep: &Keep, now: i64, dry: bool) -> Result<Pruned, S
             if total <= cap {
                 break;
             }
-            if removed.contains(&index) {
+            if removed.contains(&index) || held[index].pinned {
                 continue;
             }
             total -= held[index].bytes;
             removed.push(index);
         }
         if total > cap {
+            let mut kept_by: Vec<&str> = Vec::new();
+            if !held[0].pinned {
+                kept_by.push("the newest run");
+            }
+            if !report.held.is_empty() {
+                kept_by.push(if report.held.len() == 1 {
+                    "1 pinned run"
+                } else {
+                    "pinned runs"
+                });
+            }
             report.blocked = Some(format!(
-                "the newest run alone holds {} byte(s), over the {} byte cap: it was kept and the cap was not met",
-                held[0].bytes, cap
+                "{} hold(s) {} byte(s), over the {} byte cap: kept, and the cap was not met",
+                if kept_by.is_empty() {
+                    "the runs left".to_string()
+                } else {
+                    kept_by.join(" and ")
+                },
+                total,
+                cap
             ));
         }
     }
@@ -1203,6 +1266,104 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_run_survives_a_prune_that_would_have_taken_it() {
+        let dir = scratch("journal-pin-survives");
+        let state = dir.join("state");
+        run_with(&state, "wanted", 100, 30);
+        run_with(&state, "middle", 200, 30);
+        run_with(&state, "newest", 300, 30);
+        Journal::at(&state, "wanted").pin(true).expect("a pin");
+
+        // keep one run: without the pin this removes both older ones, and `wanted` is the first candidate.
+        let report = prune(
+            &state,
+            &Keep {
+                runs: Some(1),
+                ..Keep::default()
+            },
+            1_000,
+            false,
+        )
+        .expect("a prune");
+        assert!(
+            Journal::at(&state, "wanted").index().is_file(),
+            "the pin outranks the cap"
+        );
+        assert!(
+            !Journal::at(&state, "middle").index().is_file(),
+            "the unpinned one still goes"
+        );
+        assert_eq!(report.held, vec!["wanted".to_string()]);
+        assert_eq!(report.removed.len(), 1);
+        // A pinned run does not consume a slot counted by --keep-runs: keeping one keeps one plus the pin.
+        assert_eq!(report.kept.len(), 2);
+    }
+
+    #[test]
+    fn unpinning_returns_a_run_to_candidacy() {
+        let dir = scratch("journal-unpin");
+        let state = dir.join("state");
+        run_with(&state, "old", 100, 20);
+        run_with(&state, "new", 200, 20);
+        let journal = Journal::at(&state, "old");
+        journal.pin(true).expect("a pin");
+        assert!(journal.pinned());
+        journal.pin(false).expect("an unpin");
+        assert!(!journal.pinned());
+
+        let report = prune(
+            &state,
+            &Keep {
+                runs: Some(1),
+                ..Keep::default()
+            },
+            1_000,
+            false,
+        )
+        .expect("a prune");
+        assert!(
+            !Journal::at(&state, "old").index().is_file(),
+            "unpinned means a candidate again"
+        );
+        assert!(report.held.is_empty());
+    }
+
+    #[test]
+    fn pins_that_block_the_byte_cap_are_named() {
+        let dir = scratch("journal-pin-blocked");
+        let state = dir.join("state");
+        run_with(&state, "pinned-big", 100, 3_000);
+        run_with(&state, "newest", 200, 20);
+        Journal::at(&state, "pinned-big").pin(true).expect("a pin");
+
+        let report = prune(
+            &state,
+            &Keep {
+                bytes: Some(100),
+                ..Keep::default()
+            },
+            1_000,
+            false,
+        )
+        .expect("a prune");
+        assert!(Journal::at(&state, "pinned-big").index().is_file());
+        assert_eq!(report.held, vec!["pinned-big".to_string()]);
+        let blocked = report.blocked.expect("the unmet cap is said out loud");
+        assert!(blocked.contains("pinned run"), "{blocked}");
+    }
+
+    #[test]
+    fn a_run_with_no_journal_cannot_be_pinned() {
+        let dir = scratch("journal-pin-nothing");
+        let state = dir.join("state");
+        let error = Journal::at(&state, "absent")
+            .pin(true)
+            .expect_err("there is nothing to protect");
+        assert!(error.contains("nothing to pin"), "{error}");
+        assert!(!Journal::at(&state, "absent").dir().join(PINNED).exists());
+    }
+
+    #[test]
     fn prune_keeps_the_newest_runs_and_removes_whole_ones() {
         let dir = scratch("journal-prune-runs");
         let state = dir.join("state");
@@ -1286,7 +1447,11 @@ mod tests {
             "the newest survives its own size"
         );
         let blocked = report.blocked.expect("the unmet cap is said out loud");
-        assert!(blocked.contains("newest run alone"), "{blocked}");
+        assert!(blocked.contains("the newest run"), "{blocked}");
+        assert!(
+            blocked.contains("over the"),
+            "the unmet cap names the number: {blocked}"
+        );
     }
 
     #[test]

@@ -3,6 +3,29 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.9
+
+### A run can be pinned, and a pin outranks every cap
+
+0.4.8 exempted one run from prune: the newest. Everything older was a candidate, which meant the run someone
+most wanted to keep was usually the first thing a cap took. `hades journal <run> --pin` writes a `pinned`
+marker inside that run's own directory, and no prune removes a run that carries one. `--unpin` puts it back
+among the candidates.
+
+The marker lives with the run rather than in an index or a config file, so a run copied, moved or restored
+from a backup keeps its pin with it and nothing has to be carried alongside. Presence is the whole fact.
+
+Three behaviours worth stating. A pin is checked before the run count, so `--keep-runs 5` keeps five runs
+plus whatever is pinned, which is what a person means by pinning. Pins are also honoured against the byte
+cap, and when pins are what stop the cap being met the report names them instead of silently missing the
+number. And pinning a run with no journal is refused: a marker in a directory holding no entries would read
+as a kept run to anything that later listed the journal.
+
+This is the answer to the question the 0.4.8 post raised, which had no good answer at the time: moving a run
+out of the journal directory worked, at the cost of `rewind` no longer finding it.
+
+1299 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.8
 
 ### The journal gets a reaper, and a limit cannot go stale
