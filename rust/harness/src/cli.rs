@@ -72,7 +72,16 @@ hades — the harness, one turn or a whole graph
   hades journal <run> [--json] [--state <dir>]
       what one run changed: every path it captured, the digest the path held, the digest the
       step left behind, and whether the bytes were kept. The run is the session id the writes
-      came from. --json prints it as an object for a script
+      came from. --json prints it as an object for a script. `hades prune` is what reclaims
+      the space these journals hold
+
+  hades prune [--keep-runs <n>] [--keep-days <d>] [--max-bytes <size>] [--dry-run] [--json]
+      reclaim journal space by removing whole runs, oldest first. The newest run is never
+      removed, even when it alone is over the byte cap: that is reported instead. --max-bytes
+      takes 64M, 2G or a plain byte count. --dry-run prints the plan and writes nothing. The
+      flags compose and the stricter wins, so --keep-days 30 --keep-runs 5 keeps the five
+      newest runs that are also under thirty days old. A pruned run can no longer be rewound,
+      which `hades rewind` already reports by name rather than claiming an undo it did not make
 
   hades rewind <run> [--to <step>] [--path <glob>] [--dry-run] [--force] [--state <dir>]
       put the files back. Every path is hashed as it stands now and compared with the digest
@@ -534,6 +543,7 @@ fn dispatch(
         "activity" => activity(rest),
         "journal" => journal_cmd(rest),
         "rewind" => rewind_cmd(rest),
+        "prune" => prune_cmd(rest),
         "stop" => stop(rest),
         "cancel" => cancel(rest),
         "shutdown" => shutdown(rest),
@@ -1150,6 +1160,115 @@ fn activity(args: &[String]) -> Result<(String, i32), String> {
         text.push('\n');
     }
     Ok((text, 0))
+}
+
+/// Reclaim journal space by removing whole runs.
+///
+/// The command exists because the writer shipped before the reaper: shell capture stores the previous bytes
+/// of every path a command touches, and nothing ever removed them. Every flag is a cap and they compose, so
+/// a caller can say "five runs" or "thirty days" or "under two gigabytes" without learning a config file.
+/// Nothing is removed without --dry-run being available for it first, and the newest run is never a
+/// candidate: deleting the run someone is working in is the failure this must not have.
+fn prune_cmd(args: &[String]) -> Result<(String, i32), String> {
+    let flags = parse_with(
+        args,
+        &["state", "keep-runs", "keep-days", "max-bytes"],
+        &["json", "dry-run"],
+    )?;
+    let state = state_of(&flags)?;
+    let mut keep = crate::journal::Keep::default();
+    if let Some(value) = flags.named.get("keep-runs") {
+        keep.runs = Some(
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("--keep-runs takes a count of runs, not `{value}`"))?,
+        );
+    }
+    if let Some(value) = flags.named.get("keep-days") {
+        keep.days = Some(
+            value
+                .parse::<i64>()
+                .map_err(|_| format!("--keep-days takes a number of days, not `{value}`"))?,
+        );
+    }
+    if let Some(value) = flags.named.get("max-bytes") {
+        keep.bytes = Some(size_of(value)?);
+    }
+    if keep == crate::journal::Keep::default() {
+        return Ok((
+            format!(
+                "nothing to do: name a cap, for example `hades prune --keep-runs 10` or \
+                 `hades prune --max-bytes 2G`. Journals live under {}\n",
+                state.join("journal").display()
+            ),
+            1,
+        ));
+    }
+    let dry = switched(&flags, "dry-run");
+    let report = crate::journal::prune(&state, &keep, crate::journal::now(), dry)?;
+    if switched(&flags, "json") {
+        let body = serde_json::json!({
+            "dry_run": dry,
+            "removed": report.removed.iter().map(|(name, bytes)| serde_json::json!({"run": name, "bytes": bytes})).collect::<Vec<_>>(),
+            "kept": report.kept.iter().map(|(name, bytes)| serde_json::json!({"run": name, "bytes": bytes})).collect::<Vec<_>>(),
+            "freed": report.freed,
+            "blocked": report.blocked,
+        });
+        let mut text = serde_json::to_string_pretty(&body)
+            .map_err(|error| format!("could not write the plan as json: {error}"))?;
+        text.push('\n');
+        return Ok((text, 0));
+    }
+    let verb = if dry { "would remove" } else { "removed" };
+    let mut text = format!(
+        "{} run(s) {}, {} byte(s):\n",
+        report.removed.len(),
+        verb,
+        report.freed
+    );
+    for (name, bytes) in &report.removed {
+        text.push_str(&format!("  {name} ({bytes} byte(s))\n"));
+    }
+    if report.removed.is_empty() {
+        text.push_str("  nothing was over the cap\n");
+    }
+    text.push_str(&format!("{} run(s) kept:\n", report.kept.len()));
+    for (name, bytes) in report.kept.iter().take(10) {
+        text.push_str(&format!("  {name} ({bytes} byte(s))\n"));
+    }
+    if report.kept.len() > 10 {
+        text.push_str(&format!("  and {} more\n", report.kept.len() - 10));
+    }
+    if let Some(blocked) = &report.blocked {
+        text.push_str(&format!("note: {blocked}\n"));
+    }
+    if dry {
+        text.push_str("this was a dry run: nothing was deleted\n");
+    }
+    Ok((text, 0))
+}
+
+/// A byte count as a person writes it: `64M`, `2G`, or a plain number.
+///
+/// Suffixes are binary, because the cap they set is compared against file sizes the filesystem reports in
+/// binary units. A decimal reading would make `--max-bytes 2G` mean 2,000,000,000 while every other number
+/// on the machine means 2,147,483,648, and the difference is exactly the sort of quiet slip that makes a
+/// limit look respected while it is not.
+fn size_of(value: &str) -> Result<u64, String> {
+    let text = value.trim();
+    let (digits, scale) = match text.chars().last() {
+        Some('k') | Some('K') => (&text[..text.len() - 1], 1024u64),
+        Some('m') | Some('M') => (&text[..text.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&text[..text.len() - 1], 1024 * 1024 * 1024),
+        _ => (text, 1),
+    };
+    let count: f64 = digits
+        .parse()
+        .map_err(|_| format!("`{value}` is not a size: give bytes, or a number with K, M or G"))?;
+    if count < 0.0 {
+        return Err(format!("`{value}` is negative"));
+    }
+    Ok((count * scale as f64) as u64)
 }
 
 /// What one run changed, read from its journal.

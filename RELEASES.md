@@ -3,6 +3,33 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.4.8
+
+### The journal gets a reaper, and a limit cannot go stale
+
+0.4.5 gave shell capture the ability to keep the previous bytes of everything a command touched, and nothing
+ever removed them. Caps bounded one step; the state directory did not stop growing. `hades prune` reclaims it
+by removing whole runs, oldest first: `--keep-runs`, `--keep-days` and `--max-bytes` compose and the stricter
+wins, `--dry-run` prints the plan and writes nothing, and `--json` makes it scriptable.
+
+Three properties are deliberate. A run is removed whole, because a blob lives inside its own run's directory,
+so a pruned run cannot orphan an entry in a run that stays. The newest run is never a candidate, even when it
+alone is over the byte cap; that is reported as an unmet cap instead of deleting the run someone is working
+in. And no new rewind semantics were needed: `rewind` already names a missing blob as one path's problem and
+returns 2 or 1 rather than claiming an undo, so retention only had to delete.
+
+The second half is about a limit that had gone stale. `Limits` said "Telegram is the only messaging transport"
+for five releases after Discord shipped as a pack, and the gate stayed green because it pins the test count and
+the version in four places and reads no prose. That claim is now a line the suite parses:
+
+    - Transports: `telegram` (in the binary), `discord` (a pack built against a release tag).
+
+Every pack in the compiled-in shelf whose items include a connector must appear there, and the retired
+sentence cannot come back. Adding a connector pack without updating `Limits` fails the suite instead of
+shipping a false statement to someone deciding whether to install this.
+
+1295 tests, 13 ignored. Twelve of the ignored are the live browser suite.
+
 ## 0.4.7
 
 ### The typing interval belongs to the surface, not to the release

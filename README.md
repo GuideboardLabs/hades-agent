@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.4.7-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1286%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.8-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1295%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.4.7 |
+| **Version** | 0.4.8 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -62,7 +62,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1286 passing, 13 ignored (12 live browser) |
+| **Tests** | 1295 passing, 13 ignored (12 live browser) |
 
 ---
 
@@ -800,7 +800,7 @@ which is where the deadline lives: 1800 seconds, `HADES_TEST_TIMEOUT` to overrid
 timeout, so a test that parks would otherwise hold the command until something outside killed it, and a
 hang prints no test name; under the deadline the run ends with a `the suite timed out` line instead.
 
-Current state: **1286 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
+Current state: **1295 passing, 0 failing, 13 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:
@@ -820,7 +820,7 @@ vision endpoint in the config.
 These are current limits, not aspirations hidden in a roadmap:
 
 - Linux only. Landlock and systemd units are part of the design.
-- Telegram is the only messaging transport.
+- Transports: `telegram` (in the binary), `discord` (a pack built against a release tag). A third is a connector pack rather than a fork. The suite checks this line against the shelf compiled into the binary, so a connector pack that is not listed here fails before release instead of shipping a false limit.
 - The network is open or closed per role. There is no per-domain egress proxy.
 - Harness rollback restores the files named in a generation manifest. It does not roll back the model, the sessions or the state directory.
 - Part II of the 0.0.3 plan (satellite transport, generation swap in service, the evolve loop) is not shipped.

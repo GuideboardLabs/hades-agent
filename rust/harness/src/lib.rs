@@ -84,6 +84,7 @@ pub mod profile;
 pub mod provider;
 pub mod question;
 pub mod recipe;
+pub mod release_claims;
 pub mod repomap;
 pub mod research;
 pub mod retry;

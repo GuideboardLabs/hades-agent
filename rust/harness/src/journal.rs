@@ -519,6 +519,164 @@ impl Journal {
     }
 }
 
+/// How much of the run journal to keep.
+///
+/// Every field is optional and every field is a cap: a caller that names none keeps everything, which is
+/// what a state directory did before this existed. The fields compose, and the stricter of them wins, so
+/// `--keep-days 30 --keep-runs 5` keeps the five newest runs that are also under thirty days old.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Keep {
+    /// Keep at most this many runs, newest first.
+    pub runs: Option<usize>,
+    /// Keep runs whose newest entry is younger than this many days.
+    pub days: Option<i64>,
+    /// Keep the journal under this many bytes, newest runs first. A cap smaller than the newest run alone
+    /// cannot be met, and the report says so instead of deleting the run the person is in.
+    pub bytes: Option<u64>,
+}
+
+/// What one prune did, or would do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// Runs removed, newest first, with the bytes each held.
+    pub removed: Vec<(String, u64)>,
+    /// Runs left in place, newest first.
+    pub kept: Vec<(String, u64)>,
+    /// Bytes the removed runs held.
+    pub freed: u64,
+    /// Set when the byte cap could not be met without removing the newest run.
+    pub blocked: Option<String>,
+}
+
+/// One run as the pruner sees it: its directory name, when it last wrote, and how much it holds.
+struct Held {
+    name: String,
+    at: i64,
+    bytes: u64,
+    dir: PathBuf,
+}
+
+/// Reclaim journal space by removing runs.
+///
+/// Whole runs, never a file at a time: a blob lives inside its own run's `blobs/` directory, so a removed
+/// run cannot orphan an entry in a run that stays, and nothing here has to reason about sharing. The newest
+/// run is never removed even when it alone is over the byte cap, because pruning the run someone is working
+/// in is the one outcome a retention tool must not produce; the report names that instead.
+///
+/// `now` is passed rather than read so a test can age a journal without waiting. `dry` computes the same
+/// answer and writes nothing, which is what makes the command safe to run first.
+pub fn prune(state: &Path, keep: &Keep, now: i64, dry: bool) -> Result<Pruned, String> {
+    let holder = state.join("journal");
+    let mut held: Vec<Held> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&holder) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let journal = Journal {
+                root: dir.clone(),
+                run: name.to_string(),
+            };
+            // A run whose index will not parse still holds bytes somebody may want, so its age comes from
+            // the newest entry it does have and, failing that, from the directory itself rather than zero.
+            let scan = journal.scan();
+            let newest = scan.entries.iter().map(|entry| entry.at).max();
+            let at = newest.unwrap_or_else(|| modified(&dir).unwrap_or(0));
+            held.push(Held {
+                name: name.to_string(),
+                at,
+                bytes: held_bytes(&dir),
+                dir,
+            });
+        }
+    }
+    // Newest first, and the name breaks a tie so two runs captured in the same second have one order.
+    held.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.name.cmp(&a.name)));
+
+    let mut report = Pruned::default();
+    let mut removed: Vec<usize> = Vec::new();
+    for (index, run) in held.iter().enumerate() {
+        if index == 0 {
+            continue; // the newest run is never a candidate
+        }
+        let too_many = keep.runs.is_some_and(|runs| index >= runs);
+        let too_old = keep.days.is_some_and(|days| run.at < now - days * 86_400);
+        if too_many || too_old {
+            removed.push(index);
+        }
+    }
+
+    // Then the byte cap, oldest first, still never touching the newest run.
+    if let Some(cap) = keep.bytes {
+        let mut total: u64 = held
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !removed.contains(index))
+            .map(|(_, run)| run.bytes)
+            .sum();
+        for index in (1..held.len()).rev() {
+            if total <= cap {
+                break;
+            }
+            if removed.contains(&index) {
+                continue;
+            }
+            total -= held[index].bytes;
+            removed.push(index);
+        }
+        if total > cap {
+            report.blocked = Some(format!(
+                "the newest run alone holds {} byte(s), over the {} byte cap: it was kept and the cap was not met",
+                held[0].bytes, cap
+            ));
+        }
+    }
+
+    for index in &removed {
+        let run = &held[*index];
+        report.freed += run.bytes;
+        report.removed.push((run.name.clone(), run.bytes));
+        if !dry {
+            std::fs::remove_dir_all(&run.dir)
+                .map_err(|error| format!("{}: {error}", run.dir.display()))?;
+        }
+    }
+    for (index, run) in held.iter().enumerate() {
+        if !removed.contains(&index) {
+            report.kept.push((run.name.clone(), run.bytes));
+        }
+    }
+    Ok(report)
+}
+
+/// Everything one run's directory holds, in bytes.
+fn held_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => total += held_bytes(&path),
+            Ok(meta) => total += meta.len(),
+            Err(_) => {}
+        }
+    }
+    total
+}
+
+/// When a path last changed, in unix seconds. Used only as an age of last resort.
+fn modified(path: &Path) -> Option<i64> {
+    let changed = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = changed.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_secs()).ok()
+}
+
 /// One write, captured. Both mutating file tools go through this, and so does the governed turn, so a
 /// path cannot be written by any of them without its previous bytes being kept. There is no uncaptured
 /// variant: a writer that has no journal has no `Capture` to hand, which is why the type is a reference
@@ -848,6 +1006,14 @@ fn read_before(path: &Path) -> Result<Before, String> {
     })
 }
 
+/// The clock a prune decides with, in unix seconds.
+///
+/// Exposed so the caller can pass the same instant the entries were written against, and so a test can age a
+/// journal by naming a time rather than waiting for one.
+pub fn now() -> i64 {
+    epoch()
+}
+
 fn epoch() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1012,6 +1178,161 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         crate::scratch::unique(name)
+    }
+
+    /// One run under `state`, holding `bytes` of blob and one index line stamped `at`.
+    fn run_with(state: &Path, run: &str, at: i64, bytes: usize) -> Journal {
+        let journal = Journal::at(state, run);
+        let bytes = vec![b'x'; bytes];
+        let digest = mneme::sha256::hex(&bytes);
+        journal.put_blob(&digest, &bytes).expect("a blob");
+        journal
+            .append(&Entry {
+                at,
+                run: journal.run().to_string(),
+                step: 1,
+                tool: "write_file".to_string(),
+                path: format!("/tmp/{run}.txt"),
+                before: digest.clone(),
+                after: String::new(),
+                kind: Kind::File,
+                bytes: bytes.len() as u64,
+            })
+            .expect("an index line");
+        journal
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_runs_and_removes_whole_ones() {
+        let dir = scratch("journal-prune-runs");
+        let state = dir.join("state");
+        for (index, run) in ["oldest", "middle", "newest"].iter().enumerate() {
+            run_with(&state, run, 1_000 + index as i64, 40);
+        }
+        let report = prune(
+            &state,
+            &Keep {
+                runs: Some(2),
+                ..Keep::default()
+            },
+            2_000,
+            false,
+        )
+        .expect("a prune");
+
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].0, "oldest", "the oldest run goes first");
+        assert!(report.freed >= 40);
+        assert_eq!(report.kept.len(), 2);
+        assert!(
+            !Journal::at(&state, "oldest").index().is_file(),
+            "the run is gone"
+        );
+        assert!(
+            Journal::at(&state, "newest").index().is_file(),
+            "the newest stays"
+        );
+        // Removing a run removes its blobs with it: a blob lives inside the run it belongs to.
+        assert!(!Journal::at(&state, "oldest").dir().exists());
+    }
+
+    #[test]
+    fn prune_by_age_uses_the_newest_entry_rather_than_the_directory() {
+        let dir = scratch("journal-prune-days");
+        let state = dir.join("state");
+        let day = 86_400;
+        // Forty-five days in: one run last wrote on day one, the other on day forty, and the cap is thirty.
+        run_with(&state, "ancient", day, 10);
+        run_with(&state, "recent", 40 * day, 10);
+
+        let report = prune(
+            &state,
+            &Keep {
+                days: Some(30),
+                ..Keep::default()
+            },
+            45 * day,
+            false,
+        )
+        .expect("a prune");
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].0, "ancient");
+        assert!(Journal::at(&state, "recent").index().is_file());
+    }
+
+    #[test]
+    fn the_newest_run_is_never_removed_and_a_cap_it_breaks_is_reported() {
+        let dir = scratch("journal-prune-blocked");
+        let state = dir.join("state");
+        run_with(&state, "huge", 900, 4_000);
+        run_with(&state, "small", 800, 10);
+
+        // A cap smaller than the newest run alone cannot be met. The honest answer is to keep the run and
+        // say so, not to delete the run the person is working in to satisfy a number.
+        let report = prune(
+            &state,
+            &Keep {
+                bytes: Some(100),
+                ..Keep::default()
+            },
+            1_000,
+            false,
+        )
+        .expect("a prune");
+        assert_eq!(report.removed.len(), 1, "the older run still goes");
+        assert_eq!(report.removed[0].0, "small");
+        assert!(
+            Journal::at(&state, "huge").index().is_file(),
+            "the newest survives its own size"
+        );
+        let blocked = report.blocked.expect("the unmet cap is said out loud");
+        assert!(blocked.contains("newest run alone"), "{blocked}");
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_same_plan_and_writes_nothing() {
+        let dir = scratch("journal-prune-dry");
+        let state = dir.join("state");
+        for (index, run) in ["a", "b", "c"].iter().enumerate() {
+            run_with(&state, run, 100 + index as i64, 20);
+        }
+        let keep = Keep {
+            runs: Some(1),
+            ..Keep::default()
+        };
+        let planned = prune(&state, &keep, 1_000, true).expect("a plan");
+        assert_eq!(planned.removed.len(), 2);
+        assert!(
+            Journal::at(&state, "a").index().is_file(),
+            "nothing was deleted"
+        );
+
+        let done = prune(&state, &keep, 1_000, false).expect("the prune");
+        assert_eq!(
+            planned
+                .removed
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+            done.removed
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+            "the plan and the act agree"
+        );
+        assert!(!Journal::at(&state, "a").index().is_file());
+    }
+
+    #[test]
+    fn no_cap_keeps_everything() {
+        let dir = scratch("journal-prune-none");
+        let state = dir.join("state");
+        run_with(&state, "one", 100, 5);
+        run_with(&state, "two", 200, 5);
+        let report = prune(&state, &Keep::default(), 1_000, false).expect("a prune");
+        assert!(report.removed.is_empty());
+        assert_eq!(report.kept.len(), 2);
+        assert_eq!(report.freed, 0);
     }
 
     #[test]
