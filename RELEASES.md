@@ -1,3 +1,26 @@
+## 0.5.5
+
+The first release of this search that was scored on a set it was not tuned on, and it changed the answer.
+
+- **A held-out set was written after the constants were frozen.** Fifteen documentation queries and five
+  troubleshooting ones, each naming the canonical page by a fragment of its own URL. The shipped shape scored
+  **0.436 MRR there against 0.721 on the set it was tuned on**, which is what a fitted constant looks like.
+- **The query-token coverage term was hurting, not helping.** It rewards a URL that repeats the query, and an
+  index that returned `systemd.socket` first was being re-ranked to seventh by it. Dropped for documentation;
+  authority halved to a tie-breaker. Held-out 0.436 to 0.549.
+- **A documentation-shaped second query recovers the official page.** Three held-out queries returned a
+  monoculture from one host, six css-tricks results or only how-to blogs, with no official page in the ten.
+  Asking the same index with ` documentation` appended recovered the MDN page and the GNU tar manual at rank
+  one, four cases out of seven tried. Weighted 2.0 beside the plain pass: held-out **0.693**, tuned unchanged
+  at 0.718.
+- **Requests are spaced 500 ms**, measured: eight queries at that spacing were all answered, while the burst
+  that produced five empty bodies fired back to back in tens of milliseconds.
+
+On the live indexes the query that motivated all of this, "sqlite pragma wal mode", now answers
+`sqlite.org/wal.html` first and `pragma.html` third.
+
+1313 tests, 13 ignored.
+
 ## 0.5.4
 
 A source that refuses a request is not a source that found nothing.

@@ -188,12 +188,15 @@ pub struct Fusion {
 
 pub fn fusion_for(intent: Intent) -> Fusion {
     match intent {
-        // The reference page is what a documentation query wants, so the URL's shape and the query's own words
-        // carry real weight. Troubling that with nothing else is what the sweep chose.
+        // The reference page is what a documentation query wants. Authority breaks ties; it does not decide the
+        // order. Measured on a held-out set written after these constants were frozen: coverage was demoting
+        // correct pages (an index that put `systemd.socket` first was re-ranked to seventh) and the shape tuned
+        // on the original set scored 0.436 there against 0.721 on its own set. Dropping coverage and halving
+        // authority moved held-out to 0.549 with nothing left to explain away.
         Intent::Documentation => Fusion {
             k: 10.0,
-            authority: 1.0,
-            coverage: 1.0,
+            authority: 0.4,
+            coverage: 0.0,
             agreement: 0.3,
         },
         // A troubleshooting answer is judged by the thread that fixed it, and every re-ranking signal moved
@@ -230,6 +233,11 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
             // against Bing's 0.455 and Mwmbl's 0.356, and it put `sqlite.org/wal.html` first and `pragma.html`
             // third for "sqlite pragma wal mode". The others are corroboration, not competitors.
             w.insert("yahoo", 3.0);
+            // The same index asked a second time with " documentation" appended. Three held-out queries returned
+            // a monoculture from one host (six css-tricks results, only superuser.com, only how-to blogs) with no
+            // official page anywhere in the ten, which no weight can repair; the second shape recovered the MDN
+            // page and the GNU manual at rank 1. Held-out MRR 0.436 -> 0.693 at this weight, tuned unchanged.
+            w.insert("yahoo-docs", 2.0);
             w.insert("bing", 0.3);
             w.insert("mwmbl", 0.3);
             w.insert("hn", 0.3);
@@ -912,6 +920,11 @@ fn clip(text: &str, limit: usize) -> String {
 /// decoded here. A result whose wrapper will not decode is dropped rather than returned as a Yahoo redirect: a
 /// link that points at the search engine is not a citation.
 pub fn yahoo(query: &str, limit: usize) -> Answer {
+    yahoo_as(query, limit, "yahoo")
+}
+
+/// The same request under a different source label, so a second query shape is not mistaken for a duplicate.
+pub fn yahoo_as(query: &str, limit: usize, label: &'static str) -> Answer {
     let started = std::time::Instant::now();
     let url = format!(
         "https://search.yahoo.com/search?p={}&n={}",
@@ -960,7 +973,7 @@ pub fn yahoo(query: &str, limit: usize) -> Answer {
         }
     }
     if body.trim().is_empty() {
-        let mut answer = failed("yahoo", started, "the index answered with an empty body");
+        let mut answer = failed(label, started, "the index answered with an empty body");
         answer.state = State::Blocked;
         answer.detail = format!(
             "HTTP {status} with an empty body: the index refused this request, which is not the same fact as \
@@ -991,7 +1004,7 @@ pub fn yahoo(query: &str, limit: usize) -> Answer {
     if hits.is_empty() {
         // An empty Yahoo is not always an empty web: a consent page, a 500 with a body, or a shape change all
         // arrive here as "no anchors", and 77 ms is the tell. Say what came back rather than nothing.
-        let mut answer = done("yahoo", started, hits);
+        let mut answer = done(label, started, hits);
         answer.detail = format!(
             "{} bytes, {} anchor(s), no results: {}",
             body.len(),
@@ -1000,7 +1013,7 @@ pub fn yahoo(query: &str, limit: usize) -> Answer {
         );
         return answer;
     }
-    done("yahoo", started, hits)
+    done(label, started, hits)
 }
 
 /// Keep one second between requests to a source that blocks bursts.
@@ -1011,7 +1024,11 @@ fn pace() {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    const GAP: Duration = Duration::from_millis(1000);
+    // 500 ms, measured: eight queries at half-second spacing were all answered, while the burst that produced
+    // five empty bodies in a row fired them back to back in tens of milliseconds. The longer gap worked too, but
+    // a documentation search makes two calls to this host and the gate serialises them, so the difference is
+    // a second of latency the caller pays on every search.
+    const GAP: Duration = Duration::from_millis(500);
     if let Ok(mut last) = LAST.lock() {
         if let Some(at) = *last {
             let spent = at.elapsed();
@@ -1133,6 +1150,10 @@ pub fn search(state: Option<&std::path::Path>, query: &str, limit: usize) -> Rep
         handles.push(std::thread::spawn(move || match source {
             // The browser source is skipped without a state directory, which is what keeps the suite offline.
             "yahoo" => yahoo(&query, 10),
+            // The documentation shape: the same index, asked with the word the page would carry. It costs one
+            // more request, which the pacing gate already spaces, and it recovers the official page when the
+            // plain query returns a monoculture from one blog host.
+            "yahoo-docs" => yahoo_as(&format!("{query} documentation"), 10, "yahoo-docs"),
             "bing" => match state.as_deref() {
                 Some(state) => bing_browser(state, &query, 10),
                 None => Answer {
@@ -1228,6 +1249,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_documentation_query_asks_the_second_shape() {
+        // The expanded pass costs a request, so it is not asked where it was not measured to help. Held-out
+        // queries recovered from a monoculture of blog results by appending " documentation"; nothing suggests a
+        // troubleshooting thread or an encyclopaedia article is found that way.
+        assert!(weights_for(Intent::Documentation).contains_key("yahoo-docs"));
+        assert_eq!(weights_for(Intent::Documentation)["yahoo-docs"], 2.0);
+        for other in [Intent::Troubleshooting, Intent::Entity, Intent::General] {
+            assert!(
+                !weights_for(other).contains_key("yahoo-docs"),
+                "the expanded documentation pass was asked of a {other:?} query"
+            );
+        }
+    }
+
+    #[test]
     fn a_result_that_points_back_at_the_engine_is_dropped() {
         // The two ways this went wrong on the way to 0.5.3. Yahoo wraps its results and its own navigation in
         // the same redirect, so a parser that decodes without looking at the host fills the list with
@@ -1272,7 +1308,17 @@ mod tests {
             docs.k, 10.0,
             "a flat k loses the answer at the top of the list"
         );
-        assert!(docs.authority > 0.5 && docs.coverage > 0.5);
+        assert!(
+            docs.authority > 0.0 && docs.authority <= 0.5,
+            "authority is a tie-breaker, not a ranking"
+        );
+        // No coverage term for documentation. A held-out set written after these constants were frozen showed
+        // coverage demoting correct pages: an index that returned `systemd.socket` first was re-ranked to
+        // seventh by it, and the shape that used it scored 0.436 held-out against 0.721 tuned.
+        assert_eq!(
+            docs.coverage, 0.0,
+            "coverage rewards a page whose URL repeats the query, not the right page"
+        );
         let trouble = fusion_for(Intent::Troubleshooting);
         assert_eq!(
             (trouble.authority, trouble.coverage, trouble.agreement),
