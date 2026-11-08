@@ -1,3 +1,26 @@
+## 0.5.8
+
+The classifier was the defect behind the ranking work, and it was invisible until the measurement moved into
+the binary.
+
+- **Documentation is the default now, not the fallback.** The classifier filed any query that did not say
+  "docs", "api" or "syntax" as `General`, which routed most documentation questions away from the documentation
+  weights. "git worktree remove force", "numpy einsum tutorial" and "pandas merge indicator column" all landed
+  in `General`. 32 of 62 recorded queries agreed with their gold class before; **60 of 62 after.**
+- **A symptom beats a noun, and a phrase beats a number.** "postgres fatal: too many connections" names a
+  product and a word, and the symptom decides. Bare error codes cannot tell a symptom from a thing being looked
+  up, so `bad gateway`, `permission denied` and `gateway timeout` carry it instead, and "http 429 retry-after
+  header" stays a documentation lookup.
+- **A question about an idea is not a lookup.** `why does`, `should i`, `difference between` and `versus` are
+  the queries that genuinely want prose. "difference between latency and throughput" had been filed as an
+  entity, which asks Wikipedia about latency.
+- **`--live-class` on `hades search-eval`.** Scores a recording through the classifier production actually uses
+  rather than the gold label, which is how the above was visible at all. With it, the documentation score in
+  production now equals the score on the gold label: **0.865 tuned and 0.846 held-out**, where before the tuned
+  weights were only reaching a minority of documentation queries.
+
+1326 tests, 13 ignored.
+
 ## 0.5.7
 
 The measurement moves into the binary, and finds two things a copy could not.

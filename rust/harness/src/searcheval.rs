@@ -166,6 +166,17 @@ pub fn score_report(
     recorded: &[Recorded],
     shape_override: Option<Fusion>,
 ) -> (Vec<Score>, Vec<String>) {
+    score_with(gold, recorded, shape_override, false)
+}
+
+/// `live` decides where the class comes from: the gold label (a measurement of the ranking) or `intent_of` on
+/// the query (a measurement of what production will actually do, classifier included).
+pub fn score_with(
+    gold: &[GoldRow],
+    recorded: &[Recorded],
+    shape_override: Option<Fusion>,
+    live: bool,
+) -> (Vec<Score>, Vec<String>) {
     let mut by_query: BTreeMap<(String, String), Vec<&Recorded>> = BTreeMap::new();
     for row in recorded {
         by_query
@@ -187,8 +198,12 @@ pub fn score_report(
         // The class comes from the gold label, not from re-deriving an intent at scoring time. A measurement
         // that lets the scorer guess the class is measuring the classifier as well as the ranking, and the two
         // failures need different fixes. Disagreement is counted and reported separately.
-        let intent = class_of(&target.set);
-        if intent_of(&target.query) != intent {
+        let intent = if live {
+            intent_of(&target.query)
+        } else {
+            class_of(&target.set)
+        };
+        if intent_of(&target.query) != class_of(&target.set) {
             misclassified.push(format!(
                 "{} -> {:?} (gold {})",
                 target.query,
@@ -350,6 +365,10 @@ pub fn fetch(
 
 /// Every query's rank and the first result it ranked, for when a number needs explaining.
 pub fn rank_report(gold: &[GoldRow], recorded: &[Recorded]) -> Vec<String> {
+    rank_report_with(gold, recorded, false)
+}
+
+pub fn rank_report_with(gold: &[GoldRow], recorded: &[Recorded], live: bool) -> Vec<String> {
     let mut out = Vec::new();
     for target in gold {
         let rows: Vec<&Recorded> = recorded
@@ -360,7 +379,11 @@ pub fn rank_report(gold: &[GoldRow], recorded: &[Recorded]) -> Vec<String> {
             out.push(format!("{:44} no recording", target.query));
             continue;
         }
-        let intent = class_of(&target.set);
+        let intent = if live {
+            intent_of(&target.query)
+        } else {
+            class_of(&target.set)
+        };
         let weights = weights_for(intent);
         let shape = fusion_for(intent);
         let answers: Vec<Answer> = rows
@@ -498,6 +521,7 @@ pub fn cmd(args: &[String]) -> i32 {
     let mut hits: Vec<PathBuf> = Vec::new();
     let mut json = false;
     let mut verbose = false;
+    let mut live = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -513,6 +537,7 @@ pub fn cmd(args: &[String]) -> i32 {
             }
             "--json" => json = true,
             "--verbose" => verbose = true,
+            "--live-class" => live = true,
             "-h" | "--help" => {
                 println!(
                     "hades search-eval --gold <set.jsonl> --hits <recording.jsonl> [--hits ...] [--json]\n\
@@ -551,9 +576,9 @@ pub fn cmd(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let (scores, misclassified) = score_report(&gold_rows, &recorded, None);
+    let (scores, misclassified) = score_with(&gold_rows, &recorded, None, live);
     if verbose {
-        for line in rank_report(&gold_rows, &recorded) {
+        for line in rank_report_with(&gold_rows, &recorded, live) {
             eprintln!("{line}");
         }
     }
