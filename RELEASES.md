@@ -1,3 +1,21 @@
+## 0.5.4
+
+A source that refuses a request is not a source that found nothing.
+
+- **Yahoo soft-blocks a burst.** Five consecutive queries came back as `200` with an empty body in about 80 ms
+  and the sixth answered normally. That is a refusal, and the tool was reporting it as an empty web. It is now
+  retried once after a pause and, if it persists, reported as blocked with the status code, which is the same
+  rule the blocked-index paths already followed.
+- **Requests to that index are spaced by a second**, through a process-wide gate rather than a per-call sleep, so
+  a burst of searches cannot outrun it.
+- **An HTTP status is carried out of the fetch layer.** A `200` with no body and a `403` are different facts, and
+  a caller that cannot tell them apart will blame the web.
+- **Navigation is not a citation.** Results that decode back to the search engine's own hosts are dropped, with
+  a test for the exact two shapes that cost a release: `yahoo.com/news` from the navigation rail and
+  `shopping.yahoo.com` from the shopping vertical.
+
+1312 tests, 13 ignored.
+
 ## 0.5.3
 
 Search, measured against a person's expectation rather than a domain match.

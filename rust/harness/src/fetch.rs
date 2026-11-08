@@ -544,7 +544,7 @@ pub fn get_with_headers(
     limit: usize,
     allow_private: bool,
     headers: &[(&str, &str)],
-) -> Result<String, String> {
+) -> Result<(u16, String), String> {
     let deadline = Instant::now() + FETCH_DEADLINE;
     let target = Target::parse(url)?;
     let addresses = resolve(&target, allow_private)?;
@@ -552,14 +552,14 @@ pub fn get_with_headers(
         call_with_headers(&target, url, address, max_time, headers)
     })?;
     match outcome {
-        Outcome::Page(bytes) => {
+        Outcome::Page { status, bytes } => {
             if bytes.len() > limit {
                 return Err(format!(
                     "refused: the body is {} bytes, over the {limit} ceiling",
                     bytes.len()
                 ));
             }
-            Ok(String::from_utf8_lossy(&bytes).to_string())
+            Ok((status, String::from_utf8_lossy(&bytes).to_string()))
         }
         // A redirect is reported rather than followed: a search endpoint that answers 3xx is asking for a
         // session this call does not have, and following it blind would be a second request nobody asked for.
@@ -568,6 +568,16 @@ pub fn get_with_headers(
         )),
         Outcome::Oversize => Err(format!("the body is over the {limit} ceiling")),
     }
+}
+
+/// The status code from a curl header dump, or 0 when there is not one to read.
+pub(crate) fn status_of(headers: &str) -> u16 {
+    headers
+        .lines()
+        .find(|line| line.starts_with("HTTP/"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
 }
 
 /// One curl call with extra headers, with the same protocol, redirect and size constraints as [`call`].
@@ -637,7 +647,10 @@ fn call_with_headers(
     let text = String::from_utf8_lossy(&text);
     match location_in(&text) {
         Some(value) => Ok(Outcome::Redirect(value)),
-        None => Ok(Outcome::Page(body)),
+        None => Ok(Outcome::Page {
+            status: status_of(&text),
+            bytes: body,
+        }),
     }
 }
 
@@ -668,7 +681,7 @@ fn chase_bytes(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<Vec<
             hop(&target, &current, address, max_time, ca)
         })?;
         match outcome {
-            Outcome::Page(bytes) => return Ok(bytes),
+            Outcome::Page { bytes, .. } => return Ok(bytes),
             Outcome::Oversize => {
                 return Err(
                     "refused: the body passed the cap, and a body this tool would not be able to \
@@ -745,8 +758,10 @@ fn remaining_seconds(deadline: Instant) -> Result<u64, String> {
 
 /// The three ways one curl call can end, decided from its exit code and its header file.
 enum Outcome {
-    /// A terminal response (2xx, 4xx, 5xx): the body file is what matters.
-    Page(Vec<u8>),
+    /// A terminal response (2xx, 4xx, 5xx): the body file is what matters. The status is carried because a
+    /// 200 with an empty body is not the same fact as a 403, and a source that reports "no results" for a
+    /// soft block teaches its caller the wrong thing.
+    Page { status: u16, bytes: Vec<u8> },
     /// `--max-filesize` fired: the body was never completed, so the call is over.
     Oversize,
     /// A 3xx with a `Location`: the chain continues with the value as it arrived.
@@ -821,7 +836,10 @@ fn call(
     let location = read_location(&headers)?;
     Ok(match location {
         Some(value) => Outcome::Redirect(value),
-        None => Outcome::Page(read_capped(&body)?),
+        None => Outcome::Page {
+            status: status_of(&std::fs::read_to_string(&headers).unwrap_or_default()),
+            bytes: read_capped(&body)?,
+        },
     })
 }
 
@@ -852,10 +870,10 @@ fn hop(
                     Some(value) => Ok(Outcome::Redirect(value)),
                     // A `204`, a `304` or a `3xx` this tool does not follow: the body is the answer,
                     // and a body is what the caller gets.
-                    None => {
-                        let _ = status;
-                        Ok(Outcome::Page(body))
-                    }
+                    None => Ok(Outcome::Page {
+                        status,
+                        bytes: body,
+                    }),
                 }
             }
             // `--max-filesize` in the process path reports 63; the pool reports the same trip as a
@@ -1240,7 +1258,10 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(2_500));
                     Err("curl failed with exit 7".to_string())
                 } else {
-                    Ok(Outcome::Page(b"ok".to_vec()))
+                    Ok(Outcome::Page {
+                        status: 200,
+                        bytes: b"ok".to_vec(),
+                    })
                 }
             },
         );

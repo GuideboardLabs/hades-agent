@@ -918,26 +918,56 @@ pub fn yahoo(query: &str, limit: usize) -> Answer {
         encode(query),
         limit.max(10)
     );
-    let body = match crate::fetch::get_with_headers(
-        &url,
-        MAX_BYTES,
-        false,
-        &[
-            (
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 \
-                 Safari/537.36",
-            ),
-            (
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ),
-            ("Accept-Language", "en-US,en;q=0.9"),
-        ],
-    ) {
-        Ok(body) => body,
-        Err(error) => return failed("yahoo", started, &error),
-    };
+    // Yahoo soft-blocks a burst: five queries in a row came back as a 200 with **zero bytes in 80 ms**, and the
+    // sixth answered normally. That is a refusal, not an empty web, so it is retried once after a pause and
+    // reported as blocked rather than empty when it persists.
+    let mut body = String::new();
+    let mut status = 0u16;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(900));
+        }
+        pace();
+        match crate::fetch::get_with_headers(
+            &url,
+            MAX_BYTES,
+            false,
+            &[
+                (
+                    "User-Agent",
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 \
+                     Safari/537.36",
+                ),
+                (
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ),
+                ("Accept-Language", "en-US,en;q=0.9"),
+            ],
+        ) {
+            Ok((code, text)) => {
+                body = text;
+                status = code;
+                if !body.trim().is_empty() {
+                    break;
+                }
+            }
+            Err(error) => {
+                if attempt == 1 {
+                    return failed("yahoo", started, &error);
+                }
+            }
+        }
+    }
+    if body.trim().is_empty() {
+        let mut answer = failed("yahoo", started, "the index answered with an empty body");
+        answer.state = State::Blocked;
+        answer.detail = format!(
+            "HTTP {status} with an empty body: the index refused this request, which is not the same fact as \
+             an empty web"
+        );
+        return answer;
+    }
     let mut hits = Vec::new();
     for (href, inner) in anchors(&body) {
         if hits.len() >= limit {
@@ -971,6 +1001,26 @@ pub fn yahoo(query: &str, limit: usize) -> Answer {
         return answer;
     }
     done("yahoo", started, hits)
+}
+
+/// Keep one second between requests to a source that blocks bursts.
+///
+/// Measured on search.yahoo.com: back-to-back queries come back as a 200 with zero bytes, which a caller cannot
+/// tell from "no results" unless the source says so. A second of spacing costs a search nothing.
+fn pace() {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    const GAP: Duration = Duration::from_millis(1000);
+    if let Ok(mut last) = LAST.lock() {
+        if let Some(at) = *last {
+            let spent = at.elapsed();
+            if spent < GAP {
+                std::thread::sleep(GAP - spent);
+            }
+        }
+        *last = Some(Instant::now());
+    }
 }
 
 /// `(href, inner html)` for every anchor on the page, in document order.
@@ -1178,6 +1228,40 @@ mod tests {
     }
 
     #[test]
+    fn a_result_that_points_back_at_the_engine_is_dropped() {
+        // The two ways this went wrong on the way to 0.5.3. Yahoo wraps its results and its own navigation in
+        // the same redirect, so a parser that decodes without looking at the host fills the list with
+        // yahoo.com/news; measured, that is how the strongest source on this machine scored 0%.
+        let wrapped = "https://r.search.yahoo.com/_ylt=x/RV=2/RE=1/RO=10/RU=https%3a%2f%2fsqlite.org%2fwal.html/RK=2/RS=a-";
+        assert_eq!(
+            unwrap_yahoo(wrapped).as_deref(),
+            Some("https://sqlite.org/wal.html")
+        );
+        let nav =
+            "https://r.search.yahoo.com/_ylt=x/RU=https%3a%2f%2fwww.yahoo.com%2fnews%2f/RK=2/RS=a-";
+        assert_eq!(unwrap_yahoo(nav), None, "navigation is not a citation");
+        let shopping = "https://r.search.yahoo.com/_ylt=x/RU=https%3a%2f%2fshopping.yahoo.com%2fsearch/RK=2/RS=a-";
+        assert_eq!(unwrap_yahoo(shopping), None);
+        assert_eq!(unwrap_yahoo("/r/not-a-url"), None);
+        assert_eq!(
+            unwrap_yahoo("https://example.org/plain"),
+            Some("https://example.org/plain".to_string())
+        );
+    }
+
+    #[test]
+    fn a_status_line_is_read_or_reported_as_unknown() {
+        use crate::fetch::status_of;
+        assert_eq!(status_of("HTTP/1.1 200 OK\r\ndate: x\r\n"), 200);
+        assert_eq!(status_of("HTTP/2 500 \r\n"), 500);
+        assert_eq!(
+            status_of(""),
+            0,
+            "no header means no claim about the status"
+        );
+    }
+
+    #[test]
     fn the_fusion_shape_and_weights_are_what_the_sweep_chose() {
         // These constants came from a grid sweep over 42 recorded queries graded on the canonical page. The test
         // is here so a later edit cannot quietly flatten them back to a single global shape: k=10 rather than
@@ -1372,6 +1456,9 @@ mod tests {
             "sqlite pragma wal mode",
             "docker permission denied var run docker sock",
             "jacquard loom punched cards",
+            "cargo clippy allow lint attribute",
+            "redis rdb persistence",
+            "python asyncio taskgroup",
         ] {
             let report = search(None, query, 6);
             println!("\n=== {query}  [{}]", report.intent.name());
