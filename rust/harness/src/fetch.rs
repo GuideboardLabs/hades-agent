@@ -530,6 +530,40 @@ fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, St
     chase_bytes(url, allow_private, ca).map(|body| String::from_utf8_lossy(&body).to_string())
 }
 
+/// POST a JSON body and return the status and the response text.
+///
+/// Keenable's public search is the caller: one plain REST endpoint that answers without a key, which is worth a
+/// function because it is the only source in the set that is not a scrape and not a GET.
+pub fn post_json(
+    url: &str,
+    payload: &str,
+    limit: usize,
+    allow_private: bool,
+    headers: &[(&str, &str)],
+) -> Result<(u16, String), String> {
+    let deadline = Instant::now() + FETCH_DEADLINE;
+    let target = Target::parse(url)?;
+    let addresses = resolve(&target, allow_private)?;
+    let outcome = try_addresses(&addresses, deadline, url, |address, max_time| {
+        call_with(&target, url, address, max_time, headers, Some(payload))
+    })?;
+    match outcome {
+        Outcome::Page { status, bytes } => {
+            if bytes.len() > limit {
+                return Err(format!(
+                    "refused: the body is {} bytes, over the {limit} ceiling",
+                    bytes.len()
+                ));
+            }
+            Ok((status, String::from_utf8_lossy(&bytes).to_string()))
+        }
+        Outcome::Redirect(to) => Err(format!(
+            "the endpoint redirected to {to}, which it should not"
+        )),
+        Outcome::Oversize => Err(format!("the body is over the {limit} ceiling")),
+    }
+}
+
 /// A GET that carries explicit request headers, for the one case the runtime needs them.
 ///
 /// A search index decides whether to answer based on the request's `Accept` and `Accept-Language`, and this
@@ -588,6 +622,22 @@ fn call_with_headers(
     max_time: u64,
     headers: &[(&str, &str)],
 ) -> Result<Outcome, String> {
+    call_with(target, url, address, max_time, headers, None)
+}
+
+/// The same call with a request body, which makes it a POST.
+///
+/// A body is written to the scratch directory and handed to curl as `--data-binary @file`, so a payload with
+/// quotes, newlines or a non-ASCII query reaches the endpoint byte for byte instead of being re-quoted by a
+/// shell that is not involved.
+fn call_with(
+    target: &Target,
+    url: &str,
+    address: IpAddr,
+    max_time: u64,
+    headers: &[(&str, &str)],
+    request_body: Option<&str>,
+) -> Result<Outcome, String> {
     let scratch = Scratch::new()?;
     let header_file = scratch.file("hdr");
     let body_file = scratch.file("body");
@@ -611,6 +661,14 @@ fn call_with_headers(
     // that works and one that reports nothing. A caller asking for headers is a search endpoint, and they are
     // the class of endpoint that does this.
     args.insert(url_at, "--http1.1".to_string());
+    if let Some(payload) = request_body {
+        let request_file = scratch.file("req");
+        std::fs::write(&request_file, payload).map_err(|error| error.to_string())?;
+        args.insert(url_at, "-X".to_string());
+        args.insert(url_at + 1, "POST".to_string());
+        args.insert(url_at + 2, "--data-binary".to_string());
+        args.insert(url_at + 3, format!("@{}", request_file.display()));
+    }
     for (name, value) in headers {
         args.insert(url_at, "-H".to_string());
         args.insert(url_at + 1, format!("{name}: {value}"));

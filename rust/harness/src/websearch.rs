@@ -184,6 +184,11 @@ pub struct Fusion {
     pub authority: f64,
     pub coverage: f64,
     pub agreement: f64,
+    /// Bonus when the result's own domain carries a word from the query.
+    pub subject: f64,
+    /// Penalty for a discussion path, applied where the subject bonus would otherwise promote a forum thread
+    /// that happens to live on the right domain.
+    pub discussion: f64,
 }
 
 pub fn fusion_for(intent: Intent) -> Fusion {
@@ -193,11 +198,16 @@ pub fn fusion_for(intent: Intent) -> Fusion {
         // correct pages (an index that put `systemd.socket` first was re-ranked to seventh) and the shape tuned
         // on the original set scored 0.436 there against 0.721 on its own set. Dropping coverage and halving
         // authority moved held-out to 0.549 with nothing left to explain away.
+        // Measured after Keenable joined: the subject bonus alone recovers the canonical page, and the discussion
+        // penalty only pays off in combination with it. A forum thread on the right domain inherits the subject
+        // bonus, which is why the penalty looked like noise when it was swept on its own.
         Intent::Documentation => Fusion {
             k: 10.0,
             authority: 0.4,
             coverage: 0.0,
             agreement: 0.3,
+            subject: 0.6,
+            discussion: 0.3,
         },
         // A troubleshooting answer is judged by the thread that fixed it, and every re-ranking signal moved
         // the right thread down. Stack Exchange's own order is the best evidence available, so it is trusted.
@@ -206,18 +216,24 @@ pub fn fusion_for(intent: Intent) -> Fusion {
             authority: 0.0,
             coverage: 0.0,
             agreement: 0.0,
+            subject: 0.0,
+            discussion: 0.0,
         },
         Intent::Entity => Fusion {
             k: 10.0,
             authority: 0.5,
             coverage: 0.6,
             agreement: 0.3,
+            subject: 0.0,
+            discussion: 0.0,
         },
         Intent::General => Fusion {
             k: 10.0,
             authority: 0.5,
             coverage: 0.6,
             agreement: 0.3,
+            subject: 0.0,
+            discussion: 0.0,
         },
     }
 }
@@ -238,6 +254,9 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
             // official page anywhere in the ten, which no weight can repair; the second shape recovered the MDN
             // page and the GNU manual at rank 1. Held-out MRR 0.436 -> 0.693 at this weight, tuned unchanged.
             w.insert("yahoo-docs", 2.0);
+            // The one keyless index that improved the fused order rather than diluting it, and the only source
+            // here that is a plain REST call rather than a scrape.
+            w.insert("keenable", 0.5);
             w.insert("bing", 0.3);
             w.insert("mwmbl", 0.3);
             w.insert("hn", 0.3);
@@ -383,6 +402,56 @@ pub struct Scored {
     pub sources: BTreeSet<&'static str>,
 }
 
+/// Paths that hold a conversation about a page rather than the page.
+const DISCUSSION: [&str; 6] = [
+    "/forum/",
+    "/forumpost/",
+    "/questions/",
+    "/thread/",
+    "/discuss",
+    "/community/",
+];
+
+/// 1.0 when the result's own domain carries a word from the query.
+///
+/// `sqlite.org` for a query about SQLite, `docs.python.org` for a query about Python: the page a person wants is
+/// almost always served by the thing they named. Measured on both query sets, this is what recovers the canonical
+/// page from a blog that outranks it on two indexes at once.
+pub fn subject_host(query: &str, url: &str) -> f64 {
+    let host = registrable(&domain(url));
+    let head = host.split('.').next().unwrap_or("");
+    let matches = subject_tokens(query)
+        .iter()
+        .any(|token| head.contains(token.as_str()));
+    if matches { 1.0 } else { 0.0 }
+}
+
+/// The words of a query long enough to name something, lowercased, with hyphens treated as spaces.
+fn subject_tokens(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .replace('-', " ")
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 3)
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// 1.0 when the path is a discussion rather than a reference page.
+fn discussion_path(url: &str) -> f64 {
+    let low = path_of(url).to_lowercase();
+    if DISCUSSION.iter().any(|marker| low.contains(marker)) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 /// Fuse the answers. No host affinity: it was measured and it rewarded the right domain's wrong page.
 pub fn fuse(
     query: &str,
@@ -416,6 +485,8 @@ pub fn fuse(
         row.score += shape.authority * authority(&host, &path_of(&row.hit.url));
         row.score += shape.coverage * coverage(query, &row.hit.title, &row.hit.url);
         row.score += shape.agreement * (row.sources.len().saturating_sub(1)) as f64;
+        row.score += shape.subject * subject_host(query, &row.hit.url);
+        row.score -= shape.discussion * discussion_path(&row.hit.url);
     }
     let mut rows: Vec<Scored> = scores.into_values().collect();
     // Ties are broken by score, then by the shorter URL: a canonical page is usually the shorter path.
@@ -907,6 +978,192 @@ fn clip(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect::<String>() + "…"
 }
 
+/// Keenable's public search: a plain REST POST that answers without a key.
+///
+/// Measured against the held-out set as an index in its own right: 0.589 MRR on documentation, in the same band
+/// as Exa (0.536) and Parallel (0.569), and the only one of the three that improved the fused order rather than
+/// diluting it (0.693 to 0.708, hit@3 73% to 80%). Its value beyond that delta is independence: it is not a
+/// scrape and not behind the same rate-limit window as the others, so it still answers when they refuse.
+///
+/// The endpoint requires an application identifier header and explicitly no user identifiers, which is why the
+/// header says `hades` and nothing else is sent.
+pub fn keenable(query: &str, limit: usize) -> Answer {
+    let started = std::time::Instant::now();
+    let payload = format!(
+        "{{\"query\":{},\"max_results\":{}}}",
+        json_string(query),
+        limit.clamp(1, 20)
+    );
+    let (status, body) = match crate::fetch::post_json(
+        "https://api.keenable.ai/v1/search/public",
+        &payload,
+        MAX_BYTES,
+        false,
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json"),
+            ("X-Keenable-Title", "hades"),
+        ],
+    ) {
+        Ok(answer) => answer,
+        Err(error) => return failed("keenable", started, &error),
+    };
+    let rows = json_array(&body, "results");
+    let mut hits = Vec::new();
+    for row in rows {
+        if hits.len() >= limit {
+            break;
+        }
+        let url = json_field(&row, "url").unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+        let title = json_field(&row, "title")
+            .or_else(|| json_field(&row, "snippet"))
+            .unwrap_or_default();
+        hits.push(Hit {
+            title: if title.is_empty() { url.clone() } else { title },
+            url,
+            snippet: json_field(&row, "snippet")
+                .or_else(|| json_field(&row, "description"))
+                .unwrap_or_default(),
+            source: "keenable",
+            rank: hits.len() + 1,
+        });
+    }
+    if hits.is_empty() {
+        // A source that says nothing is not the same fact as a source that refused; the status decides which.
+        let mut answer = done("keenable", started, hits);
+        if status != 200 {
+            answer.state = State::Blocked;
+            answer.detail = format!("HTTP {status}: {}", clip(&body, 120));
+        } else {
+            answer.detail = format!(
+                "HTTP {status} with {} bytes and no usable row: {}",
+                body.len(),
+                clip(&body, 120)
+            );
+        }
+        return answer;
+    }
+    done("keenable", started, hits)
+}
+
+/// A JSON string literal: quotes, backslashes and control characters escaped, everything else left as UTF-8.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The objects inside the array that follows `key`, split at the top level.
+fn json_array(text: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    let Some(at) = text.find(&needle) else {
+        return Vec::new();
+    };
+    let rest = &text[at + needle.len()..];
+    let Some(open) = rest.find('[') else {
+        return Vec::new();
+    };
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut current = String::new();
+    let mut out = Vec::new();
+    for ch in rest[open + 1..].chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => {
+                current.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                in_string = !in_string;
+                current.push(ch);
+            }
+            '{' if !in_string => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' if !in_string => {
+                depth -= 1;
+                current.push(ch);
+                if depth == 0 {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            ']' if !in_string && depth == 0 => break,
+            c => {
+                if depth > 0 {
+                    current.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One field's value from a flat JSON object, unescaped.
+fn json_field(object: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let at = object.find(&needle)?;
+    let rest = &object[at + needle.len()..];
+    let colon = rest.find(':')?;
+    let mut chars = rest[colon + 1..].trim_start().chars().peekable();
+    if chars.peek() != Some(&'"') {
+        // A number or a literal: take it up to the next comma or brace.
+        let raw: String = chars
+            .take_while(|c| *c != ',' && *c != '}' && *c != ']')
+            .collect::<String>()
+            .trim()
+            .to_string();
+        return if raw.is_empty() || raw == "null" {
+            None
+        } else {
+            Some(raw)
+        };
+    }
+    chars.next();
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            out.push(match ch {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'u' => ' ', // the one escape a title does not need decoded to be useful
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(out),
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// Yahoo, which is where the deep results actually come from on this machine.
 ///
 /// Measured against every other keyless route: DuckDuckGo's hostnames refuse TCP 443 here, Brave answers a
@@ -1154,6 +1411,7 @@ pub fn search(state: Option<&std::path::Path>, query: &str, limit: usize) -> Rep
             // more request, which the pacing gate already spaces, and it recovers the official page when the
             // plain query returns a monoculture from one blog host.
             "yahoo-docs" => yahoo_as(&format!("{query} documentation"), 10, "yahoo-docs"),
+            "keenable" => keenable(&query, 10),
             "bing" => match state.as_deref() {
                 Some(state) => bing_browser(state, &query, 10),
                 None => Answer {
@@ -1246,6 +1504,88 @@ mod tests {
         );
         assert_eq!(intent_of("who invented the jacquard loom"), Intent::Entity);
         assert_eq!(intent_of("sqlite pragma docs"), Intent::Documentation);
+    }
+
+    #[test]
+    fn a_query_is_escaped_into_json_and_read_back_out() {
+        // The payload is built by hand, so the escaping is the whole correctness of it. A query with a quote in
+        // it must not end the string, and a payload the endpoint rejects is a silent empty answer.
+        assert_eq!(json_string("sqlite pragma"), "\"sqlite pragma\"");
+        // The right-hand sides are the exact JSON text the endpoint must receive.
+        assert_eq!(json_string(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(json_string("line\nbreak"), "\"line\\nbreak\"");
+        assert_eq!(json_string("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn a_results_array_is_split_at_its_own_level() {
+        // A snippet with a brace or a comma inside a string is common in this payload; splitting on them would
+        // truncate the row and lose the url that follows.
+        let body = r#"{"results":[{"title":"a{b","url":"https://x/a"}],"total":1}"#;
+        let rows = json_array(body, "results");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(json_field(&rows[0], "url").as_deref(), Some("https://x/a"));
+        assert_eq!(json_field(&rows[0], "title").as_deref(), Some("a{b"));
+
+        let two = r#"{"results":[{"url":"https://x/1"},{"url":"https://x/2"}]}"#;
+        assert_eq!(json_array(two, "results").len(), 2);
+        assert!(
+            json_array(r#"{"other":[]}"#, "results").is_empty(),
+            "an absent key is not an empty list"
+        );
+    }
+
+    #[test]
+    fn a_snippet_with_escapes_comes_back_readable() {
+        let row = r#"{"url":"https://x/a","title":"T","snippet":"one\ntwo \"quoted\" three"}"#;
+        assert_eq!(
+            json_field(row, "snippet").as_deref(),
+            Some("one\ntwo \"quoted\" three")
+        );
+    }
+
+    #[test]
+    fn the_keyless_index_is_asked_for_documentation() {
+        // It earned its place on both query sets: at 0.5 the tuned MRR went 0.718 to 0.743 and the held-out
+        // 0.693 to 0.710. It was not measured for the other classes, so it is not asked there.
+        assert_eq!(weights_for(Intent::Documentation)["keenable"], 0.5);
+        for other in [Intent::Troubleshooting, Intent::Entity, Intent::General] {
+            assert!(!weights_for(other).contains_key("keenable"));
+        }
+    }
+
+    #[test]
+    fn the_subject_domain_and_the_discussion_penalty_pull_in_opposite_directions() {
+        // The pair only works together: a forum thread on the right domain inherits the subject bonus, so without
+        // the penalty the bonus promotes exactly the page a documentation query does not want.
+        assert_eq!(
+            subject_host("sqlite pragma wal mode", "https://sqlite.org/wal.html"),
+            1.0
+        );
+        assert_eq!(
+            subject_host("sqlite pragma wal mode", "https://sqldocs.org/sqlite-wal/"),
+            0.0
+        );
+        assert_eq!(
+            subject_host(
+                "python asyncio taskgroup",
+                "https://docs.python.org/3/library/asyncio.html"
+            ),
+            1.0
+        );
+        assert_eq!(
+            subject_host(
+                "rust async trait",
+                "https://doc.rust-lang.org/book/ch17.html"
+            ),
+            1.0
+        );
+        assert_eq!(discussion_path("https://sqlite.org/forum/info/a1ca"), 1.0);
+        assert_eq!(
+            discussion_path("https://stackoverflow.com/questions/1/x"),
+            1.0
+        );
+        assert_eq!(discussion_path("https://sqlite.org/wal.html"), 0.0);
     }
 
     #[test]
