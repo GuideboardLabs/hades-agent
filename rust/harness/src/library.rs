@@ -898,6 +898,24 @@ fn extract(
     }
 }
 
+/// Extract the text of a file already on disk, by its detected format.
+///
+/// The read path needs exactly what the library does on ingest, minus the catalog entry: a URL that returns a
+/// PDF is parsed by the same code that parses a file a person drops in, so the two can never disagree about
+/// what a document says. Written because `extract` and `detect_format` were already here and private.
+pub fn text_of_file(title: &str, path: &Path, bytes: &[u8]) -> Result<String, String> {
+    let format = detect_format(path, bytes)
+        .ok_or_else(|| "the file format was not recognised".to_string())?;
+    let options = AddOptions {
+        title: None,
+        authors: Vec::new(),
+        year: None,
+        tags: Vec::new(),
+        ocr_lang: None,
+    };
+    extract(title, path, format, bytes, &options).map(|done| done.text)
+}
+
 fn extract_pdf(path: &Path, ocr_lang: &str) -> Result<Extracted, String> {
     let output = Command::new("pdftotext")
         .args(["-layout", "-enc", "UTF-8"])

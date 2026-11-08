@@ -1,4 +1,85 @@
+## 0.6.0
+
+### The Nekyia Release: one road into the page
+
+The Nekyia is the book where Odysseus goes down to ask the dead what is coming. He does not shout into the dark: he
+digs a trench, pours the blood, and holds every shade to the same ritual so that the answer arrives in a form he can
+use. That is the claim of this release. Reading is no longer four tools with no chooser. There is one road in, and it
+says which road it took.
+
+The suite reports **1344 tests, 15 ignored**.
+
+### What changed
+
+- **One `read` path.** `read.rs` sniffs the bytes, then chooses: a PDF or an office document goes to the library
+  parser, a JavaScript shell goes to the browser, HTML goes to main-content extraction, and plain text is passed
+  through. `fetch` stays beside it, unchanged, as the raw escape hatch, so a pack that wants the old behaviour gets
+  exactly the old behaviour.
+- **Main-content extraction with citation spans.** Navigation, header, footer and sidebars are dropped by two rules
+  that are tested separately: semantic containers (`<nav>`, `<aside>`, `<footer>`) and the structural one, a short run
+  that is mostly anchor text. Every surviving block records its byte range in the extracted text, so a citation names
+  a passage rather than a page.
+- **A named failure for every ending.** `ok`, `blocked(403)`, `empty`, `binary`, `too-large`, `js-required`,
+  `unreachable`, each with the steps that led to it. A refusal is a state, not an empty result.
+- **Stack Exchange through its own API.** Every Stack Exchange site answers 403 to a client without a session, and
+  the keyless API serves the same question with its answers. Four forum rows of the gold set went from 1 of 4 to 4 of
+  4 without pretending a block was a read.
+- **Redirects followed, bounded at five hops.** `rfc-editor.org/rfc/rfc2616` answers `/info/rfc2616/` and MDN moved a
+  whole section; both were reported `unreachable` before this.
+- **A digest cache**, keyed on the URL, the accept header and an extraction version, so an extraction change cannot
+  serve a stale page.
+
+### The measurement
+
+`hades read-eval` reads a frozen 30-row gold set through the shipped pipeline. The set was written before `read.rs`
+compiled, and every row whose expectation was corrected carries its reason in the notes. It ships with the
+repository at `rust/harness/tests/fixtures/read-gold.jsonl`, so the number below can be reproduced:
+
+```
+hades read-eval --gold rust/harness/tests/fixtures/read-gold.jsonl --state /tmp/read-state --refresh
+```
+
+| class | rows | found | recall | state correct |
+|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100% |
+| reference | 6 | 6 | 100% | 100% |
+| forum | 4 | 4 | 100% | 100% |
+| news | 6 | 5 | 83% | 100% |
+| pdf | 3 | 2 | 67% | 67% |
+| js-shell | 3 | 1 | 33% | 67% |
+| **all** | **30** | **26** | **86.7%** | **93%** |
+
+The day-one baseline was **63.3%** over the same rows. What moved it: redirects (two reference rows), the byte
+ceiling (two pdf rows), the Stack Exchange API (three forum rows), and the PDF byte defect below.
+
+### Defects this release found and fixed
+
+- **A PDF was decoded through `String::from_utf8_lossy`.** Every invalid byte became U+FFFD, so a 2,215,244-byte
+  paper arrived as 3,077,637 bytes with broken cross-reference offsets and `pdftotext` said "Bad FCHECK in flate
+  stream" about a file that had downloaded perfectly. The fetch layer now returns bytes and the caller converts.
+  Verified by hash: our copy and `curl`'s are byte-identical.
+- **77 characters of garbage counted as a successful read.** A document must clear 200 characters or it is reported
+  `empty`, and a parse failure is `empty` rather than `binary`.
+- **`--compressed` placed before `-q`.** `-q` is only honoured as curl's first argument; moving it re-enabled the
+  user's `.curlrc` proxy and the fetch went to the wrong server. The existing `fetch_config` test caught it by timing
+  out against its fixture.
+
+### Known limits, measured
+
+- **A paywall is a block.** `reuters.com` answers 401 to a client with no session and is reported `blocked(401)`.
+- **`x.com` answers a shell with no text**, and `app.diagrams.net` returns 664 characters: both are honest reads of
+  pages that carry their content in script.
+- **One PDF row still fails** because the file itself is refused (403 from the W3C test server).
+- **The gold set is 30 rows and I wrote it.** It is frozen and it is small; a second set written by someone else
+  would be worth more than a larger set written by me.
+
 ## 0.5.10
+
+### The Lampades Release: the torch is in the binary
+
+The Lampades are the torch-bearers of the underworld, the ones who walk ahead and light the road. They carry
+their own fire. That is the claim this series makes: six keyless indexes and one REST endpoint, no vendor
+torch, nothing asked for at run time. The name covers the whole 0.5 line, of which this is the last patch.
 
 A clean query set, written after every constant froze, and what it cost the classifier.
 

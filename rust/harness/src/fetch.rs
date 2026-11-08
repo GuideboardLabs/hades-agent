@@ -555,6 +555,9 @@ pub fn post_json(
                     bytes.len()
                 ));
             }
+            // Bytes, not text. Decoding here cost a whole afternoon: a 2.2 MB PDF came back as 3.1 MB of
+            // U+FFFD replacements, and `pdftotext` reported "Bad FCHECK in flate stream" on a file that had
+            // downloaded perfectly. A caller that wants text converts it itself.
             Ok((status, String::from_utf8_lossy(&bytes).to_string()))
         }
         Outcome::Redirect(to) => Err(format!(
@@ -562,6 +565,44 @@ pub fn post_json(
         )),
         Outcome::Oversize => Err(format!("the body is over the {limit} ceiling")),
     }
+}
+
+/// Follow up to `hops` redirects and return the final status and body.
+///
+/// The single-hop path refuses a 3xx on purpose: a tool that follows a redirect blind can be walked to somewhere
+/// the caller never named. Reading is the one caller where that is wrong, because a redirect is ordinary on the
+/// web: `rfc-editor.org/rfc/rfc2616` answers `/info/rfc2616/` and `developer.mozilla.org` moved a whole section,
+/// and a reader that reports both as unreachable has not read the page. The bound and the hop list are returned so
+/// the caller can say where it went.
+pub fn get_following(
+    url: &str,
+    limit: usize,
+    allow_private: bool,
+    headers: &[(&str, &str)],
+    hops: usize,
+) -> Result<(u16, Vec<u8>, Vec<String>), String> {
+    let mut current = url.to_string();
+    let mut visited = Vec::new();
+    for _ in 0..=hops {
+        match get_with_headers(&current, limit, allow_private, headers) {
+            Ok(pair) => return Ok((pair.0, pair.1, visited)),
+            Err(reason) => {
+                let Some(target) = reason
+                    .strip_prefix("the source redirected to ")
+                    .and_then(|rest| rest.strip_suffix(", which it should not"))
+                else {
+                    return Err(reason);
+                };
+                let next = resolve_location(&current, target);
+                visited.push(next.clone());
+                current = next;
+            }
+        }
+    }
+    Err(format!(
+        "followed {hops} redirects and never reached a page: {}",
+        visited.join(" -> ")
+    ))
 }
 
 /// A GET that carries explicit request headers, for the one case the runtime needs them.
@@ -578,7 +619,7 @@ pub fn get_with_headers(
     limit: usize,
     allow_private: bool,
     headers: &[(&str, &str)],
-) -> Result<(u16, String), String> {
+) -> Result<(u16, Vec<u8>), String> {
     let deadline = Instant::now() + FETCH_DEADLINE;
     let target = Target::parse(url)?;
     let addresses = resolve(&target, allow_private)?;
@@ -593,7 +634,7 @@ pub fn get_with_headers(
                     bytes.len()
                 ));
             }
-            Ok((status, String::from_utf8_lossy(&bytes).to_string()))
+            Ok((status, bytes))
         }
         // A redirect is reported rather than followed: a search endpoint that answers 3xx is asking for a
         // session this call does not have, and following it blind would be a second request nobody asked for.
@@ -962,8 +1003,12 @@ fn curl_args(
     // The pin is `--resolve host:port:addr`, host spelled as the URL spelled it (bracketed for a
     // v6 literal, which curl also cannot parse - but a literal needs no pin, because there is no
     // lookup for a literal to race).
+    // `-q` has to stay first: it is the flag that stops curl reading .curlrc, and curl only honours it in
+    // position zero. Inserting anything ahead of it (a `--compressed` was tried) silently re-enables the user's
+    // proxy config, which a test caught by never reaching its fixture.
     let mut args: Vec<String> = vec![
         "-q".to_string(),
+        "--compressed".to_string(),
         // `-q` must be the first argument: curl otherwise reads `.curlrc`, which can name a proxy, extra
         // URLs or a relaxed TLS check, and none of that is visible to the caller that cleared the
         // environment. The rest of this list assumes the config file had no say.

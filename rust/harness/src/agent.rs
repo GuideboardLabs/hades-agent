@@ -1412,6 +1412,7 @@ fn execute_with_stop(
         "browser" => crate::browser::tool(&args, &world.state),
         "image" => image(&args, world),
         "fetch" => fetch(&args),
+        "read" => read(&args, world),
         "web_search" => web_search(&args, world),
         "react" => react_tool(&args, world),
         "library" => library_tool(&args, world),
@@ -2590,6 +2591,37 @@ fn search(args: &Value, world: &World) -> String {
 /// arguments in and the clip back out. `HADES_FETCH_ALLOW_PRIVATE=1` in the surface's environment
 /// is the one explicit hole for private targets, and it stays an environment read precisely so a
 /// test can exercise both sides of the gate without touching process state.
+/// The read tool: the acquisition pipeline, with every state named.
+///
+/// `fetch` stays beside it, unchanged, as the raw escape hatch: a pack or a prompt that wants the previous
+/// behaviour gets exactly the previous behaviour. This one chooses a path, extracts the main content and
+/// reports what it did.
+fn read(args: &Value, world: &World) -> String {
+    let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+    if url.is_empty() {
+        return "no url given".to_string();
+    }
+    let refresh = args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let allow_private = std::env::var("HADES_FETCH_ALLOW_PRIVATE").as_deref() == Ok("1");
+    let reading = crate::read::read(Some(&world.state), url, refresh, allow_private);
+    let mut out = format!(
+        "{}  [{}] {}  ({} chars)\n",
+        reading.url,
+        reading.path,
+        reading.state,
+        reading.chars()
+    );
+    if !reading.title.is_empty() {
+        out.push_str(&format!("title: {}\n", reading.title));
+    }
+    out.push('\n');
+    out.push_str(&reading.text);
+    out
+}
+
 fn fetch(args: &Value) -> String {
     let url = args.get("url").and_then(Value::as_str).unwrap_or("");
     if url.is_empty() {

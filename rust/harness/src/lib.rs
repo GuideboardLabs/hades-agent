@@ -83,6 +83,8 @@ pub mod policy;
 pub mod profile;
 pub mod provider;
 pub mod question;
+pub mod read;
+pub mod readeval;
 pub mod recipe;
 pub mod release_claims;
 pub mod repomap;

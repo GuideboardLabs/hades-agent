@@ -1329,8 +1329,8 @@ pub fn yahoo_as(query: &str, limit: usize, label: &'static str) -> Answer {
                 ("Accept-Language", "en-US,en;q=0.9"),
             ],
         ) {
-            Ok((code, text)) => {
-                body = text;
+            Ok((code, bytes)) => {
+                body = String::from_utf8_lossy(&bytes).to_string();
                 status = code;
                 if !body.trim().is_empty() {
                     break;

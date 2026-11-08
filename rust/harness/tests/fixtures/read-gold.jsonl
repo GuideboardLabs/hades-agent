@@ -1,0 +1,30 @@
+{"url": "https://sqlite.org/wal.html", "class": "docs", "question": "how do I enable WAL", "fragments": ["journal_mode=WAL"], "expect": "ok"}
+{"url": "https://docs.python.org/3/library/asyncio-task.html", "class": "docs", "question": "structured concurrency", "fragments": ["TaskGroup"], "expect": "ok"}
+{"url": "https://doc.rust-lang.org/std/vec/struct.Vec.html", "class": "docs", "question": "growable array", "fragments": ["Vec"], "expect": "ok"}
+{"url": "https://docs.docker.com/reference/cli/docker/container/run/", "class": "docs", "question": "run a container", "fragments": ["docker run"], "expect": "ok"}
+{"url": "https://nginx.org/en/docs/http/ngx_http_proxy_module.html", "class": "docs", "question": "reverse proxy", "fragments": ["proxy_pass"], "expect": "ok"}
+{"url": "https://www.postgresql.org/docs/current/sql-vacuum.html", "class": "docs", "question": "reclaim space", "fragments": ["VACUUM"], "expect": "ok"}
+{"url": "https://git-scm.com/docs/git-worktree", "class": "docs", "question": "multiple working trees", "fragments": ["worktree"], "expect": "ok"}
+{"url": "https://man7.org/linux/man-pages/man5/ssh_config.5.html", "class": "docs", "question": "hostname pattern", "fragments": ["HostName"], "expect": "ok"}
+{"url": "https://news.ycombinator.com/", "class": "news", "question": "what is on the front page", "fragments": ["Hacker News"], "expect": "ok"}
+{"url": "https://lwn.net/", "class": "news", "question": "linux weekly news", "fragments": ["LWN"], "expect": "ok"}
+{"url": "https://arstechnica.com/", "class": "news", "question": "technology news", "fragments": ["Ars Technica"], "expect": "ok"}
+{"url": "https://www.theverge.com/", "class": "news", "question": "technology news", "fragments": ["Verge"], "expect": "ok"}
+{"url": "https://www.bbc.com/news", "class": "news", "question": "world news", "fragments": ["BBC"], "expect": "ok"}
+{"url": "https://www.reuters.com/", "class": "news", "question": "world news", "fragments": ["Reuters"], "expect": "blocked(401)"}
+{"url": "https://en.wikipedia.org/wiki/Write-ahead_logging", "class": "reference", "question": "what is WAL", "fragments": ["write-ahead logging"], "expect": "ok"}
+{"url": "https://en.wikipedia.org/wiki/Uniform_Resource_Locator", "class": "reference", "question": "what is a URL", "fragments": ["Uniform Resource Locator"], "expect": "ok"}
+{"url": "https://www.rfc-editor.org/rfc/rfc2616", "class": "reference", "question": "http specification", "fragments": ["HTTP/1.1"], "expect": "ok"}
+{"url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/403", "class": "reference", "question": "403 status", "fragments": ["403"], "expect": "ok"}
+{"url": "https://www.gnu.org/software/tar/manual/tar.html", "class": "reference", "question": "tar manual", "fragments": ["tar"], "expect": "ok"}
+{"url": "https://www.kernel.org/doc/html/latest/", "class": "reference", "question": "linux kernel docs", "fragments": ["kernel"], "expect": "ok"}
+{"url": "https://stackoverflow.com/questions/48957195/how-to-fix-docker-got-permission-denied-issue", "class": "forum", "question": "docker permission denied", "fragments": ["permission denied"], "expect": "ok"}
+{"url": "https://unix.stackexchange.com/questions/537174", "class": "forum", "question": "ssh permission denied", "fragments": ["ssh"], "expect": "ok"}
+{"url": "https://superuser.com/questions/469329/ssh-config-wildcard-on-expanded-hostname", "class": "forum", "question": "ssh wildcard hostname", "fragments": ["Host"], "expect": "ok"}
+{"url": "https://discourse.ubuntu.com/", "class": "forum", "question": "ubuntu discussion", "fragments": ["Ubuntu"], "expect": "ok"}
+{"url": "https://www.rfc-editor.org/rfc/rfc9110.pdf", "class": "pdf", "question": "http semantics", "fragments": ["HTTP Semantics"], "expect": "ok"}
+{"url": "https://arxiv.org/pdf/1706.03762", "class": "pdf", "question": "attention is all you need", "fragments": ["Attention"], "expect": "ok"}
+{"url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf", "class": "pdf", "question": "dummy pdf", "fragments": ["Dummy"], "expect": "ok"}
+{"url": "https://x.com/explore", "class": "js-shell", "question": "explore", "fragments": ["Explore"], "expect": "js-required"}
+{"url": "https://www.instagram.com/", "class": "js-shell", "question": "instagram", "fragments": ["Instagram"], "expect": "ok"}
+{"url": "https://app.diagrams.net/", "class": "js-shell", "question": "diagram editor", "fragments": ["diagrams"], "expect": "ok"}

@@ -549,6 +549,9 @@ fn dispatch(
         // Search quality, scored by the same fusion a live search uses. It prints its own report and returns an
         // exit code, because the numbers are the output.
         "search-eval" => std::process::exit(crate::searcheval::cmd(rest)),
+        "read-eval" => std::process::exit(crate::readeval::cmd(rest)),
+        // `hades read <url>` prints the extracted text and names every state it went through.
+        "read" => read_cmd(rest),
         "stop" => stop(rest),
         "cancel" => cancel(rest),
         "shutdown" => shutdown(rest),
@@ -1174,6 +1177,69 @@ fn activity(args: &[String]) -> Result<(String, i32), String> {
 /// a caller can say "five runs" or "thirty days" or "under two gigabytes" without learning a config file.
 /// Nothing is removed without --dry-run being available for it first, and the newest run is never a
 /// candidate: deleting the run someone is working in is the failure this must not have.
+/// `hades read <url> [--state <dir>] [--refresh] [--json]`
+fn read_cmd(rest: &[String]) -> Result<(String, i32), String> {
+    let mut url = String::new();
+    let mut state: Option<std::path::PathBuf> = None;
+    let mut refresh = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--state" => {
+                index += 1;
+                state = rest.get(index).map(std::path::PathBuf::from);
+            }
+            "--refresh" => refresh = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => return Err(format!("read: unknown flag `{other}`")),
+            other => url = other.to_string(),
+        }
+        index += 1;
+    }
+    if url.is_empty() {
+        return Err("read: a url is required".to_string());
+    }
+    let reading = crate::read::read(state.as_deref(), &url, refresh, false);
+    if json {
+        let blocks: Vec<serde_json::Value> = reading
+            .blocks
+            .iter()
+            .map(|b| serde_json::json!({"kind": b.kind, "start": b.range.0, "end": b.range.1}))
+            .collect();
+        let body = serde_json::json!({
+            "url": reading.url,
+            "path": reading.path.to_string(),
+            "state": reading.state.to_string(),
+            "states": reading.states,
+            "title": reading.title,
+            "chars": reading.chars(),
+            "ms": reading.ms,
+            "blocks": blocks,
+            "text": reading.text,
+        })
+        .to_string();
+        return Ok((body, 0));
+    }
+    let mut out = format!(
+        "{}  [{}] {}  ({} chars, {} ms)\n",
+        reading.url,
+        reading.path,
+        reading.state,
+        reading.chars(),
+        reading.ms
+    );
+    for step in &reading.states {
+        out.push_str(&format!("  · {step}\n"));
+    }
+    if !reading.title.is_empty() {
+        out.push_str(&format!("  title: {}\n", reading.title));
+    }
+    out.push('\n');
+    out.push_str(&reading.text);
+    Ok((out, 0))
+}
+
 fn prune_cmd(args: &[String]) -> Result<(String, i32), String> {
     let flags = parse_with(
         args,
