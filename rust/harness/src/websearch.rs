@@ -178,6 +178,10 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
     let mut w = BTreeMap::new();
     match intent {
         Intent::Documentation => {
+            // The only general index measured to return deep pages from this machine, and it costs one
+            // browser navigation. Troubleshooting and entity queries leave it out: their specialist wins those
+            // classes outright (Stack Exchange 1.000, Wikipedia 1.000).
+            w.insert("bing", 1.0);
             // Marginalia is deliberately absent: it took 29 seconds on a live query and scored 0.039 MRR on
             // the gold set. A source that cannot answer inside the caller's patience is not a source.
             w.insert("mwmbl", 0.9);
@@ -192,6 +196,7 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
             w.insert("mwmbl", 0.3);
         }
         Intent::General => {
+            w.insert("bing", 1.0);
             // Wikipedia rides along on general queries: it costs 280 ms and it is the right answer whenever
             // the question turns out to be about a thing, which a keyword classifier will sometimes miss.
             w.insert("mwmbl", 0.7);
@@ -695,6 +700,159 @@ fn failed(source: &'static str, started: std::time::Instant, detail: &str) -> An
     }
 }
 
+/// Bing, asked through the browser, because its HTTP endpoints answer with site roots.
+///
+/// Measured: `sqlite pragma wal mode` over HTTP returns `sqlite.org/index.html` and `sqlite.org/download.html`;
+/// the same query in a real Chromium returns `docs.python.org/3/library/asyncio-task.html` at rank one for
+/// `python asyncio taskgroup` and the Docker compose reference page for `docker compose healthcheck`. The
+/// browser is the difference between a site and a page, and `site:` does not fix it over HTTP either: the same
+/// shallow endpoint answers `site:redis.io` with `redis.io/`.
+///
+/// The results arrive wrapped in `/ck/a?u=a1<base64url>` redirects, so every URL is decoded here. A wrapper that
+/// does not decode is returned as it came rather than dropped, because a dropped result is a silent miss.
+pub fn bing_browser(state: &std::path::Path, query: &str, limit: usize) -> Answer {
+    let started = std::time::Instant::now();
+    let url = format!("https://www.bing.com/search?q={}&count=20", encode(query));
+    let opened = crate::browser::tool(&serde_json::json!({"action": "open", "url": url}), state);
+    if opened.starts_with("Refused") || opened.contains("could not") || opened.contains("error") {
+        // A host without unprivileged user namespaces cannot give Chromium a sandbox, and the failure arrives
+        // as a closed pipe. Naming the opt-out here turns a mysterious search failure into one instruction.
+        let detail = if opened.contains("No usable sandbox") {
+            format!(
+                "this host cannot give Chromium a sandbox; set HADES_BROWSER_NO_SANDBOX=1 to allow the browser \
+                 source here, and leave it unset on a host that can: {}",
+                clip(&opened, 120)
+            )
+        } else {
+            opened
+        };
+        return failed("bing", started, &detail);
+    }
+    let reply = crate::browser::tool(
+        &serde_json::json!({"action": "eval", "script": BING_EXTRACT, "full": true}),
+        state,
+    );
+    let Some(rows) = json_rows(&reply) else {
+        return failed(
+            "bing",
+            started,
+            &format!("no result table from the browser: {}", clip(&reply, 160)),
+        );
+    };
+    let mut hits = Vec::new();
+    for (i, row) in rows.iter().take(limit).enumerate() {
+        let Some(title) = row.get("t").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(raw) = row.get("u").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let url = unwrap_bing(raw);
+        if !url.starts_with("http") {
+            continue;
+        }
+        hits.push(Hit {
+            title: plain(title),
+            url,
+            snippet: String::new(),
+            source: "bing",
+            rank: i + 1,
+        });
+    }
+    done("bing", started, hits)
+}
+
+/// What the browser evaluates on a Bing results page: every organic result, as text.
+const BING_EXTRACT: &str = r#"JSON.stringify([...document.querySelectorAll('li.b_algo')].map(li => {
+  const a = li.querySelector('h2 a') || li.querySelector('a[href]');
+  if (!a) return null;
+  let u = a.href || '';
+  // Decode the /ck/a?u=a1<base64url> wrapper in the page: it keeps the payload small and the result honest,
+  // since a wrapper that never decoded would otherwise sit in the answer looking like a Bing link.
+  const wrapped = u.match(/[?&]u=a1([^&]+)/);
+  if (wrapped) {
+    try {
+      const b64 = wrapped[1].replace(/-/g, '+').replace(/_/g, '/');
+      u = decodeURIComponent(escape(atob(b64)));
+    } catch (e) { /* leave the wrapper; the Rust side decodes it as a fallback */ }
+  }
+  return {t: (a.textContent || a.innerText || '').trim().slice(0, 160), u: u};
+}).filter(Boolean))"#;
+
+/// Decode `https://www.bing.com/ck/a?...&u=a1<base64url>...`, or return the URL unchanged.
+pub fn unwrap_bing(url: &str) -> String {
+    if !url.contains("/ck/a") {
+        return url.to_string();
+    }
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut raw = String::new();
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("u=") {
+            raw = value.to_string();
+            break;
+        }
+    }
+    if raw.len() < 3 {
+        return url.to_string();
+    }
+    let body = raw.strip_prefix("a1").unwrap_or(&raw).trim_end_matches('=');
+    match base64url_decode(body) {
+        Some(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        None => url.to_string(),
+    }
+}
+
+/// base64url without padding, which is what Bing's wrapper uses.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u32;
+    for ch in text.chars() {
+        let value = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '-' | '+' => 62,
+            '_' | '/' => 63,
+            '=' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The first JSON array in a browser reply. The tool wraps a value in a line of page context, so the array is
+/// located rather than assumed to be the whole string.
+fn json_rows(reply: &str) -> Option<Vec<serde_json::Value>> {
+    // The browser tool serialises whatever the script returned, and a script that returns JSON.stringify(...)
+    // therefore arrives as a JSON *string* with escaped quotes. Reading the array out of the escaped text
+    // fails on the first `\"`, which is exactly how this went wrong: the rows were there, the parser was not.
+    let inner = match serde_json::from_str::<serde_json::Value>(reply.trim()) {
+        Ok(serde_json::Value::String(text)) => text,
+        Ok(other) => other.to_string(),
+        Err(_) => reply.to_string(),
+    };
+    let start = inner.find('[')?;
+    let end = inner.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Vec<serde_json::Value>>(&inner[start..=end]).ok()
+}
+
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect::<String>() + "…"
+}
+
 /// What one search did: the class it decided, the answers, and the fused order.
 pub struct Report {
     pub intent: Intent,
@@ -703,14 +861,27 @@ pub struct Report {
 }
 
 /// Ask the sources this query class needs, fuse, and return the ranking plus what happened to every source.
-pub fn search(query: &str, limit: usize) -> Report {
+pub fn search(state: Option<&std::path::Path>, query: &str, limit: usize) -> Report {
     let intent = intent_of(query);
     let weights = weights_for(intent);
     let asked: Vec<&'static str> = weights.keys().copied().collect();
     let mut handles = Vec::new();
+    let owned_state = state.map(|path| path.to_path_buf());
     for source in asked {
         let query = query.to_string();
+        let state = owned_state.clone();
         handles.push(std::thread::spawn(move || match source {
+            // The browser source is skipped without a state directory, which is what keeps the suite offline.
+            "bing" => match state.as_deref() {
+                Some(state) => bing_browser(state, &query, 10),
+                None => Answer {
+                    source: "bing",
+                    hits: Vec::new(),
+                    state: State::Blocked,
+                    ms: 0,
+                    detail: "no state directory for a browser profile".into(),
+                },
+            },
             "wikipedia" => wikipedia(&query, 10),
             "stackexchange" => stackexchange(&query, 10),
             "hn" => hn(&query, 10),
@@ -931,7 +1102,7 @@ mod tests {
             "docker permission denied var run docker sock",
             "jacquard loom punched cards",
         ] {
-            let report = search(query, 6);
+            let report = search(None, query, 6);
             println!("\n=== {query}  [{}]", report.intent.name());
             for answer in &report.answers {
                 println!(
@@ -951,6 +1122,62 @@ mod tests {
                     row.hit.title.chars().take(54).collect::<String>(),
                     row.hit.url
                 );
+            }
+        }
+    }
+
+    /// Live browser: proves the general index returns pages and not site roots.
+    ///
+    ///     cargo test -p harness --lib websearch::tests::live_browser -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_browser_returns_pages_from_the_general_index() {
+        let state = std::path::PathBuf::from("/tmp/hades-search-live");
+        for (query, want_domain, want_fragment) in [
+            ("sqlite pragma wal mode", "sqlite.org", "pragma"),
+            (
+                "python asyncio taskgroup",
+                "docs.python.org",
+                "asyncio-task",
+            ),
+            (
+                "docker compose healthcheck",
+                "docs.docker.com",
+                "healthcheck",
+            ),
+            ("redis rdb persistence", "redis.io", "persistence"),
+        ] {
+            let answer = bing_browser(&state, query, 10);
+            let host_match = |url: &str| {
+                let host = domain(url);
+                host == want_domain || host.ends_with(&format!(".{want_domain}"))
+            };
+            let right = answer
+                .hits
+                .iter()
+                .position(|h| host_match(&h.url) && h.url.contains(want_fragment));
+            println!("\n{query}");
+            println!(
+                "  {} {:?} {} hit(s) {} ms {}",
+                answer.source,
+                answer.state,
+                answer.hits.len(),
+                answer.ms,
+                if answer.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", answer.detail)
+                }
+            );
+            println!(
+                "  canonical page: {}",
+                match right {
+                    Some(i) => format!("#{}", i + 1),
+                    None => "absent".into(),
+                }
+            );
+            for (i, h) in answer.hits.iter().take(5).enumerate() {
+                println!("   {}. {}", i + 1, h.url);
             }
         }
     }

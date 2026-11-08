@@ -3,6 +3,43 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.5.1
+
+### The general index, asked through the browser
+
+`web_search` had no general index. It has one now: Bing, driven through the browser the runtime already ships.
+That is not a shortcut, it is the only route that works from this machine, and each alternative was measured:
+
+| route | result |
+|---|---|
+| Bing over HTTP | returns **site roots**: `sqlite.org/index.html` for "sqlite pragma wal mode" |
+| Bing over HTTP with `site:sqlite.org` | still the site root, so scoping does not fix a shallow endpoint |
+| DuckDuckGo | its three hostnames resolve to one address that refuses TCP 443 |
+| Brave | CAPTCHA wall, in a real browser and in a stealth build |
+| Mojeek, Startpage | bot wall, consent wall |
+| server-rendered site search (gnu.org) | works, and is a useful hint for where to look next |
+| **Bing through the browser** | **10 results, ~800 ms, canonical page at rank 1 for `python asyncio taskgroup`** |
+
+So the source decodes Bing's `/ck/a?u=a1<base64url>` wrappers, in the page where it is cheap and in Rust as a
+fallback, and returns real URLs. It runs only for documentation and general queries: troubleshooting and entity
+questions already have a specialist that scores 1.000 on its class, and asking a general index there would
+dilute them.
+
+Two things this release learned the hard way, both now in the code:
+
+- **The browser's sandbox.** On a host with `apparmor_restrict_unprivileged_userns=1` Chromium cannot start,
+  and the failure arrives as a closed pipe. `HADES_BROWSER_NO_SANDBOX=1` remains the explicit opt-out, and the
+  source now names it in the error instead of reporting a mysterious empty result.
+- **The tool's reply is a JSON string.** A script returning `JSON.stringify(rows)` comes back escaped, so a
+  parser that looks for `[` fails on the first backslash-quote. The rows were there; the parser was not.
+
+What it still cannot do, measured on the same four queries: Bing's own ranking is weak for some lookups, so
+`sqlite pragma wal mode` and `redis rdb persistence` still come back with site roots, while
+`python asyncio taskgroup` lands the exact page first. Content verification was tested and parked: it cannot
+promote a page that was never returned, and it moved rank 1 from 1/6 to 1/6.
+
+1308 tests, 13 ignored.
+
 ## 0.5.0
 
 ### Web search, chosen per query class instead of averaged

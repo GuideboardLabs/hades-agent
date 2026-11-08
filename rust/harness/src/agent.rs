@@ -1412,7 +1412,7 @@ fn execute_with_stop(
         "browser" => crate::browser::tool(&args, &world.state),
         "image" => image(&args, world),
         "fetch" => fetch(&args),
-        "web_search" => web_search(&args),
+        "web_search" => web_search(&args, world),
         "react" => react_tool(&args, world),
         "library" => library_tool(&args, world),
         "delegate" => delegate(&args, world, client, activity),
@@ -2679,7 +2679,7 @@ fn react_tool(args: &Value, world: &World) -> String {
     }
 }
 
-fn web_search(args: &Value) -> String {
+fn web_search(args: &Value, world: &World) -> String {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -2693,7 +2693,7 @@ fn web_search(args: &Value) -> String {
         .and_then(Value::as_u64)
         .map(|n| n.clamp(1, 20) as usize)
         .unwrap_or(8);
-    let report = crate::websearch::search(query, limit);
+    let report = crate::websearch::search(Some(&world.state), query, limit);
 
     // The header names what was asked and what answered. A tool that says "no results" without saying which
     // source was blocked teaches its caller that the web is empty.
