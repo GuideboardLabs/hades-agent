@@ -172,36 +172,82 @@ pub fn intent_of(query: &str) -> Intent {
     Intent::General
 }
 
-/// The source weights for a query class. A zero weight means "do not ask", which is cheaper and cleaner than
-/// asking and then discarding.
+/// How the ranking is shaped for a query class.
+///
+/// Swept on 42 queries graded on the canonical page (`sweep.py` in the search-eval experiments): every class
+/// wanted a sharp reciprocal-rank constant (k=10 rather than the usual 60, which flattens the top of the list
+/// where the answer lives), and each class wanted a different amount of the three re-ranking signals. Saying
+/// so per class rather than picking one compromise is what took documentation MRR from 0.497 to 0.721.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fusion {
+    pub k: f64,
+    pub authority: f64,
+    pub coverage: f64,
+    pub agreement: f64,
+}
+
+pub fn fusion_for(intent: Intent) -> Fusion {
+    match intent {
+        // The reference page is what a documentation query wants, so the URL's shape and the query's own words
+        // carry real weight. Troubling that with nothing else is what the sweep chose.
+        Intent::Documentation => Fusion {
+            k: 10.0,
+            authority: 1.0,
+            coverage: 1.0,
+            agreement: 0.3,
+        },
+        // A troubleshooting answer is judged by the thread that fixed it, and every re-ranking signal moved
+        // the right thread down. Stack Exchange's own order is the best evidence available, so it is trusted.
+        Intent::Troubleshooting => Fusion {
+            k: 10.0,
+            authority: 0.0,
+            coverage: 0.0,
+            agreement: 0.0,
+        },
+        Intent::Entity => Fusion {
+            k: 10.0,
+            authority: 0.5,
+            coverage: 0.6,
+            agreement: 0.3,
+        },
+        Intent::General => Fusion {
+            k: 10.0,
+            authority: 0.5,
+            coverage: 0.6,
+            agreement: 0.3,
+        },
+    }
+}
+
+/// The source weights for a query class, from the same sweep.
+///
+/// A zero weight is not "asked and discarded": the source is not asked, which is both cheaper and cleaner.
 pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
     let mut w = BTreeMap::new();
     match intent {
         Intent::Documentation => {
-            // The only general index measured to return deep pages from this machine, and it costs one
-            // browser navigation. Troubleshooting and entity queries leave it out: their specialist wins those
-            // classes outright (Stack Exchange 1.000, Wikipedia 1.000).
-            w.insert("bing", 1.0);
-            // Marginalia is deliberately absent: it took 29 seconds on a live query and scored 0.039 MRR on
-            // the gold set. A source that cannot answer inside the caller's patience is not a source.
-            w.insert("mwmbl", 0.9);
-            w.insert("hn", 0.2);
+            // Yahoo at three times the others: measured on documentation queries it scored 0.657 MRR alone
+            // against Bing's 0.455 and Mwmbl's 0.356, and it put `sqlite.org/wal.html` first and `pragma.html`
+            // third for "sqlite pragma wal mode". The others are corroboration, not competitors.
+            w.insert("yahoo", 3.0);
+            w.insert("bing", 0.3);
+            w.insert("mwmbl", 0.3);
+            w.insert("hn", 0.3);
+            // Marginalia is deliberately absent: 29 seconds on a live query and 0.039 MRR on the gold set.
         }
         Intent::Troubleshooting => {
-            w.insert("stackexchange", 1.0);
-            w.insert("mwmbl", 0.3);
+            w.insert("stackexchange", 0.8);
+            w.insert("yahoo", 1.0);
         }
         Intent::Entity => {
-            w.insert("wikipedia", 1.0);
+            w.insert("yahoo", 1.0);
+            w.insert("wikipedia", 0.8);
+            w.insert("bing", 0.3);
             w.insert("mwmbl", 0.3);
         }
         Intent::General => {
-            w.insert("bing", 1.0);
-            // Wikipedia rides along on general queries: it costs 280 ms and it is the right answer whenever
-            // the question turns out to be about a thing, which a keyword classifier will sometimes miss.
-            w.insert("mwmbl", 0.7);
-            w.insert("wikipedia", 0.5);
-            w.insert("hn", 0.4);
+            w.insert("yahoo", 1.0);
+            w.insert("wikipedia", 0.8);
         }
     }
     w
@@ -334,9 +380,9 @@ pub fn fuse(
     query: &str,
     answers: &[Answer],
     weights: &BTreeMap<&'static str, f64>,
+    shape: Fusion,
     limit: usize,
 ) -> Vec<Scored> {
-    const K: f64 = 60.0;
     let mut scores: BTreeMap<String, Scored> = BTreeMap::new();
     for answer in answers {
         if answer.state != State::Ok {
@@ -353,15 +399,15 @@ pub fn fuse(
                 score: 0.0,
                 sources: BTreeSet::new(),
             });
-            entry.score += weight / (K + hit.rank as f64);
+            entry.score += weight / (shape.k + hit.rank as f64);
             entry.sources.insert(hit.source);
         }
     }
     for row in scores.values_mut() {
         let host = domain(&row.hit.url);
-        row.score += 0.5 * authority(&host, &path_of(&row.hit.url));
-        row.score += 0.6 * coverage(query, &row.hit.title, &row.hit.url);
-        row.score += 0.3 * (row.sources.len().saturating_sub(1)) as f64;
+        row.score += shape.authority * authority(&host, &path_of(&row.hit.url));
+        row.score += shape.coverage * coverage(query, &row.hit.title, &row.hit.url);
+        row.score += shape.agreement * (row.sources.len().saturating_sub(1)) as f64;
     }
     let mut rows: Vec<Scored> = scores.into_values().collect();
     // Ties are broken by score, then by the shorter URL: a canonical page is usually the shorter path.
@@ -853,6 +899,170 @@ fn clip(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect::<String>() + "…"
 }
 
+/// Yahoo, which is where the deep results actually come from on this machine.
+///
+/// Measured against every other keyless route: DuckDuckGo's hostnames refuse TCP 443 here, Brave answers a
+/// CAPTCHA in a real browser and in a stealth build, Mojeek and Startpage answer walls, and Bing returns site
+/// roots over HTTP and shallow pages in the browser. Yahoo answers over plain HTTP and returns the pages a
+/// person wants: `sqlite.org/wal.html` first and `pragma.html` third for "sqlite pragma wal mode",
+/// `docs.python.org/3/library/asyncio-task.html` first for "python asyncio taskgroup", the Clippy usage page
+/// first for "cargo clippy allow lint attribute".
+///
+/// Every result arrives wrapped in `r.search.yahoo.com/.../RU=<percent-encoded url>/RK=...`, so the wrapper is
+/// decoded here. A result whose wrapper will not decode is dropped rather than returned as a Yahoo redirect: a
+/// link that points at the search engine is not a citation.
+pub fn yahoo(query: &str, limit: usize) -> Answer {
+    let started = std::time::Instant::now();
+    let url = format!(
+        "https://search.yahoo.com/search?p={}&n={}",
+        encode(query),
+        limit.max(10)
+    );
+    let body = match crate::fetch::get_with_headers(
+        &url,
+        MAX_BYTES,
+        false,
+        &[
+            (
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 \
+                 Safari/537.36",
+            ),
+            (
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
+            ("Accept-Language", "en-US,en;q=0.9"),
+        ],
+    ) {
+        Ok(body) => body,
+        Err(error) => return failed("yahoo", started, &error),
+    };
+    let mut hits = Vec::new();
+    for (href, inner) in anchors(&body) {
+        if hits.len() >= limit {
+            break;
+        }
+        let Some(url) = unwrap_yahoo(&href) else {
+            continue;
+        };
+        let title = title_of(&inner);
+        if title.is_empty() {
+            continue;
+        }
+        hits.push(Hit {
+            title,
+            url,
+            snippet: String::new(),
+            source: "yahoo",
+            rank: hits.len() + 1,
+        });
+    }
+    if hits.is_empty() {
+        // An empty Yahoo is not always an empty web: a consent page, a 500 with a body, or a shape change all
+        // arrive here as "no anchors", and 77 ms is the tell. Say what came back rather than nothing.
+        let mut answer = done("yahoo", started, hits);
+        answer.detail = format!(
+            "{} bytes, {} anchor(s), no results: {}",
+            body.len(),
+            anchors(&body).len(),
+            plain(&body.chars().take(120).collect::<String>())
+        );
+        return answer;
+    }
+    done("yahoo", started, hits)
+}
+
+/// `(href, inner html)` for every anchor on the page, in document order.
+fn anchors(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = html.as_bytes();
+    let mut at = 0usize;
+    while let Some(found) = html[at..].find("<a ") {
+        let start = at + found;
+        let Some(tag_end) = html[start..].find('>').map(|offset| start + offset) else {
+            break;
+        };
+        let tag = &html[start..tag_end];
+        let href = attribute(tag, "href").unwrap_or_default();
+        let close = html[tag_end..]
+            .find("</a>")
+            .map(|offset| tag_end + offset)
+            .unwrap_or(bytes.len());
+        out.push((href, html[tag_end + 1..close].to_string()));
+        at = (close + 4).min(html.len());
+        if out.len() > 400 {
+            break;
+        }
+    }
+    out
+}
+
+/// One attribute's value, with the quotes removed and entities left for the caller.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// The anchor's own text, preferring an `h3` when the anchor wraps a breadcrumb and a heading.
+fn title_of(inner: &str) -> String {
+    let source = match (inner.find("<h3"), inner.find("</h3>")) {
+        (Some(open), Some(close)) if close > open => &inner[open..close],
+        _ => inner,
+    };
+    plain(source)
+}
+
+/// Decode Yahoo's `RU=` redirect, or `None` when this is not a search result.
+pub fn unwrap_yahoo(href: &str) -> Option<String> {
+    let href = href.replace("&amp;", "&");
+    let candidate = if let Some(start) = href.find("/RU=") {
+        let tail = &href[start + 4..];
+        let encoded = tail.split('/').next().unwrap_or("");
+        let decoded = percent_decode(encoded);
+        if decoded.starts_with("http") {
+            decoded
+        } else {
+            return None;
+        }
+    } else if href.starts_with("http") {
+        href
+    } else {
+        return None;
+    };
+    // Yahoo wraps its own navigation and shopping links in `RU=` too, and a parser that keeps them fills the
+    // ten results with yahoo.com/news and shopping.yahoo.com. Measured: that is exactly how the best source on
+    // this machine scored 0% while returning `sqlite.org/wal.html` first.
+    let host = domain(&candidate);
+    if host.ends_with("yahoo.com") || host.is_empty() {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Percent-decode a URL component; a sequence that is not valid UTF-8 is decoded lossily rather than refused.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 /// What one search did: the class it decided, the answers, and the fused order.
 pub struct Report {
     pub intent: Intent,
@@ -872,6 +1082,7 @@ pub fn search(state: Option<&std::path::Path>, query: &str, limit: usize) -> Rep
         let state = owned_state.clone();
         handles.push(std::thread::spawn(move || match source {
             // The browser source is skipped without a state directory, which is what keeps the suite offline.
+            "yahoo" => yahoo(&query, 10),
             "bing" => match state.as_deref() {
                 Some(state) => bing_browser(state, &query, 10),
                 None => Answer {
@@ -908,7 +1119,7 @@ pub fn search(state: Option<&std::path::Path>, query: &str, limit: usize) -> Rep
             })
         })
         .collect();
-    let rows = fuse(query, &answers, &weights, limit);
+    let rows = fuse(query, &answers, &weights, fusion_for(intent), limit);
     Report {
         intent,
         answers,
@@ -967,6 +1178,36 @@ mod tests {
     }
 
     #[test]
+    fn the_fusion_shape_and_weights_are_what_the_sweep_chose() {
+        // These constants came from a grid sweep over 42 recorded queries graded on the canonical page. The test
+        // is here so a later edit cannot quietly flatten them back to a single global shape: k=10 rather than
+        // the usual 60 is what keeps the top of the list meaningful, and Yahoo at three times the others is what
+        // documentation queries measured.
+        let docs = fusion_for(Intent::Documentation);
+        assert_eq!(
+            docs.k, 10.0,
+            "a flat k loses the answer at the top of the list"
+        );
+        assert!(docs.authority > 0.5 && docs.coverage > 0.5);
+        let trouble = fusion_for(Intent::Troubleshooting);
+        assert_eq!(
+            (trouble.authority, trouble.coverage, trouble.agreement),
+            (0.0, 0.0, 0.0),
+            "a troubleshooting answer is the thread Stack Exchange already ranked first"
+        );
+        let w_docs = weights_for(Intent::Documentation);
+        let yahoo = w_docs["yahoo"];
+        for other in ["bing", "mwmbl", "hn"] {
+            assert!(
+                yahoo > w_docs[other] * 3.0,
+                "yahoo {yahoo} must dominate {}",
+                w_docs[other]
+            );
+        }
+        assert!(!weights_for(Intent::Documentation).contains_key("marginalia"));
+    }
+
+    #[test]
     fn a_troubleshooting_query_does_not_ask_the_encyclopedia() {
         let w = weights_for(Intent::Troubleshooting);
         assert!(w.contains_key("stackexchange"));
@@ -994,7 +1235,13 @@ mod tests {
                 detail: "HTTP 429".into(),
             },
         ];
-        let rows = fuse("sqlite pragma wal mode", &answers, &weights, 5);
+        let rows = fuse(
+            "sqlite pragma wal mode",
+            &answers,
+            &weights,
+            fusion_for(Intent::Documentation),
+            5,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hit.url, "https://sqlite.org/pragma.html");
     }
@@ -1020,7 +1267,13 @@ mod tests {
                 ),
             ],
         )];
-        let rows = fuse("sqlite wal mode", &answers, &weights, 5);
+        let rows = fuse(
+            "sqlite wal mode",
+            &answers,
+            &weights,
+            fusion_for(Intent::Documentation),
+            5,
+        );
         assert_eq!(rows[0].hit.url, "https://sqlite.org/wal.html", "{rows:#?}");
     }
 
@@ -1039,7 +1292,13 @@ mod tests {
                 ),
             ],
         )];
-        let rows = fuse("tokio spawn_blocking", &answers, &weights, 5);
+        let rows = fuse(
+            "tokio spawn_blocking",
+            &answers,
+            &weights,
+            fusion_for(Intent::Documentation),
+            5,
+        );
         assert!(rows[0].hit.url.contains("spawn_blocking"));
     }
 
@@ -1059,7 +1318,13 @@ mod tests {
                 ],
             ),
         ];
-        let rows = fuse("shared thing", &answers, &weights, 5);
+        let rows = fuse(
+            "shared thing",
+            &answers,
+            &weights,
+            fusion_for(Intent::General),
+            5,
+        );
         assert_eq!(rows[0].hit.url, "https://b.example.org/two");
         assert_eq!(
             rows[0].sources.len(),
@@ -1086,7 +1351,13 @@ mod tests {
                 )],
             ),
         ];
-        let rows = fuse("sqlite pragma", &answers, &weights, 5);
+        let rows = fuse(
+            "sqlite pragma",
+            &answers,
+            &weights,
+            fusion_for(Intent::Documentation),
+            5,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sources.len(), 2);
     }

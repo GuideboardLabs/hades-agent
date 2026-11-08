@@ -530,6 +530,117 @@ fn chase(url: &str, allow_private: bool, ca: Option<&Path>) -> Result<String, St
     chase_bytes(url, allow_private, ca).map(|body| String::from_utf8_lossy(&body).to_string())
 }
 
+/// A GET that carries explicit request headers, for the one case the runtime needs them.
+///
+/// A search index decides whether to answer based on the request's `Accept` and `Accept-Language`, and this
+/// machine proved it: the same URL returns a results page with a browser's headers and a bot wall without them.
+/// The policy checks are the same ones every other fetch gets (parse, resolve, refuse private addresses, pin the
+/// address), because a source is not a reason to relax the boundary that exists for a URL supplied by a page.
+///
+/// The pool is deliberately not used: a search is one request per query with headers the pool does not key on,
+/// and adding headers to the pool's key would be a change with no caller.
+pub fn get_with_headers(
+    url: &str,
+    limit: usize,
+    allow_private: bool,
+    headers: &[(&str, &str)],
+) -> Result<String, String> {
+    let deadline = Instant::now() + FETCH_DEADLINE;
+    let target = Target::parse(url)?;
+    let addresses = resolve(&target, allow_private)?;
+    let outcome = try_addresses(&addresses, deadline, url, |address, max_time| {
+        call_with_headers(&target, url, address, max_time, headers)
+    })?;
+    match outcome {
+        Outcome::Page(bytes) => {
+            if bytes.len() > limit {
+                return Err(format!(
+                    "refused: the body is {} bytes, over the {limit} ceiling",
+                    bytes.len()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&bytes).to_string())
+        }
+        // A redirect is reported rather than followed: a search endpoint that answers 3xx is asking for a
+        // session this call does not have, and following it blind would be a second request nobody asked for.
+        Outcome::Redirect(to) => Err(format!(
+            "the source redirected to {to}, which it should not"
+        )),
+        Outcome::Oversize => Err(format!("the body is over the {limit} ceiling")),
+    }
+}
+
+/// One curl call with extra headers, with the same protocol, redirect and size constraints as [`call`].
+fn call_with_headers(
+    target: &Target,
+    url: &str,
+    address: IpAddr,
+    max_time: u64,
+    headers: &[(&str, &str)],
+) -> Result<Outcome, String> {
+    let scratch = Scratch::new()?;
+    let header_file = scratch.file("hdr");
+    let body_file = scratch.file("body");
+    let mut args = curl_args(
+        target,
+        url,
+        address,
+        max_time,
+        &header_file,
+        &body_file,
+        None,
+    );
+    // The URL is not the last argument: `curl_args` appends `--resolve host:port:addr` after it, and assuming
+    // otherwise put the header inside the pin, which curl reported as "Port number was not a decimal number".
+    // The position is found by value, and a URL that cannot be found is an error rather than a guess.
+    let Some(url_at) = args.iter().position(|arg| arg == url) else {
+        return Err("the curl argument list lost its URL".to_string());
+    };
+    // HTTP/1.1, deliberately. Measured on search.yahoo.com: the same request answers 200 with 399 KB of results
+    // over HTTP/1.1 and 500 with an empty body over HTTP/2, so the protocol is the difference between a source
+    // that works and one that reports nothing. A caller asking for headers is a search endpoint, and they are
+    // the class of endpoint that does this.
+    args.insert(url_at, "--http1.1".to_string());
+    for (name, value) in headers {
+        args.insert(url_at, "-H".to_string());
+        args.insert(url_at + 1, format!("{name}: {value}"));
+    }
+    let mut command = std::process::Command::new("curl");
+    command
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for variable in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("could not run curl: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            clip_ref(String::from_utf8_lossy(&output.stderr).trim(), 300)
+        ));
+    }
+    let body = std::fs::read(&body_file).map_err(|error| error.to_string())?;
+    let text = std::fs::read(&header_file).unwrap_or_default();
+    let text = String::from_utf8_lossy(&text);
+    match location_in(&text) {
+        Some(value) => Ok(Outcome::Redirect(value)),
+        None => Ok(Outcome::Page(body)),
+    }
+}
+
 /// A fetch for something that is not text. Same parse, pin, deadline and cap as [`run`]; the difference is
 /// that an archive is bytes, and lossily decoding it would corrupt the one thing worth checking, its digest.
 pub fn bytes(url: &str, limit: usize, allow_private: bool) -> Result<Vec<u8>, String> {

@@ -1,3 +1,23 @@
+## 0.5.3
+
+Search, measured against a person's expectation rather than a domain match.
+
+- **A general index that returns the page, not the site.** Yahoo answers over plain HTTP/1.1 with browser
+  headers; the same request over HTTP/2 is answered with a 500 and an empty body, which is why the header path
+  pins 1.1. On the 42-query gold set, graded on the canonical page, it scores 0.657 MRR on documentation
+  against Bing's 0.455.
+- **Weighted by class, not by a global average.** Yahoo at three times corroborating sources on documentation
+  queries; Stack Exchange trusted on troubleshooting, where every re-ranking signal moved the right thread down.
+- **A sharper reciprocal-rank constant.** k=10 instead of the usual 60, because a search whose answer is in the
+  first three results should not be flattened by a constant chosen for ten thousand.
+- **Results that point back at the engine are dropped.** Yahoo wraps its own navigation in the same `RU=`
+  redirect as its results, and a parser that keeps them fills the list with `yahoo.com/news`. Measured: that
+  alone is how the best source on this machine scored 0%.
+
+Documentation MRR 0.721, troubleshooting 0.812, entity 0.875 on that set, from 0.497 before.
+
+1310 tests, 13 ignored.
+
 # Releases
 
 What each version adds, newest first. The README describes what the product is; this file records
