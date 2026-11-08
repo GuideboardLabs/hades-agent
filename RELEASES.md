@@ -3,6 +3,52 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.5.0
+
+### Web search, chosen per query class instead of averaged
+
+`web_search` proxied a local SearXNG that was not running. It is a real search tool now: it asks the indexes
+that answer this kind of question, fuses them, and reports which sources answered.
+
+The design came from measurement, not taste. 42 queries, seven sources, graded on whether the canonical page
+appears rather than whether the right domain does:
+
+| source | documentation MRR | troubleshooting | entity |
+|---|---|---|---|
+| bing over HTTP | 0.153 | 0.000 | 0.396 |
+| mwmbl | 0.372 | 0.135 | 0.250 |
+| stack exchange | 0.000 | **1.000** | 0.000 |
+| wikipedia | 0.000 | 0.000 | **1.000** |
+| hn algolia | 0.042 | 0.000 | 0.000 |
+
+Four things the numbers changed:
+
+1. **Blind fusion lost to the best single source** (0.166 against 0.153 for bing alone, and 0.279 against
+   0.369 on a domain-level metric), because a specialist's irrelevant hits displace the generalist's right
+   answer. So the sources are chosen per query class and weighted there.
+2. **Host affinity was removed.** Rewarding a result whose host names the query's subject promoted the right
+   domain's wrong page: a forum post above the reference page. Measured, then deleted.
+3. **What survived:** intent routing, an authority prior from the URL's shape with a content-farm penalty,
+   query-token coverage, and a small bonus for cross-source agreement. That scored 0.497 on documentation
+   queries where bing alone scored 0.153.
+4. **Marginalia was dropped.** 29 seconds on a live query and 0.039 MRR. A source that cannot answer inside
+   the caller's patience is not a source.
+
+Sources today: Wikipedia, Stack Exchange, Hacker News via Algolia, and Mwmbl, all over HTTP with no key.
+Every answer carries its own state, so the tool header says `mwmbl ok 340ms, stackexchange ok 180ms` and a
+blocked source is named as blocked rather than reported as an empty web. Fewer than four distinct sites adds a
+`weak:` line, because thin evidence should look thin.
+
+**What this release does not do, stated plainly.** Content verification is not in it: a page is ranked on
+title, URL and cross-source agreement, not on whether it contains the answer, so "right site, wrong page" is
+still possible. Reading is still the old `fetch`: no markdown extraction, no code fences, no PDF text. And the
+general index is not here at all, for a reason measured on the box this was built on: DuckDuckGo resolves
+to one address that refuses TCP 443, Brave answers with a CAPTCHA, Mojeek with a bot wall, and Bing over HTTP
+returns site roots rather than pages. A browser-driven Bing is the one keyless route that works and it lands next.
+
+1308 tests, 13 ignored. Twelve of the ignored are the live browser suite; the thirteenth asks the real indexes
+and is run by hand (`cargo test -p harness --lib websearch::tests::live -- --ignored --nocapture`).
+
 ## 0.4.9
 
 ### A run can be pinned, and a pin outranks every cap

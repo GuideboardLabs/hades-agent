@@ -668,7 +668,7 @@ impl Searx {
         let url = format!(
             "{}/search?q={}&format=json",
             self.base.trim_end_matches('/'),
-            urlencode(query)
+            crate::websearch::encode(query)
         );
         let output = Command::new("curl")
             .arg("-sS")
@@ -718,7 +718,7 @@ impl Searx {
     fn search_jina(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
         let url = format!(
             "https://r.jina.ai/http://html.duckduckgo.com/html/?q={}",
-            urlencode(query)
+            crate::websearch::encode(query)
         );
         let output = Command::new("curl")
             .arg("-sS")
@@ -869,19 +869,6 @@ fn hex(byte: u8) -> Option<u8> {
 
 fn host_of(url: &str) -> String {
     url.split('/').nth(2).unwrap_or(url).to_string()
-}
-
-fn urlencode(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 fn clip(text: &str, limit: usize) -> String {

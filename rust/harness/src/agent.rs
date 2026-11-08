@@ -430,7 +430,7 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search the web through the local SearXNG instance and return titles, links and snippets.",
+                "description": "Search the web. Asks the indexes that answer this kind of question (documentation, a troubleshooting thread, an encyclopedia entry, discussions), fuses them, and returns ranked titles, links and snippets. The header says which sources were asked and which answered, and a `weak:` line marks a thin result set. Use `fetch` to read a result properly before quoting it.",
                 "parameters": {
                     "type": "object",
                     "properties": {"query": {"type": "string"}},
@@ -2680,58 +2680,72 @@ fn react_tool(args: &Value, world: &World) -> String {
 }
 
 fn web_search(args: &Value) -> String {
-    let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if query.is_empty() {
         return "no query given".to_string();
     }
-    let base = std::env::var("SEARXNG_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-    let url = format!(
-        "{}/search?q={}&format=json",
-        base.trim_end_matches('/'),
-        urlencode(query)
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n.clamp(1, 20) as usize)
+        .unwrap_or(8);
+    let report = crate::websearch::search(query, limit);
+
+    // The header names what was asked and what answered. A tool that says "no results" without saying which
+    // source was blocked teaches its caller that the web is empty.
+    let asked: Vec<String> = report
+        .answers
+        .iter()
+        .map(|a| format!("{} {} {}ms", a.source, a.state.name(), a.ms))
+        .collect();
+    let distinct = report
+        .rows
+        .iter()
+        .map(|row| crate::websearch::domain(&row.hit.url))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let mut text = format!(
+        "web_search \"{query}\" ({})\nsources: {}\n",
+        report.intent.name(),
+        asked.join(", ")
     );
-    let output = Command::new("curl")
-        .arg("-sS")
-        .arg("--max-time")
-        .arg("20")
-        .arg(&url)
-        .output();
-    let Ok(output) = output else {
-        return "could not run curl".to_string();
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return format!(
-            "the search endpoint did not answer with JSON: {}",
-            clip(String::from_utf8_lossy(&output.stdout).trim(), 300)
-        );
-    };
-    let results = value
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if results.is_empty() {
-        return "no results".to_string();
+    if report.rows.is_empty() {
+        text.push_str("no results: every source this class of query asks answered with nothing\n");
+        return text;
     }
-    let mut text = String::new();
-    for result in results.iter().take(6) {
-        let title = result.get("title").and_then(Value::as_str).unwrap_or("");
-        let link = result.get("url").and_then(Value::as_str).unwrap_or("");
-        let snippet = result
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .replace('\n', " ");
-        text.push_str(&format!("{title}\n{link}\n{}\n\n", clip(&snippet, 240)));
+    if distinct < 4 {
+        // Fewer than four distinct sites is thin evidence, and saying so is the difference between a citation
+        // and a guess dressed as one.
+        text.push_str(&format!(
+            "weak: {distinct} distinct site(s) across {} result(s); verify before relying on this\n",
+            report.rows.len()
+        ));
     }
-    clip(&text, 6000)
+    for (i, row) in report.rows.iter().enumerate() {
+        // The score is formatted once: nesting a format! inside format! arguments is a clippy warning for a
+        // reason, and the outer call is already dense enough.
+        let score = format!("{:.3}", row.score);
+        let from = row.sources.iter().copied().collect::<Vec<_>>().join("+");
+        text.push_str(&format!(
+            "{}. {} ({} of {}) [{}] {}\n",
+            i + 1,
+            row.hit.title,
+            from,
+            row.sources.len(),
+            score,
+            row.hit.url
+        ));
+        if !row.hit.snippet.is_empty() {
+            text.push_str(&format!("   {}\n", clip(&row.hit.snippet, 260)));
+        }
+    }
+    text
 }
 
-/// Read the local shelf. The library path is the state's own shelf, so a process started with a different
-/// `--state` cannot reach another install's books.
 fn library_tool(args: &Value, world: &World) -> String {
     let action = args
         .get("action")
@@ -2837,19 +2851,6 @@ fn library_tool(args: &Value, world: &World) -> String {
             }
         }
     }
-}
-
-fn urlencode(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// Coarse: a person reading a page does not need the tag soup, and the model needs the words.
