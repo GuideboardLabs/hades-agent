@@ -546,6 +546,9 @@ fn dispatch(
         "journal" => journal_cmd(rest),
         "rewind" => rewind_cmd(rest),
         "prune" => prune_cmd(rest),
+        // Search quality, scored by the same fusion a live search uses. It prints its own report and returns an
+        // exit code, because the numbers are the output.
+        "search-eval" => std::process::exit(crate::searcheval::cmd(rest)),
         "stop" => stop(rest),
         "cancel" => cancel(rest),
         "shutdown" => shutdown(rest),

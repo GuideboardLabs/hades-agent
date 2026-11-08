@@ -189,6 +189,9 @@ pub struct Fusion {
     /// Penalty for a discussion path, applied where the subject bonus would otherwise promote a forum thread
     /// that happens to live on the right domain.
     pub discussion: f64,
+    /// Penalty for a site root. `https://www.docker.com/` is not the answer to a question about docker's socket,
+    /// and a bare root ranking above a specific thread is the failure this exists to stop.
+    pub root: f64,
 }
 
 pub fn fusion_for(intent: Intent) -> Fusion {
@@ -208,6 +211,7 @@ pub fn fusion_for(intent: Intent) -> Fusion {
             agreement: 0.3,
             subject: 0.6,
             discussion: 0.3,
+            root: 0.5,
         },
         // A troubleshooting answer is judged by the thread that fixed it, and every re-ranking signal moved
         // the right thread down. Stack Exchange's own order is the best evidence available, so it is trusted.
@@ -218,6 +222,7 @@ pub fn fusion_for(intent: Intent) -> Fusion {
             agreement: 0.0,
             subject: 0.0,
             discussion: 0.0,
+            root: 1.0,
         },
         Intent::Entity => Fusion {
             k: 10.0,
@@ -226,6 +231,7 @@ pub fn fusion_for(intent: Intent) -> Fusion {
             agreement: 0.3,
             subject: 0.0,
             discussion: 0.0,
+            root: 0.5,
         },
         Intent::General => Fusion {
             k: 10.0,
@@ -234,6 +240,7 @@ pub fn fusion_for(intent: Intent) -> Fusion {
             agreement: 0.3,
             subject: 0.0,
             discussion: 0.0,
+            root: 0.5,
         },
     }
 }
@@ -262,6 +269,10 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
             w.insert("hn", 0.3);
             // Marginalia is deliberately absent: 29 seconds on a live query and 0.039 MRR on the gold set.
         }
+        // Unchanged, and deliberately so: this class cannot be graded at page level yet. Its canonical answers are
+        // often bare `/a/<id>` URLs with no slug, so the gold fragments only match the general index's links and a
+        // weight change here cannot be validated in either direction. The root penalty below is what stops a site
+        // root from topping the list, and that part is signal rather than weight.
         Intent::Troubleshooting => {
             w.insert("stackexchange", 0.8);
             w.insert("yahoo", 1.0);
@@ -442,6 +453,16 @@ fn subject_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// 1.0 when the URL is a site root, which is almost never the page a question is asking for.
+fn root_path(url: &str) -> f64 {
+    let path = path_of(url);
+    if path.is_empty() || path == "/" {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 /// 1.0 when the path is a discussion rather than a reference page.
 fn discussion_path(url: &str) -> f64 {
     let low = path_of(url).to_lowercase();
@@ -487,6 +508,7 @@ pub fn fuse(
         row.score += shape.agreement * (row.sources.len().saturating_sub(1)) as f64;
         row.score += shape.subject * subject_host(query, &row.hit.url);
         row.score -= shape.discussion * discussion_path(&row.hit.url);
+        row.score -= shape.root * root_path(&row.hit.url);
     }
     let mut rows: Vec<Scored> = scores.into_values().collect();
     // Ties are broken by score, then by the shorter URL: a canonical page is usually the shorter path.

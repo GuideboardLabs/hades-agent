@@ -95,6 +95,7 @@ pub mod scoreboard;
 /// Where a test writes: never inside the source tree's `target/`. Public because the integration
 /// tests are separate crates and need the same root as the unit tests.
 pub mod scratch;
+pub mod searcheval;
 pub mod service;
 pub mod shadow;
 pub mod skills;

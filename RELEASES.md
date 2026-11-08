@@ -1,3 +1,23 @@
+## 0.5.7
+
+The measurement moves into the binary, and finds two things a copy could not.
+
+- **`hades search-eval`.** Scores a recording through the same `fuse` a live search calls, and
+  `hades search-eval fetch` drives the shipping `search` to produce that recording. The harness that chose every
+  constant in 0.5.3 to 0.5.6 was a Python reimplementation of the fusion, the signals and the grader: it scored
+  0.78 where the shipped code scores 0.79, measured Yahoo at 0% where the Rust parser found 53% on the same
+  bytes, and silently mixed the held-out queries into the tuning set. A measurement of a copy is not a
+  measurement of the product.
+- **A site root is not an answer.** `Fusion.root` subtracts for a path that is empty or `/`. Yahoo's front pages
+  for `docker.com` and `nginx.org/en/` were ranking above the thread that answered a troubleshooting question.
+  On documentation the same rule moved tuned MRR 0.790 to 0.865 and held-out 0.803 to 0.846.
+- **The scorer reports its own disagreement with the live classifier.** 13 of 20 held-out queries classify as
+  `General` rather than `Documentation` at runtime, so the tuned documentation weights never reach most
+  documentation questions. That is now printed rather than averaged away, and fixing the classifier is the next
+  piece of work, not a claim already made.
+
+1322 tests, 13 ignored.
+
 ## 0.5.6
 
 The keyless index Hermes falls back on, and the signal that makes it safe to use.
