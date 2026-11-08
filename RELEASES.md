@@ -3,6 +3,21 @@
 What each version adds, newest first. The README describes what the product is; this file records
 what changed, and which limits each release closed.
 
+## 0.5.2
+
+### A cached shelf from an older build no longer answers a newer binary
+
+0.4.5 gave the shelf cache an age, because a cache from 2026-10-26 was still answering `pack find discord` with
+0.1.1 on a 0.4.4 binary. An age was not enough, and this shipped visibly: a shelf fetched at 20:26 still named
+discord 0.4.3, so `hades pack find discord` answered 0.4.3 on a 0.5.1 binary whose own compiled shelf says 0.4.5.
+
+The cache now records the version that wrote it and refuses to answer across a version. A cache written by an
+older build describes an older product, and the reason to compile a shelf into the binary is that the binary's
+own answer is the one that can be trusted. An unversioned cache is the pre-0.5.2 shape and is refused as well,
+rather than trusted by default.
+
+1309 tests, 13 ignored.
+
 ## 0.5.1
 
 ### The general index, asked through the browser

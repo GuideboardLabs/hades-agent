@@ -77,8 +77,24 @@ pub fn cached_age(state: &Path) -> Option<u64> {
 /// without a new release and long enough that a search loop does not refetch on every call.
 pub const CACHE_TTL_SECS: u64 = 24 * 3600;
 
-/// The cache, but only while it is young enough to be believed.
+/// The version that wrote the cached shelf, if it was recorded.
+fn cached_version(state: &Path) -> Option<String> {
+    fs::read_to_string(cache_dir(state).join("INDEX.version"))
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+/// The cache, but only while it is young enough to be believed *and* was written by this binary.
+///
+/// The age alone was not enough, and the failure was visible on the day it shipped: a shelf fetched at 20:26
+/// still said discord 0.4.3, and `hades pack find discord` answered 0.4.3 on a 0.5.1 binary that ships 0.4.5 in
+/// its own compiled shelf. A cache written by an older build describes an older product; the point of shipping
+/// a shelf is that the binary's own answer is the one you can trust.
 pub fn fresh_cached(state: &Path) -> Option<Vec<Row>> {
+    let same_build = cached_version(state).as_deref() == Some(env!("CARGO_PKG_VERSION"));
+    if !same_build {
+        return None;
+    }
     match cached_age(state) {
         Some(age) if age <= CACHE_TTL_SECS => cached(state),
         _ => None,
@@ -116,6 +132,11 @@ pub fn rows(state: &Path, refresh: bool) -> Result<Vec<Row>, String> {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     let _ = fs::write(cache_dir(state).join("INDEX.fetched"), at.to_string());
+    // The writer is recorded so a later binary cannot be answered by a shelf this one fetched.
+    let _ = fs::write(
+        cache_dir(state).join("INDEX.version"),
+        env!("CARGO_PKG_VERSION"),
+    );
     Ok(rows)
 }
 
@@ -424,6 +445,51 @@ fn render(rows: &[crate::pack::Row]) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod cache_version {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        crate::scratch::unique(name)
+    }
+
+    #[test]
+    fn a_shelf_fetched_by_another_build_is_not_believed() {
+        // The failure this holds shut: a shelf cached at 20:26 answered `pack find discord` with 0.4.3 on a
+        // binary that shipped 0.4.5, because the only test on the cache was its age.
+        let state = scratch("pack-cache-version");
+        let dir = cache_dir(&state);
+        fs::create_dir_all(&dir).expect("a cache dir");
+        fs::write(dir.join("INDEX.json"), r#"{"menu":1,"packs":[]}"#).expect("a cache");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs();
+        fs::write(dir.join("INDEX.fetched"), now.to_string()).expect("a timestamp");
+
+        // Written by an older build: refused.
+        fs::write(dir.join("INDEX.version"), "0.0.1").expect("an old version");
+        assert!(
+            fresh_cached(&state).is_none(),
+            "an older build's cache must not answer"
+        );
+
+        // Written by this build and young: believed.
+        fs::write(dir.join("INDEX.version"), env!("CARGO_PKG_VERSION")).expect("this version");
+        assert!(
+            fresh_cached(&state).is_some(),
+            "this build's own cache is fine"
+        );
+
+        // No version at all is the pre-0.5.2 shape, so it is refused too rather than trusted by default.
+        fs::remove_file(dir.join("INDEX.version")).expect("remove the marker");
+        assert!(
+            fresh_cached(&state).is_none(),
+            "an unversioned cache cannot be trusted"
+        );
+    }
 }
 
 #[cfg(test)]
