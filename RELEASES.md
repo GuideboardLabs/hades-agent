@@ -1,3 +1,23 @@
+## 0.5.9
+
+One line in the fusion, and it was the largest defect in the tool.
+
+- **A source missing from a class's weight table counted as full weight.** `unwrap_or(&1.0)` meant Wikipedia and
+  Hacker News competed in classes that never asked for them: HN discussion items were topping troubleshooting
+  queries while the archive that class consults first sat below them. The default is now zero, which is what
+  "this class does not ask that source" was always supposed to mean.
+- **Measured on a troubleshooting gold that names the thread**, built from the archive's own top answer so the
+  class could be graded at page level at all: hit@1 **18% to 91%**, hit@3 64% to 100%, MRR 0.435 to 0.939.
+- **Entity moved too**, 0.750 to 0.875, because Wikipedia had been competing with the sources that class names.
+  Documentation is unchanged at 0.865 tuned and 0.846 held-out, which is the check that the fix is not a
+  reshuffle.
+
+The troubleshooting gold is circular by construction, since its canonical answer comes from the archive the
+class weights highest. It measures whether the fusion preserves the archive's answer, not whether the archive
+is right, and it is reported that way.
+
+1327 tests, 13 ignored.
+
 ## 0.5.8
 
 The classifier was the defect behind the ranking work, and it was invisible until the measurement moved into

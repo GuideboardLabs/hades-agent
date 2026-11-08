@@ -141,6 +141,10 @@ fn known(source: &str) -> Option<&'static str> {
         "mwmbl" => Some("mwmbl"),
         "hn" => Some("hn"),
         "stackexchange" => Some("stackexchange"),
+        // The recordings name this source `so`. Without this arm the archive's answers were dropped from every
+        // troubleshooting query, which left the general index's site roots to top a class whose whole point is
+        // the thread that fixed it.
+        "so" => Some("stackexchange"),
         "wikipedia" => Some("wikipedia"),
         "exa" => Some("exa"),
         "parallel" => Some("parallel"),

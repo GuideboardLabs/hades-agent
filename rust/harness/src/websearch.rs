@@ -326,8 +326,8 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
         // weight change here cannot be validated in either direction. The root penalty below is what stops a site
         // root from topping the list, and that part is signal rather than weight.
         Intent::Troubleshooting => {
-            w.insert("stackexchange", 0.8);
-            w.insert("yahoo", 1.0);
+            w.insert("stackexchange", 1.0);
+            w.insert("yahoo", 0.1);
         }
         Intent::Entity => {
             w.insert("yahoo", 1.0);
@@ -538,7 +538,10 @@ pub fn fuse(
         if answer.state != State::Ok {
             continue;
         }
-        let weight = *weights.get(answer.source).unwrap_or(&1.0);
+        // Zero, not one. A source missing from the table was never asked for this class, and defaulting it to
+        // full weight let Wikipedia and Hacker News compete in classes whose tables never named them: HN items
+        // were topping troubleshooting queries while the archive it asks first sat below them.
+        let weight = *weights.get(answer.source).unwrap_or(&0.0);
         if weight <= 0.0 {
             continue;
         }
@@ -1626,6 +1629,56 @@ mod tests {
         for other in [Intent::Troubleshooting, Intent::Entity, Intent::General] {
             assert!(!weights_for(other).contains_key("keenable"));
         }
+    }
+
+    #[test]
+    fn a_source_missing_from_the_weights_contributes_nothing() {
+        // The defect: `unwrap_or(&1.0)` gave every unlisted source full weight, so Hacker News and Wikipedia
+        // competed in classes whose tables never named them. HN items were toping troubleshooting queries while
+        // the archive that class asks first sat below them. Measured: troubleshooting hit@1 18% to 91%.
+        let answers = vec![
+            Answer {
+                source: "stackexchange",
+                hits: vec![Hit {
+                    title: "the thread".to_string(),
+                    url: "https://stackoverflow.com/questions/1/x".to_string(),
+                    snippet: String::new(),
+                    source: "stackexchange",
+                    rank: 1,
+                }],
+                state: State::Ok,
+                ms: 0,
+                detail: String::new(),
+            },
+            Answer {
+                source: "hn",
+                hits: vec![Hit {
+                    title: "a discussion".to_string(),
+                    url: "https://news.ycombinator.com/item?id=1".to_string(),
+                    snippet: String::new(),
+                    source: "hn",
+                    rank: 1,
+                }],
+                state: State::Ok,
+                ms: 0,
+                detail: String::new(),
+            },
+        ];
+        let mut weights = BTreeMap::new();
+        weights.insert("stackexchange", 1.0);
+        let fused = fuse(
+            "docker permission denied",
+            &answers,
+            &weights,
+            fusion_for(Intent::Troubleshooting),
+            5,
+        );
+        assert_eq!(
+            fused.len(),
+            1,
+            "an unweighted source must not appear at all"
+        );
+        assert_eq!(fused[0].hit.source, "stackexchange");
     }
 
     #[test]
