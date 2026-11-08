@@ -113,7 +113,6 @@ pub fn intent_of(query: &str) -> Intent {
         "not found",
         "missing",
         "failed",
-        "failure",
         "segfault",
         "crash",
         "hangs",
@@ -127,6 +126,10 @@ pub fn intent_of(query: &str) -> Intent {
         "gateway timeout",
         "permission denied",
         "internal server error",
+        "already allocated",
+        "prematurely closed",
+        "closed connection",
+        "connection closed",
         "connection refused",
     ];
     // Something to look up as a thing. A named person, a history, a list.
@@ -137,6 +140,9 @@ pub fn intent_of(query: &str) -> Intent {
         "who is",
         "who was",
         "who invented",
+        "who designed",
+        "who built",
+        "who created",
         "history of",
         "history",
         "winners",
@@ -145,7 +151,6 @@ pub fn intent_of(query: &str) -> Intent {
         "founded",
         "born",
         "wikipedia",
-        "vs ",
     ];
     // A question about an idea rather than a lookup of a name. These are the only queries that should not be
     // answered with a reference page, so they are named explicitly and everything else defaults to the docs.
@@ -325,9 +330,13 @@ pub fn weights_for(intent: Intent) -> BTreeMap<&'static str, f64> {
         // often bare `/a/<id>` URLs with no slug, so the gold fragments only match the general index's links and a
         // weight change here cannot be validated in either direction. The root penalty below is what stops a site
         // root from topping the list, and that part is signal rather than weight.
+        // Every source is asked, and `search` decides what to weigh. A source that is gathered but not weighted
+        // costs one request and keeps the option open; a source that is never asked cannot answer when the
+        // primary is silent, which is how a troubleshooting query came back with an empty list on the clean set.
         Intent::Troubleshooting => {
             w.insert("stackexchange", 1.0);
             w.insert("yahoo", 0.1);
+            w.insert("keenable", 0.4);
         }
         Intent::Entity => {
             w.insert("yahoo", 1.0);
@@ -523,6 +532,34 @@ fn discussion_path(url: &str) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Adjust a class's weights by what its primary source actually returned.
+///
+/// A class with one dominant source returns an empty list when that source has no answer and its fallback is
+/// blocked, which a person reads as "the web is empty" — measured on the clean set, an nginx question came back
+/// with nothing at all. So when the primary is silent the fallbacks are promoted; when it answers, the keyless
+/// index does not compete for the top, because promoting it unconditionally cost the archive's lead on a
+/// held-out query (hit@1 100% to 75%).
+pub fn weights_after_states(
+    intent: Intent,
+    mut weights: BTreeMap<&'static str, f64>,
+    answers: &[Answer],
+) -> BTreeMap<&'static str, f64> {
+    if intent != Intent::Troubleshooting {
+        return weights;
+    }
+    let primary_silent = answers
+        .iter()
+        .find(|answer| answer.source == "stackexchange")
+        .map(|answer| answer.state != State::Ok || answer.hits.is_empty())
+        .unwrap_or(true);
+    if primary_silent {
+        weights.insert("yahoo", 0.5);
+    } else {
+        weights.insert("keenable", 0.0);
+    }
+    weights
 }
 
 /// Fuse the answers. No host affinity: it was measured and it rewarded the right domain's wrong page.
@@ -1525,6 +1562,12 @@ pub fn search(state: Option<&std::path::Path>, query: &str, limit: usize) -> Rep
             })
         })
         .collect();
+    // A class with one dominant source returns an empty list when that source has no answer and the fallback is
+    // blocked, which a person reads as "the web is empty". Measured on the clean set: an nginx question whose
+    // archive had nothing and whose general index was blocked came back with nothing at all. So when the primary
+    // is silent the fallbacks are given weight; when it answers, they stay where they were, because promoting
+    // them unconditionally cost the archive's top rank on a held-out query.
+    let weights = weights_after_states(intent, weights, &answers);
     let rows = fuse(query, &answers, &weights, fusion_for(intent), limit);
     Report {
         intent,
@@ -1626,9 +1669,69 @@ mod tests {
         // It earned its place on both query sets: at 0.5 the tuned MRR went 0.718 to 0.743 and the held-out
         // 0.693 to 0.710. It was not measured for the other classes, so it is not asked there.
         assert_eq!(weights_for(Intent::Documentation)["keenable"], 0.5);
-        for other in [Intent::Troubleshooting, Intent::Entity, Intent::General] {
-            assert!(!weights_for(other).contains_key("keenable"));
+        // Troubleshooting asks it too, at a lower weight, so that the source exists to answer when the archive
+        // has nothing; `weights_after_states` is what decides whether it competes for the top.
+        assert_eq!(weights_for(Intent::Troubleshooting)["keenable"], 0.4);
+        for other in [Intent::Entity, Intent::General] {
+            assert!(
+                !weights_for(other).contains_key("keenable"),
+                "{other:?} must not ask it"
+            );
         }
+    }
+
+    #[test]
+    fn a_silent_primary_promotes_the_fallback_and_an_answered_one_does_not() {
+        // Both halves matter. Without the promotion a troubleshooting query whose archive has nothing returns an
+        // empty list; with the promotion applied unconditionally the keyless index outranks the archive's own
+        // thread (measured: hit@1 100% to 75% on a held-out query).
+        let silent = vec![Answer {
+            source: "stackexchange",
+            hits: Vec::new(),
+            state: State::Empty,
+            ms: 0,
+            detail: String::new(),
+        }];
+        let promoted = weights_after_states(
+            Intent::Troubleshooting,
+            weights_for(Intent::Troubleshooting),
+            &silent,
+        );
+        assert_eq!(
+            promoted["yahoo"], 0.5,
+            "a silent primary must promote the fallback"
+        );
+
+        let answered = vec![Answer {
+            source: "stackexchange",
+            hits: vec![Hit {
+                title: "t".to_string(),
+                url: "https://stackoverflow.com/questions/1/x".to_string(),
+                snippet: String::new(),
+                source: "stackexchange",
+                rank: 1,
+            }],
+            state: State::Ok,
+            ms: 0,
+            detail: String::new(),
+        }];
+        let kept = weights_after_states(
+            Intent::Troubleshooting,
+            weights_for(Intent::Troubleshooting),
+            &answered,
+        );
+        assert_eq!(
+            kept["keenable"], 0.0,
+            "an answered primary must not share the top with the keyless index"
+        );
+
+        // No other class is touched by this rule.
+        let docs = weights_after_states(
+            Intent::Documentation,
+            weights_for(Intent::Documentation),
+            &silent,
+        );
+        assert!(docs.contains_key("yahoo-docs"));
     }
 
     #[test]

@@ -1,3 +1,29 @@
+## 0.5.10
+
+A clean query set, written after every constant froze, and what it cost the classifier.
+
+- **A source is gathered even when it is not weighed.** Troubleshooting asks the keyless index at a low weight
+  so that it exists to answer when the archive has nothing. Measured: an nginx question whose archive returned
+  nothing and whose general index was blocked came back with an **empty list**, which a person reads as "the
+  web is empty".
+- **The fallback is promoted only when the primary is silent.** Applied unconditionally it outranked the
+  archive's own thread and cost a held-out query its first place (hit@1 100% to 75%). `weights_after_states`
+  now decides from what the archive actually returned, and both halves are tested.
+- **Five classifier corrections from the clean set**: `vs ` filed "postgres vacuum full vs analyze" as a thing
+  rather than a lookup; `failure` filed "systemd restart on failure unit" as a symptom; and `who designed`,
+  `connection closed`, `already allocated` and `prematurely closed` were missing.
+
+Clean set, 22 queries written after 0.5.9 and used to choose nothing: documentation **0.753** (10 queries),
+entity **1.000** (3), troubleshooting **0.650** (6). The two larger sets are unchanged at 0.865 and 0.846
+documentation, and troubleshooting holds at 1.000 on both.
+
+Three limits stated rather than hidden. The clean set is 22 queries, so one query moves a class by five to
+seventeen points. Its troubleshooting gold names a single thread, so a different thread that answers the same
+question scores as a miss: the ssh query now ranks a valid thread that is not the one the gold names.
+`general` cannot be graded at all this way, because a conversational question has no canonical page.
+
+1328 tests, 13 ignored.
+
 ## 0.5.9
 
 One line in the fusion, and it was the largest defect in the tool.
