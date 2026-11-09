@@ -1,3 +1,46 @@
+## 0.6.10
+
+### The Kledon Release: the table is a command's output
+
+A kledon is a chance utterance taken as an omen, and the useful thing about one is that you did not compose it. The
+release table in these notes used to be typed by hand from a command's output, which is how 0.6.2 invented a figure
+and how 0.6.8 published a false refutation. `read-eval --emit-table` prints the table. The table in the 0.6.9 section
+was compared to that output byte for byte before this release:
+
+```
+emitted rows: 9, notes rows: 9, byte identical: True
+```
+
+**1353 tests, 15 ignored.**
+
+### What changed
+
+- **`--emit-table` prints the markdown table, `all` row included.** The notes are now a copy of output rather than a
+  transcription of it, which is the difference between the two failures this series is named after.
+- **The check still compares cell by cell**, so a hand edit is caught; the point of the flag is that there is no
+  reason to make one.
+
+### The measurement, emitted by the command above
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 88% | 0 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 100% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 13/19 | 11 | 0% |
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **`clean` still rests on the chrome strings each row names.** It is a positive test now, but a row is only as good
+  as its list.
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4.** Two of the eight were dominated by a false claim of mine.
+
 ## 0.6.9
 
 ### The Aidos Release: the check that tested a rule the code does not use

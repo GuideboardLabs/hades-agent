@@ -558,6 +558,7 @@ pub fn cmd(args: &[String]) -> i32 {
     let mut refresh = false;
     let mut json = false;
     let mut limit = usize::MAX;
+    let mut emit_table = false;
     let mut save_path: Option<PathBuf> = None;
     let mut notes_path: Option<PathBuf> = None;
     let mut baseline_path: Option<PathBuf> = None;
@@ -573,6 +574,7 @@ pub fn cmd(args: &[String]) -> i32 {
                 state = args.get(index).map(PathBuf::from);
             }
             "--refresh" => refresh = true,
+            "--emit-table" => emit_table = true,
             "--save" => {
                 index += 1;
                 save_path = args.get(index).map(PathBuf::from);
@@ -656,6 +658,44 @@ pub fn cmd(args: &[String]) -> i32 {
         readings.push((row.clone(), reading));
     }
     let scores = score(&rows, &readings);
+    if emit_table {
+        // The release notes carry this table. Printing it here means the notes are a copy of a command's output
+        // rather than a transcription of one, which is the defect that put a 4 on 0.6.8.
+        println!("| class | rows | found | state% | recall | clean | unchecked | boiler |");
+        println!("|---|---|---|---|---|---|---|---|");
+        for score in &scores {
+            println!(
+                "| {} | {} | {} | {:.0}% | {:.1}% | {:.0}% | {} | {:.0}% |",
+                score.class,
+                score.asked,
+                score.found,
+                score.states() * 100.0,
+                score.recall() * 100.0,
+                score.cleanliness() * 100.0,
+                score.unchecked,
+                score.boilerplate * 100.0
+            );
+        }
+        let asked: usize = scores.iter().map(|s| s.asked).sum();
+        let found: usize = scores.iter().map(|s| s.found).sum();
+        let stated: usize = scores.iter().map(|s| s.stated).sum();
+        let clean: usize = scores.iter().map(|s| s.clean).sum();
+        let checked: usize = scores.iter().map(|s| s.checked()).sum();
+        let unchecked: usize = scores.iter().map(|s| s.unchecked).sum();
+        let boiler = scores.iter().map(|s| s.boilerplate).sum::<f64>() / scores.len().max(1) as f64;
+        println!(
+            "| all | {} | {} | {:.0}% | {:.1}% | {}/{} | {} | {:.0}% |",
+            asked,
+            found,
+            100.0 * stated as f64 / asked.max(1) as f64,
+            100.0 * found as f64 / asked.max(1) as f64,
+            clean,
+            checked,
+            unchecked,
+            boiler * 100.0
+        );
+        return 0;
+    }
     if let Some(path) = save_path.as_ref() {
         if let Err(why) = save(path, &scores) {
             eprintln!("read-eval: {why}");
