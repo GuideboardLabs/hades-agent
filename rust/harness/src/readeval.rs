@@ -409,18 +409,18 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         }
         out
     };
+    // The header is matched first and the `| all |` row required second, so a message can describe the condition
+    // that actually failed. Filtering on `| all |` and then reporting "no measurement table" misnamed a section
+    // that had a table missing one row.
     let measured: Vec<&str> = sections
         .iter()
         .filter(|section| {
             section
                 .lines()
-                .any(|line| line.trim_start().starts_with("| all |"))
+                .any(|line| line.trim_start().starts_with("## "))
         })
         .copied()
         .collect();
-    if measured.is_empty() {
-        return Err("no section of the notes carries a measurement table".to_string());
-    }
     // A baseline measured against a different gold set describes a different test.
     match saved.get("gold_digest").and_then(|v| v.as_str()) {
         Some(recorded) if recorded == gold_digest() => {}
@@ -467,9 +467,18 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         .copied()
     else {
         return Err(format!(
-            "the notes have no measurement table under `{shipped}`: the release being shipped states no numbers"
+            "the notes have no section headed `{shipped}`: the release being shipped states no numbers"
         ));
     };
+    // Now that the shipped section is found, it must actually carry the table. Two conditions, two messages.
+    if !newest
+        .lines()
+        .any(|line| line.trim_start().starts_with("| all |"))
+    {
+        return Err(format!(
+            "the section under `{shipped}` carries no `| all |` row: its table is incomplete"
+        ));
+    }
     {
         let is_separator = |line: &str| {
             line.trim_start().starts_with("| ")
@@ -944,6 +953,28 @@ mod tests {
         assert!(
             check_notes(&older_tampered, &baseline).is_ok(),
             "an older section's table must not fail the check"
+        );
+
+        // THE shape of the bug: the shipped section has no table and an older section does. Reverting the anchor to
+        // `measured[0]` must fail this, which the previous fixtures did not manage because the shipped section came
+        // first and the no-table fixture had no older section to fall through to.
+        let shipped_empty_older_complete = dir.join("empty-newer.md");
+        std::fs::write(
+            &shipped_empty_older_complete,
+            // The OLDER section comes first on purpose. With the anchor, the shipped section is found by name and
+            // its missing table fails; without the anchor, the first section in the file is the older one, which is
+            // complete, so the check passes and this assertion fails. That is the only ordering that tells the two
+            // implementations apart, and it is the shape the review's revert exposed.
+            format!(
+                "## 0.0.1\n\n{header}{honest_row}{all_row}\n## {}\n\nno table here\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        let why = check_notes(&shipped_empty_older_complete, &baseline).unwrap_err();
+        assert!(
+            why.contains("no section headed") || why.contains("carries no `| all |` row"),
+            "a shipped section without a table must fail even when an older section has one: {why}"
         );
 
         // A release whose own section carries no table states no numbers, and that is a failure rather than a

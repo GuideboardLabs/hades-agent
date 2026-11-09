@@ -1,3 +1,56 @@
+## 0.6.14
+
+### The Basanos Release: the test that did not fail on the regression
+
+Basanos is the touchstone that tests gold by what it leaves on the stone, and the twelfth review used the same
+method on the test this series has been leaning on. I said 0.6.13 added two tests that could tell the difference
+between the version anchor and `measured[0]`. Reverting to `measured[0]` left the whole library green: my
+no-table fixture had no older section to fall through to, and my two-section fixture put the shipped section
+first, which is the one ordering `measured[0]` also gets right.
+
+Twelfth review: **6 out of 10**. The anchor is real and could not be broken on the shipped corpus; the sentence
+describing the tests was false.
+
+**1353 tests, 15 ignored.**
+
+### What changed
+
+- **A fixture with the older section FIRST and the shipped section second and empty.** That ordering is the only
+  one that separates the two implementations. Verified by reverting the anchor: the suite now fails with
+  `called Result::unwrap_err() on an Ok value`, and passes with the anchor restored. Before this, the revert was
+  invisible.
+- **Two conditions, two messages.** `measured` filtered on `| all |` and then reported "no measurement table",
+  which misnamed a section that had a table missing one row. The header is matched first, then the `| all |` row
+  is required, and each failure says which of the two it was.
+- **The paragraph about the failed run was imprecise.** It described an API response as an unreachable host and
+  counted a `js-required` row among the casualties. What happened: the Stack Exchange API answered the four forum
+  queries with an error, so those rows did not resolve; the shell rows are `js-required` by design and had nothing
+  to do with it.
+
+### The measurement
+
+The reader did not change in this release, so the table is the one the 0.6.13 gate verified, unchanged:
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Seven checked rows still rest on hand-typed chrome strings.**
+- **Provenance is anchored to the version, not to the build that emitted the table**, so the same table can be
+  republished. The review is right that this leaves honesty as a prose habit.
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4, 4, 6.**
+
 ## 0.6.13
 
 ### The Aletheia Trite Release: the comment under the code, and the section named by the version
