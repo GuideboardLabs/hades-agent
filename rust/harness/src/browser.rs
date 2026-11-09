@@ -192,10 +192,10 @@ const MAX_EVAL: usize = 6000;
 const MAX_FULL: usize = 100_000;
 
 /// The tool entry point. A failure kills the process so the next call starts from a known state.
-pub fn tool(args: &Value, state: &Path) -> String {
+pub fn tool(args: &Value, state: &Path) -> Result<String, String> {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
     if action.is_empty() {
-        return "no action given".to_string();
+        return Err("no action given".to_string());
     }
     let key = session_key(state);
     let now = Instant::now();
@@ -235,22 +235,18 @@ pub fn tool(args: &Value, state: &Path) -> String {
             {
                 session.session.close();
             }
-            return "browser closed".to_string();
+            return Ok("browser closed".to_string());
         }
 
         if !held.contains_key(&key) {
-            match Session::start(state) {
-                Ok(session) => {
-                    held.insert(
-                        key.clone(),
-                        std::sync::Arc::new(Mutex::new(Held {
-                            session,
-                            last_used: now,
-                        })),
-                    );
-                }
-                Err(said) => return said,
-            }
+            let session = Session::start(state)?;
+            held.insert(
+                key.clone(),
+                std::sync::Arc::new(Mutex::new(Held {
+                    session,
+                    last_used: now,
+                })),
+            );
         }
         held.get(&key).cloned()
     };
@@ -275,8 +271,11 @@ pub fn tool(args: &Value, state: &Path) -> String {
         },
         None => Err("the browser did not start".to_string()),
     };
+    // A page and a failure are different types, so a caller no longer recognises a failure by its wording. The
+    // previous version returned `format!("the browser failed: {said}")` for every error, which is indistinguishable
+    // from a page that happens to contain that sentence.
     match result {
-        Ok(said) => said,
+        Ok(said) => Ok(said),
         Err(said) => {
             // The pipe or the page is no longer trustworthy. Drop this state's child only; another state's
             // session has nothing to do with this failure.
@@ -289,7 +288,7 @@ pub fn tool(args: &Value, state: &Path) -> String {
             {
                 session.session.close();
             }
-            format!("the browser failed: {said}")
+            Err(format!("the browser failed: {said}"))
         }
     }
 }
@@ -3186,6 +3185,12 @@ const F_SETFD: i32 = 2;
 
 #[cfg(test)]
 mod tests {
+    /// The live tests read pages; `tool` returns a `Result` now, so this shadow unwraps where a page is expected
+    /// and names the failure when there is none.
+    fn tool(args: &Value, state: &std::path::Path) -> String {
+        super::tool(args, state).unwrap_or_else(|why| panic!("the browser failed: {why}"))
+    }
+
     use super::*;
 
     /// A fixture page is a `file://` URL. The session opts in explicitly; production never calls this.

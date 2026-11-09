@@ -1428,7 +1428,8 @@ fn execute_with_stop(
         "remember" => remember(&args, world),
         "skills" => skills(&args, world),
         "session_search" => session_search(&args, world),
-        "browser" => crate::browser::tool(&args, &world.state),
+        "browser" => crate::browser::tool(&args, &world.state)
+            .unwrap_or_else(|why| format!("the browser failed: {why}")),
         "image" => image(&args, world),
         "fetch" => fetch(&args),
         "read" => read(&args, world),

@@ -1438,11 +1438,12 @@ fn path_stem(path: &Path) -> String {
         .unwrap_or_else(|| "document".to_string())
 }
 
-/// The browser tool's own error sentences, recognised before their words become page text.
+/// A success that is not HTML, which is not a page whatever it says.
 ///
-/// `browser::tool` returns `String` for both outcomes. The phrasings are the ones it actually emits; a message
-/// that matches none of them is treated as a page, because guessing wrong in that direction would discard a real
-/// render.
+/// `browser::tool` returns `Result`, so a failure no longer reaches here; this is the remaining net for a call that
+/// returned `Ok` with something that is not markup. The verdict does not depend on the phrase list below: a
+/// non-HTML reply is refused on its shape, and the list only supplies a clearer reason.
+#[cfg(test)]
 fn browser_failure(body: &str) -> Option<String> {
     const SIGNALS: &[&str] = &[
         "no usable sandbox",
@@ -1489,24 +1490,26 @@ fn read_browser(state: Option<&Path>, url: &str, states: &mut Vec<String>) -> Re
         };
     };
     let args = serde_json::json!({"action": "open", "url": url});
-    let body = crate::browser::tool(&args, state_dir);
-    // The browser tool returns the page on success and an error sentence on failure, and the two are the same
-    // type. Feeding the failure through extraction reported `ok` with Chromium's own complaint as the page: state
-    // ok, 592 characters, "No usable sandbox!" as the text. A tool that cannot tell its own error from a page is
-    // the exact defect this release is supposed to have closed, so the error is recognised before extraction.
-    if let Some(why) = browser_failure(&body) {
-        states.push(format!("browser failed: {why}"));
-        return Reading {
-            url: url.to_string(),
-            path: Path_::Browser,
-            state: State::Unreachable(why),
-            states: states.clone(),
-            title: String::new(),
-            text: String::new(),
-            blocks: Vec::new(),
-            ms: 0,
-        };
-    }
+    // `browser::tool` returns a `Result`, so a page and a failure are different types. Before that, feeding a
+    // failure through extraction reported `ok` with Chromium's own complaint as the page; then the error was
+    // recognised by matching a sentence list, which is a phrase list that has to be kept in step with the tool.
+    // Now the failure arrives as an error and the reason is the tool's own words.
+    let body = match crate::browser::tool(&args, state_dir) {
+        Ok(body) => body,
+        Err(why) => {
+            states.push(format!("browser failed: {why}"));
+            return Reading {
+                url: url.to_string(),
+                path: Path_::Browser,
+                state: State::Unreachable(why),
+                states: states.clone(),
+                title: String::new(),
+                text: String::new(),
+                blocks: Vec::new(),
+                ms: 0,
+            };
+        }
+    };
     let (text, blocks, title) = extract_html(&body);
     let empty = text.trim().is_empty();
     states.push(if empty {

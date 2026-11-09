@@ -365,11 +365,23 @@ fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Compare the newest release section's measurement table against a saved measurement.
-///
-/// The defect this closes: 0.6.2 shipped notes claiming cleanliness 100% while the binary reported 63.3%, because
-/// the table column the figure came from never existed and nothing compared the two. This runs offline, from the
-/// files, so the gate can call it on every build. A note that disagrees with the recorded measurement fails.
+/// Ordered comparison for the dotted versions used in provenance lines, so a table cannot claim to come from a
+/// later build than the one being shipped.
+fn version_key(v: &str) -> Vec<u32> {
+    v.split('.')
+        .map(|p| p.parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+/// The identity of the measurement: the build that produced it and the fixture it ran against.
+pub fn provenance_line() -> String {
+    format!(
+        "read-eval {} gold {}",
+        env!("CARGO_PKG_VERSION"),
+        gold_digest()
+    )
+}
+
 /// A digest of the shipped gold set, so a baseline taken against a different fixture cannot pass.
 fn gold_digest() -> String {
     let path =
@@ -385,6 +397,11 @@ fn gold_digest() -> String {
     format!("{hash:016x}")
 }
 
+/// Compare the newest release section's measurement table against a saved measurement.
+///
+/// The defect this closes: 0.6.2 shipped notes claiming cleanliness 100% while the binary reported 63.3%, because
+/// the table column the figure came from never existed and nothing compared the two. This runs offline, from the
+/// files, so the gate can call it on every build. A note that disagrees with the recorded measurement fails.
 fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<(), String> {
     let baseline_text =
         std::fs::read_to_string(baseline).map_err(|e| format!("{}: {e}", baseline.display()))?;
@@ -477,6 +494,36 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
     {
         return Err(format!(
             "the section under `{shipped}` carries no `| all |` row: its table is incomplete"
+        ));
+    }
+    // The table must name the build that MEASURED it and the fixture it ran against. The version in the line is the
+    // measuring build, not the shipping one: a release that changed only the guard has no new measurement to take,
+    // and writing today's version over yesterday's numbers would be the lie this line exists to prevent. What is
+    // enforced is that the fixture digest matches and that no table claims to come from a build that does not exist
+    // yet. The notes then say which build measured the table, so a reader can see its age.
+    let provenance = newest
+        .lines()
+        .find(|line| line.trim_start().starts_with("read-eval "))
+        .map(str::trim)
+        .ok_or_else(|| {
+            format!("the table under `{shipped}` carries no provenance line naming the build that measured it")
+        })?;
+    let (measured_by, fixture) = provenance
+        .strip_prefix("read-eval ")
+        .and_then(|rest| rest.split_once(" gold "))
+        .ok_or_else(|| {
+            format!("the provenance line `{provenance}` is not `read-eval <version> gold <digest>`")
+        })?;
+    if fixture != gold_digest() {
+        return Err(format!(
+            "the table under `{shipped}` was measured against gold `{fixture}`, but the shipped fixture is `{}`",
+            gold_digest()
+        ));
+    }
+    if version_key(measured_by) > version_key(env!("CARGO_PKG_VERSION")) {
+        return Err(format!(
+            "the table under `{shipped}` claims to have been measured by `{measured_by}`, which is newer than the \
+             build being shipped"
         ));
     }
     {
@@ -736,6 +783,10 @@ pub fn cmd(args: &[String]) -> i32 {
     if emit_table {
         // The release notes carry this table. Printing it here means the notes are a copy of a command's output
         // rather than a transcription of one, which is the defect that put a 4 on 0.6.8.
+        // The line above the table names the build and the fixture the numbers came from. Without it the same
+        // table can be republished indefinitely and the check prints ok every time, which leaves honesty as a
+        // prose habit rather than a property of the artifact.
+        println!("{}", provenance_line());
         println!("| class | rows | found | state% | recall | clean | unchecked | boiler |");
         println!("|---|---|---|---|---|---|---|---|");
         for score in &scores {
@@ -890,8 +941,9 @@ mod tests {
         std::fs::write(
             &honest,
             format!(
-                "## {}\n\n{header}{honest_row}{all_row}",
-                env!("CARGO_PKG_VERSION")
+                "## {}\n\n{}\n{header}{honest_row}{all_row}",
+                env!("CARGO_PKG_VERSION"),
+                provenance_line()
             ),
         )
         .unwrap();
@@ -906,8 +958,9 @@ mod tests {
         std::fs::write(
             &lying,
             format!(
-                "## {}\n\n{header}{}{all_row}",
+                "## {}\n\n{}\n{header}{}{all_row}",
                 env!("CARGO_PKG_VERSION"),
+                provenance_line(),
                 honest_row.replace("| 0% |", "| 99% |")
             ),
         )
@@ -922,7 +975,11 @@ mod tests {
         let missing = dir.join("missing.md");
         std::fs::write(
             &missing,
-            format!("## {}\n\n{header}{all_row}", env!("CARGO_PKG_VERSION")),
+            format!(
+                "## {}\n\n{}\n{header}{all_row}",
+                env!("CARGO_PKG_VERSION"),
+                provenance_line()
+            ),
         )
         .unwrap();
         assert!(
@@ -944,8 +1001,9 @@ mod tests {
         std::fs::write(
             &older_tampered,
             format!(
-                "## {}\n\n{header}{honest_row}{all_row}\n## 0.0.1\n\n{header}{}{all_row}",
+                "## {}\n\n{}\n{header}{honest_row}{all_row}\n## 0.0.1\n\n{header}{}{all_row}",
                 env!("CARGO_PKG_VERSION"),
+                provenance_line(),
                 honest_row.replace("| 3 |", "| 9 |")
             ),
         )

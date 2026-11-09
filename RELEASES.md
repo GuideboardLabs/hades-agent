@@ -1,3 +1,53 @@
+## 0.6.15
+
+### The Basanos Triton Release: the line names the build that measured
+
+The twelfth review's third item was that provenance was anchored to the version, not to the build behind the
+numbers, which left honesty as a prose habit. The first attempt at the fix made the line claim the *shipping*
+version, and that is a worse lie than the one it replaced: a release that changes only the guard has no new
+measurement to take, and stamping today's version on yesterday's numbers invents a measurement.
+
+**1353 tests, 15 ignored.**
+
+### What changed
+
+- **The provenance line names the build that measured the table**, and the check enforces what can actually be
+  verified: the fixture digest in the line matches the shipped fixture, and the recorded build is not newer than
+  the build being shipped. Which build measured it is then visible in the artifact instead of implied.
+- **`read-eval --emit-table` prints that line above the table.**
+- **The two failure conditions fire in the order that names the real fault**: no table at all, then provenance,
+  then the rows.
+- **`browser::tool` returns `Result<String, String>`.** A page and a failure are now different types, so a caller
+  cannot confuse one for the other by its wording. `read.rs` uses the error directly and no longer decides
+  "did the browser fail" by matching a sentence list; `websearch.rs` matches on the error instead of on
+  substrings like `"error"`, which a real result page can contain; the agent tool maps the error to text so the
+  model still reads a sentence. The live browser tests get a shadowing `tool` in their own module that unwraps.
+- **Seven readeval tests**, including the reverting check: with the version anchor removed the suite fails.
+
+### The measurement
+
+The reader did not change, so there is no new measurement. The table below was taken by the **0.6.5 build** and
+has been reproduced byte-identically by every build since. The line above it records exactly that, verified by
+`git log -S` on the baseline: the values first appear in `664b294`, which is tag `v0.6.5`.
+
+read-eval 0.6.5 gold 1d9233b12b2529c5
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+
+### Still not fixed
+
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Seven checked rows still rest on hand-typed chrome strings.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4, 4, 6.**
+
 ## 0.6.14
 
 ### The Basanos Release: the test that did not fail on the regression

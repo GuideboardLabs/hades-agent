@@ -952,25 +952,38 @@ fn failed(source: &'static str, started: std::time::Instant, detail: &str) -> An
 pub fn bing_browser(state: &std::path::Path, query: &str, limit: usize) -> Answer {
     let started = std::time::Instant::now();
     let url = format!("https://www.bing.com/search?q={}&count=20", encode(query));
-    let opened = crate::browser::tool(&serde_json::json!({"action": "open", "url": url}), state);
-    if opened.starts_with("Refused") || opened.contains("could not") || opened.contains("error") {
-        // A host without unprivileged user namespaces cannot give Chromium a sandbox, and the failure arrives
-        // as a closed pipe. Naming the opt-out here turns a mysterious search failure into one instruction.
-        let detail = if opened.contains("No usable sandbox") {
-            format!(
-                "this host cannot give Chromium a sandbox; set HADES_BROWSER_NO_SANDBOX=1 to allow the browser \
-                 source here, and leave it unset on a host that can: {}",
-                clip(&opened, 120)
-            )
-        } else {
-            opened
-        };
-        return failed("bing", started, &detail);
-    }
-    let reply = crate::browser::tool(
+    // A failure is an `Err` now, so it cannot be mistaken for a page by its wording. The old test here matched
+    // substrings like "error", which a real result page can contain, and missed any phrasing that did not.
+    match crate::browser::tool(&serde_json::json!({"action": "open", "url": url}), state) {
+        Ok(_page) => {}
+        Err(why) => {
+            // A host without unprivileged user namespaces cannot give Chromium a sandbox, and the failure arrives
+            // as a closed pipe. Naming the opt-out here turns a mysterious search failure into one instruction.
+            let detail = if why.to_ascii_lowercase().contains("sandbox") {
+                format!(
+                    "this host cannot give Chromium a sandbox; set HADES_BROWSER_NO_SANDBOX=1 to allow the browser \
+                     source here, and leave it unset on a host that can: {}",
+                    clip(&why, 120)
+                )
+            } else {
+                why
+            };
+            return failed("bing", started, &detail);
+        }
+    };
+    let reply = match crate::browser::tool(
         &serde_json::json!({"action": "eval", "script": BING_EXTRACT, "full": true}),
         state,
-    );
+    ) {
+        Ok(reply) => reply,
+        Err(why) => {
+            return failed(
+                "bing",
+                started,
+                &format!("the page could not be read: {why}"),
+            );
+        }
+    };
     let Some(rows) = json_rows(&reply) else {
         return failed(
             "bing",
