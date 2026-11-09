@@ -46,10 +46,14 @@ jobs:
       # The release notes are checked here too, because a check that only runs on the author's machine is not a
       # check on a release. Offline: two files.
       - name: The release notes match the saved measurement
+        working-directory: rust
         run: |
-          BIN="$(ls -d target/*/release/hades target/release/hades 2>/dev/null | head -1)"
-          if [ -z "$BIN" ]; then cargo build --release -q -p harness && BIN=target/release/hades; fi
-          "$BIN" read-eval --check-notes RELEASES.md rust/harness/tests/fixtures/read-eval-baseline.json
+          # Cargo lives in rust/, so the workspace root is this directory and the notes are one level up. The first
+          # version of this step ran from the repository root, exited 127 on `could not find Cargo.toml`, failed the
+          # gate job and blocked the release: a step nobody had executed is the same defect as no step.
+          BIN="${CARGO_TARGET_DIR:-target}/release/hades"
+          [ -x "$BIN" ] || cargo build --release -q -p harness
+          "$BIN" read-eval --check-notes ../RELEASES.md harness/tests/fixtures/read-eval-baseline.json
 
   arm64:
     needs: gate

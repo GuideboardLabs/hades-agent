@@ -232,7 +232,9 @@ pub fn score(gold: &[GoldRow], readings: &[(GoldRow, crate::read::Reading)]) -> 
         }
         // `all()` over an empty iterator is true, so a row with no absence list must count as unchecked rather
         // than clean. Fourteen of thirty rows had an empty list and every one of them passed for free.
-        if row.absent.is_empty() {
+        // A row whose reading produced no text at all cannot be clean: no assertion was exercised, because there
+        // was nothing to assert against. The pdf class scored 2/2 clean while one of those rows never resolved.
+        if row.absent.is_empty() || reading.text.trim().is_empty() {
             entry.unchecked += 1;
         } else if row
             .absent
@@ -366,9 +368,19 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         .iter()
         .filter_map(|c| c.get("class").and_then(|v| v.as_str()).map(str::to_string))
         .collect();
+    // The separator has to be recognised by its CELLS, not by the line: `| mystery | --- | 999 |` is a data row with
+    // a dashed second cell, and skipping any line containing `---` let it through as a recorded class.
+    let is_separator = |line: &str| {
+        line.trim_start().starts_with("| ")
+            && line
+                .split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
+    };
     let table_rows: Vec<String> = newest
         .lines()
-        .filter(|line| line.trim_start().starts_with("| ") && !line.contains("---"))
+        .filter(|line| line.trim_start().starts_with("| ") && !is_separator(line))
         .filter_map(|line| {
             line.split('|')
                 .nth(1)

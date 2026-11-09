@@ -1,3 +1,49 @@
+## 0.6.7
+
+### The Aisa Release: the step that never ran
+
+Aisa is the portion, and a portion is only real if it is handed over. 0.6.6 added a step to the release workflow to
+check the notes on a tagged release and never executed it: it ran from the repository root, could not find
+`Cargo.toml`, exited 127, failed the `gate` job and blocked the release. **v0.6.6 has a tag and no assets because of
+my change.** That step is fixed and the exact block has been run from `rust/` with a real exit code of 0.
+
+Seventh review: **6 out of 10**. It could not break the two fixes it tested; it broke the third before it ever ran.
+
+**1352 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **The release step could not run.** `working-directory: rust` with `../RELEASES.md`, and the binary is
+  `${CARGO_TARGET_DIR:-target}/release/hades` so a moved target directory does not break it. Verified by running the
+  block verbatim: `ok   the newest release notes match the saved measurement`, exit 0. This also unblocks publishing.
+- **The separator bypass.** `| mystery | --- | 999 | ... |` was treated as a data row and skipped, so a notes row the
+  measurement never recorded could hide behind a dash. The separator is now recognised by its cells rather than by
+  the line containing `---`.
+- **A row with no text counted as clean.** A reading that produced nothing cannot be clean, because no assertion was
+  exercised; it counts as unchecked now.
+
+### The measurement
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 100% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 100% | 3 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 50% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 12/16 | 14 | 0% |
+
+### Still not fixed, and the review is right about both
+
+- **`12/16` is not yet a measurement of chrome.** Eight of the twelve rows it counts clean keep the asserted word in
+  prose somewhere else in the page, and the python docs row keeps its whole Sphinx footer. A clean row needs a
+  *label* test: a line that does not continue into a sentence. That is the next change, not this one.
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6.** Seven rounds.
+
 ## 0.6.6
 
 ### The Plouton Release: the count that measures the thing
