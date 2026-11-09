@@ -456,10 +456,21 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         .collect();
     // The separator has to be recognised by its CELLS, not by the line: `| mystery | --- | 999 |` is a data row with
     // a dashed second cell, and skipping any line containing `---` let it through as a recorded class.
-    // Every measured section is compared, one after another. A table in the 0.6.9 section is a claim about the
-    // measurement just as the newest one is.
-    for section in measured.iter().take(1) {
-        let newest = *section;
+    // ONE section is compared: the one whose header names the version being shipped. A table in an older section
+    // records what the measurement was at that release, so comparing it here would fail every build after the
+    // numbers move. The previous version compared whichever section came first in the file, which meant a release
+    // with no table of its own silently validated an older one.
+    let shipped = format!("## {}", env!("CARGO_PKG_VERSION"));
+    let Some(newest) = measured
+        .iter()
+        .find(|section| section.lines().any(|line| line.trim() == shipped))
+        .copied()
+    else {
+        return Err(format!(
+            "the notes have no measurement table under `{shipped}`: the release being shipped states no numbers"
+        ));
+    };
+    {
         let is_separator = |line: &str| {
             line.trim_start().starts_with("| ")
                 && line
@@ -592,7 +603,6 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
             }
         }
     }
-
     if problems.is_empty() {
         Ok(())
     } else {
@@ -870,7 +880,10 @@ mod tests {
         let honest = dir.join("honest.md");
         std::fs::write(
             &honest,
-            format!("## 1.0.0\n\n{header}{honest_row}{all_row}"),
+            format!(
+                "## {}\n\n{header}{honest_row}{all_row}",
+                env!("CARGO_PKG_VERSION")
+            ),
         )
         .unwrap();
         assert!(
@@ -884,7 +897,8 @@ mod tests {
         std::fs::write(
             &lying,
             format!(
-                "## 1.0.0\n\n{header}{}{all_row}",
+                "## {}\n\n{header}{}{all_row}",
+                env!("CARGO_PKG_VERSION"),
                 honest_row.replace("| 0% |", "| 99% |")
             ),
         )
@@ -897,7 +911,11 @@ mod tests {
 
         // a row that is simply absent is a failure, not a pass
         let missing = dir.join("missing.md");
-        std::fs::write(&missing, format!("## 1.0.0\n\n{header}{all_row}")).unwrap();
+        std::fs::write(
+            &missing,
+            format!("## {}\n\n{header}{all_row}", env!("CARGO_PKG_VERSION")),
+        )
+        .unwrap();
         assert!(
             check_notes(&missing, &baseline).is_err(),
             "a missing row must fail"
@@ -911,20 +929,36 @@ mod tests {
             "an empty measurement must fail"
         );
 
-        // the newest section is the one compared, not the second one in the file
-        let two = dir.join("two.md");
+        // A section for an OLDER version is not compared: it records what the measurement was then. This fixture
+        // has two measured sections and only the shipped one may decide the outcome.
+        let older_tampered = dir.join("older.md");
         std::fs::write(
-            &two,
+            &older_tampered,
             format!(
-                "## 2.0.0\n\n{header}{}{header}{honest_row}",
+                "## {}\n\n{header}{honest_row}{all_row}\n## 0.0.1\n\n{header}{}{all_row}",
+                env!("CARGO_PKG_VERSION"),
                 honest_row.replace("| 3 |", "| 9 |")
             ),
         )
         .unwrap();
         assert!(
-            check_notes(&two, &baseline).is_err(),
-            "the newest section is the one compared"
+            check_notes(&older_tampered, &baseline).is_ok(),
+            "an older section's table must not fail the check"
         );
+
+        // A release whose own section carries no table states no numbers, and that is a failure rather than a
+        // pass by falling through to an older section.
+        let no_table = dir.join("no-table.md");
+        std::fs::write(
+            &no_table,
+            format!("## {}\n\nnothing here\n", env!("CARGO_PKG_VERSION")),
+        )
+        .unwrap();
+        assert!(
+            check_notes(&no_table, &baseline).is_err(),
+            "a release with no table must fail"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

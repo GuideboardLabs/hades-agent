@@ -1,3 +1,61 @@
+## 0.6.13
+
+### The Aletheia Trite Release: the comment under the code, and the section named by the version
+
+The eleventh review scored 0.6.12 at **4 out of 10** and found the same class in a new place. I deleted a false
+comment and wrote a replacement that meant the same thing:
+
+```rust
+// Every measured section is compared, one after another. ...
+for section in measured.iter().take(1) {
+```
+
+A release that exists to stop shipping claims the code does not support shipped that claim inside the code. It also
+found that `measured` was not anchored to the version being shipped, so a release section with no table fell through
+and validated an older one: the gate printed that the newest notes match.
+
+**1353 tests, 15 ignored.**
+
+### What changed
+
+- **The compared section is the one whose header names `CARGO_PKG_VERSION`.** A section for an older version records
+  what the measurement was then and is not compared, which is now enforced rather than described. A release whose own
+  section carries no table is a failure: "the notes have no measurement table under `## X`: the release being shipped
+  states no numbers".
+- **The comment above the code describes the code under it**, and the sentence that claimed otherwise is gone from
+  both.
+- **Two tests that could tell the difference.** A fixture with the shipped section honest and an older section
+  tampered must pass; a release section with no table must fail. The previous test wrote one header, so `take(1)` and
+  a full walk were indistinguishable and it stayed green either way.
+
+### The measurement
+
+**This run could not reach the Stack Exchange API**, so the four forum rows did not resolve and a live
+`--emit-table` reported 19 of 30 with forum at 0. A degraded run is not a measurement of the reader, so the table
+below is the last **complete** measurement, byte-identical to the one the 0.6.12 gate verified. It is unchanged
+because nothing about the reader changed in this release.
+
+### Emitted by `--emit-table` on the run that completed
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Seven checked rows still rest on hand-typed chrome strings.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4, 4.** Three of the last four were a false sentence rather than broken code.
+
 ## 0.6.12
 
 ### The Aletheia Deutera Release: two sentences corrected
