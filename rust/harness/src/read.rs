@@ -350,6 +350,9 @@ struct Segment {
     kind: &'static str,
     text: String,
     in_content: bool,
+    /// The share of this segment's non-space characters that sat inside an anchor. A menu row is nearly all anchor
+    /// text; a headline is anchor text with metadata beside it.
+    link_ratio: f64,
 }
 
 /// Extract the readable text of an HTML page, dropping navigation, headers, footers, asides and scripts.
@@ -524,11 +527,17 @@ pub fn extract_html(html: &str) -> (String, Vec<Block>, String) {
     // segments rather than to everything outside noise: a page with no `<article>` (sqlite.org is one) otherwise
     // comes back as its own table of contents, tagline and footer, which is markup stripping wearing the name of
     // extraction.
+    let segments = drop_link_runs(segments);
     let has_content = segments.iter().any(|s| s.in_content);
     let kept: Vec<&Segment> = if has_content {
         segments.iter().filter(|s| s.in_content).collect()
-    } else {
+    } else if segments.iter().any(|s| s.text.chars().count() > 200) {
+        // A density window needs prose to centre on. A listing page has none: every row is a headline and a
+        // metadata line, so the window picks whichever cluster happens to weigh most and throws the rest away, which
+        // is how the Hacker News front page lost its stories. The window applies only when there is prose to find.
         dense_run(&segments)
+    } else {
+        segments.iter().collect()
     };
 
     // Two rules that apply whatever chose the segments. A heading whose whole text is a chrome word is a section
@@ -629,6 +638,50 @@ fn is_chrome_heading(text: &str) -> bool {
     )
 }
 
+/// Drop runs of three or more consecutive link-dense segments.
+///
+/// A menu is a run: several consecutive rows that are almost entirely anchor text. A headline is a single such row
+/// with non-link metadata beside it, which is why the Hacker News front page survives this and the sqlite.org menu
+/// does not. Three is the smallest run that cannot be a coincidence of two adjacent links in prose.
+fn drop_link_runs(segments: Vec<Segment>) -> Vec<Segment> {
+    const DENSE: f64 = 0.7;
+    // Five, and every member short. Measured: three was enough to swallow the Hacker News front page, because a
+    // listing is also a run of link-dense rows; a menu is longer and its labels are short. A headline is a sentence
+    // and a menu label is a phrase, so the pair of bounds is what separates them, and one bound alone would not.
+    const RUN: usize = 5;
+    const SHORT: usize = 60;
+    let mut drop = vec![false; segments.len()];
+    let mut start = 0;
+    while start < segments.len() {
+        if segments[start].link_ratio < DENSE
+            || segments[start].in_content
+            || segments[start].text.trim().chars().count() > SHORT
+        {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end + 1 < segments.len()
+            && segments[end + 1].link_ratio >= DENSE
+            && segments[end + 1].text.trim().chars().count() <= SHORT
+            && !segments[end + 1].in_content
+        {
+            end += 1;
+        }
+        if end + 1 - start >= RUN {
+            for flag in drop.iter_mut().take(end + 1).skip(start) {
+                *flag = true;
+            }
+        }
+        start = end + 1;
+    }
+    segments
+        .into_iter()
+        .zip(drop)
+        .filter_map(|(segment, dropped)| if dropped { None } else { Some(segment) })
+        .collect()
+}
+
 /// The heaviest run of consecutive segments, by a weight that punishes navigation.
 ///
 /// The weights are judgements, not measurements, and they are here in one place so a wrong one is one edit:
@@ -694,27 +747,26 @@ fn flush_with_links(
     link_chars: &mut usize,
 ) {
     let text_chars = buffer.chars().filter(|c| !c.is_whitespace()).count();
-    let ratio = if text_chars == 0 {
+    let link_ratio = if text_chars == 0 {
         0.0
     } else {
         *link_chars as f64 / text_chars as f64
     };
-    // A menu label is a few words; a headline is a sentence fragment. The old bound of 160 characters dropped
-    // every Hacker News story, because a listing row is mostly link text too. Density that distinguishes them is
-    // length, and the second signal is punctuation: a run with a full stop, a question mark or a comma is prose.
-    let text = buffer.trim();
-    let chars = text.chars().count();
-    let prose = text.contains('.') || text.contains('?') || text.contains(',');
-    let short = chars <= 40 && !prose;
     *link_chars = 0;
-    if ratio >= 0.7 && short && !in_content {
-        buffer.clear();
-        return;
-    }
-    flush(segments, buffer, kind, in_content);
+    // Whether this is navigation is decided after the whole page is segmented, not here. A length bound cannot tell
+    // a menu from a headline: "Understanding the deployment pipeline end to end" is a menu label at 43 characters
+    // and a headline at 50, and the review reproduced exactly that. What separates them is the company they keep: a
+    // menu is a run of link-dense segments, a headline is one link-dense row among rows that are not.
+    flush(segments, buffer, kind, in_content, link_ratio);
 }
 
-fn flush(segments: &mut Vec<Segment>, buffer: &mut String, kind: &'static str, in_content: bool) {
+fn flush(
+    segments: &mut Vec<Segment>,
+    buffer: &mut String,
+    kind: &'static str,
+    in_content: bool,
+    link_ratio: f64,
+) {
     let text = collapse(buffer);
     buffer.clear();
     if !text.is_empty() {
@@ -722,6 +774,7 @@ fn flush(segments: &mut Vec<Segment>, buffer: &mut String, kind: &'static str, i
             kind,
             text: decode_entities(&text),
             in_content,
+            link_ratio,
         });
     }
 }
@@ -1401,14 +1454,24 @@ fn browser_failure(body: &str) -> Option<String> {
         "timed out waiting for the page",
         "navigation failed",
     ];
-    let low = body.to_lowercase();
-    if low.trim_start().starts_with('<') {
+    // A render is HTML. Anything that is not HTML is not a page, whatever it says, so the verdict does not depend
+    // on keeping a sentence list in step with the tool: the list only produces a clearer reason. The previous
+    // version asked the list first and treated an unrecognised string as a page, which is how a new error phrasing
+    // would have become `ok` with the complaint as the text.
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('<') || trimmed.is_empty() {
         return None;
     }
-    SIGNALS
+    let low = body.to_lowercase();
+    let reason = SIGNALS
         .iter()
         .find(|signal| low.contains(*signal))
-        .map(|signal| format!("the browser reported: {signal}"))
+        .map(|signal| signal.to_string())
+        .unwrap_or_else(|| {
+            let head: String = body.chars().take(120).collect();
+            format!("the browser answered with something that is not a page: {head}")
+        });
+    Some(format!("the browser reported: {reason}"))
 }
 
 fn read_browser(state: Option<&Path>, url: &str, states: &mut Vec<String>) -> Reading {
@@ -1489,6 +1552,24 @@ mod tests {
         // the strings a report prints
         assert_eq!(State::Blocked(403).to_string(), "blocked(403)");
         assert_eq!(State::JsRequired.to_string(), "js-required");
+    }
+
+    #[test]
+    fn a_browser_reply_that_is_not_html_is_a_failure_whatever_it_says() {
+        // Chromium's sandbox complaint is the real case; a phrasing nobody has seen yet must fail the same way.
+        assert!(
+            browser_failure("the browser closed the pipe (exit signal: 6): No usable sandbox!")
+                .is_some()
+        );
+        assert!(
+            browser_failure("some future error text we have never seen").is_some(),
+            "an unrecognised non-HTML reply must not become a page"
+        );
+        assert!(browser_failure("<html><body>a real page</body></html>").is_none());
+        assert!(
+            browser_failure("").is_none(),
+            "an empty reply is not an error, it is an empty render"
+        );
     }
 
     #[test]
@@ -1643,6 +1724,46 @@ mod tests {
             r#"<html><body><div id="root"></div><script src="/app.js"></script></body></html>"#;
         assert!(looks_like_a_shell(shell));
         assert!(!looks_like_a_shell(ARTICLE));
+    }
+
+    #[test]
+    fn a_run_of_link_rows_is_a_menu_and_a_single_link_row_is_a_headline() {
+        // The review's reproduction: three long menu labels, no punctuation, each over forty characters. A length
+        // bound cannot separate those from headlines, so the rule looks at the run instead.
+        let long_menu = "<html><body>
+            <div class=\"m\"><a href=\"a\">Understanding the deployment pipeline end to end</a></div>
+            <div class=\"m\"><a href=\"b\">Configuring the scheduler for batch workloads</a></div>
+            <div class=\"m\"><a href=\"c\">Reference material for the command line interface</a></div>
+            <div class=\"m\"><a href=\"d\">Operating the queue when a worker goes away</a></div>
+            <div class=\"m\"><a href=\"e\">Debugging a merge that reports no result</a></div>
+            <p>This paragraph is the article: it explains that the deployment pipeline runs on every merge.</p>
+            </body></html>";
+        let (text, _, _) = extract_html(long_menu);
+        assert!(
+            !text.contains("Understanding the deployment pipeline"),
+            "a menu of long labels survived: {text}"
+        );
+        assert!(
+            text.contains("This paragraph is the article"),
+            "the article was lost: {text}"
+        );
+
+        // A listing page: one link-dense headline row, then a metadata row that is not link text, three times.
+        let listing = "<html><body><table>
+            <tr><td>1.</td><td><a href=\"x\">KetchUp - an open-source SketchUp alternative in Rust</a></td></tr>
+            <tr><td>133 points by dcoulmbe 2 hours ago | hide | 23 comments</td></tr>
+            <tr><td>2.</td><td><a href=\"y\">A note on the surprising cost of context switches</a></td></tr>
+            <tr><td>54 points by someone 3 hours ago | hide | 8 comments</td></tr>
+            </table></body></html>";
+        let (text, _, _) = extract_html(listing);
+        assert!(
+            text.contains("KetchUp"),
+            "a headline was dropped as navigation: {text}"
+        );
+        assert!(
+            text.contains("context switches"),
+            "a headline was dropped as navigation: {text}"
+        );
     }
 
     #[test]

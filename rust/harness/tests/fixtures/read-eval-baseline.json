@@ -1,9 +1,11 @@
 {
   "classes": [
     {
+      "boiler": "1%",
       "checked": 6,
       "class": "docs",
-      "clean": 2,
+      "clean": 6,
+      "cleanliness": "100%",
       "found": 8,
       "recall": "100.0%",
       "rows": 8,
@@ -12,9 +14,11 @@
       "unchecked": 2
     },
     {
+      "boiler": "0%",
       "checked": 0,
       "class": "forum",
       "clean": 0,
+      "cleanliness": "0%",
       "found": 3,
       "recall": "75.0%",
       "rows": 4,
@@ -23,9 +27,11 @@
       "unchecked": 4
     },
     {
+      "boiler": "0%",
       "checked": 0,
       "class": "js-shell",
       "clean": 0,
+      "cleanliness": "0%",
       "found": 0,
       "recall": "0.0%",
       "rows": 3,
@@ -34,9 +40,11 @@
       "unchecked": 3
     },
     {
+      "boiler": "0%",
       "checked": 3,
       "class": "news",
-      "clean": 1,
+      "clean": 3,
+      "cleanliness": "100%",
       "found": 3,
       "recall": "50.0%",
       "rows": 6,
@@ -45,9 +53,11 @@
       "unchecked": 3
     },
     {
+      "boiler": "0%",
       "checked": 1,
       "class": "pdf",
       "clean": 0,
+      "cleanliness": "0%",
       "found": 2,
       "recall": "66.7%",
       "rows": 3,
@@ -56,15 +66,30 @@
       "unchecked": 2
     },
     {
+      "boiler": "1%",
       "checked": 6,
       "class": "reference",
-      "clean": 2,
+      "clean": 4,
+      "cleanliness": "67%",
       "found": 6,
       "recall": "100.0%",
       "rows": 6,
       "stated": 6,
       "states": "100%",
       "unchecked": 0
+    },
+    {
+      "boiler": "0%",
+      "checked": 16,
+      "class": "all",
+      "clean": 13,
+      "cleanliness": "13/16",
+      "found": 22,
+      "recall": "73.3%",
+      "rows": 30,
+      "stated": 27,
+      "states": "90%",
+      "unchecked": 14
     }
   ]
 }

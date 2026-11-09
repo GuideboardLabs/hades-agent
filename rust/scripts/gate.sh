@@ -35,9 +35,14 @@ else
   # The measurement table in the release notes is compared against the measurement that was saved when it was
   # taken. This is the rule the 0.6.2 defect needed: its notes claimed a cleanliness figure the binary never
   # printed, and nothing compared the two. Offline: two files, no network, deterministic.
+  # A check that skips when its binary is missing is not a check. The first version of this passed silently the
+  # moment CARGO_TARGET_DIR moved, which is the same fail-open shape the measurement check exists to prevent.
   notes_bin="${CARGO_TARGET_DIR:-target}/release/hades"
-  if [ -x "$notes_bin" ]; then
-    "$notes_bin" read-eval --check-notes ../RELEASES.md harness/tests/fixtures/read-eval-baseline.json ||
-      { echo "FAIL the release notes disagree with the saved measurement" >&2; exit 1; }
+  if [ ! -x "$notes_bin" ]; then
+    echo "building the release binary the notes check needs" >&2
+    cargo build --release -q -p harness || { echo "FAIL could not build $notes_bin" >&2; exit 1; }
   fi
+  [ -x "$notes_bin" ] || { echo "FAIL the notes check has no binary at $notes_bin" >&2; exit 1; }
+  "$notes_bin" read-eval --check-notes ../RELEASES.md harness/tests/fixtures/read-eval-baseline.json ||
+    { echo "FAIL the release notes disagree with the saved measurement" >&2; exit 1; }
 fi

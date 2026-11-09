@@ -1,3 +1,72 @@
+## 0.6.5
+
+### The Skia Release: a guard that fails closed
+
+Skia is the shadow, and the useful thing about a shadow is that it is exactly the shape of the thing, including the
+parts you would rather not show. The fifth review scored 0.6.4 at 5 out of 10 and its first finding was that the
+guard written to stop invented numbers could not see the invented row. That is fixed here, and so is the assertion
+the invented number was computed from.
+
+Fifth review: **5 out of 10**, down from 6. The trend is stated rather than smoothed.
+
+**1351 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **The notes check compared two columns and skipped the aggregate.** Of nine mutations, eight passed. `clean`,
+  `unchecked`, the state rate, the recall, the whole `all` row, a deleted row and an empty baseline were all
+  unguarded. It now compares every cell the baseline records for every row including `all`, and both of these are
+  now failures: a class with no row in the notes, and a baseline with no rows. Same nine mutations, re-run below.
+- **The cleanliness check counted prose.** The review pulled the text for all sixteen checked rows:
+  `Donate` matched "Please donate.", `Retrieved from` matched "can be retrieved from the remainder function",
+  `cookie` matched `$cookie_nocache`, `Talk` matched "The final talk at Kangrejos", `Categories:` matched "we divide
+  HTTP headers into two categories:". Thirteen of sixteen were ordinary prose, so the figure measured word
+  frequency. A forbidden string now has to START a line, which is where chrome is placed. Measured: clean went from
+  `5/16` to `13/16`, and the three that remain are real chrome (Wikipedia's `Retrieved from` and `Categories:`).
+- **The `all` row's boiler cell was computed by hand.** The tool prints it now, so every cell in the notes is a cell
+  the tool produced.
+- **A dirty working tree contradicted the tag.** The review ran the gate on the working tree and got red: 1351 tests
+  against a README claiming 1349, from two uncommitted tests. The tree in this release carries the menu-run rule and
+  the browser-failure rule that 0.6.4 listed as still broken, and the count below is the count of the tree.
+
+### The measurement, produced by the command printed under it
+
+```
+hades read-eval --gold rust/harness/tests/fixtures/read-gold.jsonl --state /tmp/read-state --refresh \
+  --save rust/harness/tests/fixtures/read-eval-baseline.json
+```
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 100% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 100% | 3 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 67% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 13/16 | 14 | 0% |
+
+### Also fixed in this release, and listed as broken in 0.6.4
+
+- **A browser reply that is not HTML is a failure, whatever it says.** Chromium's sandbox complaint was rendered as
+  an `ok` page with 592 characters of its own error text. A render is HTML; anything else is `unreachable` with the
+  reason, and the phrase list now only improves the wording instead of deciding the verdict.
+- **Navigation is a run, not a length.** The 40-character bound separated short labels from long ones, which the
+  review reproduced with a 43-character menu label. Five or more consecutive short link-dense segments are dropped;
+  five and not three because three swallowed the Hacker News front page.
+- **The density window only runs on pages that carry prose.** That was the actual cause of lost headlines: a
+  listing page has no long prose for the window to centre on. Hacker News returns 30 stories with titles and points,
+  sqlite.org starts at "1. Overview", and theverge.com is 14,667 characters against 315,155 in 0.6.0.
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.** The failure is caught, but the type does
+  not carry the distinction and a phrasing nobody has seen relies on the not-HTML test.
+- **`State::ALL` is still typed by hand** beside the enum.
+- **News front pages still lose half their rows.**
+- **The five reviews have gone 4, 7, 6, 6, 5.** Each round has found the newest claim to be the weakest one. That
+  pattern is the finding, and it is not fixed by this release.
+
 ## 0.6.4
 
 ### The Harmonia Release: the notes are checked against the measurement

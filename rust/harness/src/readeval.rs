@@ -128,9 +128,19 @@ pub fn answers(text: &str, fragments: &[String]) -> bool {
 /// exactly the places a reader does not notice: `journal_mode = WAL` and `journal_mode=WAL` are one answer.
 /// Collapsing runs to a single space was not enough, because the difference here is a space beside punctuation,
 /// so the comparison drops spaces entirely.
-/// Whether the text contains a forbidden string, under the same normalisation as `answers`.
+/// Whether any line of the text STARTS with the forbidden string.
+///
+/// Not `contains`. The review pulled the extracted text for every checked row and printed the match in context:
+/// `Donate` matched "Please donate.", `Retrieved from` matched "can be retrieved from the remainder function",
+/// `cookie` matched `$cookie_nocache`, `Talk` matched "The final talk at Kangrejos", `Categories:` matched "we divide
+/// HTTP headers into two categories:". Thirteen of sixteen matches were ordinary prose, so the figure counted word
+/// frequency. Chrome is placed at the start of a line; prose mentions the word inside one.
 pub fn contains(text: &str, needle: &str) -> bool {
-    !needle.is_empty() && squash(text).contains(&squash(needle))
+    if needle.is_empty() {
+        return false;
+    }
+    let wanted = squash(needle);
+    text.lines().any(|line| squash(line).starts_with(&wanted))
 }
 
 fn squash(text: &str) -> String {
@@ -262,9 +272,35 @@ fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
                 "unchecked": score.unchecked,
                 "recall": format!("{:.1}%", score.recall() * 100.0),
                 "states": format!("{:.0}%", score.states() * 100.0),
+                "cleanliness": format!("{:.0}%", score.cleanliness() * 100.0),
+                "boiler": format!("{:.0}%", score.boilerplate * 100.0),
             })
         })
         .collect();
+    let asked: usize = scores.iter().map(|s| s.asked).sum();
+    let found: usize = scores.iter().map(|s| s.found).sum();
+    let stated: usize = scores.iter().map(|s| s.stated).sum();
+    let clean: usize = scores.iter().map(|s| s.clean).sum();
+    let checked: usize = scores.iter().map(|s| s.checked()).sum();
+    let unchecked: usize = scores.iter().map(|s| s.unchecked).sum();
+    let boiler: f64 =
+        scores.iter().map(|s| s.boilerplate).sum::<f64>() / scores.len().max(1) as f64;
+    // The aggregate is saved as a class named `all`, so it is a guarded row like any other. Leaving it out of the
+    // baseline left `5/16` and `73.3%` unguarded, and the invented figure in 0.6.2 lived in exactly that row.
+    let mut rows = rows;
+    rows.push(serde_json::json!({
+        "class": "all",
+        "rows": asked,
+        "found": found,
+        "stated": stated,
+        "clean": clean,
+        "checked": checked,
+        "unchecked": unchecked,
+        "recall": format!("{:.1}%", 100.0 * found as f64 / asked.max(1) as f64),
+        "states": format!("{:.0}%", 100.0 * stated as f64 / asked.max(1) as f64),
+        "cleanliness": format!("{clean}/{checked}"),
+        "boiler": format!("{:.0}%", boiler * 100.0),
+    }));
     let document = serde_json::json!({ "classes": rows });
     std::fs::write(
         path,
@@ -285,8 +321,9 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         serde_json::from_str(&baseline_text).map_err(|e| format!("{}: {e}", baseline.display()))?;
     let notes_text =
         std::fs::read_to_string(notes).map_err(|e| format!("{}: {e}", notes.display()))?;
-    // The newest section is the first `## ` header in the file. Searching for "\n## " found the SECOND section
-    // when the file opens with a header, which is how a tampered row passed the check the first time it ran.
+
+    // The newest section is the first `## ` header in the file. Searching for "\n## " found the SECOND section when
+    // the file opens with a header, which is how a tampered row passed the check the first time it ran.
     let start = notes_text
         .lines()
         .scan(0usize, |offset, line| {
@@ -302,34 +339,96 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         Some(end) => &newest[..end + 3],
         None => newest,
     };
-    let mut problems = Vec::new();
-    for class in saved
+
+    let classes = saved
         .get("classes")
         .and_then(|c| c.as_array())
         .cloned()
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    // A guard that fails open on absence is not a guard: an empty baseline, or a notes section with no table, used
+    // to report ok. Both are failures now.
+    if classes.is_empty() {
+        return Err("the saved measurement has no rows, so nothing was checked".to_string());
+    }
+    let mut problems = Vec::new();
+    for class in &classes {
         let name = class.get("class").and_then(|v| v.as_str()).unwrap_or("");
-        let found = class.get("found").and_then(|v| v.as_u64()).unwrap_or(0);
-        let rows = class.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
-        // a table row that names the class must state the same found/rows
-        if let Some(line) = newest.lines().find(|line| {
+        let Some(line) = newest.lines().find(|line| {
             let low = line.to_lowercase();
-            low.starts_with("| ") && low.contains(&name.to_lowercase())
-        }) {
-            let cells: Vec<&str> = line
-                .split('|')
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .collect();
-            if cells.len() >= 3 {
-                let noted_rows: u64 = cells[1].parse().unwrap_or(u64::MAX);
-                let noted_found: u64 = cells[2].parse().unwrap_or(u64::MAX);
-                if noted_rows != rows || noted_found != found {
-                    problems.push(format!(
-                        "{name}: notes say {noted_found} of {noted_rows}, the measurement says {found} of {rows}"
-                    ));
-                }
+            low.starts_with("| ") && low.contains(&format!(" {name} "))
+                || low.starts_with(&format!("| {name} "))
+        }) else {
+            problems.push(format!("{name}: the notes table has no row for this class"));
+            continue;
+        };
+        let cells: Vec<String> = line
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        // Compared BY POSITION, not by presence. Presence-checking let a mutation through: changing the docs
+        // cleanliness from 100% to 99% still found a "100%" in the row, in the state or recall column. The table
+        // has a fixed column order, so cell i is compared to the value for column i:
+        //   class | rows | found | state% | recall | clean | unchecked | boiler
+        let expected = [
+            class.get("rows").map(|v| v.to_string()).unwrap_or_default(),
+            class
+                .get("found")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            class
+                .get("states")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            class
+                .get("recall")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            class
+                .get("cleanliness")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            class
+                .get("unchecked")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            class
+                .get("boiler")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ];
+        let labels = [
+            "rows",
+            "found",
+            "state%",
+            "recall",
+            "clean",
+            "unchecked",
+            "boiler",
+        ];
+        // cells[0] is the class name; the rest are the columns, in order
+        let present: Vec<String> = cells.iter().skip(1).map(|c| c.replace('*', "")).collect();
+        if present.len() < expected.len() {
+            problems.push(format!(
+                "{name}: the row has {} columns, the measurement records {}",
+                present.len() + 1,
+                expected.len() + 1
+            ));
+            continue;
+        }
+        for (index, (want, label)) in expected.iter().zip(labels).enumerate() {
+            if want.is_empty() || want == "null" {
+                continue;
+            }
+            if present.get(index) != Some(want) {
+                problems.push(format!(
+                    "{name}: {label} is {:?} in the notes, {want:?} in the measurement",
+                    present.get(index).cloned().unwrap_or_default()
+                ));
             }
         }
     }
@@ -495,17 +594,20 @@ pub fn cmd(args: &[String]) -> i32 {
     let checked: usize = scores.iter().map(|s| s.checked()).sum();
     let unchecked: usize = scores.iter().map(|s| s.unchecked).sum();
     if asked > 0 {
-        // The all-row is printed, not computed by whoever writes the notes. A figure the tool does not print is a
-        // figure the notes can invent, and 0.6.2 invented one.
+        // The all row is printed, not computed by whoever writes the notes. A figure the tool does not print is a
+        // figure the notes can invent, and 0.6.2 invented one. Every cell here is the same kind of cell as the class
+        // rows above it, boiler included, and it is the row `--check-notes` must guard hardest.
+        let boiler = scores.iter().map(|s| s.boilerplate).sum::<f64>() / scores.len().max(1) as f64;
         println!(
-            "\n{:<10} {:>5} {:>6} {:>7} {:>7} {:>6} {:>9}",
+            "{:<10} {:>5} {:>6} {:>7} {:>7} {:>6} {:>9} {:>7}",
             "all",
             asked,
             found,
             format!("{:.0}%", 100.0 * stated as f64 / asked as f64),
             format!("{:.1}%", 100.0 * found as f64 / asked as f64),
             format!("{clean}/{checked}"),
-            unchecked
+            unchecked,
+            format!("{:.0}%", boiler * 100.0)
         );
         println!(
             "overall recall {:.1}% over {asked} rows",
@@ -546,32 +648,43 @@ mod tests {
 
     #[test]
     fn a_release_note_that_disagrees_with_the_measurement_fails() {
-        // The 0.6.2 defect, made impossible: notes claiming a figure the measurement does not contain must fail.
-        // Falsified by hand first (a digit was changed, the check failed, it was reverted), then locked here.
+        // The 0.6.2 defect, made impossible, and then the 0.6.4 weakness too: the first version of this test let a
+        // mutation through because it compared by presence. Cells are compared by position now, so changing one
+        // percentage is caught even when the same digits appear in another column.
         let dir = std::env::temp_dir().join(format!("read-eval-notes-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let baseline = dir.join("baseline.json");
         std::fs::write(
             &baseline,
-            r#"{"classes":[{"class":"forum","rows":4,"found":3,"stated":3,"clean":0,"checked":0,"unchecked":4}]}"#,
+            r#"{"classes":[
+                {"class":"forum","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0%","unchecked":4,"boiler":"0%"},
+                {"class":"all","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0/4","unchecked":4,"boiler":"0%"}]}"#,
         )
         .unwrap();
+        let header = "| class | rows | found | state% | recall | clean | unchecked | boiler |\n|---|---|---|---|---|---|---|---|\n";
+        let honest_row = "| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |\n";
+        let all_row = "| all | 4 | 3 | 75% | 75.0% | 0/4 | 4 | 0% |\n";
 
         let honest = dir.join("honest.md");
         std::fs::write(
             &honest,
-            "## 0.6.4\n\n| class | rows | found |\n|---|---|---|\n| forum | 4 | 3 |\n",
+            format!("## 1.0.0\n\n{header}{honest_row}{all_row}"),
         )
         .unwrap();
         assert!(
             check_notes(&honest, &baseline).is_ok(),
-            "an honest table must pass"
+            "an honest table must pass: {:?}",
+            check_notes(&honest, &baseline)
         );
 
+        // one percentage changed, while the same digits still appear in the state and recall columns
         let lying = dir.join("lying.md");
         std::fs::write(
             &lying,
-            "## 0.6.4\n\n| class | rows | found |\n|---|---|---|\n| forum | 4 | 4 |\n",
+            format!(
+                "## 1.0.0\n\n{header}{}{all_row}",
+                honest_row.replace("| 0% |", "| 99% |")
+            ),
         )
         .unwrap();
         let why = check_notes(&lying, &baseline).unwrap_err();
@@ -579,20 +692,35 @@ mod tests {
             why.contains("forum"),
             "the failure must name the class: {why}"
         );
+
+        // a row that is simply absent is a failure, not a pass
+        let missing = dir.join("missing.md");
+        std::fs::write(&missing, format!("## 1.0.0\n\n{header}{all_row}")).unwrap();
         assert!(
-            why.contains("3 of 4"),
-            "the failure must state the measurement: {why}"
+            check_notes(&missing, &baseline).is_err(),
+            "a missing row must fail"
         );
 
-        // the newest section is the one checked, not the second one in the file
-        let two_sections = dir.join("two.md");
+        // an empty baseline checked nothing, so it cannot report ok
+        let empty = dir.join("empty.json");
+        std::fs::write(&empty, r#"{"classes":[]}"#).unwrap();
+        assert!(
+            check_notes(&honest, &empty).is_err(),
+            "an empty measurement must fail"
+        );
+
+        // the newest section is the one compared, not the second one in the file
+        let two = dir.join("two.md");
         std::fs::write(
-            &two_sections,
-            "## 0.6.4\n\n| forum | 4 | 9 |\n## 0.6.3\n\n| forum | 4 | 3 |\n",
+            &two,
+            format!(
+                "## 2.0.0\n\n{header}{}{header}{honest_row}",
+                honest_row.replace("| 3 |", "| 9 |")
+            ),
         )
         .unwrap();
         assert!(
-            check_notes(&two_sections, &baseline).is_err(),
+            check_notes(&two, &baseline).is_err(),
             "the newest section is the one compared"
         );
         let _ = std::fs::remove_dir_all(&dir);
