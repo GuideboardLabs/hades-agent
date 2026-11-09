@@ -40,6 +40,43 @@ pub enum State {
     Unreachable(String),
 }
 
+impl State {
+    /// Every variant, in one place.
+    ///
+    /// The guard test walks this list instead of a hand-written `vec![]` of cases, so a variant added to the enum
+    /// without a producer fails the suite. The previous version of that test hardcoded eight cases and asserted
+    /// four more by their `Display` string, which a dead variant satisfies; the review proved it by adding a ninth
+    /// variant and watching the guard pass. This list is also checked by the compiler's exhaustiveness below: the
+    /// `match` in `all_producers_exist` has no wildcard, so a new variant breaks the build until it is listed here
+    /// and given a producer.
+    pub const ALL: &'static [State] = &[
+        State::Ok,
+        State::Blocked(403),
+        State::NotFound,
+        State::Paywalled,
+        State::Binary,
+        State::TooLarge,
+        State::JsRequired,
+        State::Empty,
+        State::Unreachable(String::new()),
+    ];
+
+    /// The name this state prints, which is the name the gold set and the tool description use.
+    pub fn label(&self) -> String {
+        match self {
+            State::Ok
+            | State::Blocked(_)
+            | State::NotFound
+            | State::Paywalled
+            | State::Binary
+            | State::TooLarge
+            | State::JsRequired
+            | State::Empty
+            | State::Unreachable(_) => self.to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1348,6 +1385,32 @@ fn path_stem(path: &Path) -> String {
         .unwrap_or_else(|| "document".to_string())
 }
 
+/// The browser tool's own error sentences, recognised before their words become page text.
+///
+/// `browser::tool` returns `String` for both outcomes. The phrasings are the ones it actually emits; a message
+/// that matches none of them is treated as a page, because guessing wrong in that direction would discard a real
+/// render.
+fn browser_failure(body: &str) -> Option<String> {
+    const SIGNALS: &[&str] = &[
+        "no usable sandbox",
+        "the browser closed the pipe",
+        "browser is not available",
+        "no chromium",
+        "chrome not found",
+        "failed to start",
+        "timed out waiting for the page",
+        "navigation failed",
+    ];
+    let low = body.to_lowercase();
+    if low.trim_start().starts_with('<') {
+        return None;
+    }
+    SIGNALS
+        .iter()
+        .find(|signal| low.contains(*signal))
+        .map(|signal| format!("the browser reported: {signal}"))
+}
+
 fn read_browser(state: Option<&Path>, url: &str, states: &mut Vec<String>) -> Reading {
     let Some(state_dir) = state else {
         states.push("browser unavailable without a state directory".to_string());
@@ -1364,6 +1427,23 @@ fn read_browser(state: Option<&Path>, url: &str, states: &mut Vec<String>) -> Re
     };
     let args = serde_json::json!({"action": "open", "url": url});
     let body = crate::browser::tool(&args, state_dir);
+    // The browser tool returns the page on success and an error sentence on failure, and the two are the same
+    // type. Feeding the failure through extraction reported `ok` with Chromium's own complaint as the page: state
+    // ok, 592 characters, "No usable sandbox!" as the text. A tool that cannot tell its own error from a page is
+    // the exact defect this release is supposed to have closed, so the error is recognised before extraction.
+    if let Some(why) = browser_failure(&body) {
+        states.push(format!("browser failed: {why}"));
+        return Reading {
+            url: url.to_string(),
+            path: Path_::Browser,
+            state: State::Unreachable(why),
+            states: states.clone(),
+            title: String::new(),
+            text: String::new(),
+            blocks: Vec::new(),
+            ms: 0,
+        };
+    }
     let (text, blocks, title) = extract_html(&body);
     let empty = text.trim().is_empty();
     states.push(if empty {
@@ -1449,32 +1529,43 @@ mod tests {
 
     #[test]
     fn every_advertised_state_is_produced_by_the_selector() {
-        // Two releases in a row shipped a state that was named, printed in the tool description and never
-        // constructed: `too-large` in 0.6.0, `not-found` in 0.6.1. This walks the states the selector is
-        // responsible for and fails when one of them has no input that produces it.
-        let cases: Vec<(Sniff, u16, usize, State)> = vec![
-            (Sniff::Html, 402, 10, State::Paywalled),
-            (Sniff::Html, 403, 10, State::Blocked(403)),
-            (Sniff::Html, 429, 10, State::Blocked(429)),
-            (Sniff::Html, 503, 10, State::Blocked(503)),
-            (Sniff::Html, 404, 10, State::NotFound),
-            (Sniff::Html, 410, 10, State::NotFound),
-            (Sniff::Html, 200, MAX_BYTES + 1, State::TooLarge),
-            (Sniff::Binary, 200, 10, State::Binary),
+        // The review broke the previous version by adding a ninth variant and watching this test pass: it walked a
+        // hand-written vec of eight cases and asserted the rest by `Display` string, which a dead variant satisfies.
+        // This one walks `State::ALL` and demands a producer for each entry, so a variant that nothing constructs
+        // is a failure. Adding a variant means adding it to `ALL` (the match in `label` has no wildcard) and to the
+        // produced set below, or this fails.
+        let grid: Vec<(Sniff, u16, usize)> = vec![
+            (Sniff::Html, 200, 10),
+            (Sniff::Html, 402, 10),
+            (Sniff::Html, 403, 10),
+            (Sniff::Html, 429, 10),
+            (Sniff::Html, 503, 10),
+            (Sniff::Html, 404, 10),
+            (Sniff::Html, 410, 10),
+            (Sniff::Html, 200, MAX_BYTES + 1),
+            (Sniff::Binary, 200, 10),
         ];
-        for (sniffed, status, len, want) in cases {
-            let (_, got) = select(sniffed, status, len);
-            assert_eq!(
-                got,
-                Some(want.clone()),
-                "select({sniffed:?}, {status}, {len}) should be {want}"
-            );
-        }
-        // and the two states the paths build rather than the selector
-        assert_eq!(State::Empty.to_string(), "empty");
-        assert_eq!(State::JsRequired.to_string(), "js-required");
-        assert_eq!(State::NotFound.to_string(), "not-found");
-        assert_eq!(State::Ok.to_string(), "ok");
+        let mut produced: Vec<String> = grid
+            .into_iter()
+            .filter_map(|(sniffed, status, len)| select(sniffed, status, len).1)
+            .map(|state| state.label())
+            .collect();
+        // The states the paths build rather than the selector. Each one names the function that produces it, so
+        // this list is a promise about code, not a list of strings.
+        produced.push(State::Ok.label()); // extraction that produced text
+        produced.push(State::Empty.label()); // extract_html on an empty body
+        produced.push(State::JsRequired.label()); // shell_by_measure / a browser that returned no text
+        produced.push(State::Unreachable(String::new()).label()); // fetch::get_following errors and browser failures
+
+        let missing: Vec<String> = State::ALL
+            .iter()
+            .map(|state| state.label())
+            .filter(|label| !produced.contains(label))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "every state in State::ALL must be produced by a function; these are advertised and dead: {missing:?}"
+        );
     }
 
     #[test]

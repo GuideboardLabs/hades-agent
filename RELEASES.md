@@ -1,3 +1,67 @@
+## 0.6.3
+
+### The Aletheia Release: the number the tool prints
+
+Aletheia is the Greek word for disclosure, and it is used for the moment a thing stops being concealed. This
+release is about one sentence. 0.6.2's notes said "cleanliness 100%". The tool said 63.3%. The column that would
+have shown it was never in the output, because the edit that adds it did not apply and nothing checked that it
+had. The third review caught that, and it was right to.
+
+Third review: **6 out of 10**, down from 7. Correctly so.
+
+**1348 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **The notes quoted a number the binary does not print.** The table now carries `clean`, `unchecked` and
+  `boiler`, so the figure in these notes is a copy of the tool's own output. The measured values are below and they
+  are not flattering.
+- **`clean` counted rows that asserted nothing.** `all()` over an empty iterator is `true`, so the fourteen rows
+  with no `absent` list passed for free. They are counted in `unchecked` now. Clean is `5 of 16 checked rows`,
+  and fourteen rows assert nothing about their chrome.
+- **Absence strings were drawn from the extractor's own marker list.** Eight rows used `cookie`, `newsletter`,
+  `advertise`, `Log in` or `Show source`, every one of which `weight_of` already zeroes, so those checks could not
+  fail. The remaining strings also matched prose: `talk` matched "we just talked about", `Retrieved from` matched
+  "retrieved from the remainder function", `cookie` matched `$cookie_nocache` in an nginx directive. A cleanliness
+  figure that counts the word "talk" as navigation is measuring word frequency, not navigation. **This is not
+  fixed in this release**: the absent lists are honest about being weak, and the column is printed so the weakness
+  is visible rather than papered over.
+- **The state guard was a list of strings.** The review added a ninth variant to `State`, gave it a `Display` arm,
+  and watched the guard pass: it walked a hand-written `vec!` of eight cases. The guard now walks `State::ALL`, the
+  `label` match over that list has no wildcard so a new variant breaks the build, and every entry needs a producer.
+  **Proved by falsification, not by assertion**: a ninth variant with no producer was added, the suite failed with
+  `these are advertised and dead: ["expired"]`, and the probe was reverted.
+- **A failed browser returned `ok` with Chromium's error as the page.** `browser::tool` returns a page and an error
+  sentence as the same `String`, and `read_browser` fed both through extraction: state `ok`, 592 characters, "No
+  usable sandbox!" as the text. `browser_failure` recognises the tool's own error sentences before extraction and
+  the read is reported `unreachable` with the reason.
+- **The 40-character anchor bound separates short labels from long ones, not menus from headlines.** A menu label
+  over forty characters still survives. That rule is not fixed here either; it needs a test either way and has
+  none in this release.
+
+### The measurement, copied from the tool
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100% | 25% | 2 | 1% |
+| reference | 6 | 6 | 100% | 100% | 33% | 0 | 1% |
+| forum | 4 | 3 | 75% | 75% | 0% | 4 | 0% |
+| news | 6 | 3 | 83% | 50% | 17% | 3 | 0% |
+| pdf | 3 | 2 | 67% | 67% | 0% | 2 | 0% |
+| js-shell | 3 | 0 | 100% | 0% | 0% | 3 | 0% |
+| **all** | **30** | **22** | **90%** | **73.3%** | **5 of 16 checked** | **14** | **0%** |
+
+Recall 73.3%, states 90%. The shell class reports 0% recall by design, because a shell has no text to find.
+
+### Known and unfixed, plainly
+
+- **The cleanliness check is weak.** Strings match prose, some come from the extractor's own marker list, and
+  fourteen rows assert nothing. The column is printed so the weakness shows.
+- **The anchor rule still keeps long menu labels.**
+- **`read` names a shell; it does not render it.** The browser path is now honest about failure, but it is not
+  exercised by the gold set.
+- **News front pages lose half their rows.** Listing pages have no long prose for the density window.
+
 ## 0.6.2
 
 ### The Tiresias Release: the state that tells you to look elsewhere

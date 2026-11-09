@@ -54,8 +54,12 @@ pub struct Score {
     pub found: usize,
     /// Rows whose terminal state was the one the gold expected.
     pub stated: usize,
-    /// Rows with no forbidden text in the extracted body.
+    /// Rows that carried an absence list and satisfied it. A row with no list is counted in `unchecked`, never
+    /// here: `all()` over an empty iterator is true, so counting those as clean made fourteen rows pass without a
+    /// check being made.
     pub clean: usize,
+    /// Rows that carried no absence list at all, so nothing was asserted about their chrome.
+    pub unchecked: usize,
     pub chars: usize,
     pub ms: u128,
     /// Mean share of lines that look like navigation, per the marker list. Printed because the release notes
@@ -87,6 +91,11 @@ impl Score {
         } else {
             self.clean as f64 / self.asked as f64
         }
+    }
+
+    /// Rows whose chrome nothing asserted, because the set has no absence list for them.
+    pub fn unchecked(&self) -> usize {
+        self.unchecked
     }
 }
 
@@ -179,6 +188,7 @@ pub fn score(gold: &[GoldRow], readings: &[(GoldRow, crate::read::Reading)]) -> 
             found: 0,
             stated: 0,
             clean: 0,
+            unchecked: 0,
             chars: 0,
             ms: 0,
             boilerplate: 0.0,
@@ -193,7 +203,11 @@ pub fn score(gold: &[GoldRow], readings: &[(GoldRow, crate::read::Reading)]) -> 
         if reading.state.to_string() == row.expect {
             entry.stated += 1;
         }
-        if row
+        // `all()` over an empty iterator is true, so a row with no absence list must count as unchecked rather
+        // than clean. Fourteen of thirty rows had an empty list and every one of them passed for free.
+        if row.absent.is_empty() {
+            entry.unchecked += 1;
+        } else if row
             .absent
             .iter()
             .all(|forbidden| !contains(&reading.text, forbidden))
@@ -324,18 +338,20 @@ pub fn cmd(args: &[String]) -> i32 {
         return 0;
     }
     println!(
-        "{:<10} {:>5} {:>6} {:>7} {:>7} {:>9}",
-        "class", "rows", "found", "state%", "recall", "avg chars"
+        "{:<10} {:>5} {:>6} {:>7} {:>7} {:>6} {:>9} {:>7}",
+        "class", "rows", "found", "state%", "recall", "clean", "unchecked", "boiler"
     );
     for row in &scores {
         println!(
-            "{:<10} {:>5} {:>6} {:>6.0}% {:>6.0}% {:>9}",
+            "{:<10} {:>5} {:>6} {:>6.0}% {:>6.0}% {:>5.0}% {:>9} {:>6.0}%",
             row.class,
             row.asked,
             row.found,
             row.states() * 100.0,
             row.recall() * 100.0,
-            row.chars / row.asked.max(1)
+            row.cleanliness() * 100.0,
+            row.unchecked(),
+            row.boilerplate * 100.0
         );
     }
     let asked: usize = scores.iter().map(|s| s.asked).sum();
