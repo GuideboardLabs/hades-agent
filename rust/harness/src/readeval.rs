@@ -357,7 +357,8 @@ fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
     }));
     // The baseline records the gold set it was measured against: editing the fixture without refreshing left the
     // notes passing against a different test.
-    let document = serde_json::json!({ "gold_digest": gold_digest(), "classes": rows });
+    let document = serde_json::json!({ "gold_digest": gold_digest(),
+            "measured_by": env!("CARGO_PKG_VERSION"), "classes": rows });
     std::fs::write(
         path,
         serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?,
@@ -365,21 +366,25 @@ fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
     .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Ordered comparison for the dotted versions used in provenance lines, so a table cannot claim to come from a
-/// later build than the one being shipped.
-fn version_key(v: &str) -> Vec<u32> {
-    v.split('.')
-        .map(|p| p.parse::<u32>().unwrap_or(0))
-        .collect()
-}
-
 /// The identity of the measurement: the build that produced it and the fixture it ran against.
 pub fn provenance_line() -> String {
+    provenance_line_for(env!("CARGO_PKG_VERSION"))
+}
+
+/// The line for a given build, so a release can say which build produced its numbers rather than which build is
+/// running now. `--emit-table` passes the running build, because that is what it just measured with.
+pub fn provenance_line_for(measured_by: &str) -> String {
     format!(
-        "read-eval {} gold {}",
-        env!("CARGO_PKG_VERSION"),
-        gold_digest()
+        "read-eval gold {} measured-by {}",
+        gold_digest(),
+        measured_by
     )
+}
+
+/// The build recorded in a baseline, or `None` when the file predates the field. `None` is a real answer: the build
+/// that produced those numbers was not recorded, and saying so beats picking whichever version happens to be current.
+pub fn recorded_measured_by(baseline: &serde_json::Value) -> Option<&str> {
+    baseline.get("measured_by").and_then(|v| v.as_str())
 }
 
 /// A digest of the shipped gold set, so a baseline taken against a different fixture cannot pass.
@@ -496,11 +501,10 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
             "the section under `{shipped}` carries no `| all |` row: its table is incomplete"
         ));
     }
-    // The table must name the build that MEASURED it and the fixture it ran against. The version in the line is the
-    // measuring build, not the shipping one: a release that changed only the guard has no new measurement to take,
-    // and writing today's version over yesterday's numbers would be the lie this line exists to prevent. What is
-    // enforced is that the fixture digest matches and that no table claims to come from a build that does not exist
-    // yet. The notes then say which build measured the table, so a reader can see its age.
+    // The table must name the fixture and the build that measured it, and the build is compared against the value
+    // the BASELINE recorded, not against whatever the notes say. Typing a version into the notes cannot satisfy
+    // this: `--save` writes the field and `check-notes` reads it. A baseline saved before the field existed carries
+    // `unrecorded`, and the notes must say that rather than name a build nobody witnessed.
     let provenance = newest
         .lines()
         .find(|line| line.trim_start().starts_with("read-eval "))
@@ -508,11 +512,12 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         .ok_or_else(|| {
             format!("the table under `{shipped}` carries no provenance line naming the build that measured it")
         })?;
-    let (measured_by, fixture) = provenance
+    let (fixture, measured_by) = provenance
         .strip_prefix("read-eval ")
-        .and_then(|rest| rest.split_once(" gold "))
+        .and_then(|rest| rest.split_once(" measured-by "))
+        .and_then(|(gold, build)| gold.strip_prefix("gold ").map(|gold| (gold, build)))
         .ok_or_else(|| {
-            format!("the provenance line `{provenance}` is not `read-eval <version> gold <digest>`")
+            format!("the provenance line `{provenance}` is not `read-eval gold <digest> measured-by <version>`")
         })?;
     if fixture != gold_digest() {
         return Err(format!(
@@ -520,10 +525,15 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
             gold_digest()
         ));
     }
-    if version_key(measured_by) > version_key(env!("CARGO_PKG_VERSION")) {
+    let Some(recorded_build) = recorded_measured_by(&saved) else {
+        return Err(
+            "the baseline does not record which build measured it; re-run `read-eval --save` with this build"
+                .to_string(),
+        );
+    };
+    if measured_by != recorded_build {
         return Err(format!(
-            "the table under `{shipped}` claims to have been measured by `{measured_by}`, which is newer than the \
-             build being shipped"
+            "the notes say the table was measured by `{measured_by}`, but the baseline recorded `{recorded_build}`"
         ));
     }
     {
@@ -927,7 +937,7 @@ mod tests {
         let baseline = dir.join("baseline.json");
         // The baseline must name the gold set it was measured against, or the check refuses it before comparing.
         let baseline_json = format!(
-            r#"{{"gold_digest":"{}","classes":[
+            r#"{{"gold_digest":"{}","measured_by":"0.0.9","classes":[
                 {{"class":"forum","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0%","unchecked":4,"boiler":"0%"}},
                 {{"class":"all","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0/4","unchecked":4,"boiler":"0%"}}]}}"#,
             gold_digest()
@@ -943,7 +953,7 @@ mod tests {
             format!(
                 "## {}\n\n{}\n{header}{honest_row}{all_row}",
                 env!("CARGO_PKG_VERSION"),
-                provenance_line()
+                provenance_line_for("0.0.9")
             ),
         )
         .unwrap();
@@ -960,7 +970,7 @@ mod tests {
             format!(
                 "## {}\n\n{}\n{header}{}{all_row}",
                 env!("CARGO_PKG_VERSION"),
-                provenance_line(),
+                provenance_line_for("0.0.9"),
                 honest_row.replace("| 0% |", "| 99% |")
             ),
         )
@@ -978,7 +988,7 @@ mod tests {
             format!(
                 "## {}\n\n{}\n{header}{all_row}",
                 env!("CARGO_PKG_VERSION"),
-                provenance_line()
+                provenance_line_for("0.0.9")
             ),
         )
         .unwrap();
@@ -1003,7 +1013,7 @@ mod tests {
             format!(
                 "## {}\n\n{}\n{header}{honest_row}{all_row}\n## 0.0.1\n\n{header}{}{all_row}",
                 env!("CARGO_PKG_VERSION"),
-                provenance_line(),
+                provenance_line_for("0.0.9"),
                 honest_row.replace("| 3 |", "| 9 |")
             ),
         )
@@ -1013,9 +1023,9 @@ mod tests {
             "an older section's table must not fail the check"
         );
 
-        // THE shape of the bug: the shipped section has no table and an older section does. Reverting the anchor to
-        // `measured[0]` must fail this, which the previous fixtures did not manage because the shipped section came
-        // first and the no-table fixture had no older section to fall through to.
+        // THE shape of the bug: the shipped section has no table and an older section does, with the older one FIRST
+        // in the file. Reverting the anchor to `measured[0]` must fail here; the earlier fixtures did not manage it
+        // because the shipped section came first and the no-table fixture had no older section to fall through to.
         let shipped_empty_older_complete = dir.join("empty-newer.md");
         std::fs::write(
             &shipped_empty_older_complete,
@@ -1033,6 +1043,24 @@ mod tests {
         assert!(
             why.contains("no section headed") || why.contains("carries no `| all |` row"),
             "a shipped section without a table must fail even when an older section has one: {why}"
+        );
+
+        // A note that names a build the baseline does not agree with fails, so the version in the line cannot be
+        // typed by hand into agreement.
+        let wrong_builder = dir.join("wrong-builder.md");
+        std::fs::write(
+            &wrong_builder,
+            format!(
+                "## {}\n\n{}\n{header}{honest_row}{all_row}",
+                env!("CARGO_PKG_VERSION"),
+                provenance_line_for("0.0.1")
+            ),
+        )
+        .unwrap();
+        let why = check_notes(&wrong_builder, &baseline).unwrap_err();
+        assert!(
+            why.contains("baseline recorded `0.0.9`"),
+            "a note naming a build the baseline disagrees with must fail: {why}"
         );
 
         // A release whose own section carries no table states no numbers, and that is a failure rather than a

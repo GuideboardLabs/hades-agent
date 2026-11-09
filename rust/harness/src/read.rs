@@ -1440,9 +1440,10 @@ fn path_stem(path: &Path) -> String {
 
 /// A success that is not HTML, which is not a page whatever it says.
 ///
-/// `browser::tool` returns `Result`, so a failure no longer reaches here; this is the remaining net for a call that
-/// returned `Ok` with something that is not markup. The verdict does not depend on the phrase list below: a
-/// non-HTML reply is refused on its shape, and the list only supplies a clearer reason.
+/// This is test-only since `browser::tool` began returning `Result`: a failure arrives as an error and never reaches
+/// extraction, so nothing at runtime calls this. It is kept because its assertions are the record of the shapes that
+/// used to be mistaken for a page. The verdict does not depend on the phrase list below: a non-HTML reply is refused
+/// on its shape, and the list only supplies a clearer reason.
 #[cfg(test)]
 fn browser_failure(body: &str) -> Option<String> {
     const SIGNALS: &[&str] = &[

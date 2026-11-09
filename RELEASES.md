@@ -1,3 +1,57 @@
+## 0.6.16
+
+### The Elenchos Release: the line I typed was false, and the checker agreed with it
+
+The thirteenth review scored 0.6.15 at **5 out of 10** and found that the provenance line it shipped was false:
+`read-eval 0.6.5 gold 1d9233b1...` paired a 0.6.5 build with a fixture that did not exist until 0.6.11. I had
+checked `git log -S'"found": 22'`, which told me when the **numbers** first appeared, and reported it as when the
+**fixture** did. The fixture changed at 0.6.8, 0.6.9 and 0.6.11; the digest in the line is the later one.
+
+Worse, the guard certified it. `check-notes` verified the shape of the claim and left the claim itself to whoever
+typed it, which is the same failure this series keeps producing: a check that observes the artifact instead of
+the fact.
+
+**1353 tests, 15 ignored.**
+
+### What changed
+
+- **The baseline records `measured_by`**, written by `--save` from `env!("CARGO_PKG_VERSION")`, and `check-notes`
+  compares the notes' line against that field. Typing a version into the notes can no longer satisfy the check: a
+  note naming a build the baseline disagrees with fails with both values printed.
+- **The line is `read-eval gold <digest> measured-by <version>`.** No version is inferred from the shipping build.
+- **The real baseline says `measured_by: unrecorded`.** The build that produced those numbers was never recorded;
+  saying so is the honest value, and the next real `--save` replaces it.
+- **Two comments described behaviour the code does not have.** The fixture comment claimed the check passes when
+  the anchor is reverted (it fails); `read.rs` described a `#[cfg(test)]` function as the runtime net. Both now say
+  what is true.
+
+### The measurement
+
+```
+read-eval gold 1d9233b12b2529c5 measured-by unrecorded
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+```
+
+The numbers have not changed since 0.6.5. The fixture has, which is why the digest in this line is not the 0.6.5
+one, and why the line no longer names a build nobody witnessed.
+
+### Still not fixed
+
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Seven checked rows still rest on hand-typed chrome strings.**
+- **The measuring build is `unrecorded` until a live `--save` can run**, which the Stack Exchange rate limit is
+  blocking.
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4, 4, 6, 5.**
+
 ## 0.6.15
 
 ### The Basanos Triton Release: the line names the build that measured
