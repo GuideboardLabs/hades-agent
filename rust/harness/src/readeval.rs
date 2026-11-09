@@ -139,17 +139,60 @@ pub fn contains(text: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let wanted = squash(needle);
-    text.lines().any(|line| {
-        // Strip what a marker is rendered inside of before matching: a bullet, a list number, a heading hash or an
-        // opening quote. Without this, `- Show Source` and `            Cookie" as a special case` were both scored
-        // clean, which the review found by checking the two strings this release had just claimed to catch.
-        let squashed = squash(line);
-        let trimmed: String = squashed
-            .trim_start_matches(|c: char| !c.is_alphanumeric())
-            .to_string();
-        trimmed.starts_with(&wanted) || squashed.starts_with(&wanted)
-    })
+    text.lines().any(|line| line_is_chrome(line, needle))
+}
+
+/// Whether one line carries the marker as a LABEL rather than as a word opening a sentence.
+///
+/// Worked on the raw line, not the squashed one: whitespace and quotes are exactly the evidence that separates
+/// "Retrieved from \"https://example.org/x\"" (a footer label) from "Retrieved from the remainder function of the
+/// iterator" (prose). The tail is stripped of quoted segments and URL tokens before its punctuation is judged,
+/// because a URL is full of full stops and a quoted citation is not a sentence.
+fn line_is_chrome(line: &str, needle: &str) -> bool {
+    // `Categories :` with a space before the colon is how Wikipedia renders it, so the marker is searched in a
+    // compacted copy of the line rather than the literal one.
+    let compact = line.replace(" :", ":").replace("  ", " ");
+    let leading_trimmed =
+        compact.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '"' && c != '\'');
+    let low = leading_trimmed.to_lowercase();
+    let wanted = needle.trim().to_lowercase();
+    let Some(at) = low.find(&wanted) else {
+        return false;
+    };
+    // the marker must START the line, not merely appear in it
+    if at != 0 {
+        return false;
+    }
+    let rest = &leading_trimmed[wanted.len()..];
+    let prose = tail_is_prose(rest);
+    !prose
+}
+
+fn tail_is_prose(rest: &str) -> bool {
+    let mut visible = String::new();
+    let mut in_quote = false;
+    for c in rest.chars() {
+        if c == '"' || c == '\'' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if !in_quote {
+            visible.push(c);
+        }
+    }
+    // a URL token is not a sentence: drop anything with a scheme or a slash
+    let words: Vec<&str> = visible
+        .split_whitespace()
+        .filter(|word| !word.contains("://") && !word.contains('/'))
+        .collect();
+    let tail = words.join(" ");
+    let tail = tail.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if tail.contains('.') || tail.contains('?') || tail.contains('!') {
+        return true;
+    }
+    // A label tail is a few words. "the remainder function of the iterator" is 39 characters and is prose, so the
+    // bound is 25: "https://example.org/x" is dropped as a URL token before this, and "Database algorithms" fits.
+    tail.chars().count() > 25
 }
 
 fn squash(text: &str) -> String {
@@ -793,6 +836,39 @@ mod tests {
             "the newest section is the one compared"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_must_be_a_label_not_a_word_that_opens_a_sentence() {
+        // The distinction the sixth review asked for: a nav label ends, or continues into a short tail with no
+        // sentence punctuation. Prose runs on.
+        assert!(
+            contains("Show source", "Show source"),
+            "a bare label matches"
+        );
+        assert!(
+            contains("- Show Source", "Show source"),
+            "a bulleted label matches"
+        );
+        assert!(
+            contains("Retrieved from \"https://example.org/x\"", "Retrieved from"),
+            "a short tail is a label"
+        );
+        assert!(contains("Categories: - Database algorithms", "Categories:"));
+
+        // prose that happens to begin with the marker is not chrome
+        assert!(
+            !contains(
+                "Retrieved from the remainder function of the iterator",
+                "Retrieved from"
+            ),
+            "a sentence that opens with the marker is prose"
+        );
+        assert!(!contains("Please donate.", "Donate"));
+        assert!(!contains(
+            "The final talk at Kangrejos was about the removal of the old API",
+            "The final talk"
+        ));
     }
 
     #[test]

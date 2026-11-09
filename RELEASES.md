@@ -1,3 +1,66 @@
+## 0.6.8
+
+### The Krino Release: the word had to be a label
+
+Krino means to judge, and the point of judging is to separate. `12/16` counted clean any page where the asserted word
+did not open a line; eight of those twelve kept the word in prose elsewhere. A marker now has to be a **label**: a
+line that ends there, or continues only into a short tail with no sentence punctuation, after quoted segments and URL
+tokens are set aside.
+
+Eighth review: not yet run for this tag. The seventh scored 0.6.6 at **6 out of 10** and found the release step could
+not run, which 0.6.7 fixed and this release carries.
+
+**1353 tests, 15 ignored.**
+
+### What changed
+
+- **`clean` is a label test.** `Retrieved from "https://example.org/x"` is a footer label; `Retrieved from the
+  remainder function of the iterator` is prose. `Categories :` with a space before the colon is matched.
+  `Please donate.` and `$cookie_nocache` are not labels. There is a test for each of those four cases.
+- **One row gained assertions it did not have.** The gold set now records chrome labels that a page carries and its
+  extraction still returns, so that row is dirty until stripping improves. That is a regression test, not a
+  description.
+- **The count moved down, from `12/16` to `11/16`.** The label test found a reference row that was being scored
+  clean while carrying a marker. I first wrote this section with the previous run's table and the gate refused it:
+  `reference: clean is "50%" in the notes, "33%" in the measurement`. The numbers above are the tool's output from
+  the run that saved the baseline.
+
+### One finding that does not reproduce, with the check
+
+The seventh review reported that "the python docs row keeps its whole Sphinx footer while scoring clean". Against the
+binary built from this tree:
+
+```
+$ hades read --state /tmp/label-scan --json https://docs.python.org/3/library/asyncio-task.html | ...
+Show source      0 line(s)
+Report a bug     0 line(s)
+Previous topic   0 line(s)
+Next topic       0 line(s)
+chars 45385
+```
+
+Zero. Either the page changed or the extraction changed between the review's sample and today; either way the claim is
+not true of this build, and this is the command that says so.
+
+### The measurement
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 100% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 100% | 3 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 11/16 | 14 | 0% |
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand beside the enum.**
+- **News front pages still lose half their rows.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6.** Seven scored rounds, and no round has yet been broken by the one after it.
+
 ## 0.6.7
 
 ### The Aisa Release: the step that never ran
