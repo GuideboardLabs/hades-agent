@@ -1,3 +1,50 @@
+## 0.6.9
+
+### The Aidos Release: the check that tested a rule the code does not use
+
+Aidos is the sense of shame that keeps a person from saying a false thing. 0.6.8 said a reviewer's finding did not
+reproduce. It does. The check behind that claim counted lines that literally start with the marker; the matcher
+trims leading punctuation first, so `- Show source` and `#### Previous topic` are labels to the code and invisible to
+the check. **The claim was false in the notes and in the commit message**, and it is corrected here rather than
+quietly dropped.
+
+Eighth review: **4 out of 10**, down from 6, and it earned every point of that.
+
+**1353 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **`clean` still was not a measure of stripping.** Eleven of sixteen rows were clean because the one string they
+  asserted was absent from the text, or sat inside a sentence. Not one rested on a positive check that chrome had
+  been removed. Each row's `absent` list is now built from the `NAV_MARKERS` its own raw page carries, so a row is
+  clean only when the extractor actually removed labels the page really has. Nineteen rows are now checked instead
+  of sixteen, and the docs class scores **88%**: the python documentation row is dirty, as it should have been.
+- **The refutation of the seventh review was wrong.** Verified against this build: the asyncio-task extraction
+  carries four marker lines, `#### Previous topic`, `#### Next topic`, `- Report a bug`, `- Show source`, and the
+  shipped matcher reads all four as chrome.
+- **A metric that moves because a fixture changed is not a sharper metric.** Stated in 0.6.8's own section and true
+  there: the fall from 12/16 to 11/16 came partly from editing the gold set. This release edits it again, for a
+  reason that is a rule rather than a convenience: a row asserts what the page carries.
+
+### The measurement
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 88% | 0 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 100% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 13/19 | 11 | 0% |
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4.** The drop to 4 is a false claim I published, not a regression in the reader.
+
 ## 0.6.8
 
 ### The Krino Release: the word had to be a label
