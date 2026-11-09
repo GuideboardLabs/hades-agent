@@ -355,7 +355,9 @@ fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
         "cleanliness": format!("{clean}/{checked}"),
         "boiler": format!("{:.0}%", boiler * 100.0),
     }));
-    let document = serde_json::json!({ "classes": rows });
+    // The baseline records the gold set it was measured against: editing the fixture without refreshing left the
+    // notes passing against a different test.
+    let document = serde_json::json!({ "gold_digest": gold_digest(), "classes": rows });
     std::fs::write(
         path,
         serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?,
@@ -368,6 +370,21 @@ fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
 /// The defect this closes: 0.6.2 shipped notes claiming cleanliness 100% while the binary reported 63.3%, because
 /// the table column the figure came from never existed and nothing compared the two. This runs offline, from the
 /// files, so the gate can call it on every build. A note that disagrees with the recorded measurement fails.
+/// A digest of the shipped gold set, so a baseline taken against a different fixture cannot pass.
+fn gold_digest() -> String {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/read-gold.jsonl");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return "missing".to_string();
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<(), String> {
     let baseline_text =
         std::fs::read_to_string(baseline).map_err(|e| format!("{}: {e}", baseline.display()))?;
@@ -388,12 +405,51 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         .find(|(_, line)| line.starts_with("## "))
         .map(|(at, _)| at)
         .unwrap_or(0);
-    let newest = &notes_text[start..];
-    let newest = match newest[3..].find("\n## ") {
-        Some(end) => &newest[..end + 3],
-        None => newest,
+    // EVERY section is compared, not only the newest. An edit to the 0.6.9 table passed the check that was
+    // written to catch exactly that, because only the first section was ever read.
+    let sections: Vec<&str> = {
+        let mut out = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut walked = 0usize;
+        for line in notes_text.lines() {
+            if line.starts_with("## ") {
+                offsets.push(walked);
+            }
+            walked += line.len() + 1;
+        }
+        offsets.push(notes_text.len());
+        for window in offsets.windows(2) {
+            out.push(&notes_text[window[0]..window[1]]);
+        }
+        out
     };
+    let _ = start;
+    let newest = sections
+        .iter()
+        .find(|section| {
+            section
+                .lines()
+                .any(|line| line.trim_start().starts_with("| all |"))
+        })
+        .copied()
+        .unwrap_or(&notes_text[..]);
 
+    // A baseline measured against a different gold set describes a different test.
+    match saved.get("gold_digest").and_then(|v| v.as_str()) {
+        Some(recorded) if recorded == gold_digest() => {}
+        Some(recorded) => {
+            return Err(format!(
+                "the saved measurement was taken against gold {recorded}; the shipped set is {} - re-run --refresh --save before trusting the notes",
+                gold_digest()
+            ));
+        }
+        None => {
+            return Err(
+                "the saved measurement does not record which gold set it was taken against"
+                    .to_string(),
+            );
+        }
+    }
     let classes = saved
         .get("classes")
         .and_then(|c| c.as_array())
@@ -658,6 +714,13 @@ pub fn cmd(args: &[String]) -> i32 {
         readings.push((row.clone(), reading));
     }
     let scores = score(&rows, &readings);
+    if let Some(path) = save_path.as_ref() {
+        if let Err(why) = save(path, &scores) {
+            eprintln!("read-eval: {why}");
+            return 1;
+        }
+        eprintln!("saved the measurement to {}", path.display());
+    }
     if emit_table {
         // The release notes carry this table. Printing it here means the notes are a copy of a command's output
         // rather than a transcription of one, which is the defect that put a 4 on 0.6.8.
@@ -695,13 +758,6 @@ pub fn cmd(args: &[String]) -> i32 {
             boiler * 100.0
         );
         return 0;
-    }
-    if let Some(path) = save_path.as_ref() {
-        if let Err(why) = save(path, &scores) {
-            eprintln!("read-eval: {why}");
-            return 1;
-        }
-        eprintln!("saved the measurement to {}", path.display());
     }
     if json {
         for row in &scores {
@@ -806,13 +862,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("read-eval-notes-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let baseline = dir.join("baseline.json");
-        std::fs::write(
-            &baseline,
-            r#"{"classes":[
-                {"class":"forum","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0%","unchecked":4,"boiler":"0%"},
-                {"class":"all","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0/4","unchecked":4,"boiler":"0%"}]}"#,
-        )
-        .unwrap();
+        // The baseline must name the gold set it was measured against, or the check refuses it before comparing.
+        let baseline_json = format!(
+            r#"{{"gold_digest":"{}","classes":[
+                {{"class":"forum","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0%","unchecked":4,"boiler":"0%"}},
+                {{"class":"all","rows":4,"found":3,"states":"75%","recall":"75.0%","cleanliness":"0/4","unchecked":4,"boiler":"0%"}}]}}"#,
+            gold_digest()
+        );
+        std::fs::write(&baseline, baseline_json).unwrap();
         let header = "| class | rows | found | state% | recall | clean | unchecked | boiler |\n|---|---|---|---|---|---|---|---|\n";
         let honest_row = "| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |\n";
         let all_row = "| all | 4 | 3 | 75% | 75.0% | 0/4 | 4 | 0% |\n";

@@ -2,16 +2,16 @@
   "classes": [
     {
       "boiler": "1%",
-      "checked": 8,
+      "checked": 6,
       "class": "docs",
-      "clean": 7,
-      "cleanliness": "88%",
+      "clean": 5,
+      "cleanliness": "83%",
       "found": 8,
       "recall": "100.0%",
       "rows": 8,
       "stated": 8,
       "states": "100%",
-      "unchecked": 0
+      "unchecked": 2
     },
     {
       "boiler": "0%",
@@ -43,8 +43,8 @@
       "boiler": "0%",
       "checked": 4,
       "class": "news",
-      "clean": 4,
-      "cleanliness": "100%",
+      "clean": 3,
+      "cleanliness": "75%",
       "found": 3,
       "recall": "50.0%",
       "rows": 6,
@@ -80,16 +80,17 @@
     },
     {
       "boiler": "0%",
-      "checked": 19,
+      "checked": 17,
       "class": "all",
-      "clean": 13,
-      "cleanliness": "13/19",
+      "clean": 10,
+      "cleanliness": "10/17",
       "found": 22,
       "recall": "73.3%",
       "rows": 30,
       "stated": 27,
       "states": "90%",
-      "unchecked": 11
+      "unchecked": 13
     }
-  ]
+  ],
+  "gold_digest": "1d9233b12b2529c5"
 }

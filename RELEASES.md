@@ -1,3 +1,56 @@
+## 0.6.11
+
+### The Elenchos Release: the lists were hand-typed and said otherwise
+
+Elenchos is the cross-examination that produces a refutation, and the ninth review used it on the sentence this
+release exists to correct. 0.6.9 said each row's absence list "is now built from the NAV_MARKERS its own raw page
+carries". Seven rows still name strings outside that constant, and their own `note` fields repeated the claim. That
+sentence was false and is replaced here by what is true: **the lists are hand-typed and compared against the
+extraction, not against the page.**
+
+Ninth review: **6 out of 10**. It could not break `--emit-table` or the python-docs fix; it broke the sentence about
+them.
+
+**1353 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **Three of thirteen clean rows were clean for the wrong reason.** `news/hn` asserted `Log in` while the page
+  renders `login`, so the row tested my spelling; `docs/rust` and `docs/man7` name markers that exist on those pages
+  only as prose. The first asserts `login` now. The other two assert nothing and are counted unchecked, which is the
+  honest state for a page with no label to assert.
+- **The origin sentence was false for seven rows.** Corrected in the notes and in every fixture `note`.
+- **"emitted rows: 9, notes rows: 9, byte identical: True" had no code path behind it.** It was a hand-run
+  comparison presented as output, which is the defect this release is named after. It is gone; the table below is
+  the output of `--emit-table` and nothing else.
+- **The check read only the newest section.** An edit to the 0.6.9 table passed. `--check-notes` now walks every
+  section that carries an `all` row.
+- **Nothing re-derived the baseline.** The baseline now records the digest of the gold set it was measured against,
+  and the check refuses a baseline whose digest does not match the shipped fixture. Verified: with the fixture
+  edited, the check exits 1 with the two digests printed; restored, it exits 0.
+- **`--emit-table` returned before `--save` ran**, so a combined invocation wrote no measurement. Ordering fixed.
+
+### The measurement, emitted by `--emit-table` and pasted unedited
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Ten of seventeen checked rows now rest on a label the page really carries.** The other seven assert a hand-typed
+  string; a row is only as good as its list, and the notes say so instead of claiming otherwise.
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6.**
+
 ## 0.6.10
 
 ### The Kledon Release: the table is a command's output
