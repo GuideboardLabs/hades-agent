@@ -140,7 +140,16 @@ pub fn contains(text: &str, needle: &str) -> bool {
         return false;
     }
     let wanted = squash(needle);
-    text.lines().any(|line| squash(line).starts_with(&wanted))
+    text.lines().any(|line| {
+        // Strip what a marker is rendered inside of before matching: a bullet, a list number, a heading hash or an
+        // opening quote. Without this, `- Show Source` and `            Cookie" as a special case` were both scored
+        // clean, which the review found by checking the two strings this release had just claimed to catch.
+        let squashed = squash(line);
+        let trimmed: String = squashed
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .to_string();
+        trimmed.starts_with(&wanted) || squashed.starts_with(&wanted)
+    })
 }
 
 fn squash(text: &str) -> String {
@@ -351,13 +360,53 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         return Err("the saved measurement has no rows, so nothing was checked".to_string());
     }
     let mut problems = Vec::new();
+
+    // Shape one: a row in the notes that the measurement does not record is unguarded.
+    let recorded: Vec<String> = classes
+        .iter()
+        .filter_map(|c| c.get("class").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let table_rows: Vec<String> = newest
+        .lines()
+        .filter(|line| line.trim_start().starts_with("| ") && !line.contains("---"))
+        .filter_map(|line| {
+            line.split('|')
+                .nth(1)
+                .map(|cell| cell.trim().replace('*', ""))
+        })
+        .filter(|cell| !cell.is_empty() && cell != "class")
+        .collect();
+    for row in &table_rows {
+        if !recorded.iter().any(|name| name == row) {
+            problems.push(format!(
+                "{row}: the notes have a row the measurement does not record"
+            ));
+        }
+    }
+
     for class in &classes {
         let name = class.get("class").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(line) = newest.lines().find(|line| {
-            let low = line.to_lowercase();
-            low.starts_with("| ") && low.contains(&format!(" {name} "))
-                || low.starts_with(&format!("| {name} "))
-        }) else {
+        // Shape three: a class that matches more than one row means the first is taken and the rest are unguarded.
+        let matches: Vec<&str> = newest
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("| ")
+                    && trimmed
+                        .split('|')
+                        .nth(1)
+                        .map(|cell| cell.trim().replace('*', "") == name)
+                        .unwrap_or(false)
+            })
+            .collect();
+        if matches.len() > 1 {
+            problems.push(format!(
+                "{name}: the notes table has {} rows for this class",
+                matches.len()
+            ));
+            continue;
+        }
+        let Some(line) = matches.first().copied() else {
             problems.push(format!("{name}: the notes table has no row for this class"));
             continue;
         };
@@ -412,6 +461,14 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         ];
         // cells[0] is the class name; the rest are the columns, in order
         let present: Vec<String> = cells.iter().skip(1).map(|c| c.replace('*', "")).collect();
+        if present.len() > expected.len() {
+            problems.push(format!(
+                "{name}: the row has {} columns, the measurement records {}",
+                present.len() + 1,
+                expected.len() + 1
+            ));
+            continue;
+        }
         if present.len() < expected.len() {
             problems.push(format!(
                 "{name}: the row has {} columns, the measurement records {}",
@@ -724,6 +781,36 @@ mod tests {
             "the newest section is the one compared"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_inside_a_bullet_or_a_quote_still_counts_as_chrome() {
+        // The two strings the 0.6.5 release claimed to catch and did not.
+        assert!(
+            contains("- Show Source", "Show Source"),
+            "a bulleted marker must match"
+        );
+        assert!(
+            contains("            Cookie\" as a special case", "Cookie"),
+            "a marker after leading space and a quote must match"
+        );
+        assert!(contains(
+            "Retrieved from \"https://example.org/x\"",
+            "Retrieved from"
+        ));
+        assert!(contains(
+            "Categories : - Database algorithms",
+            "Categories:"
+        ));
+
+        // prose must not match, which is the half the earlier check got wrong
+        assert!(!contains("Please donate.", "Donate"));
+        assert!(!contains("proxy_cache_bypass $cookie_nocache", "cookie"));
+        assert!(!contains("The final talk at Kangrejos 2026", "Talk"));
+        assert!(!contains(
+            "we divide HTTP headers into two categories:",
+            "Categories:"
+        ));
     }
 
     #[test]

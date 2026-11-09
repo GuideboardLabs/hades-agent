@@ -43,6 +43,14 @@ jobs:
       - name: The test count the docs claim is the count that ran
         run: bash rust/scripts/check-claims.sh --tests "$(cat rust/.test-count)" --ignored "$(cat rust/.test-ignored)"
 
+      # The release notes are checked here too, because a check that only runs on the author's machine is not a
+      # check on a release. Offline: two files.
+      - name: The release notes match the saved measurement
+        run: |
+          BIN="$(ls -d target/*/release/hades target/release/hades 2>/dev/null | head -1)"
+          if [ -z "$BIN" ]; then cargo build --release -q -p harness && BIN=target/release/hades; fi
+          "$BIN" read-eval --check-notes RELEASES.md rust/harness/tests/fixtures/read-eval-baseline.json
+
   arm64:
     needs: gate
     runs-on: ubuntu-latest

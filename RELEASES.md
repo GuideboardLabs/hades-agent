@@ -1,3 +1,58 @@
+## 0.6.6
+
+### The Plouton Release: the count that measures the thing
+
+Plouton is wealth, and the lesson in his name is that a number is worth only what it counts. 0.6.5's guard was real
+and its number was not: `13/16` counted line-leading tokens rather than chrome, and it scored two pages clean while
+they still carried `- Show Source` and a quoted `Cookie` banner, which its own assertions named.
+
+Sixth review: **6 out of 10**, up from 5.
+
+**1352 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **The cleanliness matcher missed a marker inside a bullet or a quote.** `- Show Source` squashes to
+  `-showsource`, which does not start with `showsource`, and a marker after leading space and a quote did not
+  either. Leading non-alphanumeric characters are stripped from the line before the comparison. `contains` had no
+  test at all; it has one now, with both strings this release had claimed to catch and four it must not.
+  **The number went down to `12/16` and that is the honest direction**: stricter assertions, fewer passes.
+- **Three fail-open shapes remained.** A row in the notes the measurement does not record, a row with more columns
+  than the measurement records, and a class matching two rows (the first was taken, the rest unguarded) all passed.
+  All three are failures now, so the check fails closed on absence and on surplus alike.
+- **The check did not run where a release is published.** `release.yml` now runs it as its own step, so a tagged
+  release cannot carry notes that disagree with the measurement. The claim in 0.6.4 that the guard ran "on every
+  build" was true of `gate.sh` and false of the release workflow.
+
+### The measurement, produced by the command printed under it
+
+```
+hades read-eval --gold rust/harness/tests/fixtures/read-gold.jsonl --state /tmp/read-state --refresh \
+  --save /tmp/read-eval.json        # a scratch file: refreshing the committed baseline is a separate act
+```
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 100% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 100% | 3 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 50% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 12/16 | 14 | 0% |
+
+### Still not fixed
+
+- **The baseline is refreshed by hand.** `--refresh --save` against the committed path is a one-command way to make
+  the guard agree with anything, and the review is right that it should not be the command the notes print. The
+  published command now writes to a scratch file; refreshing the committed baseline is a separate, documented act.
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Reviews: 4, 7, 6, 6, 5, 6.** Six rounds, and each has found the newest claim to be the weakest one. The
+  corrections this release makes are to a claim made one release earlier, which is the pattern rather than progress
+  in it.
+
 ## 0.6.5
 
 ### The Skia Release: a guard that fails closed
