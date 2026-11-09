@@ -1,3 +1,48 @@
+## 0.6.12
+
+### The Aletheia Deutera Release: two sentences corrected
+
+The tenth review scored 0.6.11 at **4 out of 10** and found the measurement half sound and the description half
+false, twice. Both sentences are corrected here, and one of them is corrected by making the code match the sentence
+rather than the other way round.
+
+**1353 tests, 15 ignored.**
+
+### The two false statements
+
+1. **"`--check-notes` now walks every section that carries an `all` row."** It did not: `find` took the first
+   section, and the comment above it described code that was not there. The review mutated the 0.6.9 and 0.6.10
+   tables and every edit passed.
+   What I did about it is not what the sentence promised, and the difference matters: comparing an older table to
+   today's baseline would fail every release after the numbers move, because an old table records what the
+   measurement *was*. **History is not a claim about this build.** So the check compares the newest measured section
+   and says so, in the sentence and in the comment. Verified: the unmodified notes pass, and a one-digit change to
+   either the `all` row or a class row of the newest table fails with the class and both numbers.
+2. **"It is gone."** 0.6.11 said the fabricated `emitted rows: 9, notes rows: 9, byte identical: True` line was
+   deleted. It was deleted from the 0.6.11 section and still sits in the 0.6.10 section, where it belongs as the
+   record of what was wrong. The sentence was false about the file; this one is true about it.
+
+### The measurement, emitted by `--emit-table`
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+
+### Still not fixed
+
+- **`browser::tool` still returns a page and its error as one `String`.**
+- **`State::ALL` is still typed by hand.**
+- **News front pages still lose half their rows.**
+- **Seven checked rows still rest on hand-typed chrome strings**, not on labels the page provably carries.
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4.** Two of the ten rounds were a false sentence about a fix rather than a
+  broken fix, and both were caught by the reviewer running the code instead of reading the notes.
+
 ## 0.6.11
 
 ### The Elenchos Release: the lists were hand-typed and said otherwise

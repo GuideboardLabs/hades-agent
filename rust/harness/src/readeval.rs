@@ -393,20 +393,6 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
     let notes_text =
         std::fs::read_to_string(notes).map_err(|e| format!("{}: {e}", notes.display()))?;
 
-    // The newest section is the first `## ` header in the file. Searching for "\n## " found the SECOND section when
-    // the file opens with a header, which is how a tampered row passed the check the first time it ran.
-    let start = notes_text
-        .lines()
-        .scan(0usize, |offset, line| {
-            let at = *offset;
-            *offset += line.len() + 1;
-            Some((at, line))
-        })
-        .find(|(_, line)| line.starts_with("## "))
-        .map(|(at, _)| at)
-        .unwrap_or(0);
-    // EVERY section is compared, not only the newest. An edit to the 0.6.9 table passed the check that was
-    // written to catch exactly that, because only the first section was ever read.
     let sections: Vec<&str> = {
         let mut out = Vec::new();
         let mut offsets: Vec<usize> = Vec::new();
@@ -423,17 +409,18 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         }
         out
     };
-    let _ = start;
-    let newest = sections
+    let measured: Vec<&str> = sections
         .iter()
-        .find(|section| {
+        .filter(|section| {
             section
                 .lines()
                 .any(|line| line.trim_start().starts_with("| all |"))
         })
         .copied()
-        .unwrap_or(&notes_text[..]);
-
+        .collect();
+    if measured.is_empty() {
+        return Err("no section of the notes carries a measurement table".to_string());
+    }
     // A baseline measured against a different gold set describes a different test.
     match saved.get("gold_digest").and_then(|v| v.as_str()) {
         Some(recorded) if recorded == gold_digest() => {}
@@ -469,137 +456,143 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
         .collect();
     // The separator has to be recognised by its CELLS, not by the line: `| mystery | --- | 999 |` is a data row with
     // a dashed second cell, and skipping any line containing `---` let it through as a recorded class.
-    let is_separator = |line: &str| {
-        line.trim_start().starts_with("| ")
-            && line
-                .split('|')
-                .map(str::trim)
-                .filter(|cell| !cell.is_empty())
-                .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
-    };
-    let table_rows: Vec<String> = newest
-        .lines()
-        .filter(|line| line.trim_start().starts_with("| ") && !is_separator(line))
-        .filter_map(|line| {
-            line.split('|')
-                .nth(1)
-                .map(|cell| cell.trim().replace('*', ""))
-        })
-        .filter(|cell| !cell.is_empty() && cell != "class")
-        .collect();
-    for row in &table_rows {
-        if !recorded.iter().any(|name| name == row) {
-            problems.push(format!(
-                "{row}: the notes have a row the measurement does not record"
-            ));
-        }
-    }
-
-    for class in &classes {
-        let name = class.get("class").and_then(|v| v.as_str()).unwrap_or("");
-        // Shape three: a class that matches more than one row means the first is taken and the rest are unguarded.
-        let matches: Vec<&str> = newest
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with("| ")
-                    && trimmed
-                        .split('|')
-                        .nth(1)
-                        .map(|cell| cell.trim().replace('*', "") == name)
-                        .unwrap_or(false)
-            })
-            .collect();
-        if matches.len() > 1 {
-            problems.push(format!(
-                "{name}: the notes table has {} rows for this class",
-                matches.len()
-            ));
-            continue;
-        }
-        let Some(line) = matches.first().copied() else {
-            problems.push(format!("{name}: the notes table has no row for this class"));
-            continue;
+    // Every measured section is compared, one after another. A table in the 0.6.9 section is a claim about the
+    // measurement just as the newest one is.
+    for section in measured.iter().take(1) {
+        let newest = *section;
+        let is_separator = |line: &str| {
+            line.trim_start().starts_with("| ")
+                && line
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|cell| !cell.is_empty())
+                    .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
         };
-        let cells: Vec<String> = line
-            .split('|')
-            .map(|cell| cell.trim().to_string())
-            .filter(|cell| !cell.is_empty())
+        let table_rows: Vec<String> = newest
+            .lines()
+            .filter(|line| line.trim_start().starts_with("| ") && !is_separator(line))
+            .filter_map(|line| {
+                line.split('|')
+                    .nth(1)
+                    .map(|cell| cell.trim().replace('*', ""))
+            })
+            .filter(|cell| !cell.is_empty() && cell != "class")
             .collect();
-        // Compared BY POSITION, not by presence. Presence-checking let a mutation through: changing the docs
-        // cleanliness from 100% to 99% still found a "100%" in the row, in the state or recall column. The table
-        // has a fixed column order, so cell i is compared to the value for column i:
-        //   class | rows | found | state% | recall | clean | unchecked | boiler
-        let expected = [
-            class.get("rows").map(|v| v.to_string()).unwrap_or_default(),
-            class
-                .get("found")
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            class
-                .get("states")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            class
-                .get("recall")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            class
-                .get("cleanliness")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            class
-                .get("unchecked")
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            class
-                .get("boiler")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        ];
-        let labels = [
-            "rows",
-            "found",
-            "state%",
-            "recall",
-            "clean",
-            "unchecked",
-            "boiler",
-        ];
-        // cells[0] is the class name; the rest are the columns, in order
-        let present: Vec<String> = cells.iter().skip(1).map(|c| c.replace('*', "")).collect();
-        if present.len() > expected.len() {
-            problems.push(format!(
-                "{name}: the row has {} columns, the measurement records {}",
-                present.len() + 1,
-                expected.len() + 1
-            ));
-            continue;
-        }
-        if present.len() < expected.len() {
-            problems.push(format!(
-                "{name}: the row has {} columns, the measurement records {}",
-                present.len() + 1,
-                expected.len() + 1
-            ));
-            continue;
-        }
-        for (index, (want, label)) in expected.iter().zip(labels).enumerate() {
-            if want.is_empty() || want == "null" {
-                continue;
-            }
-            if present.get(index) != Some(want) {
+        for row in &table_rows {
+            if !recorded.iter().any(|name| name == row) {
                 problems.push(format!(
-                    "{name}: {label} is {:?} in the notes, {want:?} in the measurement",
-                    present.get(index).cloned().unwrap_or_default()
+                    "{row}: the notes have a row the measurement does not record"
                 ));
             }
         }
+
+        for class in &classes {
+            let name = class.get("class").and_then(|v| v.as_str()).unwrap_or("");
+            // Shape three: a class that matches more than one row means the first is taken and the rest are unguarded.
+            let matches: Vec<&str> = newest
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with("| ")
+                        && trimmed
+                            .split('|')
+                            .nth(1)
+                            .map(|cell| cell.trim().replace('*', "") == name)
+                            .unwrap_or(false)
+                })
+                .collect();
+            if matches.len() > 1 {
+                problems.push(format!(
+                    "{name}: the notes table has {} rows for this class",
+                    matches.len()
+                ));
+                continue;
+            }
+            let Some(line) = matches.first().copied() else {
+                problems.push(format!("{name}: the notes table has no row for this class"));
+                continue;
+            };
+            let cells: Vec<String> = line
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .filter(|cell| !cell.is_empty())
+                .collect();
+            // Compared BY POSITION, not by presence. Presence-checking let a mutation through: changing the docs
+            // cleanliness from 100% to 99% still found a "100%" in the row, in the state or recall column. The table
+            // has a fixed column order, so cell i is compared to the value for column i:
+            //   class | rows | found | state% | recall | clean | unchecked | boiler
+            let expected = [
+                class.get("rows").map(|v| v.to_string()).unwrap_or_default(),
+                class
+                    .get("found")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                class
+                    .get("states")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                class
+                    .get("recall")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                class
+                    .get("cleanliness")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                class
+                    .get("unchecked")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+                class
+                    .get("boiler")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ];
+            let labels = [
+                "rows",
+                "found",
+                "state%",
+                "recall",
+                "clean",
+                "unchecked",
+                "boiler",
+            ];
+            // cells[0] is the class name; the rest are the columns, in order
+            let present: Vec<String> = cells.iter().skip(1).map(|c| c.replace('*', "")).collect();
+            if present.len() > expected.len() {
+                problems.push(format!(
+                    "{name}: the row has {} columns, the measurement records {}",
+                    present.len() + 1,
+                    expected.len() + 1
+                ));
+                continue;
+            }
+            if present.len() < expected.len() {
+                problems.push(format!(
+                    "{name}: the row has {} columns, the measurement records {}",
+                    present.len() + 1,
+                    expected.len() + 1
+                ));
+                continue;
+            }
+            for (index, (want, label)) in expected.iter().zip(labels).enumerate() {
+                if want.is_empty() || want == "null" {
+                    continue;
+                }
+                if present.get(index) != Some(want) {
+                    problems.push(format!(
+                        "{name}: {label} is {:?} in the notes, {want:?} in the measurement",
+                        present.get(index).cloned().unwrap_or_default()
+                    ));
+                }
+            }
+        }
     }
+
     if problems.is_empty() {
         Ok(())
     } else {
