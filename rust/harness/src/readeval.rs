@@ -23,8 +23,18 @@ pub struct GoldRow {
     pub expect: String,
     #[serde(default)]
     pub question: String,
+    /// Text the extraction must contain, as a sentence copied from the body where possible. A single word scores
+    /// `found` against a whole-page dump, which is how the first version of this set reported 86.7% while the
+    /// extractor passed every site menu straight through.
     #[serde(default)]
     pub fragments: Vec<String>,
+    /// Text the extraction must NOT contain: navigation, cookie banners, footers. This is the half of the claim
+    /// that a substring search for content cannot make.
+    #[serde(default)]
+    pub absent: Vec<String>,
+    /// Why this row is shaped the way it is, when it was changed after the set froze.
+    #[serde(default)]
+    pub note: String,
 }
 
 fn docs_class() -> String {
@@ -44,8 +54,13 @@ pub struct Score {
     pub found: usize,
     /// Rows whose terminal state was the one the gold expected.
     pub stated: usize,
+    /// Rows with no forbidden text in the extracted body.
+    pub clean: usize,
     pub chars: usize,
     pub ms: u128,
+    /// Mean share of lines that look like navigation, per the marker list. Printed because the release notes
+    /// claim navigation is stripped and a claim with no number behind it is what the last review caught.
+    pub boilerplate: f64,
 }
 
 impl Score {
@@ -62,6 +77,15 @@ impl Score {
             0.0
         } else {
             self.stated as f64 / self.asked as f64
+        }
+    }
+
+    /// The proportion of rows whose body carried none of the strings the gold says must be absent.
+    pub fn cleanliness(&self) -> f64 {
+        if self.asked == 0 {
+            0.0
+        } else {
+            self.clean as f64 / self.asked as f64
         }
     }
 }
@@ -87,12 +111,39 @@ pub fn answers(text: &str, fragments: &[String]) -> bool {
 /// exactly the places a reader does not notice: `journal_mode = WAL` and `journal_mode=WAL` are one answer.
 /// Collapsing runs to a single space was not enough, because the difference here is a space beside punctuation,
 /// so the comparison drops spaces entirely.
+/// Whether the text contains a forbidden string, under the same normalisation as `answers`.
+pub fn contains(text: &str, needle: &str) -> bool {
+    !needle.is_empty() && squash(text).contains(&squash(needle))
+}
+
 fn squash(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_whitespace())
         .flat_map(|c| c.to_lowercase())
         .collect()
 }
+
+/// Lines that are almost always chrome. A page whose body still carries these was stripped of markup, not of
+/// everything that is not the article.
+pub const NAV_MARKERS: &[&str] = &[
+    "skip to content",
+    "sign in",
+    "sign up",
+    "log in",
+    "subscribe",
+    "newsletter",
+    "cookie",
+    "privacy policy",
+    "terms of service",
+    "all rights reserved",
+    "report a bug",
+    "show source",
+    "previous topic",
+    "next topic",
+    "table of contents",
+    "advertise",
+    "download the app",
+];
 
 /// The proportion of lines that look like navigation, for the boilerplate claim.
 ///
@@ -127,11 +178,14 @@ pub fn score(gold: &[GoldRow], readings: &[(GoldRow, crate::read::Reading)]) -> 
             asked: 0,
             found: 0,
             stated: 0,
+            clean: 0,
             chars: 0,
             ms: 0,
+            boilerplate: 0.0,
         });
         entry.asked += 1;
         entry.chars += reading.chars();
+        entry.boilerplate += boilerplate_ratio(&reading.text, NAV_MARKERS);
         entry.ms += reading.ms;
         if answers(&reading.text, &row.fragments) {
             entry.found += 1;
@@ -139,6 +193,16 @@ pub fn score(gold: &[GoldRow], readings: &[(GoldRow, crate::read::Reading)]) -> 
         if reading.state.to_string() == row.expect {
             entry.stated += 1;
         }
+        if row
+            .absent
+            .iter()
+            .all(|forbidden| !contains(&reading.text, forbidden))
+        {
+            entry.clean += 1;
+        }
+    }
+    for score in scores.values_mut() {
+        score.boilerplate /= score.asked.max(1) as f64;
     }
     let _ = gold;
     scores.into_values().collect()
@@ -243,15 +307,18 @@ pub fn cmd(args: &[String]) -> i32 {
     if json {
         for row in &scores {
             println!(
-                "{{\"class\":\"{}\",\"asked\":{},\"found\":{},\"stated\":{},\"chars\":{},\"ms\":{},\"recall\":{:.3},\"states\":{:.3}}}",
+                "{{\"class\":\"{}\",\"asked\":{},\"found\":{},\"stated\":{},\"clean\":{},\"chars\":{},\"ms\":{},\"recall\":{:.3},\"states\":{:.3},\"cleanliness\":{:.3},\"boilerplate\":{:.3}}}",
                 row.class,
                 row.asked,
                 row.found,
                 row.stated,
+                row.clean,
                 row.chars,
                 row.ms,
                 row.recall(),
-                row.states()
+                row.states(),
+                row.cleanliness(),
+                row.boilerplate
             );
         }
         return 0;
@@ -293,6 +360,8 @@ mod tests {
             expect: expect.to_string(),
             question: "q".to_string(),
             fragments: fragments.iter().map(|f| f.to_string()).collect(),
+            absent: Vec::new(),
+            note: String::new(),
         }
     }
 

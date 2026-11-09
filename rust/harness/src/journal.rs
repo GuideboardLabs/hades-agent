@@ -1112,13 +1112,14 @@ pub const CAPTURE: [&str; 3] = ["write_file", "patch", "shell"];
 /// is no "the path this tool writes". [`Capture::shell`] scans the tree before the step and after it, keeps
 /// the bytes that are about to change, and records one entry per path that actually moved. The caps on that
 /// scan are in [`Caps`], and a file past them is counted as a gap rather than left silently uncovered.
-pub const NOT_CAPTURED: [&str; 22] = [
+pub const NOT_CAPTURED: [&str; 23] = [
     "read_file",
     "list_dir",
     "search",
     "image",
     "browser",
     "fetch",
+    "read",
     "library",
     "recall",
     "remember",

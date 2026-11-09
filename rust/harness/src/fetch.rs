@@ -545,7 +545,15 @@ pub fn post_json(
     let target = Target::parse(url)?;
     let addresses = resolve(&target, allow_private)?;
     let outcome = try_addresses(&addresses, deadline, url, |address, max_time| {
-        call_with(&target, url, address, max_time, headers, Some(payload))
+        call_with(
+            &target,
+            url,
+            address,
+            max_time,
+            headers,
+            Some(payload),
+            limit as u64,
+        )
     })?;
     match outcome {
         Outcome::Page { status, bytes } => {
@@ -624,7 +632,7 @@ pub fn get_with_headers(
     let target = Target::parse(url)?;
     let addresses = resolve(&target, allow_private)?;
     let outcome = try_addresses(&addresses, deadline, url, |address, max_time| {
-        call_with_headers(&target, url, address, max_time, headers)
+        call_with_headers(&target, url, address, max_time, headers, limit)
     })?;
     match outcome {
         Outcome::Page { status, bytes } => {
@@ -662,8 +670,9 @@ fn call_with_headers(
     address: IpAddr,
     max_time: u64,
     headers: &[(&str, &str)],
+    limit: usize,
 ) -> Result<Outcome, String> {
-    call_with(target, url, address, max_time, headers, None)
+    call_with(target, url, address, max_time, headers, None, limit as u64)
 }
 
 /// The same call with a request body, which makes it a POST.
@@ -678,19 +687,21 @@ fn call_with(
     max_time: u64,
     headers: &[(&str, &str)],
     request_body: Option<&str>,
+    limit: u64,
 ) -> Result<Outcome, String> {
     let scratch = Scratch::new()?;
     let header_file = scratch.file("hdr");
     let body_file = scratch.file("body");
-    let mut args = curl_args(
+    let mut args = curl_args(CallArgs {
         target,
         url,
         address,
         max_time,
-        &header_file,
-        &body_file,
-        None,
-    );
+        headers: &header_file,
+        body: &body_file,
+        ca: None,
+        limit,
+    });
     // The URL is not the last argument: `curl_args` appends `--resolve host:port:addr` after it, and assuming
     // otherwise put the header inside the pin, which curl reported as "Port number was not a decimal number".
     // The position is found by value, and a URL that cannot be found is an error rather than a guess.
@@ -882,7 +893,16 @@ fn call(
     let scratch = Scratch::new()?;
     let headers = scratch.file("hdr");
     let body = scratch.file("body");
-    let args = curl_args(target, url, address, max_time, &headers, &body, ca);
+    let args = curl_args(CallArgs {
+        target,
+        url,
+        address,
+        max_time,
+        headers: &headers,
+        body: &body,
+        ca,
+        limit: BODY_CAP,
+    });
     let mut command = std::process::Command::new("curl");
     command
         .args(&args)
@@ -991,15 +1011,30 @@ fn hop(
 /// without a server. The protocol walls, the redirects-off switch, the clock, the two scratch files,
 /// the pin and - only for the TLS fixture - a CA file are all here; `call` adds only the process's
 /// environment.
-fn curl_args(
-    target: &Target,
-    url: &str,
+/// Everything one curl invocation needs, grouped because eight positional arguments is where the compiler
+/// starts counting and a caller starts guessing which `u64` is which.
+struct CallArgs<'a> {
+    target: &'a Target,
+    url: &'a str,
     address: IpAddr,
     max_time: u64,
-    headers: &Path,
-    body: &Path,
-    ca: Option<&Path>,
-) -> Vec<String> {
+    headers: &'a Path,
+    body: &'a Path,
+    ca: Option<&'a Path>,
+    limit: u64,
+}
+
+fn curl_args(input: CallArgs<'_>) -> Vec<String> {
+    let CallArgs {
+        target,
+        url,
+        address,
+        max_time,
+        headers,
+        body,
+        ca,
+        limit,
+    } = input;
     // The pin is `--resolve host:port:addr`, host spelled as the URL spelled it (bracketed for a
     // v6 literal, which curl also cannot parse - but a literal needs no pin, because there is no
     // lookup for a literal to race).
@@ -1022,7 +1057,7 @@ fn curl_args(
         "--max-redirs".to_string(),
         "0".to_string(),
         "--max-filesize".to_string(),
-        BODY_CAP.to_string(),
+        limit.to_string(),
         "-A".to_string(),
         "Mozilla/5.0 (compatible; Hades/0.21)".to_string(),
         "-D".to_string(),
@@ -1772,15 +1807,16 @@ mod tests {
         let target = Target::parse("https://example.test/x").expect("https parses");
         assert_eq!(target.scheme, "https");
         assert_eq!(target.port, 443);
-        let args = curl_args(
-            &target,
-            "https://example.test/x",
-            IpAddr::from([93, 184, 216, 34]),
-            30,
-            Path::new("/scratch/hdr"),
-            Path::new("/scratch/body"),
-            None,
-        );
+        let args = curl_args(CallArgs {
+            target: &target,
+            url: "https://example.test/x",
+            address: IpAddr::from([93, 184, 216, 34]),
+            max_time: 30,
+            headers: Path::new("/scratch/hdr"),
+            body: Path::new("/scratch/body"),
+            ca: None,
+            limit: BODY_CAP,
+        });
         for wall in ["--proto", "--proto-redir"] {
             let at = args
                 .iter()
@@ -1797,15 +1833,16 @@ mod tests {
         // A name is pinned; a literal is not.
         assert!(args.contains(&"--resolve".to_string()), "{args:?}");
         let literal = Target::parse("https://127.0.0.1/x").expect("a literal parses");
-        let args = curl_args(
-            &literal,
-            "https://127.0.0.1/x",
-            IpAddr::from([127, 0, 0, 1]),
-            30,
-            Path::new("/scratch/hdr"),
-            Path::new("/scratch/body"),
-            None,
-        );
+        let args = curl_args(CallArgs {
+            target: &literal,
+            url: "https://127.0.0.1/x",
+            address: IpAddr::from([127, 0, 0, 1]),
+            max_time: 30,
+            headers: Path::new("/scratch/hdr"),
+            body: Path::new("/scratch/body"),
+            ca: None,
+            limit: BODY_CAP,
+        });
         assert!(!args.contains(&"--resolve".to_string()), "{args:?}");
     }
 

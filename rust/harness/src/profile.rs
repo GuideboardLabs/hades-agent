@@ -79,7 +79,11 @@ impl Role {
     /// The tools this role may hold. A missing tool is a permission, not a prompt sentence: the schema does
     /// not offer it and `execute` refuses it even if a model names it.
     pub fn allows(self, tool: &str) -> bool {
-        const READ: [&str; 9] = [
+        // `read` belongs here: it fetches and extracts, it does not write. A read-only seat that cannot read a
+        // page is not read-only, it is blind. This list is the fourth place a tool name has to appear, which is why
+        // the review found `read` offered to nobody.
+        const READ: [&str; 10] = [
+            "read",
             "read_file",
             "list_dir",
             "search",

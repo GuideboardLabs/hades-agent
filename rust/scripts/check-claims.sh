@@ -20,6 +20,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --root) ROOT=${2:?--root needs a directory}; shift 2 ;;
     --tests) EXPECTED_TESTS=${2:?--tests needs a number}; shift 2 ;;
+    --ignored) EXPECTED_IGNORED=${2:?--ignored needs a number}; shift 2 ;;
     *) echo "usage: check-claims.sh [--root DIR] [--tests N]" >&2; exit 2 ;;
   esac
 done
@@ -75,6 +76,20 @@ if [ -n "$EXPECTED_TESTS" ]; then
     echo "ok   the suite that just ran reported the claimed count: $EXPECTED_TESTS"
   else
     fail "the suite reported $EXPECTED_TESTS; README badge=$badge table=$table prose=$prose release=$notes"
+  fi
+fi
+
+
+# --- the ignored count --------------------------------------------------------------------------------
+# The last review found the README explaining thirteen ignored tests while the suite reported fifteen, and two of
+# them unaccounted for. `--ignored N` compares the prose against the number the run produced.
+if [ -n "${EXPECTED_IGNORED:-}" ]; then
+  claimed=$(grep -oE '\*\*[0-9]+ passing, [0-9]+ failing, [0-9]+ ignored' "$ROOT/README.md" | head -1 | grep -oE '[0-9]+ ignored' | cut -d' ' -f1)
+  [ -n "$claimed" ] || fail "no ignored count in the README prose"
+  if [ "$claimed" = "$EXPECTED_IGNORED" ]; then
+    echo "ok   the ignored count in the README matches the run: $claimed"
+  else
+    fail "the suite ignored $EXPECTED_IGNORED; README prose says $claimed"
   fi
 fi
 

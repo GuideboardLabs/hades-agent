@@ -22,6 +22,10 @@ pub enum State {
     Ok,
     /// The server refused, with the code it refused with.
     Blocked(u16),
+    /// There is no page at that address. Distinct from `Blocked` on purpose: a 404 says the URL is wrong, a 403
+    /// says the client is unwelcome, and telling them apart is what lets a caller retry the one that is worth
+    /// retrying.
+    NotFound,
     /// A login or subscription wall: the page is a teaser, not the document.
     Paywalled,
     /// Executable or compressed content, not text.
@@ -41,6 +45,7 @@ impl std::fmt::Display for State {
         match self {
             State::Ok => write!(f, "ok"),
             State::Blocked(code) => write!(f, "blocked({code})"),
+            State::NotFound => write!(f, "not-found"),
             State::Paywalled => write!(f, "paywalled"),
             State::Binary => write!(f, "binary"),
             State::TooLarge => write!(f, "too-large"),
@@ -55,6 +60,8 @@ impl std::fmt::Display for State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Path_ {
     Fetch,
+    /// Read through a site's own JSON API, because its HTML refuses a client without a session.
+    Api,
     Browser,
     Document,
     Cache,
@@ -64,6 +71,7 @@ impl std::fmt::Display for Path_ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Path_::Fetch => write!(f, "fetch"),
+            Path_::Api => write!(f, "api"),
             Path_::Browser => write!(f, "browser"),
             Path_::Document => write!(f, "document"),
             Path_::Cache => write!(f, "cache"),
@@ -313,19 +321,25 @@ pub fn extract_html(html: &str) -> (String, Vec<Block>, String) {
             // read the tag name
             let mut name = String::new();
             let mut closing = false;
+            // The name ends at the first character that cannot be part of one. Collecting letters after that
+            // point turns `<a href="index.html">` into `ahrefindexhtml`, which matches no rule in NOISE or
+            // CONTENT and never increments `in_link`, so a menu survives and the anchor-run rule never fires.
             let mut cursor = index + 1;
+            let mut in_name = true;
             while cursor < bytes.len() {
                 let c = bytes[cursor] as char;
                 if c == '>' {
                     cursor += 1;
                     break;
                 }
-                if name.is_empty() && c == '/' {
-                    closing = true;
-                } else if c.is_ascii_alphabetic() {
-                    name.push(c.to_ascii_lowercase());
-                } else if !name.is_empty() {
-                    // attributes: skip to '>' without collecting
+                if in_name {
+                    if name.is_empty() && c == '/' {
+                        closing = true;
+                    } else if c.is_ascii_alphanumeric() {
+                        name.push(c.to_ascii_lowercase());
+                    } else {
+                        in_name = false;
+                    }
                 }
                 cursor += 1;
             }
@@ -440,13 +454,34 @@ pub fn extract_html(html: &str) -> (String, Vec<Block>, String) {
         &mut link_chars,
     );
 
-    // prefer the page's own article or main container, and fall back to everything outside noise
+    // Prefer the page's own article or main container. When there is none, fall back to the densest run of
+    // segments rather than to everything outside noise: a page with no `<article>` (sqlite.org is one) otherwise
+    // comes back as its own table of contents, tagline and footer, which is markup stripping wearing the name of
+    // extraction.
     let has_content = segments.iter().any(|s| s.in_content);
     let kept: Vec<&Segment> = if has_content {
         segments.iter().filter(|s| s.in_content).collect()
     } else {
-        segments.iter().collect()
+        dense_run(&segments)
     };
+
+    // Two rules that apply whatever chose the segments. A heading whose whole text is a chrome word is a section
+    // label for navigation, not a section of the page, and everything above the page's own `<h1>` is the header
+    // block: a tagline, a logo line, a breadcrumb trail.
+    let first_heading = kept.iter().position(|s| s.kind == "h1");
+    let kept: Vec<&Segment> = kept
+        .into_iter()
+        .enumerate()
+        .filter(|(index, segment)| {
+            if let Some(heading) = first_heading
+                && *index < heading
+            {
+                return false;
+            }
+            !is_chrome_heading(&segment.text)
+        })
+        .map(|(_, segment)| segment)
+        .collect();
 
     let mut text = String::new();
     let mut blocks = Vec::new();
@@ -496,6 +531,76 @@ pub fn extract_html(html: &str) -> (String, Vec<Block>, String) {
         title
     };
     (text, blocks, title)
+}
+
+/// A heading that names navigation rather than a part of the document.
+fn is_chrome_heading(text: &str) -> bool {
+    let low = text.trim().to_lowercase();
+    matches!(
+        low.as_str(),
+        "navigation"
+            | "table of contents"
+            | "contents"
+            | "site navigation"
+            | "main navigation"
+            | "breadcrumb"
+            | "you are here"
+            | "jump to"
+            | "skip to content"
+            | "menu"
+    )
+}
+
+/// The heaviest run of consecutive segments, by a weight that punishes navigation.
+///
+/// The weights are judgements, not measurements, and they are here in one place so a wrong one is one edit:
+/// non-space characters are the base, a list row counts a quarter, a line carrying a known chrome phrase counts
+/// nothing, and a segment too short to hold a sentence counts half. The window is the maximum-sum subarray over
+/// that weight, which is what keeps a page's article and drops its header, tagline and footer when the page marks
+/// none of them.
+fn dense_run(segments: &[Segment]) -> Vec<&Segment> {
+    if segments.len() < 8 {
+        return segments.iter().collect();
+    }
+    let weights: Vec<f64> = segments.iter().map(weight_of).collect();
+    let (mut best, mut best_start, mut best_end) = (0.0, 0, 0);
+    let mut running = 0.0;
+    let mut start = 0;
+    for (index, weight) in weights.iter().enumerate() {
+        if running <= 0.0 {
+            running = 0.0;
+            start = index;
+        }
+        running += weight;
+        if running > best {
+            best = running;
+            best_start = start;
+            best_end = index;
+        }
+    }
+    if best <= 0.0 {
+        return segments.iter().collect();
+    }
+    segments[best_start..=best_end].iter().collect()
+}
+
+fn weight_of(segment: &Segment) -> f64 {
+    let text = segment.text.to_lowercase();
+    if crate::readeval::NAV_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        return 0.0;
+    }
+    let chars = segment.text.chars().filter(|c| !c.is_whitespace()).count() as f64;
+    let mut weight = chars;
+    if segment.kind == "li" {
+        weight *= 0.25;
+    }
+    if chars < 40.0 {
+        weight *= 0.5;
+    }
+    weight
 }
 
 /// Flush, dropping a short run that is almost entirely link text.
@@ -632,13 +737,22 @@ pub fn cache_dir(state: &Path) -> PathBuf {
 ///
 /// The version is in the key on purpose. Extraction changes are exactly when a cached reading becomes a lie,
 /// and a TTL alone cannot know that.
-pub fn cache_key(url: &str, accept: &str) -> String {
+/// The cache key, with the extractor version as a parameter so a test can change it.
+///
+/// One implementation, so the test that varies the version is exercising the key the cache actually uses. The
+/// separators matter: without them a URL ending in `a` and an accept header starting with `b` hash the same as a
+/// URL ending in `ab`.
+pub fn cache_key_with(url: &str, accept: &str, version: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in format!("{url}\u{0}{accept}\u{0}{EXTRACTOR_VERSION}").bytes() {
+    for byte in format!("{url}\u{0}{accept}\u{0}{version}").bytes() {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+fn cache_key(url: &str, accept: &str) -> String {
+    cache_key_with(url, accept, EXTRACTOR_VERSION)
 }
 
 /// How long a reading stays valid, by what kind of page it is.
@@ -907,7 +1021,7 @@ pub fn read(state: Option<&Path>, url: &str, refresh: bool, allow_private: bool)
         states.push(format!("state {state}"));
         return Reading {
             url: url.to_string(),
-            path: Path_::Document,
+            path: Path_::Api,
             state,
             states,
             title,
@@ -945,11 +1059,26 @@ pub fn read(state: Option<&Path>, url: &str, refresh: bool, allow_private: bool)
     ) {
         Ok(triple) => triple,
         Err(why) => {
+            // The transport refuses a body over the ceiling with its own words. Reporting that as `unreachable`
+            // tells the caller the network failed when the document was simply too big, which is the exact
+            // confusion the ceiling comment claims this release removed.
+            let too_large = why.contains("Maximum file size exceeded")
+                || why.contains("exited 63")
+                || why.contains("maximum file size");
+            let state = if too_large {
+                State::TooLarge
+            } else {
+                State::Unreachable(why.clone())
+            };
             return Reading {
                 url: url.to_string(),
                 path: Path_::Fetch,
-                state: State::Unreachable(why.clone()),
-                states: vec![format!("unreachable: {why}")],
+                state,
+                states: vec![if too_large {
+                    format!("too-large: the transport refused a body over the ceiling ({why})")
+                } else {
+                    format!("unreachable: {why}")
+                }],
                 title: String::new(),
                 text: String::new(),
                 blocks: Vec::new(),
@@ -1038,15 +1167,23 @@ pub fn read(state: Option<&Path>, url: &str, refresh: bool, allow_private: bool)
 }
 
 fn read_document(url: &str, bytes: &[u8], states: &mut Vec<String>) -> Reading {
+    let started = std::time::Instant::now();
     let dir = std::env::temp_dir().join("hades-read");
     let _ = std::fs::create_dir_all(&dir);
-    let name = url.rsplit('/').next().unwrap_or("document.pdf");
-    let name = if name.to_lowercase().ends_with(".pdf") {
-        name.to_string()
+    // The name is the digest of the bytes, never the URL's last segment. A path keyed on a basename is shared
+    // state: two reads of two different documents both called `report.pdf` raced, and each could receive the
+    // other's text and report it `ok`. A digest names exactly one body, so there is nothing to share.
+    let stem = url
+        .rsplit('/')
+        .next()
+        .unwrap_or("document")
+        .replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_");
+    let path = dir.join(format!("{:016x}-{stem}", digest(bytes)));
+    let path = if path.to_string_lossy().to_lowercase().ends_with(".pdf") {
+        path
     } else {
-        format!("{name}.pdf")
+        path.with_extension("pdf")
     };
-    let path = dir.join(name.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_"));
     if let Err(why) = std::fs::write(&path, bytes) {
         states.push(format!("document write failed: {why}"));
         return Reading {
@@ -1057,13 +1194,29 @@ fn read_document(url: &str, bytes: &[u8], states: &mut Vec<String>) -> Reading {
             title: String::new(),
             text: String::new(),
             blocks: Vec::new(),
-            ms: 0,
+            ms: started.elapsed().as_millis(),
         };
     }
-    match crate::library::text_of_file(&path_stem(&path), &path, bytes) {
+    let reading = finish_document(url, &path, bytes, states, started);
+    // One body, one file: the temp copy is removed as soon as it has been parsed, so the directory holds what is
+    // being read and nothing else.
+    let _ = std::fs::remove_file(&path);
+    reading
+}
+
+/// Parse a written document and report how it went, with the time actually taken.
+fn finish_document(
+    url: &str,
+    path: &Path,
+    bytes: &[u8],
+    states: &mut Vec<String>,
+    started: std::time::Instant,
+) -> Reading {
+    let ms = |started: std::time::Instant| started.elapsed().as_millis();
+    match crate::library::text_of_file(&path_stem(path), path, bytes) {
         Ok(text) => {
-            // 77 characters of garbage out of a 3 MB file is not a read. A document must produce enough text
-            // to be worth returning, or it is reported as empty and the caller knows to try something else.
+            // 77 characters of garbage out of a 3 MB file is not a read. A document must produce enough text to
+            // be worth returning, or it is reported `empty` and the caller knows to try something else.
             let empty = text.trim().chars().count() < 200;
             states.push(if empty {
                 "state empty".to_string()
@@ -1075,10 +1228,10 @@ fn read_document(url: &str, bytes: &[u8], states: &mut Vec<String>) -> Reading {
                 path: Path_::Document,
                 state: if empty { State::Empty } else { State::Ok },
                 states: states.clone(),
-                title: path_stem(&path),
+                title: path_stem(path),
                 text,
                 blocks: Vec::new(),
-                ms: 0,
+                ms: ms(started),
             }
         }
         Err(why) => {
@@ -1092,10 +1245,21 @@ fn read_document(url: &str, bytes: &[u8], states: &mut Vec<String>) -> Reading {
                 title: String::new(),
                 text: String::new(),
                 blocks: Vec::new(),
-                ms: 0,
+                ms: ms(started),
             }
         }
     }
+}
+
+/// FNV-1a over the body. A digest only has to tell two documents apart inside one directory, so this is enough
+/// and it costs no dependency.
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 fn path_stem(path: &Path) -> String {
@@ -1173,7 +1337,21 @@ mod tests {
         let (text, blocks, _) = extract_html("<html><body><div></div></body></html>");
         assert!(text.is_empty());
         assert!(blocks.is_empty());
-        assert_ne!(State::Ok, State::Empty);
+        // Asserted through the pipeline, not by comparing two enum variants: `assert_ne!(Ok, Empty)` is true for
+        // any two variants and says nothing about the code.
+        let mut states = Vec::new();
+        let reading = finish_document(
+            "https://example.org/blank.pdf",
+            Path::new("/nonexistent/blank.pdf"),
+            b"",
+            &mut states,
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            reading.state,
+            State::Empty,
+            "a body with no text must not report ok"
+        );
     }
 
     #[test]
@@ -1264,7 +1442,11 @@ mod tests {
         assert_eq!(a, cache_key("https://example.org/x", "text/html"));
         assert_ne!(a, cache_key("https://example.org/y", "text/html"));
         assert_ne!(a, cache_key("https://example.org/x", "application/pdf"));
-        assert!(format!("{a}{EXTRACTOR_VERSION}") != a);
+        // The version has to be inside the key, not appended to it in the test. Recomputing the key with the
+        // version forced to a different value is the only assertion that can fail if the constant is dropped.
+        let older = cache_key_with("https://example.org/x", "text/html", "v0");
+        let newer = cache_key_with("https://example.org/x", "text/html", "v1");
+        assert_ne!(older, newer, "the extractor version must change the key");
     }
 
     #[test]

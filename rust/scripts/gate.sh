@@ -31,5 +31,5 @@ bash scripts/ci-test.sh "$@"
 if [ "$#" -gt 0 ]; then
   echo "claim check: skipped, because this run was filtered ($*) and its count is not the suite's count" >&2
 else
-  bash scripts/check-claims.sh --tests "$(cat .test-count)"
+  bash scripts/check-claims.sh --tests "$(cat .test-count)" --ignored "$(cat .test-ignored)"
 fi

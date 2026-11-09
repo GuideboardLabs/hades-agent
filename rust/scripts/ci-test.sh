@@ -30,6 +30,10 @@ fi
 if [ "$status" -eq 0 ]; then
   passed=$(grep -E '^test result: ' "$OUT" | sed -nE 's/^test result: [A-Za-z]+\. ([0-9]+) passed.*/\1/p' | awk '{ total += $1 } END { print total + 0 }')
   printf '%s\n' "$passed" > .test-count
+  # The ignored count is a claim too: the last review found the README explaining thirteen while the suite
+  # reported fifteen. Recorded here so check-claims can compare the prose against the run.
+  ignored=$(grep -E '^test result: ' "$OUT" | sed -nE 's/^test result: [A-Za-z]+\. [0-9]+ passed; [0-9]+ failed; ([0-9]+) ignored.*/\1/p' | awk '{ total += $1 } END { print total + 0 }')
+  printf '%s\n' "$ignored" > .test-ignored
   echo "test count: $passed"
 fi
 

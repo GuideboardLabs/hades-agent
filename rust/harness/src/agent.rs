@@ -356,6 +356,21 @@ pub fn schemas_for(depth: u8, mode: crate::mode::Mode, role: crate::profile::Rol
         {
             "type": "function",
             "function": {
+                "name": "read",
+                "description": "Read a page or document as content rather than markup: navigation, headers, footers and sidebars are stripped, the text comes back with its title, and the result names what happened. Handles HTML, PDFs and office documents, follows up to five redirects, reads Stack Exchange questions through their API when the site refuses a plain client, and renders JavaScript shells in a browser. Prefer this to fetch when you intend to use the text. The answer begins with `url  [path] state (N chars)`; states are ok, not-found, blocked(code), paywalled, js-required, too-large, empty, binary, unreachable.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "The page or document to read. HTTP and HTTPS only."},
+                        "refresh": {"type": "boolean", "description": "Skip the digest cache and read the source again."}
+                    },
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "library",
                 "description": "Search or read Hades' offline library: PDFs, EPUB books, LaTeX, Markdown and text imported with `hades library add`. Use it when the network is unavailable, when the person names a book or paper, or when a claim should come from a local document. Search returns entry ids and snippets; read returns the canonical text around an offset.",
                 "parameters": {
@@ -666,7 +681,7 @@ fn report_envelope() -> Value {
 
 /// The tools the act surface can call. Kept beside `mutating` and tied to the schema by a test, because
 /// a ledger line that says "allowed" for a tool that does not exist is worse than no line.
-pub const TOOLS: [&str; 25] = [
+pub const TOOLS: [&str; 26] = [
     "shell",
     "read_file",
     "write_file",
@@ -676,6 +691,7 @@ pub const TOOLS: [&str; 25] = [
     "image",
     "browser",
     "fetch",
+    "read",
     "library",
     "recall",
     "remember",
@@ -730,6 +746,7 @@ pub fn chat_allows(name: &str) -> bool {
             | "search"
             | "image"
             | "fetch"
+            | "read"
             | "library"
             | "recall"
             | "session_search"
@@ -800,6 +817,7 @@ pub fn answer_stoppable(
         ("web_search", 25),
         ("react", 6),
         ("fetch", 60),
+        ("read", 60),
         ("shell", 120),
     ];
     for step in 0..steps {
@@ -1009,6 +1027,7 @@ pub(crate) fn label(name: &str, arguments: &str) -> String {
         }
         "search" => args.get("pattern").and_then(Value::as_str).unwrap_or(""),
         "fetch" => args.get("url").and_then(Value::as_str).unwrap_or(""),
+        "read" => args.get("url").and_then(Value::as_str).unwrap_or(""),
         "web_search" => args.get("query").and_then(Value::as_str).unwrap_or(""),
         "library" => args
             .get("query")
@@ -6308,5 +6327,45 @@ mod tests {
         assert!(said.contains("assumed (learned)"), "{said}");
         assert!(said.contains("postgres"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_offered_tool_is_listed_and_allowed() {
+        // The defect this exists for: `read` had a dispatch arm, no schema and no entry in TOOLS, so the model could
+        // not emit it and the runtime would have refused it if it had. A capability the agent cannot call is not a
+        // capability, and nothing caught that because no test compared the three lists.
+        //
+        // Two different promises are checked, because they cover different modes. Every tool any act surface offers
+        // must be in TOOLS (a ledger line saying "allowed" for a tool that does not exist is worse than no line).
+        // Every tool the CHAT surface offers must additionally pass `chat_allows`, because chat is the read-only
+        // surface and an act-only tool being refused there is the rule working, not a defect.
+        let act = names(&schemas_for(0, Mode::Act, crate::profile::Role::Patch));
+        let unlisted: Vec<&String> = act
+            .iter()
+            .filter(|n| !TOOLS.contains(&n.as_str()))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "offered but not in TOOLS: {unlisted:?}"
+        );
+        assert!(
+            act.iter().any(|n| n == "read"),
+            "read must be offered to the act surface"
+        );
+
+        let chat = names(&schemas_for(
+            0,
+            crate::mode::Mode::Chat,
+            crate::profile::Role::Survey,
+        ));
+        let refused: Vec<&String> = chat.iter().filter(|n| !chat_allows(n)).collect();
+        assert!(
+            refused.is_empty(),
+            "offered in chat but chat_allows refuses: {refused:?}"
+        );
+        assert!(
+            chat.iter().any(|n| n == "read"),
+            "read must be offered in chat as well"
+        );
     }
 }

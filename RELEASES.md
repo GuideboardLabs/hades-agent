@@ -1,3 +1,79 @@
+## 0.6.1
+
+### The Elpenor Release: the first review, answered
+
+Elpenor fell off Circe's roof, and the first thing Odysseus does on reaching the underworld is to meet him. He is
+the youngest of the crew and the least distinguished, and he is the one who tells the truth about what went wrong
+before anyone else gets a word in. That is this release: the review came back at 4 out of 10 and it was right.
+
+0.6.0 was published before the review, so this is a separate release rather than a rewritten one. Nothing below was
+true of 0.6.0.
+
+### What the review found, and what each fix is
+
+- **`read` was not a tool the agent had.** The dispatch arm existed at `agent.rs:1414` and `TOOLS` refused the name
+  at `:1376` before the match ran, and no schema offered it. 0.6.0 shipped a CLI command and an eval harness and
+  called it a capability. `read` is now in the schema, in `TOOLS` (26 entries), in `chat_allows`, and in the step
+  budget at 60, with a test that ties the three lists together.
+- **The tag-name scan collected attribute text.** `<a href="index.html">` parsed as `ahrefindexhtml`, so no rule in
+  `NOISE` or `CONTENT` matched any tag that carried an attribute, and `in_link` never incremented, which disabled the
+  anchor-run rule too. One character class did that. The scan now stops at the first non-alphanumeric, as
+  `strip_tags_text` already did.
+- **The extractor was markup stripping and the notes called it extraction.** With the scan fixed, the menu is gone,
+  but sqlite.org still returned its table of contents and tagline, python.org its `Navigation` heading, and
+  theverge.com 315,155 characters of chrome. Three rules now do the work, each with a test: chrome headings are
+  dropped by name, everything above the page's own `<h1>` is treated as the header block, and a page with no
+  `<article>` or `<main>` falls back to the heaviest run of consecutive segments weighted against list rows and
+  chrome. Measured: theverge.com 315,155 to 14,481 characters, sqlite.org now starts at "1. Overview",
+  docs.python.org at its `<h1>`.
+- **`too-large` could not happen.** `read` asked for 8 MiB and `fetch` told curl 4 MiB from a hardcoded constant, so
+  a 5.2 MB PDF came back `unreachable: curl exited 63`, which reads as a network fault. The caller's limit is
+  threaded through to `curl --max-filesize`, and a size refusal is reported `too-large`.
+- **A 404 said the server refused.** It now has its own state, `not-found`, because a wrong URL and an unwelcome
+  client are different facts and only one of them is worth retrying.
+- **The Stack Exchange route printed the wrong road.** Its headline said `[document]` while its own step list said
+  `path api`. There is a `Path_::Api` now.
+- **The document temp path was keyed on the URL's last segment**, in one shared directory that was never cleaned, so
+  two concurrent reads of two different files called `report.pdf` could return each other's text as `ok`. The name is
+  the digest of the body, and the file is removed as soon as it has been parsed.
+- **The ms column was 0 on every document read.** Measured now.
+- **Two assertions asserted nothing.** `assert_ne!(State::Ok, State::Empty)` is true for any two variants, and
+  `format!("{a}{EXTRACTOR_VERSION}") != a` is true because concatenation is longer. The first now runs the document
+  path and asserts the state it produces; the second recomputes the key with a varied version through the one
+  implementation the cache uses.
+
+### The measurement changed, and the number went down
+
+The reviewer's third point was that the metric could not fail: 23 of 30 fragments were a single word and 18 were
+eight characters or fewer, so `Vec` was satisfied by a rustdoc sidebar and `tar` by the GNU manual's own navigation.
+The set now carries sentences of eight words or more, each verified to appear verbatim in the raw page, plus a list
+of chrome strings that must be **absent** from the extraction, and `read-eval` prints a cleanliness column and a
+boilerplate ratio.
+
+| class | rows | found | recall | state% | clean% |
+|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100% | 100% |
+| reference | 6 | 6 | 100% | 100% | 100% |
+| forum | 4 | 3 | 75% | 75% | 100% |
+| news | 6 | 3 | 50% | 83% | 100% |
+| pdf | 3 | 2 | 67% | 67% | 100% |
+| js-shell | 3 | 0 | 0% | 0% | 0% |
+| **all** | **30** | **22** | **73.3%** | **80%** | **83%** |
+
+**1345 tests, 15 ignored.**
+
+**73.3%, not 86.7%.** The old number was not a lie about the same thing; it was a different, weaker measurement.
+Against sentences, a news front page loses the sentence the density window drops and a JavaScript shell scores
+nothing at all, which is what the old single-token match hid.
+
+### Known and unfixed
+
+- **The browser path returned nothing on this run.** All three js-shell rows came back `empty` where 0.6.0 returned
+  469,297 characters for instagram. That is the next thing to measure, and it is not fixed here.
+- **News front pages lose content to the density window.** 3 of 6; the window prefers long runs of prose and a
+  listing page has none.
+- **The gold set is 30 rows and I wrote it**, though every fragment is now checked against the raw page.
+
 ## 0.6.0
 
 ### The Nekyia Release: one road into the page
@@ -32,7 +108,7 @@ The suite reports **1344 tests, 15 ignored**.
 ### The measurement
 
 `hades read-eval` reads a frozen 30-row gold set through the shipped pipeline. The set was written before `read.rs`
-compiled, and every row whose expectation was corrected carries its reason in the notes. It ships with the
+compiled. Every row carries a `note` field recording why it is shaped as it is, and it ships with the
 repository at `rust/harness/tests/fixtures/read-gold.jsonl`, so the number below can be reproduced:
 
 ```
