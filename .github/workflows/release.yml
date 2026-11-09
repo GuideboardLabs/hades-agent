@@ -41,7 +41,7 @@ jobs:
         working-directory: rust
         run: bash scripts/ci-test.sh
       - name: The test count the docs claim is the count that ran
-        run: bash rust/scripts/check-claims.sh --tests "$(cat rust/.test-count)"
+        run: bash rust/scripts/check-claims.sh --tests "$(cat rust/.test-count)" --ignored "$(cat rust/.test-ignored)"
 
   arm64:
     needs: gate

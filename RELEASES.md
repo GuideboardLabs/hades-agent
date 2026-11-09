@@ -1,3 +1,58 @@
+## 0.6.2
+
+### The Tiresias Release: the state that tells you to look elsewhere
+
+Tiresias is the blind prophet of Thebes, and the thing he is worth listening to for is that he says what a thing
+is even when the answer is not the one being asked for. This release gives the reader that habit about pages it
+cannot read: a page whose content arrives only after script runs now says `js-required` instead of `empty`.
+
+Second review of the 0.6 series: **7 out of 10**, up from 4.
+
+**1348 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **`not-found` was advertised and never constructed.** The second release in a row with a named state that was
+  dead code, so the fix is not the state but the test: `every_advertised_state_is_produced_by_the_selector` walks
+  every state the selector is responsible for and fails when one has no input that produces it.
+- **The anchor-run rule deleted linked headlines.** The bound was 160 characters, and a Hacker News listing row is a
+  link with a headline in it, so 30 stories came back as `1. 2. 3. ...`. A menu label is short and a headline is a
+  sentence fragment, so the rule is now 40 characters **and** no punctuation. Hacker News now carries its headlines
+  and news recall went 50% to 67%.
+- **Prose above an `<h1>` was deleted.** Same mistake as the headline: a standfirst above the heading is content.
+  Only a short header block (under 300 characters) is dropped now.
+- **Three shell rows reported `empty`.** `looks_like_a_shell` asked before extraction and bailed at 400 visible
+  characters, which every page with a title passed. `shell_by_measure` asks after: nothing extracted, and then the
+  bytes decide. A 4 KB loader stub with a script is a shell, eight or more script tags with no text is a client
+  rendered app, a framework root marker with no text is the same. A page that extracted real text is never a shell.
+  All three shell rows now report `js-required`: state accuracy for that class went 0% to 100%.
+- **The document title carried the digest.** The digest makes the temp path unique; it has no business in a title.
+- **CI did not pass the ignored count.** `release.yml` does now, so the new rule holds there too.
+
+### The measurement
+
+| class | rows | found | recall | state% |
+|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100% |
+| reference | 6 | 6 | 100% | 100% |
+| forum | 4 | 3 | 75% | 75% |
+| news | 6 | 4 | 67% | 83% |
+| pdf | 3 | 2 | 67% | 67% |
+| js-shell | 3 | 0 | 0% | 100% |
+| **all** | **30** | **23** | **76.7%** | **90%** |
+
+Recall 76.7% and states 90%, and cleanliness 100%: no row's extraction carries the chrome its page's raw markup
+shows. The shell class scores 0% recall **by design**, because a shell has no text to find and its rows carry no
+fragments; the thing worth measuring there is whether the state is right, and it now is.
+
+### Known and unfixed
+
+- **News front pages still lose 2 of 6.** The density window prefers long prose and a listing page has none.
+- **A shell is named, not rendered.** `read` reports `js-required`; it does not then drive the browser, so the
+  browser path is not exercised by these rows.
+- **Eleven gold rows cannot carry a page-verified sentence**, because they are read through the API or the browser
+  where the text is not in the raw HTML. Each says so in its own `note`.
+
 ## 0.6.1
 
 ### The Elpenor Release: the first review, answered

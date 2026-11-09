@@ -166,7 +166,8 @@ pub fn select(sniffed: Sniff, status: u16, body_len: usize) -> (Path_, Option<St
         return (Path_::Fetch, Some(State::Blocked(status)));
     }
     if status == 404 || status == 410 {
-        return (Path_::Fetch, Some(State::Blocked(status)));
+        // A wrong URL and an unwelcome client are different facts, and only one of them is worth retrying.
+        return (Path_::Fetch, Some(State::NotFound));
     }
     if body_len > MAX_BYTES {
         return (Path_::Fetch, Some(State::TooLarge));
@@ -177,6 +178,34 @@ pub fn select(sniffed: Sniff, status: u16, body_len: usize) -> (Path_, Option<St
         Sniff::Text => (Path_::Fetch, None),
         Sniff::Html => (Path_::Fetch, None),
     }
+}
+
+/// Whether a page with nothing extracted is a shell, judged from its bytes and the extraction result.
+///
+/// `looks_like_a_shell` asks the question before extraction, from the markup alone, and its 400-character floor
+/// made it answer `false` for every page with a title and a nav. This asks it after: the extraction produced
+/// almost nothing, so the markup decides why. A 4 KB stub with a script is a loader; a page shipping eight or more
+/// script tags and no text is a client-rendered app; a framework root marker with no text is the same. A page that
+/// extracted real text is not a shell whatever its markup says.
+pub fn shell_by_measure(html: &str, extracted_chars: usize) -> bool {
+    if extracted_chars >= 400 {
+        return false;
+    }
+    let scripts = html.matches("<script").count();
+    let tiny = html.len() < 8 * 1024;
+    let low = html.to_lowercase();
+    let marker = [
+        "id=\"root\"",
+        "id='root'",
+        "id=\"app\"",
+        "id='app'",
+        "__next_data__",
+        "data-reactroot",
+        "ng-app",
+    ]
+    .iter()
+    .any(|m| low.contains(m));
+    marker || scripts >= 5 || (tiny && scripts >= 1)
 }
 
 /// A page whose body holds almost no text and looks like an application shell.
@@ -469,11 +498,23 @@ pub fn extract_html(html: &str) -> (String, Vec<Block>, String) {
     // label for navigation, not a section of the page, and everything above the page's own `<h1>` is the header
     // block: a tagline, a logo line, a breadcrumb trail.
     let first_heading = kept.iter().position(|s| s.kind == "h1");
+    let above: String = match first_heading {
+        Some(heading) => kept[..heading]
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => String::new(),
+    };
+    // A header block is short. A standfirst, a summary paragraph or a byline above the heading is content, and
+    // dropping it because of where the `<h1>` sits is the same mistake as dropping a headline for being a link.
+    let drop_above = !above.trim().is_empty() && above.chars().count() < 300;
     let kept: Vec<&Segment> = kept
         .into_iter()
         .enumerate()
         .filter(|(index, segment)| {
             if let Some(heading) = first_heading
+                && drop_above
                 && *index < heading
             {
                 return false;
@@ -621,7 +662,13 @@ fn flush_with_links(
     } else {
         *link_chars as f64 / text_chars as f64
     };
-    let short = buffer.chars().count() <= 160;
+    // A menu label is a few words; a headline is a sentence fragment. The old bound of 160 characters dropped
+    // every Hacker News story, because a listing row is mostly link text too. Density that distinguishes them is
+    // length, and the second signal is punctuation: a run with a full stop, a question mark or a comma is prose.
+    let text = buffer.trim();
+    let chars = text.chars().count();
+    let prose = text.contains('.') || text.contains('?') || text.contains(',');
+    let short = chars <= 40 && !prose;
     *link_chars = 0;
     if ratio >= 0.7 && short && !in_content {
         buffer.clear();
@@ -1118,13 +1165,26 @@ pub fn read(state: Option<&Path>, url: &str, refresh: bool, allow_private: bool)
             read_browser(state, url, &mut states)
         }
         _ if sniffed == Sniff::Html => {
-            let (text, blocks, title) = extract_html(&String::from_utf8_lossy(bytes));
+            let markup = String::from_utf8_lossy(bytes).to_string();
+            let (text, blocks, title) = extract_html(&markup);
             if text.trim().is_empty() {
-                states.push("state empty".to_string());
+                // An extraction that came back empty from a page whose content is script is a different fact from
+                // an empty page. The first says a browser could read it; the second says there is nothing there.
+                // Reporting both as `empty` is what made three shell rows look like blank pages.
+                let shell = shell_by_measure(&markup, text.trim().chars().count());
+                states.push(if shell {
+                    "state js-required".to_string()
+                } else {
+                    "state empty".to_string()
+                });
                 Reading {
                     url: url.to_string(),
                     path,
-                    state: State::Empty,
+                    state: if shell {
+                        State::JsRequired
+                    } else {
+                        State::Empty
+                    },
                     states,
                     title,
                     text,
@@ -1228,7 +1288,7 @@ fn finish_document(
                 path: Path_::Document,
                 state: if empty { State::Empty } else { State::Ok },
                 states: states.clone(),
-                title: path_stem(path),
+                title: title_of(path),
                 text,
                 blocks: Vec::new(),
                 ms: ms(started),
@@ -1260,6 +1320,26 @@ fn digest(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
+}
+
+/// The readable name of a document file: the stem without the digest prefix and without the extension.
+///
+/// The digest is what makes the temp path unique; it has no business being the title a person reads.
+fn title_of(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let without_digest = match name.split_once('-') {
+        Some((head, rest)) if head.len() == 16 && head.chars().all(|c| c.is_ascii_hexdigit()) => {
+            rest.to_string()
+        }
+        _ => name,
+    };
+    without_digest
+        .rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or(without_digest)
 }
 
 fn path_stem(path: &Path) -> String {
@@ -1329,6 +1409,72 @@ mod tests {
         // the strings a report prints
         assert_eq!(State::Blocked(403).to_string(), "blocked(403)");
         assert_eq!(State::JsRequired.to_string(), "js-required");
+    }
+
+    #[test]
+    fn a_page_with_nothing_extracted_is_a_shell_only_when_its_bytes_say_so() {
+        // Measured on the three shell rows: a 4 KB stub with a script, a page with eight script tags, and a page
+        // that extracted 469,000 characters. The third is not a shell whatever its markup looks like.
+        let stub =
+            "<html><body><div id=\"root\"></div><script src=\"a.js\"></script></body></html>";
+        assert!(shell_by_measure(stub, 0), "a loader stub is a shell");
+
+        let mut busy = String::from("<html><body>");
+        for _ in 0..8 {
+            busy.push_str("<script src=\"x.js\"></script>");
+        }
+        busy.push_str("</body></html>");
+        assert!(
+            shell_by_measure(&busy, 0),
+            "eight script tags and no text is a shell"
+        );
+
+        assert!(
+            !shell_by_measure(&busy, 500),
+            "a page that extracted real text is not a shell"
+        );
+        assert!(
+            !shell_by_measure("<html><body><p>plain</p></body></html>", 0),
+            "a page with no script and no text is empty, not a shell"
+        );
+    }
+
+    #[test]
+    fn a_document_title_does_not_carry_the_digest() {
+        // The digest is what makes the temp path unique; it has no business being the title a person reads.
+        let named = Path::new("/tmp/hades-read/0123456789abcdef-rfc9110.pdf");
+        assert_eq!(title_of(named), "rfc9110");
+        assert_eq!(title_of(Path::new("/tmp/x/report.pdf")), "report");
+    }
+
+    #[test]
+    fn every_advertised_state_is_produced_by_the_selector() {
+        // Two releases in a row shipped a state that was named, printed in the tool description and never
+        // constructed: `too-large` in 0.6.0, `not-found` in 0.6.1. This walks the states the selector is
+        // responsible for and fails when one of them has no input that produces it.
+        let cases: Vec<(Sniff, u16, usize, State)> = vec![
+            (Sniff::Html, 402, 10, State::Paywalled),
+            (Sniff::Html, 403, 10, State::Blocked(403)),
+            (Sniff::Html, 429, 10, State::Blocked(429)),
+            (Sniff::Html, 503, 10, State::Blocked(503)),
+            (Sniff::Html, 404, 10, State::NotFound),
+            (Sniff::Html, 410, 10, State::NotFound),
+            (Sniff::Html, 200, MAX_BYTES + 1, State::TooLarge),
+            (Sniff::Binary, 200, 10, State::Binary),
+        ];
+        for (sniffed, status, len, want) in cases {
+            let (_, got) = select(sniffed, status, len);
+            assert_eq!(
+                got,
+                Some(want.clone()),
+                "select({sniffed:?}, {status}, {len}) should be {want}"
+            );
+        }
+        // and the two states the paths build rather than the selector
+        assert_eq!(State::Empty.to_string(), "empty");
+        assert_eq!(State::JsRequired.to_string(), "js-required");
+        assert_eq!(State::NotFound.to_string(), "not-found");
+        assert_eq!(State::Ok.to_string(), "ok");
     }
 
     #[test]
