@@ -1,3 +1,56 @@
+## 0.6.4
+
+### The Harmonia Release: the notes are checked against the measurement
+
+Harmonia is the fitting together of parts that were made separately, and the thing worth taking from her is that a
+joint is only sound if something tests it. This release puts the measurement table under the gate. From here, a
+release note whose numbers disagree with the saved measurement fails the build.
+
+Fourth review: **6 out of 10**, unchanged, and the reason is in the notes below rather than hidden.
+
+**1349 tests, 15 ignored.**
+
+### What the review found and what each fix is
+
+- **The notes quoted numbers the tool did not print, and nothing compared them.** `read-eval` now prints an `all`
+  row and takes `--save <file>` to record the measurement and `--check-notes <notes> <baseline>` to compare the
+  newest release table against that recording. `gate.sh` calls it on every build, offline, from two files. The
+  check was falsified before it was trusted: a digit in this table was changed, the check failed with the class
+  name and both numbers, and the change was reverted.
+- **The cleanliness denominator counted rows that were never checked.** It is `clean / checked` now, and the
+  output prints `5/16` rather than a percentage that diluted fourteen unchecked rows. A class where nothing was
+  checked prints `0/0`, not 0%.
+- **`--json` carries the same figures**, so a script cannot read a different measurement than a person.
+
+### The measurement, produced by the command printed under it
+
+```
+hades read-eval --gold rust/harness/tests/fixtures/read-gold.jsonl --state /tmp/read-state --refresh \
+  --save rust/harness/tests/fixtures/read-eval-baseline.json
+```
+
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100% | 33% | 2 | 1% |
+| reference | 6 | 6 | 100% | 100% | 33% | 0 | 1% |
+| forum | 4 | 3 | 75% | 75% | 0% | 4 | 0% |
+| news | 6 | 3 | 83% | 50% | 33% | 3 | 0% |
+| pdf | 3 | 2 | 67% | 67% | 0% | 2 | 0% |
+| js-shell | 3 | 0 | 100% | 0% | 0% | 3 | 0% |
+| **all** | **30** | **22** | **90%** | **73.3%** | **5/16** | **14** | **0%** |
+
+### Still not fixed, and why the score did not move
+
+- **The cleanliness check is weak.** Its strings match prose (`talk` matched "we just talked about") and some come
+  from the extractor's own marker list. Printing it honestly does not make it a good check.
+- **The anchor rule separates short labels from long labels, not menus from headlines.** A 43-character menu label
+  survives.
+- **`browser::tool` still returns a page and its own error sentence as one `String`.** `browser_failure` recognises
+  the sentences it knows, which is a list kept in step by hand. The type should carry the distinction.
+- **`State::ALL` is maintained by hand** beside the enum. The guard fails on a dead state, which is what matters,
+  but a variant still has to be typed twice.
+- **News front pages lose half their rows**: a listing page has no long prose for the density window.
+
 ## 0.6.3
 
 ### The Aletheia Release: the number the tool prints

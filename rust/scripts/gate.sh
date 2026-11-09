@@ -32,4 +32,12 @@ if [ "$#" -gt 0 ]; then
   echo "claim check: skipped, because this run was filtered ($*) and its count is not the suite's count" >&2
 else
   bash scripts/check-claims.sh --tests "$(cat .test-count)" --ignored "$(cat .test-ignored)"
+  # The measurement table in the release notes is compared against the measurement that was saved when it was
+  # taken. This is the rule the 0.6.2 defect needed: its notes claimed a cleanliness figure the binary never
+  # printed, and nothing compared the two. Offline: two files, no network, deterministic.
+  notes_bin="${CARGO_TARGET_DIR:-target}/release/hades"
+  if [ -x "$notes_bin" ]; then
+    "$notes_bin" read-eval --check-notes ../RELEASES.md harness/tests/fixtures/read-eval-baseline.json ||
+      { echo "FAIL the release notes disagree with the saved measurement" >&2; exit 1; }
+  fi
 fi

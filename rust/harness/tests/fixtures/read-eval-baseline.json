@@ -1,0 +1,70 @@
+{
+  "classes": [
+    {
+      "checked": 6,
+      "class": "docs",
+      "clean": 2,
+      "found": 8,
+      "recall": "100.0%",
+      "rows": 8,
+      "stated": 8,
+      "states": "100%",
+      "unchecked": 2
+    },
+    {
+      "checked": 0,
+      "class": "forum",
+      "clean": 0,
+      "found": 3,
+      "recall": "75.0%",
+      "rows": 4,
+      "stated": 3,
+      "states": "75%",
+      "unchecked": 4
+    },
+    {
+      "checked": 0,
+      "class": "js-shell",
+      "clean": 0,
+      "found": 0,
+      "recall": "0.0%",
+      "rows": 3,
+      "stated": 3,
+      "states": "100%",
+      "unchecked": 3
+    },
+    {
+      "checked": 3,
+      "class": "news",
+      "clean": 1,
+      "found": 3,
+      "recall": "50.0%",
+      "rows": 6,
+      "stated": 5,
+      "states": "83%",
+      "unchecked": 3
+    },
+    {
+      "checked": 1,
+      "class": "pdf",
+      "clean": 0,
+      "found": 2,
+      "recall": "66.7%",
+      "rows": 3,
+      "stated": 2,
+      "states": "67%",
+      "unchecked": 2
+    },
+    {
+      "checked": 6,
+      "class": "reference",
+      "clean": 2,
+      "found": 6,
+      "recall": "100.0%",
+      "rows": 6,
+      "stated": 6,
+      "states": "100%",
+      "unchecked": 0
+    }
+  ]
+}

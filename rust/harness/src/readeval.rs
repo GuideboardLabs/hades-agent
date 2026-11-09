@@ -84,12 +84,20 @@ impl Score {
         }
     }
 
-    /// The proportion of rows whose body carried none of the strings the gold says must be absent.
+    /// Rows that carried an absence list, so a check was actually made.
+    pub fn checked(&self) -> usize {
+        self.asked - self.unchecked
+    }
+
+    /// The proportion of CHECKED rows whose body carried none of the strings the gold says must be absent.
+    ///
+    /// The denominator is the rows that were checked, not all rows: dividing by `asked` let fourteen unchecked rows
+    /// dilute a figure the notes then quoted as if it were a measurement of every row.
     pub fn cleanliness(&self) -> f64 {
-        if self.asked == 0 {
+        if self.checked() == 0 {
             0.0
         } else {
-            self.clean as f64 / self.asked as f64
+            self.clean as f64 / self.checked() as f64
         }
     }
 
@@ -239,6 +247,99 @@ pub fn read_gold(path: &std::path::Path) -> Result<Vec<GoldRow>, String> {
     Ok(rows)
 }
 
+/// Write the measured totals to a file, so a later check can compare against a measurement rather than a memory.
+fn save(path: &std::path::Path, scores: &[Score]) -> Result<(), String> {
+    let rows: Vec<serde_json::Value> = scores
+        .iter()
+        .map(|score| {
+            serde_json::json!({
+                "class": score.class,
+                "rows": score.asked,
+                "found": score.found,
+                "stated": score.stated,
+                "clean": score.clean,
+                "checked": score.checked(),
+                "unchecked": score.unchecked,
+                "recall": format!("{:.1}%", score.recall() * 100.0),
+                "states": format!("{:.0}%", score.states() * 100.0),
+            })
+        })
+        .collect();
+    let document = serde_json::json!({ "classes": rows });
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Compare the newest release section's measurement table against a saved measurement.
+///
+/// The defect this closes: 0.6.2 shipped notes claiming cleanliness 100% while the binary reported 63.3%, because
+/// the table column the figure came from never existed and nothing compared the two. This runs offline, from the
+/// files, so the gate can call it on every build. A note that disagrees with the recorded measurement fails.
+fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<(), String> {
+    let baseline_text =
+        std::fs::read_to_string(baseline).map_err(|e| format!("{}: {e}", baseline.display()))?;
+    let saved: serde_json::Value =
+        serde_json::from_str(&baseline_text).map_err(|e| format!("{}: {e}", baseline.display()))?;
+    let notes_text =
+        std::fs::read_to_string(notes).map_err(|e| format!("{}: {e}", notes.display()))?;
+    // The newest section is the first `## ` header in the file. Searching for "\n## " found the SECOND section
+    // when the file opens with a header, which is how a tampered row passed the check the first time it ran.
+    let start = notes_text
+        .lines()
+        .scan(0usize, |offset, line| {
+            let at = *offset;
+            *offset += line.len() + 1;
+            Some((at, line))
+        })
+        .find(|(_, line)| line.starts_with("## "))
+        .map(|(at, _)| at)
+        .unwrap_or(0);
+    let newest = &notes_text[start..];
+    let newest = match newest[3..].find("\n## ") {
+        Some(end) => &newest[..end + 3],
+        None => newest,
+    };
+    let mut problems = Vec::new();
+    for class in saved
+        .get("classes")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = class.get("class").and_then(|v| v.as_str()).unwrap_or("");
+        let found = class.get("found").and_then(|v| v.as_u64()).unwrap_or(0);
+        let rows = class.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
+        // a table row that names the class must state the same found/rows
+        if let Some(line) = newest.lines().find(|line| {
+            let low = line.to_lowercase();
+            low.starts_with("| ") && low.contains(&name.to_lowercase())
+        }) {
+            let cells: Vec<&str> = line
+                .split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            if cells.len() >= 3 {
+                let noted_rows: u64 = cells[1].parse().unwrap_or(u64::MAX);
+                let noted_found: u64 = cells[2].parse().unwrap_or(u64::MAX);
+                if noted_rows != rows || noted_found != found {
+                    problems.push(format!(
+                        "{name}: notes say {noted_found} of {noted_rows}, the measurement says {found} of {rows}"
+                    ));
+                }
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
 /// `hades read-eval --gold <set.jsonl> [--state <dir>] [--refresh] [--json]`
 pub fn cmd(args: &[String]) -> i32 {
     let mut gold: Option<PathBuf> = None;
@@ -246,6 +347,9 @@ pub fn cmd(args: &[String]) -> i32 {
     let mut refresh = false;
     let mut json = false;
     let mut limit = usize::MAX;
+    let mut save_path: Option<PathBuf> = None;
+    let mut notes_path: Option<PathBuf> = None;
+    let mut baseline_path: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -258,6 +362,16 @@ pub fn cmd(args: &[String]) -> i32 {
                 state = args.get(index).map(PathBuf::from);
             }
             "--refresh" => refresh = true,
+            "--save" => {
+                index += 1;
+                save_path = args.get(index).map(PathBuf::from);
+            }
+            "--check-notes" => {
+                index += 1;
+                notes_path = args.get(index).map(PathBuf::from);
+                index += 1;
+                baseline_path = args.get(index).map(PathBuf::from);
+            }
             "--json" => json = true,
             "--limit" => {
                 index += 1;
@@ -281,6 +395,19 @@ pub fn cmd(args: &[String]) -> i32 {
             }
         }
         index += 1;
+    }
+    // A check needs no gold set and no network: it compares two files.
+    if let (Some(notes), Some(baseline)) = (notes_path.as_ref(), baseline_path.as_ref()) {
+        return match check_notes(notes, baseline) {
+            Ok(()) => {
+                println!("ok   the newest release notes match the saved measurement");
+                0
+            }
+            Err(why) => {
+                eprintln!("notes disagree with the measurement: {why}");
+                1
+            }
+        };
     }
     let Some(gold_path) = gold else {
         eprintln!("read-eval: --gold is required");
@@ -318,6 +445,13 @@ pub fn cmd(args: &[String]) -> i32 {
         readings.push((row.clone(), reading));
     }
     let scores = score(&rows, &readings);
+    if let Some(path) = save_path.as_ref() {
+        if let Err(why) = save(path, &scores) {
+            eprintln!("read-eval: {why}");
+            return 1;
+        }
+        eprintln!("saved the measurement to {}", path.display());
+    }
     if json {
         for row in &scores {
             println!(
@@ -356,9 +490,25 @@ pub fn cmd(args: &[String]) -> i32 {
     }
     let asked: usize = scores.iter().map(|s| s.asked).sum();
     let found: usize = scores.iter().map(|s| s.found).sum();
+    let stated: usize = scores.iter().map(|s| s.stated).sum();
+    let clean: usize = scores.iter().map(|s| s.clean).sum();
+    let checked: usize = scores.iter().map(|s| s.checked()).sum();
+    let unchecked: usize = scores.iter().map(|s| s.unchecked).sum();
     if asked > 0 {
+        // The all-row is printed, not computed by whoever writes the notes. A figure the tool does not print is a
+        // figure the notes can invent, and 0.6.2 invented one.
         println!(
-            "\noverall recall {:.1}% over {asked} rows",
+            "\n{:<10} {:>5} {:>6} {:>7} {:>7} {:>6} {:>9}",
+            "all",
+            asked,
+            found,
+            format!("{:.0}%", 100.0 * stated as f64 / asked as f64),
+            format!("{:.1}%", 100.0 * found as f64 / asked as f64),
+            format!("{clean}/{checked}"),
+            unchecked
+        );
+        println!(
+            "overall recall {:.1}% over {asked} rows",
             100.0 * found as f64 / asked as f64
         );
     }
@@ -392,6 +542,60 @@ mod tests {
             blocks: Vec::new(),
             ms: 5,
         }
+    }
+
+    #[test]
+    fn a_release_note_that_disagrees_with_the_measurement_fails() {
+        // The 0.6.2 defect, made impossible: notes claiming a figure the measurement does not contain must fail.
+        // Falsified by hand first (a digit was changed, the check failed, it was reverted), then locked here.
+        let dir = std::env::temp_dir().join(format!("read-eval-notes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let baseline = dir.join("baseline.json");
+        std::fs::write(
+            &baseline,
+            r#"{"classes":[{"class":"forum","rows":4,"found":3,"stated":3,"clean":0,"checked":0,"unchecked":4}]}"#,
+        )
+        .unwrap();
+
+        let honest = dir.join("honest.md");
+        std::fs::write(
+            &honest,
+            "## 0.6.4\n\n| class | rows | found |\n|---|---|---|\n| forum | 4 | 3 |\n",
+        )
+        .unwrap();
+        assert!(
+            check_notes(&honest, &baseline).is_ok(),
+            "an honest table must pass"
+        );
+
+        let lying = dir.join("lying.md");
+        std::fs::write(
+            &lying,
+            "## 0.6.4\n\n| class | rows | found |\n|---|---|---|\n| forum | 4 | 4 |\n",
+        )
+        .unwrap();
+        let why = check_notes(&lying, &baseline).unwrap_err();
+        assert!(
+            why.contains("forum"),
+            "the failure must name the class: {why}"
+        );
+        assert!(
+            why.contains("3 of 4"),
+            "the failure must state the measurement: {why}"
+        );
+
+        // the newest section is the one checked, not the second one in the file
+        let two_sections = dir.join("two.md");
+        std::fs::write(
+            &two_sections,
+            "## 0.6.4\n\n| forum | 4 | 9 |\n## 0.6.3\n\n| forum | 4 | 3 |\n",
+        )
+        .unwrap();
+        assert!(
+            check_notes(&two_sections, &baseline).is_err(),
+            "the newest section is the one compared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
