@@ -545,9 +545,22 @@ fn check_notes(notes: &std::path::Path, baseline: &std::path::Path) -> Result<()
                     .filter(|cell| !cell.is_empty())
                     .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
         };
+        // Identify the measurement table by its header, not by being the first table in the section. A release note
+        // often carries another table (a measurement of something else); taking whatever came first compared the
+        // wrong rows and reported that the notes had rows the measurement does not record.
+        const HEADER: &str = "| class | rows |";
+        let Some(header_at) = newest
+            .lines()
+            .position(|line| line.trim_start().starts_with(HEADER))
+        else {
+            return Err(format!(
+                "the section under `{shipped}` has no table headed `{HEADER} ...`"
+            ));
+        };
         let table_rows: Vec<String> = newest
             .lines()
-            .filter(|line| line.trim_start().starts_with("| ") && !is_separator(line))
+            .skip(header_at + 1)
+            .take_while(|line| line.trim_start().starts_with("| ") && !is_separator(line))
             .filter_map(|line| {
                 line.split('|')
                     .nth(1)
@@ -1061,6 +1074,28 @@ mod tests {
         assert!(
             why.contains("baseline recorded `0.0.9`"),
             "a note naming a build the baseline disagrees with must fail: {why}"
+        );
+
+        // A section often carries another table before the measurement: the 0.6.17 notes open with a table of
+        // script-versus-visible words. Selecting the first table compared those rows against the baseline and CI
+        // failed a release that was green locally, because the local binary was a version behind and read the
+        // previous section. The table is found by its header now, and a tampered class row behind another table
+        // still fails.
+        let with_other_table = dir.join("with-other-table.md");
+        std::fs::write(
+            &with_other_table,
+            format!(
+                "## {}\n\n{}\n| page | words |\n|---|---|\n| example.com | 10 |\n\n{header}{}{all_row}",
+                env!("CARGO_PKG_VERSION"),
+                provenance_line_for("0.0.9"),
+                honest_row.replace("| 3 |", "| 1 |")
+            ),
+        )
+        .unwrap();
+        let why = check_notes(&with_other_table, &baseline).unwrap_err();
+        assert!(
+            why.contains("forum") || why.contains("disagree"),
+            "a tampered measurement must fail even behind an unrelated table: {why}"
         );
 
         // A release whose own section carries no table states no numbers, and that is a failure rather than a

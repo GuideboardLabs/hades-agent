@@ -1,3 +1,47 @@
+## 0.6.18
+
+### The Aletheia Tetarton Release: the check looked at the wrong table
+
+0.6.17 was tagged and its release pipeline **failed at the notes check**, while the same command passed on this
+machine. Both facts are one defect. The note for 0.6.17 opens with a table of script-versus-visible words; the
+checker took the first table in the section, compared those page rows against the baseline, and reported that the
+notes carried rows the measurement does not record. Locally it passed because the release binary was still
+**0.6.16**, so the check read the 0.6.16 section, which has only the measurement table.
+
+Two fixes, and the second one is the reason the first could hide:
+
+- **The measurement table is found by its header**, `| class | rows | ...`, not by position. A release note may
+  carry any number of other tables.
+- **The local binary is not assumed to be the version being shipped.** The local pass was real evidence about
+  0.6.16 and none at all about 0.6.17; `--version` before believing a gate result is now part of the loop.
+
+A test writes a section with an unrelated table first, a tampered measurement behind it, and requires the check to
+fail; and the honest version of the same fixture must pass.
+
+**1354 tests, 15 ignored.**
+
+### The measurement
+
+```
+read-eval gold 1d9233b12b2529c5 measured-by unrecorded
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+```
+
+### Still not fixed
+
+- **`State::ALL` is still typed by hand.**
+- **Seven checked rows still rest on hand-typed chrome strings.**
+- **The measuring build is `unrecorded` until a live `--save` can run.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4, 4, 6, 5.**
+
 ## 0.6.17
 
 ### The Pharmakon Release: a page that is not in its markup
