@@ -986,6 +986,12 @@ nothing at all, which is what the old single-token match hid.
 
 ## 0.6.0
 
+### Anagnorisis: one road into the page
+
+The 0.6 line is **Anagnorisis**. The word is the moment of recognition, when the thing in front of you turns out
+to be something else, and it names what this line kept finding: the page you fetched is not the page that renders.
+Each patch inside the line keeps its own name.
+
 ### The Nekyia Release: one road into the page
 
 The Nekyia is the book where Odysseus goes down to ask the dead what is coming. He does not shout into the dark: he
