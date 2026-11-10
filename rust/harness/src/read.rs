@@ -168,6 +168,58 @@ pub const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Bumped when extraction changes, because the cache key includes it and a stale extraction must not be served.
 pub const EXTRACTOR_VERSION: &str = "1";
 
+/// True when most of a page's words live inside its own script payloads, so the visible text is not the page: the
+/// browser builds the rest after the HTML arrives.
+///
+/// Words-in-script over words-in-visible-text, measured on four pages: sqlite.org 0.04, Hacker News 0.00, the Rust
+/// book 0.21, theverge.com 10.33. Two orders of magnitude separate the shapes, so the threshold sits in the middle
+/// of that gap rather than being tuned. On theverge.com the server HTML carries 3,048 words while a rendered
+/// extract carries 6,595; no markup parser finds words that were never sent, so escalating is both cheaper and
+/// more honest than returning `ok` with a third of the page.
+pub fn mostly_script_rendered(html: &str) -> bool {
+    fn words(text: &str) -> usize {
+        text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .filter(|w| w.chars().count() > 1)
+            .count()
+    }
+    // Only text between tags is visible; attribute values and tag names are not words a reader sees.
+    fn words_outside_tags(html: &str) -> usize {
+        let (mut total, mut run, mut in_tag) = (0usize, String::new(), false);
+        for c in html.chars() {
+            match c {
+                '<' => {
+                    total += words(&run);
+                    run.clear();
+                    in_tag = true;
+                }
+                '>' => in_tag = false,
+                _ if !in_tag => run.push(c),
+                _ => {}
+            }
+        }
+        total + words(&run)
+    }
+    let lower = html.to_ascii_lowercase();
+    let (mut blob, mut visible, mut cursor) = (0usize, String::new(), 0usize);
+    while let Some(open) = lower[cursor..].find("<script") {
+        let start = cursor + open;
+        visible.push_str(&html[cursor..start]);
+        let (Some(gt), Some(close)) = (
+            lower[start..].find('>').map(|i| start + i),
+            lower[start..].find("</script>").map(|i| start + i),
+        ) else {
+            cursor = html.len();
+            break;
+        };
+        if gt < close {
+            blob += words(&html[gt + 1..close]);
+        }
+        cursor = close + "</script>".len();
+    }
+    visible.push_str(&html[cursor.min(html.len())..]);
+    blob > 3 * words_outside_tags(&visible).max(1)
+}
+
 /// Decide what the bytes are. No header sniffing: the body decides, so a mislabelled `Content-Type` cannot
 /// route a PDF down the HTML path.
 pub fn sniff(bytes: &[u8]) -> Sniff {
@@ -1233,6 +1285,29 @@ pub fn read(state: Option<&Path>, url: &str, refresh: bool, allow_private: bool)
     states.push(format!("sniffed {sniffed:?}"));
     states.push(format!("path {path}"));
 
+    // A page whose words are mostly in its own scripts is not readable as markup. Escalate to the browser that is
+    // already here rather than returning `ok` with a third of the page, and say so when there is no browser.
+    if sniffed == Sniff::Html
+        && decided.is_none()
+        && mostly_script_rendered(&String::from_utf8_lossy(bytes))
+    {
+        states.push("client-rendered: most words are in script payloads".to_string());
+        if let Some(state_dir) = state {
+            return read_browser(Some(state_dir), url, &mut states);
+        }
+        states.push("state js-required".to_string());
+        return Reading {
+            url: url.to_string(),
+            path,
+            state: State::JsRequired,
+            states,
+            title: String::new(),
+            text: String::new(),
+            blocks: Vec::new(),
+            ms: started.elapsed().as_millis(),
+        };
+    }
+
     if let Some(state) = decided {
         states.push(format!("state {state}"));
         let out = Reading {
@@ -1540,6 +1615,32 @@ mod tests {
 <p>The WAL journal mode is enabled with a pragma.</p>
 <pre>PRAGMA journal_mode=WAL;</pre>
 </main><footer><a href="/c">Privacy</a></footer></body></html>"#;
+
+    #[test]
+    fn a_page_whose_words_are_in_its_scripts_is_not_read_as_markup() {
+        // The shape measured on the live pages: a normal page carries almost nothing in scripts, and a
+        // client-rendered page carries more there than in its body. The threshold sits in the middle of that gap.
+        let server_rendered = "<html><body><p>one two three four five six seven</p>\
+             <script>var a=1;</script></body></html>";
+        assert!(!mostly_script_rendered(server_rendered));
+        let mut rendered = String::from("<html><body><p>short body</p>");
+        rendered.push_str("<script>");
+        for _ in 0..40 {
+            rendered.push_str("\"headline here\",\"another headline here\",");
+        }
+        rendered.push_str("</script></body></html>");
+        assert!(mostly_script_rendered(&rendered));
+        // A page with no scripts at all is the ordinary case and must never escalate.
+        assert!(!mostly_script_rendered(
+            "<html><body>plain words here</body></html>"
+        ));
+        // Attribute values are not visible words, so a tag-heavy page must not look script-driven.
+        let tag_heavy = format!(
+            "<html><body><img alt=\"{}\" src=\"x\"></body></html>",
+            "word ".repeat(50)
+        );
+        assert!(!mostly_script_rendered(&tag_heavy));
+    }
 
     #[test]
     fn the_selector_names_every_refusal() {

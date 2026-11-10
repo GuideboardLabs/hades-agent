@@ -1,3 +1,61 @@
+## 0.6.17
+
+### The Pharmakon Release: a page that is not in its markup
+
+theverge.com read as `ok` at 2,689 words while a rendered extractor returned 6,595. I had written that gap up as an
+extraction weakness. It is not: the server HTML contains **3,048 words in total**, so no parser can find the rest.
+The page is built after it arrives.
+
+The generic test is the page's own shape, words inside `<script>` over words outside it:
+
+| page | script words | visible words | ratio |
+|---|---|---|---|
+| sqlite.org/wal.html | 188 | 5,062 | 0.04 |
+| news.ycombinator.com | 0 | 578 | 0.00 |
+| the rust book | 195 | 947 | 0.21 |
+| theverge.com | 31,478 | 3,048 | **10.33** |
+
+Two orders of magnitude separate the shapes, so `mostly_script_rendered` sits in the middle of that gap rather
+than being a tuned constant.
+
+**1354 tests, 15 ignored.** An HTML page over the line goes to the browser that is already here; with no browser
+it is named `js-required` with the reason, which is the same principle as the sandbox complaint that must never
+read as `ok`.
+
+### The correction this release carries
+
+**0.6.16 and every release before it listed "news front pages still lose half their rows" as an open defect. That
+claim was false.** I had measured characters, not content. In words, Hacker News is 534 against a rendered
+extractor's 535. The line is removed rather than carried forward, and this paragraph is the record of why.
+
+A `document` field holding the unpruned page was built to close the imagined gap and then reverted: on the live
+pages it added 1.4% to theverge.com and nothing to Hacker News, because pruning was never the cause.
+
+### The measurement
+
+```
+read-eval gold 1d9233b12b2529c5 measured-by unrecorded
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+```
+
+Unchanged: the reader's selection logic did not move, and the four forum rows are still unresolved behind the
+Stack Exchange rate limit.
+
+### Still not fixed
+
+- **`State::ALL` is still typed by hand.**
+- **Seven checked rows still rest on hand-typed chrome strings.**
+- **The measuring build is `unrecorded` until a live `--save` can run.**
+- **Reviews: 4, 7, 6, 6, 5, 6, 6, 4, 6, 4, 4, 6, 5.**
+
 ## 0.6.16
 
 ### The Elenchos Release: the line I typed was false, and the checker agreed with it
