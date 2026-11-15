@@ -19,8 +19,15 @@ pub fn fingerprint(text: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// The staging directory a proposal is written into.
+///
+/// This name is reserved: it is never a skill's own name (`pack_fit::RESERVED_SKILLS` refuses it), and
+/// the live loader skips the directory, because a proposal becomes a live skill only when a person's
+/// `skills promote` moves it out of here.
+pub const PROPOSED: &str = "proposed";
+
 pub fn proposed_dir(state: &Path) -> PathBuf {
-    state.join("skills").join("proposed")
+    state.join("skills").join(PROPOSED)
 }
 
 pub fn installed_dir(state: &Path) -> PathBuf {
@@ -252,6 +259,9 @@ fn directories_with_skill(dir: &Path) -> Vec<Skill> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| !name.starts_with('.'))
         })
+        // The staging directory is never an installed skill: it holds the proposals a shell or the
+        // learning loop wrote, which are live only after `skills promote`.
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some(PROPOSED))
         .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
         .filter_map(|path| {
             Some(Skill {
@@ -290,6 +300,12 @@ fn collect_skills(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with('.'))
         {
+            continue;
+        }
+        // `proposed` is the staging directory a proposal is written into, by the learning loop and by a
+        // chat's shell. A skill is live when a person promotes it out of there; walking into it would
+        // record an unreviewed instruction as part of the harness a generation captures.
+        if path.file_name().and_then(|name| name.to_str()) == Some(PROPOSED) {
             continue;
         }
         if path.is_dir() {
@@ -765,6 +781,30 @@ mod tests {
             found.path.display()
         );
         assert!(find(&state, "missing").is_none());
+    }
+
+    /// A staged proposal is not a live skill. The shell is allowed to write `skills/proposed/`, so the
+    /// live loader has to skip that directory by name: a directory-shaped proposal used to be walked into
+    /// and captured as an installed skill file, which is the gate a shell-authored
+    /// `state/skills/x/SKILL.md` bypassed.
+    #[test]
+    fn a_staged_proposal_is_not_a_live_skill_file() {
+        let state = scratch("proposed-not-live");
+        for at in ["skills/live", "skills/proposed/from-shell"] {
+            std::fs::create_dir_all(state.join(at)).expect("a skill directory");
+            std::fs::write(state.join(at).join("SKILL.md"), "---\nname: x\n---\n")
+                .expect("a skill");
+        }
+        std::fs::write(state.join("skills/proposed/SKILL.md"), "body").expect("a staged file");
+
+        let files = skill_files(&state);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].ends_with("skills/live/SKILL.md"), "{files:?}");
+        let installed: Vec<String> = installed(&state)
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(installed, vec!["live".to_string()], "{installed:?}");
     }
 
     /// The anti-drift for the staging rule: an installer's temporary directory sits beside its target and

@@ -2412,6 +2412,30 @@ fn argument(args: &Value, key: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// The cage a chat's shell runs under: the workspace, the state's scratch directory, and the staging
+/// directory a skill proposal is written to.
+///
+/// Skills are the one part of the state a model may write, and only as a proposal. A command that could
+/// write `state/skills/<name>/SKILL.md` would author an instruction for its own next session, past the
+/// propose → promote review and the `hades pack add --yes` gate; a measured install had exactly that
+/// grant. A proposal lands in `skills/proposed/`, which the live loader does not read, and only a
+/// person's `hades skills promote` moves it into `state/skills/`.
+///
+/// Both directories are made here rather than in the caller, because a Landlock rule for a path that
+/// does not exist fails the whole cage.
+fn chat_cage(world: &World) -> Result<crate::cage::Cage, String> {
+    let scratch = world.state.join("tmp");
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| format!("could not make the scratch directory: {error}"))?;
+    let proposed = crate::skills::proposed_dir(&world.state);
+    crate::scratch::state_dir(&proposed)
+        .map_err(|error| format!("could not make the skills directory: {error}"))?;
+    Ok(
+        crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network())
+            .also_writable(proposed),
+    )
+}
+
 /// Run one command for the chat.
 ///
 /// The command runs under a cage (see `Cage::chat`): the workspace and the state's scratch directory are
@@ -2439,18 +2463,14 @@ fn shell(args: &Value, world: &World, capture: &crate::journal::Capture<'_>) -> 
         .and_then(Value::as_u64)
         .unwrap_or(120)
         .clamp(1, 600);
+    let cage = match chat_cage(world) {
+        Ok(cage) => cage,
+        Err(said) => return said,
+    };
+    // The same directory `chat_cage` made and granted, handed to the runner as `$TMPDIR`: a caged
+    // program that writes a temp file needs a path it may write, and the one this process inherited is
+    // outside what the cage grants.
     let scratch = world.state.join("tmp");
-    if let Err(error) = std::fs::create_dir_all(&scratch) {
-        return format!("could not make the scratch directory: {error}");
-    }
-    let skills = world.state.join("skills");
-    if let Err(error) = std::fs::create_dir_all(&skills) {
-        return format!("could not make the skills directory: {error}");
-    }
-    let cage = crate::cage::Cage::chat_with(&world.root, &scratch, world.role.network())
-        // The skills directory is the agent's own state. A skill that cannot be installed there
-        // cannot be found by the skills tool, so the install step has to be able to write it.
-        .also_writable(skills);
     let deadline = Some(std::time::Duration::from_secs(seconds));
     // The command is run inside the capture, so what it changed is recorded against what was there
     // before it started. `shell` has no path to protect: the scan is what stands in for one.
@@ -3198,6 +3218,11 @@ fn collect_skills(dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) {
         {
             continue;
         }
+        // The staging directory holds proposals, and a proposal is not a live instruction: the shell may
+        // write there, and only `hades skills promote` moves one out of it.
+        if path.file_name().and_then(|name| name.to_str()) == Some(crate::skills::PROPOSED) {
+            continue;
+        }
         if path.is_dir() {
             collect_skills(&path, depth + 1, out);
         } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
@@ -3892,6 +3917,90 @@ mod tests {
             &|_, _| {},
         );
         assert!(listed.starts_with("Refused"), "{listed}");
+    }
+
+    /// A skill is an instruction the next session loads, so the shell must not be able to place a live
+    /// one: `cat > state/skills/x/SKILL.md` used to bypass the propose → promote gate and the
+    /// `pack add --yes` install. The shell may write a proposal, which the live loader does not read; a
+    /// person's `skills promote` still moves it live.
+    #[test]
+    fn a_chat_shell_can_propose_a_skill_but_not_install_one() {
+        let base = crate::scratch::root().join("agent-skill-gate");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("work");
+        let state = base.join("state");
+        std::fs::create_dir_all(&root).expect("a workspace");
+        std::fs::create_dir_all(&state).expect("a state");
+
+        let client = OpenAi::new("http://127.0.0.1:9/v1/chat/completions", "none");
+        let mut world = world_at(&root, Mode::Act, "chat:7");
+        // The state sits beside the workspace, as it does in a real install (`~/.hades` and
+        // `~/.hades/work`). Inside the workspace it would be writable by the workspace grant alone and
+        // the test would prove nothing about the skills directory.
+        world.state = state.clone();
+        world.skills = vec![state.join("skills")];
+
+        // Landlock is the mechanism, and a kernel without it cannot be asked to demonstrate this. The
+        // degradation is reported by `hades doctor` and is a property of the host, not of the code.
+        if crate::cage::abi() == 0 {
+            eprintln!(
+                "skipping the skill-gate check: this kernel has no Landlock (abi {}), so the cage is inert",
+                crate::cage::abi()
+            );
+            return;
+        }
+
+        let live = state.join("skills/live-from-shell");
+        let refused = execute(
+            "shell",
+            &json!({ "command": format!(
+                "mkdir -p {live} && printf x > {live}/SKILL.md && echo wrote",
+                live = live.display()
+            ) })
+            .to_string(),
+            &world,
+            &client,
+            &|_, _| {},
+        );
+        assert!(!refused.contains("wrote"), "{refused}");
+        assert!(refused.contains("Permission denied"), "{refused}");
+        assert!(
+            !live.join("SKILL.md").exists(),
+            "a live skill landed through the cage: the model authored an instruction for its own next session"
+        );
+
+        let proposed = state.join("skills/proposed/from-shell");
+        let wrote = execute(
+            "shell",
+            &json!({ "command": format!(
+                "mkdir -p {proposed} && printf '%s\\n' '---' 'name: from-shell' 'status: proposed' '---' 'body' > {proposed}/SKILL.md && echo wrote",
+                proposed = proposed.display()
+            ) })
+            .to_string(),
+            &world,
+            &client,
+            &|_, _| {},
+        );
+        assert!(wrote.contains("wrote"), "{wrote}");
+        assert!(
+            proposed.join("SKILL.md").is_file(),
+            "the proposal the shell wrote did not land"
+        );
+
+        // The live loader does not read the directory the shell may write.
+        let listed = skills(&json!({ "action": "list" }), &world);
+        assert!(!listed.contains("from-shell"), "{listed}");
+        assert!(
+            !crate::skills::skill_files(&state)
+                .iter()
+                .any(|file| file.ends_with("from-shell/SKILL.md")),
+            "a staged proposal was captured as a live skill file"
+        );
+
+        // The person-driven path still works, and then the skill is live.
+        crate::skills::promote_with(&state, "from-shell", false).expect("the promote path");
+        let listed = skills(&json!({ "action": "list" }), &world);
+        assert!(listed.contains("from-shell"), "{listed}");
     }
 
     #[test]
