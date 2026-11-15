@@ -30,6 +30,7 @@ use crate::cron;
 use crate::daemon;
 use crate::retry;
 use serde_json::{Map, Value, json};
+use session_tree::valid_session;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -1031,16 +1032,6 @@ fn limit_of(query: &str, default: usize, max: usize) -> Result<usize, Reply> {
         limit = Some(parsed.clamp(1, max));
     }
     Ok(limit.unwrap_or(default))
-}
-
-/// A session id becomes a file name under `<state>/sessions`, so it is ours to check: `SessionId::new`
-/// accepts any string and a `/` or a `..` would name a file outside the directory.
-fn valid_session(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '-' || character == '_'
-        })
 }
 
 /// Compare without an early exit. The length is observable; the bytes are not.

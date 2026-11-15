@@ -35,6 +35,19 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// Whether a string may be a session id that arrived from outside.
+///
+/// An id becomes a file name under `<state>/sessions`, so it is checked where the id type lives rather
+/// than once per surface. [`SessionId::new`] stays infallible for ids read back from disk; anything a
+/// person or a socket supplies is checked with this first.
+pub fn valid_session(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+}
+
 /// What an entry is. One enum, so a typo cannot invent a state, and an unknown kind is a load error
 /// rather than a new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,12 +154,27 @@ impl std::error::Error for Fault {}
 
 #[cfg(test)]
 mod tests {
-    use super::Kind;
+    use super::{Kind, valid_session};
 
     #[test]
     fn plan_is_a_kind_with_one_spelling() {
         assert_eq!(Kind::Plan.as_str(), "plan");
         assert_eq!(Kind::parse("plan"), Some(Kind::Plan));
         assert_eq!(Kind::parse("Plan"), None);
+    }
+
+    /// The one rule every surface imports: a session id is a plain file name.
+    #[test]
+    fn a_session_id_is_a_plain_file_name() {
+        assert!(valid_session("http-1"));
+        assert!(valid_session("tg-123456"));
+        assert!(valid_session("daemon"));
+        assert!(!valid_session(""));
+        assert!(!valid_session(".."));
+        assert!(!valid_session("a/b"));
+        assert!(!valid_session("../../x"));
+        assert!(!valid_session("a.b"));
+        assert!(!valid_session(&"a".repeat(65)));
+        assert!(valid_session(&"a".repeat(64)));
     }
 }

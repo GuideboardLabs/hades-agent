@@ -17,7 +17,7 @@ pub use clock::SystemClock;
 pub use seams::{Clock, SessionStore};
 pub use session::Session;
 pub use store::FileStore;
-pub use types::{Entry, EntryId, Fault, Kind, SessionId};
+pub use types::{Entry, EntryId, Fault, Kind, SessionId, valid_session};
 
 /// The schema version written on every entry. A newer version is a load error, never a guess.
 pub const SCHEMA_VERSION: u64 = 1;

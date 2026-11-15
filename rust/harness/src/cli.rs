@@ -4730,6 +4730,11 @@ fn session_cmd(args: &[String]) -> Result<(String, i32), String> {
                 .positional
                 .get(1)
                 .ok_or_else(|| "show needs a session id".to_string())?;
+            if !session_tree::valid_session(id) {
+                return Err(format!(
+                    "`{id}` is not a session id: a name is up to 64 letters, digits, `-` or `_`."
+                ));
+            }
             let store = session_tree::FileStore::new(&dir);
             let session = session_tree::Session::load(
                 store,
@@ -6552,6 +6557,21 @@ pub(crate) fn assemble(
     ),
     String,
 > {
+    // The session id is the cheapest thing to refuse and the most dangerous to accept: it becomes
+    // `<state>/sessions/<id>.jsonl`, and the same field arrives from a socket request and from a flag.
+    // Checked first, before a model is chosen or a config is read, so a run that cannot have a legal
+    // session never reaches the part that costs something.
+    let session_id = flags
+        .named
+        .get("session")
+        .cloned()
+        .unwrap_or_else(|| default_session.to_string());
+    if !session_tree::valid_session(&session_id) {
+        return Err(format!(
+            "`{session_id}` is not a session id: a name is up to 64 letters, digits, `-` or `_`. Nothing \
+             was started."
+        ));
+    }
     // Read once: the root and the model both come from it, and a config that changed between the two
     // reads would assemble a run that is rooted in one tree and talking to the other's model.
     let config = config_of(flags)?;
@@ -6641,12 +6661,6 @@ pub(crate) fn assemble(
             policy::shipped().join(" or ")
         )
     })?;
-
-    let session_id = flags
-        .named
-        .get("session")
-        .cloned()
-        .unwrap_or_else(|| default_session.to_string());
 
     let cage = match flags.named.get("cage").map(String::as_str) {
         None => CageMode::On,
@@ -8233,6 +8247,13 @@ pub(crate) fn fork_session(
     name: &str,
     at: Option<u64>,
 ) -> Result<(String, PathBuf, usize), String> {
+    // The same rule the daemon and the HTTP surface apply: a fork names one log, not a path.
+    if !session_tree::valid_session(name) {
+        return Err(format!(
+            "`{name}` is not a session id: a name is up to 64 letters, digits, `-` or `_`. Nothing was \
+             forked."
+        ));
+    }
     let store = session_tree::FileStore::new(state.join("sessions"));
     use session_tree::SessionStore as _;
     let id = session_tree::SessionId::new(name.to_string());

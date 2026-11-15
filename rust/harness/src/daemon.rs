@@ -276,10 +276,43 @@ impl Daemon {
                 state.join("sessions").display()
             ))
         })?;
-        if let Some(parent) = socket.parent() {
+        if let Some(parent) = socket
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let existed = parent.exists();
             fs::create_dir_all(parent).map_err(|error| {
                 Fault::harness(format!("could not make {}: {error}", parent.display()))
             })?;
+            // A directory this daemon made is this user's alone. `create_dir_all` takes its mode from
+            // the caller's umask, and a group-writable directory lets somebody else replace the socket
+            // name even when the socket itself is 0600.
+            if !existed {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(
+                    |error| {
+                        Fault::harness(format!(
+                            "could not make {} private: {error}",
+                            parent.display()
+                        ))
+                    },
+                )?;
+            }
+            if let Ok(meta) = fs::metadata(parent) {
+                use std::os::unix::fs::PermissionsExt as _;
+                if meta.permissions().mode() & 0o022 != 0 {
+                    // Said out loud rather than refused: a socket in a shared directory (a test's
+                    // temp dir, a deliberate shared run dir) is still reachable by its own 0600 mode,
+                    // and refusing would break a documented `--socket /tmp/...`. Warn because the
+                    // directory is what decides whether the name can be swapped.
+                    eprintln!(
+                        "hades daemon: warning: {} is writable by group or other; the socket inside it \
+                         is 0600, but whoever can write the directory can replace its name. Use a 0700 \
+                         directory.",
+                        parent.display()
+                    );
+                }
+            }
         }
         // A socket file left behind by a dead daemon would make `bind` fail with "address in use" forever.
         // The pid file is the only thing that distinguishes a live one from a dead one, so it is checked
@@ -324,23 +357,7 @@ impl Daemon {
     /// The same loop with the watchdog's interval named, so a test can watch one tick without waiting a
     /// second for it. The interval is the only thing a caller can change about the loop.
     fn serve_every(self, every: Duration) -> Result<(), Fault> {
-        let listener = UnixListener::bind(&self.socket).map_err(|error| {
-            Fault::harness(format!(
-                "could not bind {}: {error}{}",
-                self.socket.display(),
-                if live(&self.state).is_some() {
-                    " (another daemon is running under this state directory)"
-                } else {
-                    ""
-                }
-            ))
-        })?;
-        listener.set_nonblocking(true).map_err(|error| {
-            Fault::harness(format!(
-                "could not set {} non-blocking: {error}",
-                self.socket.display()
-            ))
-        })?;
+        let listener = self.listen()?;
 
         let announced = json!({
             "pid": std::process::id(),
@@ -392,9 +409,53 @@ impl Daemon {
         Ok(())
     }
 
+    /// Bind the socket and close its door before anyone can connect.
+    ///
+    /// The listener is created under the caller's umask, so a shell at `002` leaves a socket another
+    /// user in the group can write to, and writing to this socket is submitting work and answering
+    /// approvals. The mode is set here, between `bind` and the first `accept`.
+    fn listen(&self) -> Result<UnixListener, Fault> {
+        let listener = UnixListener::bind(&self.socket).map_err(|error| {
+            Fault::harness(format!(
+                "could not bind {}: {error}{}",
+                self.socket.display(),
+                if live(&self.state).is_some() {
+                    " (another daemon is running under this state directory)"
+                } else {
+                    ""
+                }
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Err(error) = fs::set_permissions(&self.socket, fs::Permissions::from_mode(0o600))
+            {
+                let _ = fs::remove_file(&self.socket);
+                return Err(Fault::harness(format!(
+                    "could not make {} private: {error}",
+                    self.socket.display()
+                )));
+            }
+        }
+        listener.set_nonblocking(true).map_err(|error| {
+            Fault::harness(format!(
+                "could not set {} non-blocking: {error}",
+                self.socket.display()
+            ))
+        })?;
+        Ok(listener)
+    }
+
     /// One connection: read one request, do it, answer. The two ops that keep writing (`submit` and `watch`)
     /// write their own lines and answer with nothing.
     fn handle(self: Arc<Self>, mut stream: UnixStream) -> Result<(), Fault> {
+        // The kernel reports who is on the other end. The socket mode is the first gate; this one holds
+        // even where the mode was changed, or where the path was replaced by a name somebody else made.
+        if let Err(said) = admit(&stream) {
+            let _ = writeln!(stream, "{}", json!({"ok": false, "error": said}));
+            return Ok(());
+        }
         let mut line = String::new();
         let mut reader =
             BufReader::new(stream.try_clone().map_err(|error| {
@@ -1074,8 +1135,13 @@ impl Daemon {
     /// after the fact is reading the same file a watcher that connected first is reading.
     fn watch(&self, request: &Value, stream: &mut UnixStream) -> Result<(), Fault> {
         let session = text(request, "session");
-        if session.is_empty() {
-            return Err(Fault::harness("watch needs a `session`".to_string()));
+        // The id becomes a file name under `sessions/`, and this field is chosen by a client. The rule
+        // is the same one `httpd` and `assemble` use, declared beside the id type.
+        if !session_tree::valid_session(&session) {
+            return Err(Fault::harness(format!(
+                "`{session}` is not a session id: a name is up to 64 letters, digits, `-` or `_`. Nothing \
+                 was watched."
+            )));
         }
         let log = self.state.join("sessions").join(format!("{session}.jsonl"));
         if !log.exists() {
@@ -1340,6 +1406,64 @@ fn count(payload: &Value, key: &str) -> Option<u64> {
 fn send_failed(error: std::io::Error) -> Fault {
     // A client that went away is not a fault worth reporting to anybody: there is nobody left to hear it.
     Fault::harness(format!("the client went away: {error}"))
+}
+
+/// Who may talk to the daemon: the user who started it, and nobody else.
+///
+/// A named function because the case that matters, a foreign uid, cannot be staged in a test without a
+/// second account; the decision is testable even though the staging is not.
+fn peer_allowed(peer: u32, own: u32) -> bool {
+    peer == own
+}
+
+/// This process's effective uid, which is the identity the socket and every state file belong to.
+fn own_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and no side effects.
+    unsafe { libc::geteuid() }
+}
+
+/// The uid the kernel reports for the other end of a connected unix socket (SO_PEERCRED).
+///
+/// `UnixStream::peer_cred` is still unstable, so this is the one call the standard library does not
+/// offer. The socket's own fd is the argument; libc is already a dependency.
+fn peer_uid(stream: &UnixStream) -> Result<u32, String> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the fd is owned by `stream` for the duration of the call, and both out-pointers name
+    // initialised locals of the size passed in.
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "could not read the peer's uid: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(cred.uid)
+}
+
+/// Refuse a connection that is not this user, before a byte of its request is read.
+fn admit(stream: &UnixStream) -> Result<(), String> {
+    let own = own_uid();
+    let peer = peer_uid(stream)?;
+    if peer_allowed(peer, own) {
+        return Ok(());
+    }
+    Err(format!(
+        "this daemon answers uid {own} only; this connection is uid {peer}. Nothing was done."
+    ))
 }
 
 #[cfg(test)]
@@ -2311,5 +2435,170 @@ mod watchdog_tests {
         );
         assert!(stopped(&state).is_empty(), "{:?}", stopped(&state));
         let _ = std::fs::remove_dir_all(&state);
+    }
+}
+
+/// The socket's own door, and the door of each connection through it. Separate from the watchdog tests
+/// because every one of these is about who can reach the daemon, not about what a run is doing.
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::net::UnixStream;
+
+    fn scratch(name: &str) -> PathBuf {
+        let base = crate::scratch::root().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        base
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+            .mode()
+            & 0o777
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(path.exists(), "{} never appeared", path.display());
+    }
+
+    fn ask(stream: &mut UnixStream, request: Value) -> Value {
+        writeln!(stream, "{request}").expect("a request");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("clone"))
+            .read_line(&mut line)
+            .expect("a reply");
+        serde_json::from_str(line.trim()).expect("a JSON reply")
+    }
+
+    fn shutdown(socket: &Path, served: std::thread::JoinHandle<Result<(), Fault>>) {
+        let mut stream = UnixStream::connect(socket).expect("connect to shut down");
+        let _ = writeln!(stream, "{}", json!({"op": "shutdown", "by": "test"}));
+        drop(stream);
+        served
+            .join()
+            .expect("the serving thread")
+            .expect("a clean exit");
+    }
+
+    /// The mode a shell with `umask 002` leaves: a socket another user in the group can write to, which
+    /// for a socket means another user can submit work and answer approvals. The daemon has to set both
+    /// modes itself, and a parent directory it creates is part of the same door.
+    #[test]
+    fn a_bound_socket_is_private_and_its_fresh_parent_is_too() {
+        let _held = crate::test_env::hold();
+        let base = scratch("socket-mode");
+        let state = base.join("state");
+        let dir = base.join("run");
+        let socket = dir.join("daemon.sock");
+
+        // SAFETY: the umask is process-wide; this test sets it for the length of one bind and restores it
+        // before it asserts, and `test_env::hold` keeps the tests that rewrite process state out of it.
+        let old = unsafe { libc::umask(0o002) };
+        let daemon = Daemon::bind(&state, &socket).expect("bind");
+        let parent = mode_of(&dir);
+        let watched = socket.clone();
+        let served = std::thread::spawn(move || daemon.serve_every(Duration::from_millis(5)));
+        wait_for(&socket);
+        let mode = mode_of(&socket);
+        unsafe { libc::umask(old) };
+
+        shutdown(&watched, served);
+        assert_eq!(
+            parent, 0o700,
+            "a parent the daemon created took the caller's umask, so another user can rename or replace \
+             the socket"
+        );
+        assert_eq!(
+            mode, 0o600,
+            "the socket's own mode admits a same-group client, which can submit work and answer approvals"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A session id becomes `<state>/sessions/<id>.jsonl`. `../../x` read or appended outside the state
+    /// directory, and a connected client is exactly who must not choose that path.
+    #[test]
+    fn a_submit_whose_session_id_climbs_is_refused_and_writes_nothing() {
+        let base = scratch("socket-submit-session");
+        let state = base.join("state");
+        let socket = base.join("daemon.sock");
+        let daemon = Daemon::bind(&state, &socket).expect("bind");
+        let watched = socket.clone();
+        let served = std::thread::spawn(move || daemon.serve_every(Duration::from_millis(5)));
+        wait_for(&socket);
+
+        let mut stream = UnixStream::connect(&socket).expect("connect");
+        let reply = ask(
+            &mut stream,
+            json!({"op": "submit", "session": "../../x", "goal": "say hi"}),
+        );
+        drop(stream);
+        shutdown(&watched, served);
+
+        assert_eq!(reply["ok"], json!(false), "{reply}");
+        let said = reply["error"].as_str().unwrap_or_default();
+        assert!(
+            said.contains("not a session id"),
+            "a climbing session id was not refused by name: {reply}"
+        );
+        assert!(
+            !base.join("x.jsonl").exists(),
+            "a session log was written outside sessions/ from a client-chosen id"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `watch` builds the same path from the same field, so it takes the same rule.
+    #[test]
+    fn a_watch_whose_session_id_climbs_is_refused() {
+        let base = scratch("socket-watch-session");
+        let state = base.join("state");
+        let socket = base.join("daemon.sock");
+        let daemon = Daemon::bind(&state, &socket).expect("bind");
+        let watched = socket.clone();
+        let served = std::thread::spawn(move || daemon.serve_every(Duration::from_millis(5)));
+        wait_for(&socket);
+
+        let mut stream = UnixStream::connect(&socket).expect("connect");
+        let reply = ask(&mut stream, json!({"op": "watch", "session": "../../x"}));
+        drop(stream);
+        shutdown(&watched, served);
+
+        let said = reply["error"].as_str().unwrap_or_default();
+        assert!(
+            said.contains("not a session id"),
+            "a climbing session id reached the filesystem check instead of the id rule: {reply}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The connection's credential is the authority, and it is a decision, not a side effect: a foreign
+    /// uid is refused whether the socket mode is right or not.
+    #[test]
+    fn a_peer_is_judged_by_its_uid() {
+        let me = own_uid();
+        assert!(
+            peer_allowed(me, me),
+            "the user who started the daemon was refused"
+        );
+        assert!(
+            !peer_allowed(me.wrapping_add(1), me),
+            "a foreign uid was admitted"
+        );
+        let (ours, _theirs) = UnixStream::pair().expect("a socket pair");
+        assert_eq!(
+            peer_uid(&ours).expect("peer credentials on Linux"),
+            me,
+            "the kernel did not report this process's uid for its own socket"
+        );
     }
 }
