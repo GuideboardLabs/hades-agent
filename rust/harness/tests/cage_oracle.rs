@@ -319,12 +319,14 @@ fn the_tool_says_what_it_confines() {
 
 #[test]
 fn the_report_names_the_socket_limit() {
-    // A Docker socket is a way to become root on the host, and Landlock's filesystem rules do not close a
-    // pathname Unix socket before ABI 9, and never close an abstract one. A cage that implied otherwise
-    // would be lying about what it contains; the report says the gap in words.
+    // A Docker socket is a way to become root on the host. Landlock's filesystem rules do not close a
+    // pathname Unix socket before ABI 9, and never close an abstract one, so the cage refuses
+    // `socket(AF_UNIX)` at the syscall instead. The report says which mechanism is doing the work,
+    // because "landlock" alone would imply more than it does.
     let (_base, root, _outside) = scratch("report");
     let report = Cage::around(&root).report();
-    assert!(report.contains("unix sockets"), "{report}");
+    assert!(report.contains("unix sockets: closed"), "{report}");
+    assert!(report.contains("seccomp"), "{report}");
     assert!(report.contains("landlock abi"), "{report}");
     assert!(report.contains("tcp:"), "{report}");
 }
@@ -376,10 +378,10 @@ fn the_socket_right_is_handled_only_where_the_kernel_has_it() {
         0
     );
     if harness::cage::abi() < 9 {
+        // Below ABI 9 Landlock has no socket rule at all; the cage's own note says which mechanism is
+        // doing the work rather than implying Landlock does it.
         assert!(
-            Cage::around("/work")
-                .socket_note()
-                .contains("not contained"),
+            Cage::around("/work").socket_note().contains("seccomp"),
             "{}",
             Cage::around("/work").socket_note()
         );
@@ -397,6 +399,224 @@ fn strict_mode_does_not_grant_run() {
         cage.grants_read(Path::new("/usr")),
         "the system a program needs to start is still readable"
     );
+}
+
+/// The chat shell's path list, without running anything.
+///
+/// The measurement that decided this: on Linux 7.0.0 with Landlock ABI 8, a caged child connected to
+/// `/run/docker.sock`, to `/run/user/1000/bus`, and to a socket under a directory no rule named, in the
+/// broad cage and in the strict one alike. The path list is not the boundary for sockets on an ABI-8
+/// kernel, which is why the chat cage drops `/run` for the paths it can see and refuses `socket(AF_UNIX)`
+/// for the ones it cannot.
+#[test]
+fn the_chat_cage_does_not_grant_run_and_keeps_the_resolver() {
+    let (_base, root, _outside) = scratch("chat-paths");
+    let scratch_dir = root.join("tmp");
+    std::fs::create_dir_all(&scratch_dir).expect("a scratch");
+    let cage = Cage::chat(&root, &scratch_dir).with_runtimes();
+    assert!(
+        !cage.grants_read(Path::new("/run")),
+        "the chat shell still reads /run: {}",
+        cage.describe()
+    );
+    assert!(
+        !cage.grants_read(Path::new("/run/docker.sock")),
+        "a host control socket is still on the readable list: {}",
+        cage.describe()
+    );
+    // `/etc/resolv.conf` is a symlink into `/run/systemd/resolve` on a systemd host, so the named grants
+    // are what keeps a name lookup working once the broad grant is gone.
+    for resolver in ["/run/systemd/resolve", "/run/nscd"] {
+        let path = Path::new(resolver);
+        if path.exists() {
+            assert!(
+                cage.grants_read(path),
+                "{resolver} is not granted: {}",
+                cage.describe()
+            );
+        }
+    }
+}
+
+/// A caged program cannot dial a Unix socket, whichever directory it lives in.
+#[test]
+fn a_caged_program_cannot_reach_a_unix_socket() {
+    let (_base, root, outside) = scratch("sock");
+    // The worst case for the claim: the socket sits inside the directory the cage was told to treat as
+    // writable. A path rule cannot help there, so only the syscall-level refusal can.
+    let granted = root.join("tmp");
+    std::fs::create_dir_all(&granted).expect("a scratch");
+    let inside = granted.join("ctl.sock");
+    let unattached = outside.join("ctl.sock");
+    for socket in [&inside, &unattached] {
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+        std::mem::forget(listener);
+    }
+
+    let Some(python) = python() else {
+        println!("skipping: no system python3 for the caged side of this test");
+        return;
+    };
+    let program = format!(
+        "{python} -c 'import socket,sys\n\
+         for p in sys.argv[1:]:\n\
+         \x20   try:\n\
+         \x20       s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(2);s.connect(p)\n\
+         \x20       print(\"CONNECTED\",p);s.close()\n\
+         \x20   except OSError as e:\n\
+         \x20       print(\"REFUSED\",p,e.errno,e.strerror)' {} {}",
+        inside.display(),
+        unattached.display()
+    );
+    let run = |cage: Option<&Cage>| {
+        harness::command::run_within(
+            &program,
+            &root,
+            8192,
+            cage,
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .expect("a run")
+        .output
+    };
+
+    let chat = Cage::chat(&root, &granted).with_runtimes();
+    let caged = run(Some(&chat));
+    for socket in [&inside, &unattached] {
+        assert!(
+            caged.contains(&format!("REFUSED {} 13", socket.display())),
+            "a caged program reached {}: {caged}",
+            socket.display()
+        );
+    }
+
+    // The governed run's shell is the same program under a different cage, so it is closed too.
+    let governed = run(Some(&Cage::around(&root).also_writable(&granted)));
+    assert!(
+        governed.contains(&format!("REFUSED {} 13", inside.display())),
+        "a governed run's program reached {}: {governed}",
+        inside.display()
+    );
+
+    // The twin: the same program, the same socket, with the refusal lifted. Without this, "refused"
+    // could be a missing interpreter or a broken path rather than the cage.
+    let open = caged_open(&chat, &program, &root);
+    assert!(
+        open.contains(&format!("CONNECTED {}", inside.display())),
+        "the same connect failed with the refusal lifted, so the test proves nothing: {open}"
+    );
+
+    // And a host control socket, when this host has one, is refused the same way.
+    for control in harness::cage::SOCKETS.iter().map(Path::new) {
+        if !control.exists() {
+            continue;
+        }
+        let attempt = format!(
+            "{python} -c 'import socket\ntry:\n\x20   s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(\"{}\");print(\"CONNECTED\")\nexcept OSError as e:\n\x20   print(\"REFUSED\",e.errno)'",
+            control.display()
+        );
+        let refused = harness::command::run_within(
+            &attempt,
+            &root,
+            8192,
+            Some(&chat),
+            Some(std::time::Duration::from_secs(20)),
+        )
+        .expect("a run")
+        .output;
+        assert!(
+            refused.contains("REFUSED 13"),
+            "a caged program reached {}: {refused}",
+            control.display()
+        );
+    }
+}
+
+/// The same program with the socket refusal lifted, as the twin for the test above.
+fn caged_open(cage: &Cage, program: &str, root: &Path) -> String {
+    harness::command::run_within(
+        program,
+        root,
+        8192,
+        Some(&cage.clone().allow_unix_sockets()),
+        Some(std::time::Duration::from_secs(30)),
+    )
+    .expect("a run")
+    .output
+}
+
+/// A name lookup still works in the chat cage, and so does the file it reads through.
+///
+/// Dropping `/run` from the readable set removes `/etc/resolv.conf` with it on a systemd host, because
+/// that file is a symlink to `/run/systemd/resolve/stub-resolv.conf`. The named resolver grants are what
+/// keeps a clone, an install or a fetch from failing with a DNS error that looks like a broken network.
+#[test]
+fn name_lookup_still_works_in_the_chat_cage() {
+    let (_base, root, _outside) = scratch("dns");
+    let scratch_dir = root.join("tmp");
+    std::fs::create_dir_all(&scratch_dir).expect("a scratch");
+    let Some(python) = python() else {
+        println!("skipping: no system python3 for the caged side of this test");
+        return;
+    };
+    let program = format!(
+        "{python} -c 'import socket;print(\"ADDR\", socket.getaddrinfo(\"example.com\", 80)[0][4][0])'"
+    );
+    // The guard: if this host cannot resolve the name without a cage, the cage is not what failed.
+    let open = harness::command::run_within(
+        &program,
+        &root,
+        8192,
+        None,
+        Some(std::time::Duration::from_secs(20)),
+    )
+    .expect("a run");
+    if !open.passed() || !open.output.contains("ADDR") {
+        println!(
+            "skipping: this host cannot resolve example.com without a cage: {}",
+            open.output
+        );
+        return;
+    }
+
+    let cage = Cage::chat(&root, &scratch_dir).with_runtimes();
+    let caged = harness::command::run_within(
+        &program,
+        &root,
+        8192,
+        Some(&cage),
+        Some(std::time::Duration::from_secs(20)),
+    )
+    .expect("a run");
+    assert!(
+        caged.passed() && caged.output.contains("ADDR"),
+        "name lookup broke inside the chat cage: {}",
+        caged.output
+    );
+    let resolv = harness::command::run_within(
+        "cat /etc/resolv.conf",
+        &root,
+        8192,
+        Some(&cage),
+        Some(std::time::Duration::from_secs(10)),
+    )
+    .expect("a run");
+    assert!(
+        resolv.passed(),
+        "the resolver's own file is unreadable inside the chat cage: {}",
+        resolv.output
+    );
+}
+
+/// An interpreter a caged program can start.
+///
+/// The `python3` this machine's `PATH` carries is a virtual environment under the home directory, and the
+/// cage denies the home by design, so a test that used it would fail with a missing interpreter and prove
+/// nothing about the cage. The system interpreter under `/usr` is the one a caged program has.
+fn python() -> Option<&'static str> {
+    ["/usr/bin/python3", "/usr/bin/python"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
 }
 
 /// A scratch base inside this crate's own `target/`, never the machine's temp directory.

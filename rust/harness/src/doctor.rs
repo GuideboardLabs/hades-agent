@@ -52,6 +52,22 @@ pub fn security_findings(root: &Path) -> Vec<Finding> {
     let mut found = Vec::new();
     let cage = crate::cage::Cage::around(root);
     found.push(Finding::ok("cage", cage.report()));
+    // The run cage keeps `/run` readable, and the account is in the `docker` group on a host set up like
+    // this one. The sockets there are not reachable from a caged program (the cage refuses
+    // `socket(AF_UNIX)`), so the grant is files rather than control. It is still worth a line that says
+    // both halves: what is readable, and what is standing between that and the daemon.
+    if let Some(control) = reachable_group()
+        && cage.grants_read(Path::new("/run"))
+    {
+        found.push(Finding::warn(
+            "run",
+            format!(
+                "this cage reads /run and this account is in the `{control}` group: a caged program \
+                 cannot dial the socket (the cage refuses socket(AF_UNIX)), but everything outside the \
+                 cage can, so the read grant is the reason this is said out loud"
+            ),
+        ));
+    }
     found.push(Finding::ok(
         "safety floor",
         "command-text heuristic; not a sandbox (the cage is the boundary)",
@@ -61,23 +77,105 @@ pub fn security_findings(root: &Path) -> Vec<Finding> {
     found
 }
 
-/// One warning per Unix socket a caged program could reach. A socket that is not there is not a finding.
+/// One line per Unix socket the host has, saying what the cage does about it and whether this account could
+/// use it outside the cage. A socket that is not there is not a finding.
+///
+/// The old text said a caged program could reach it, which was true until the cage learned to refuse
+/// `socket(AF_UNIX)`; a doctor that kept saying so would be the sort of reassurance that is worse than none.
 pub fn socket_findings(candidates: &[PathBuf]) -> Vec<Finding> {
     let abi = crate::cage::abi();
     crate::cage::scan_sockets(candidates)
         .into_iter()
         .filter(|(_, state)| *state == crate::cage::SocketState::Present)
         .map(|(path, _)| {
-            Finding::warn(
-                "socket",
-                format!(
-                    "unix socket at {}: a caged program can reach it and landlock abi {abi} does not \
-                     refuse the connect (use `--cage strict` to drop /run)",
-                    path.display()
+            let group = socket_group(&path);
+            match group {
+                Some(group) if in_group(&group) => Finding::warn(
+                    "socket",
+                    format!(
+                        "unix socket at {}: a caged program cannot dial it (the cage refuses \
+                         socket(AF_UNIX), landlock abi {abi} adds no rule of its own), and this account is \
+                         in the `{group}` group, so anything that runs outside the cage gets what the \
+                         socket gives",
+                        path.display()
+                    ),
                 ),
-            )
+                _ => Finding::ok(
+                    "socket",
+                    format!(
+                        "unix socket at {}: a caged program cannot dial it (the cage refuses \
+                         socket(AF_UNIX)); this account is not in the group that owns it",
+                        path.display()
+                    ),
+                ),
+            }
         })
         .collect()
+}
+
+/// The group that owns a socket, by name, when `/etc/group` names its gid.
+fn socket_group(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let gid = std::fs::metadata(path).ok()?.gid();
+        if let Ok(text) = std::fs::read_to_string("/etc/group") {
+            for line in text.lines() {
+                let mut fields = line.split(':');
+                let name = fields.next().unwrap_or("");
+                let _password = fields.next();
+                if fields.next().and_then(|id| id.parse::<u32>().ok()) == Some(gid) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether this process is a member of `group`, by the primary id or a supplementary one.
+///
+/// Membership is the fact that decides whether a socket is reachable outside the cage, and the group file's
+/// member list is not it: a login's group set comes from `/etc/group` and from the account database, and the
+/// kernel's own set (`getgroups`) is the one that decides an access check. So the group is resolved to a gid
+/// through `/etc/group` and the gid is looked for in this process's set.
+pub fn in_group(group: &str) -> bool {
+    let mut gids: Vec<libc::gid_t> = Vec::new();
+    // SAFETY: `getgid` has no preconditions. `getgroups` is asked for the count first, then fills a buffer of
+    // exactly that size; a shrinking set between the two calls reports fewer than the buffer holds, which is
+    // truncated rather than read past.
+    unsafe {
+        gids.push(libc::getgid());
+        let count = libc::getgroups(0, std::ptr::null_mut());
+        if count > 0 {
+            let mut buffer = vec![0 as libc::gid_t; count as usize];
+            let filled = libc::getgroups(count, buffer.as_mut_ptr());
+            if filled > 0 {
+                buffer.truncate(filled as usize);
+                gids.extend(buffer);
+            }
+        }
+    }
+    let Ok(text) = std::fs::read_to_string("/etc/group") else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next().unwrap_or("");
+        let _password = fields.next();
+        let id = fields.next().and_then(|id| id.parse::<libc::gid_t>().ok());
+        name == group && id.is_some_and(|id| gids.contains(&id))
+    })
+}
+
+/// The group of the first host control socket this account is in, when there is one.
+fn reachable_group() -> Option<String> {
+    crate::cage::SOCKETS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .filter_map(|path| socket_group(&path))
+        .find(|group| in_group(group))
 }
 
 /// The checks, in the order a person would debug them. `home` is the Hades home, `config` the path the CLI
@@ -607,7 +705,10 @@ mod tests {
     }
 
     #[test]
-    fn a_reachable_docker_socket_is_a_warning_and_an_absent_one_is_not() {
+    fn a_socket_this_accounts_group_owns_is_a_warning_and_an_absent_one_is_not() {
+        // The warning is no longer "the cage cannot close this": the cage refuses `socket(AF_UNIX)`, so a
+        // caged program cannot dial it at all. What is left is a standing risk about everything that runs
+        // *outside* the cage, which is why the owning group is what decides the level.
         let home = scratch("socket");
         let sock = home.join("docker.sock");
         std::fs::write(&sock, b"").expect("a socket file");
@@ -615,9 +716,31 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].level, Level::Warn);
         assert!(found[0].detail.contains("docker.sock"), "{:?}", found[0]);
-        // The report names the limit rather than implying the cage closes it.
+        assert!(
+            found[0].detail.contains("cannot dial it"),
+            "the line says what the cage does: {:?}",
+            found[0]
+        );
         let (text, _) = render(&found);
         assert!(text.contains("unix socket"), "{text}");
+    }
+
+    #[test]
+    fn a_run_grant_beside_a_socket_this_account_can_use_is_said_out_loud() {
+        // The measured state of this host: `/run/docker.sock` is owned by a group the account is in, and the
+        // run cage grants `/run`. The cage closes the connect, and the grant is still worth a line, because
+        // it is the difference between "a caged program cannot" and "nothing can".
+        let Some(group) = reachable_group() else {
+            println!("skipping: no host control socket belongs to a group this account is in");
+            return;
+        };
+        let found = security_findings(Path::new("/work"));
+        assert!(
+            found.iter().any(|finding| finding.name == "run"
+                && finding.level == Level::Warn
+                && finding.detail.contains(&group)),
+            "the /run grant beside a reachable {group} socket was not mentioned: {found:?}"
+        );
     }
 
     #[test]

@@ -2419,6 +2419,12 @@ fn argument(args: &Value, key: &str) -> Option<String> {
 /// is not readable. A chat is where a fetched page can talk to the model, so the read boundary is the
 /// thing that keeps a page from asking for a key and getting it.
 ///
+/// The cage is the strict one: `/run` is not readable, and a Unix socket cannot be created inside it at all.
+/// That second half is the one that matters most. A measured probe on this kernel (Landlock ABI 8) watched a
+/// caged shell answer `/run/docker.sock` through the path grant, which on an account in the `docker` group is
+/// the host's root behind one prompt-injected command; the path list cannot stop it, so the cage refuses
+/// `socket(AF_UNIX)` itself.
+///
 /// The deadline is the command runner's own: it owns the process group and the pipes, so a shell that exits
 /// while a background child holds its output open still ends at the deadline, and everything the program
 /// started dies with it. Wrapping the program in `timeout` looked equivalent and was not: that command

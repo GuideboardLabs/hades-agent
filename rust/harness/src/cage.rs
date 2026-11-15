@@ -14,14 +14,14 @@
 //!
 //! What the cage is, precisely. Deny by default, for the filesystem and for TCP: read and execute under a
 //! fixed list of system directories (a program cannot start without `/usr` and `/lib`), read and write under
-//! the task's root and under `/dev`, and no TCP at all.
+//! the task's root and under `/dev`, and no TCP at all. A Unix socket is refused at the syscall, because the
+//! filesystem rules cannot refuse a connect on the kernels this runs on (see [`Unix`]).
 //!
 //! What it is not, in the same breath. It does not hide anything: a denied path still exists and the program
-//! gets `EACCES`, not `ENOENT`, so a program can still learn that `~/.ssh` exists. It does not confine UDP,
-//! raw sockets, or anything that is not TCP. It does not hide other processes or make `/proc` lie, and it
-//! cannot remove access it grants more widely than a program needs. It bounds what a program can read and
-//! write, which is where the damage that costs money happens, and it says so rather than being called a
-//! sandbox.
+//! gets `EACCES`, not `ENOENT`, so a program can still learn that `~/.ssh` exists. It does not confine UDP or
+//! raw sockets. It does not hide other processes or make `/proc` lie, and it cannot remove access it grants
+//! more widely than a program needs. It bounds what a program can read, write and dial, which is where the
+//! damage that costs money happens, and it says so rather than being called a sandbox.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -245,6 +245,23 @@ pub fn scan_sockets(candidates: &[PathBuf]) -> Vec<(PathBuf, SocketState)> {
         .collect()
 }
 
+/// Whether a caged program may create a Unix-domain socket.
+///
+/// Measured, not assumed. On this host (Linux 7.0.0, Landlock ABI 8) a caged child connected to
+/// `/run/docker.sock`, to `/run/user/1000/bus`, and to a socket under a directory no rule named, in the
+/// broad cage and in the strict one alike: ABI 9 added `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, and below it the
+/// kernel has no hook on `connect` at all, so a path list cannot be the boundary for sockets on an ABI-8
+/// kernel. The boundary therefore has to sit at the syscall: seccomp refuses `socket(AF_UNIX, ...)`, which
+/// closes the pathname and the abstract namespace in one rule and cannot be dodged by choosing a daemon, a
+/// path or a socket type. What it cannot do is tell one socket from another, so a program that genuinely
+/// needs Unix sockets (a name lookup through nscd, a runtime's own IPC) does not get them; that is the
+/// trade this cage makes, and [`Cage::allow_unix_sockets`] is the explicit way to take it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unix {
+    Closed,
+    Open,
+}
+
 /// What a program the harness runs is allowed to touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cage {
@@ -253,6 +270,7 @@ pub struct Cage {
     /// Single files with their own rights, which directories cannot express.
     files: Vec<(PathBuf, u64)>,
     network: bool,
+    unix: Unix,
 }
 
 impl Cage {
@@ -273,6 +291,7 @@ impl Cage {
                 .map(|(path, rights)| (PathBuf::from(path), *rights))
                 .collect(),
             network: false,
+            unix: Unix::Closed,
         }
     }
 
@@ -342,6 +361,12 @@ impl Cage {
     /// and post it gets `EACCES` on the read, and there is nothing to post. Writes outside the workspace and
     /// its scratch directory are denied too, which is why this cage is the read boundary and not an egress
     /// filter.
+    ///
+    /// The path list is the strict one: `/run` is not on it, because `/run` is where the host's control
+    /// sockets live and a chat's shell has no business reading it. The named resolver paths stay, because
+    /// `/etc/resolv.conf` is a symlink into them on a systemd host and a name lookup that fails reads like a
+    /// broken network. And the cage refuses `socket(AF_UNIX)` outright, because on an ABI-8 kernel the path
+    /// list cannot stop a connect (see [`Unix`]).
     pub fn chat(root: impl Into<PathBuf>, scratch: impl Into<PathBuf>) -> Cage {
         Cage::chat_with(root, scratch, true)
     }
@@ -349,7 +374,7 @@ impl Cage {
     /// The chat cage with the network dial a role sets. A verifier or a memory curator has no reason to reach
     /// out, so its shell is closed; a patch profile keeps the network because a clone or an install needs it.
     pub fn chat_with(root: impl Into<PathBuf>, scratch: impl Into<PathBuf>, network: bool) -> Cage {
-        let cage = Cage::around(root).also_writable(scratch).with_runtimes();
+        let cage = Cage::strict(root).also_writable(scratch).with_runtimes();
         if network { cage.with_network() } else { cage }
     }
 
@@ -358,6 +383,24 @@ impl Cage {
     pub fn also_writable(mut self, path: impl Into<PathBuf>) -> Cage {
         self.writable.push(path.into());
         self
+    }
+
+    /// Let a caged program create Unix sockets again.
+    ///
+    /// Nothing in the tree calls this, and the default is the safe direction for a reason: a socket is a way
+    /// to ask a privileged daemon to act as you. The one case that would need it is a program whose name
+    /// lookup goes through a Unix-socket NSS module (nscd, sssd) rather than the resolver file, and even that
+    /// resolves locally without one on the hosts this was measured on. It exists so a test can prove the
+    /// refusal is the mechanism, and so a future runtime with a real need has a way in that is named rather
+    /// than a second code path.
+    pub fn allow_unix_sockets(mut self) -> Cage {
+        self.unix = Unix::Open;
+        self
+    }
+
+    /// Whether a caged program may create a Unix socket here. `doctor` reports through [`Cage::report`].
+    pub fn unix_sockets_open(&self) -> bool {
+        self.unix == Unix::Open
     }
 
     /// Let the program reach the network. Off unless a caller asks, and the caller is then on the hook for
@@ -399,22 +442,24 @@ impl Cage {
                 .any(|(grant, rights)| grant == path && rights & READ_FILE != 0)
     }
 
-    /// How the cage's Unix-socket coverage reads on this kernel.
+    /// How the cage's Unix-socket coverage reads, in the words of the mechanism that does the work.
     ///
     /// Landlock ABI 9 (Linux 7.1) added `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`: a connect to a pathname socket
     /// created outside the domain is denied unless the path grants the right. Before ABI 9 there is no such
-    /// rule, and abstract-namespace sockets are never covered by it. This says which of those is true here
-    /// rather than letting "landlock" imply more than it does.
+    /// rule, and no ABI ever covered abstract-namespace sockets. Both of those gaps are why this cage refuses
+    /// `socket(AF_UNIX)` with a seccomp filter instead of relying on the path rules, and the note says which
+    /// of the two is holding the line here rather than letting "landlock" imply more than it does.
     pub fn socket_note(&self) -> String {
         let abi = abi();
-        if abi >= 9 {
-            "closed to pathname sockets outside the granted paths (landlock ABI 9 resolve_unix); abstract \
-             sockets are not contained"
-                .to_string()
+        if self.unix == Unix::Closed {
+            format!(
+                "closed (seccomp refuses socket(AF_UNIX), so pathname and abstract sockets alike; landlock \
+                 abi {abi} adds no rule of its own for them)"
+            )
         } else {
             format!(
-                "not contained by this kernel (landlock abi {abi} has no pathname socket rule; abstract \
-                 sockets were never covered)"
+                "open at the caller's request, and not contained by landlock abi {abi} (no pathname socket \
+                 rule below ABI 9, and abstract sockets were never covered)"
             )
         }
     }
@@ -540,6 +585,10 @@ impl Cage {
         Ok(Plan {
             attr,
             rules,
+            seccomp: match self.unix {
+                Unix::Closed => Some(Seccomp::no_unix_sockets()),
+                Unix::Open => None,
+            },
             describe: self.describe(),
         })
     }
@@ -728,10 +777,11 @@ fn ask_python(interpreter: &Path) -> Option<Vec<PathBuf>> {
 ///
 /// Moved into the child's hook rather than shared, so the rules and their file descriptors have exactly one
 /// owner and no clone can leave a descriptor open behind the child's back.
-#[derive(Debug)]
 pub struct Plan {
     attr: Vec<u8>,
     rules: Vec<(Vec<u8>, OwnedFd)>,
+    /// The syscall-level half: built here, installed in the child, `None` when the caller opened the dial.
+    seccomp: Option<Seccomp>,
     describe: String,
 }
 
@@ -770,7 +820,7 @@ impl Plan {
             }
         }
         // The kernel refuses to confine a process that could still gain privileges from a set-user-id
-        // binary, so this comes first. It is also true for its own sake.
+        // binary, so this comes first. It is also true for its own sake, and seccomp requires it too.
         let set = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } as isize;
         if set < 0 {
             return Err(std::io::Error::from_raw_os_error(-set as i32));
@@ -779,7 +829,98 @@ impl Plan {
         if confined < 0 {
             return Err(std::io::Error::from_raw_os_error(-confined as i32));
         }
+        // Last, because it is the half that needs no privileges of its own and must not be skipped by a
+        // Landlock failure: if the filter cannot be installed the child does not run.
+        if let Some(seccomp) = &self.seccomp {
+            seccomp.install()?;
+        }
         Ok(())
+    }
+}
+
+/// `prctl(2)`'s request for the seccomp mode. The pinned libc names it for fuchsia and android but not for
+/// Linux, and the number is the same one on every Linux architecture (`include/uapi/linux/prctl.h`).
+const PR_SET_SECCOMP: libc::c_int = 22;
+
+/// The `struct seccomp_data` offsets the filter reads: the call number, then the first argument. Written as
+/// the kernel's own layout rather than a Rust struct, for the same reason the path rule is.
+const SECCOMP_NR_OFFSET: u32 = 0;
+const SECCOMP_ARG0_OFFSET: u32 = 16;
+
+/// Refuses `socket(AF_UNIX, ...)` and allows every other system call.
+///
+/// Seven instructions for the two things that matter: is this `socket`, and is its domain `AF_UNIX`? Both
+/// answers come from `seccomp_data`, so nothing has to be dereferenced and the filter is a fixed array built
+/// in the parent. The refusal is `EACCES`, the same answer a denied path gives, so a program is told "you may
+/// not" rather than being lied to about the machine.
+///
+/// `socketpair(AF_UNIX)` is a different call and stays allowed: it makes two connected ends for the calling
+/// process and cannot dial a socket somebody else is listening on, so it is not a way out.
+struct Seccomp {
+    filter: [libc::sock_filter; 7],
+}
+
+impl Seccomp {
+    fn no_unix_sockets() -> Seccomp {
+        let load = |offset: u32| libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        };
+        let jump = |value: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt,
+            jf,
+            k: value,
+        };
+        let ret = |action: u32| libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: action,
+        };
+        let allow = libc::SECCOMP_RET_ALLOW;
+        let deny = libc::SECCOMP_RET_ERRNO | (libc::EACCES as u32 & libc::SECCOMP_RET_DATA);
+        Seccomp {
+            filter: [
+                // A = the system call number.
+                load(SECCOMP_NR_OFFSET),
+                // Not `socket`: allow, from the sixth rule.
+                jump(libc::SYS_socket as u32, 0, 4),
+                // A = args[0], the domain.
+                load(SECCOMP_ARG0_OFFSET),
+                // AF_UNIX: refuse. Anything else: allow on the next rule.
+                jump(libc::AF_UNIX as u32, 1, 0),
+                ret(allow),
+                ret(deny),
+                ret(allow),
+            ],
+        }
+    }
+
+    /// Install the filter on the calling process, and on everything it starts.
+    fn install(&self) -> std::io::Result<()> {
+        let mut program = libc::sock_fprog {
+            len: self.filter.len() as libc::c_ushort,
+            filter: self.filter.as_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: `PR_SET_SECCOMP` with a filter reads the program it is pointed at and nothing else; the
+        // array and the structure live for the whole call.
+        let status = unsafe {
+            libc::prctl(
+                PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &mut program as *mut libc::sock_fprog as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 
