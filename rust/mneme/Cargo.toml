@@ -16,3 +16,8 @@ port_oracle = "../tests/test_hades_vault.py"
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
 # The workspace's existing JSON codec, for `extra`. Not a new crate in the build.
 serde_json = "1"
+
+[dev-dependencies]
+# The umask is process-wide and std exposes no way to set it; the test that proves the record does not
+# take its modes from it needs to. Already in the workspace lock through the harness.
+libc = "0.2"

@@ -12,3 +12,8 @@ port_oracle = "../tests/test_hades_session_tree.py"
 [dependencies]
 # JSONL is the storage format, per the design. Nothing else is needed.
 serde_json = "1"
+
+[dev-dependencies]
+# The umask is process-wide and std exposes no way to set it; the test that proves the store does not
+# take its modes from it needs to. Already in the workspace lock through the harness.
+libc = "0.2"

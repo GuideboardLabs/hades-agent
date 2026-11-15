@@ -55,6 +55,7 @@ pub mod fence;
 pub mod frontmatter;
 pub mod index;
 pub mod note;
+mod perm;
 pub mod permit;
 pub mod refs;
 pub mod seams;

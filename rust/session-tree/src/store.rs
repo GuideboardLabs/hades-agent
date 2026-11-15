@@ -1,7 +1,7 @@
 //! One JSONL file per session, one JSON object per line, append-only.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -165,9 +165,41 @@ fn decode(path: &Path, line: usize, raw: &str) -> Result<Entry, Fault> {
 /// Every key an entry must carry, checked before anything is read out of it.
 const REQUESTED_KEYS: [&str; 6] = ["v", "id", "parent", "kind", "payload", "at"];
 
+/// The directory this store owns: created if absent, and 0700.
+///
+/// `create_dir_all` takes its mode from the caller's umask, which on a desktop is `022` or `002`. A
+/// transcript is the most sensitive file the harness keeps, and a state directory that is not under a
+/// 0700 home (`HADES_HOME=/tmp/x`, a library user) has nothing else protecting it. An existing directory
+/// at a looser mode is tightened too: this store owns it.
+fn private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::symlink_metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// A new session log, at 0600 from the first instant. `File::create` takes the umask, which leaves the
+/// transcript group-readable for as long as the file lives.
+fn private_create(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 impl SessionStore for FileStore {
     fn create(&self, session: &SessionId, entries: &[Entry]) -> Result<(), Fault> {
-        fs::create_dir_all(&self.root).map_err(|e| FileStore::io(&self.root, e))?;
+        private_dir(&self.root).map_err(|e| FileStore::io(&self.root, e))?;
         let path = self.path_of(session);
         if path.exists() {
             // An append-only store never clobbers: the caller picks a fresh id instead.
@@ -175,7 +207,7 @@ impl SessionStore for FileStore {
                 session: session.0.clone(),
             });
         }
-        let mut file = File::create(&path).map_err(|e| FileStore::io(&path, e))?;
+        let mut file = private_create(&path).map_err(|e| FileStore::io(&path, e))?;
         for entry in entries {
             writeln!(file, "{}", encode(entry)).map_err(|e| FileStore::io(&path, e))?;
         }
@@ -228,5 +260,91 @@ impl SessionStore for FileStore {
             .open(&path)
             .map_err(|e| FileStore::io(&path, e))?;
         writeln!(file, "{}", encode(entry)).map_err(|e| FileStore::io(&path, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::symlink_metadata(path)
+            .expect("a path")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let named = std::env::var("CARGO_TARGET_DIR")
+            .ok()
+            .filter(|dir| !dir.trim().is_empty());
+        let base = match named {
+            Some(dir) => PathBuf::from(dir).join("scratch"),
+            None => {
+                PathBuf::from(std::env::var("HOME").expect("a home")).join(".hades/test-scratch")
+            }
+        };
+        let dir = base.join("session-tree").join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        fs::canonicalize(&dir).expect("canonical scratch")
+    }
+
+    /// A transcript used to take the caller's umask: `umask 002` left `<state>/sessions` at 0775 and the
+    /// log at 0664, so every session in a state directory that is not under the 0700 default home was
+    /// readable by the group.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_store_is_private_even_under_a_permissive_umask() {
+        let dir = scratch("private-modes");
+        let store = FileStore::new(dir.join("state/sessions"));
+        let session = SessionId::new("s1");
+
+        // SAFETY: the umask is process-wide; this test sets it for the length of one create and restores
+        // it before it asserts. The window only makes files another test creates tighter, never looser.
+        let old = unsafe { libc::umask(0o002) };
+        let created = store.create(&session, &[]);
+        let found = (
+            mode(&dir.join("state/sessions")),
+            mode(&store.path_of(&session)),
+        );
+        unsafe { libc::umask(old) };
+
+        created.expect("create");
+        assert_eq!(
+            found.0, 0o700,
+            "the sessions directory took the caller's umask, so the transcripts are group-readable"
+        );
+        assert_eq!(
+            found.1, 0o600,
+            "a new session log took the caller's umask, so its transcript is group-readable"
+        );
+    }
+
+    /// The twin: a sessions directory an earlier version left at 0775 is tightened when this one creates a
+    /// log in it, because the store owns the directory.
+    #[cfg(unix)]
+    #[test]
+    fn creating_a_log_tightens_a_sessions_directory_an_earlier_version_left_open() {
+        let dir = scratch("private-modes-existing");
+        let sessions = dir.join("state/sessions");
+        fs::create_dir_all(&sessions).expect("a sessions directory");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&sessions, fs::Permissions::from_mode(0o775))
+                .expect("loosen the directory");
+        }
+        let store = FileStore::new(&sessions);
+        store
+            .create(&SessionId::new("s1"), &[])
+            .expect("create the log");
+        assert_eq!(
+            mode(&sessions),
+            0o700,
+            "an existing sessions directory was left group-readable"
+        );
     }
 }

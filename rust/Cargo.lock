@@ -340,6 +340,7 @@ dependencies = [
 name = "mneme"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "serde_json",
 ]
@@ -519,6 +520,7 @@ dependencies = [
 name = "session-tree"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
 ]
 

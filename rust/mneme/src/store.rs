@@ -33,11 +33,12 @@ impl NoteStore for FileVault {
     }
 
     fn write(&self, path: &Path, text: &str) -> Result<(), Fault> {
-        fs::write(path, text).map_err(|error| FileVault::io(path, error))
+        fs::write(path, text).map_err(|error| FileVault::io(path, error))?;
+        crate::perm::private_file(path).map_err(|error| FileVault::io(path, error))
     }
 
     fn make_dirs(&self, path: &Path) -> Result<(), Fault> {
-        fs::create_dir_all(path).map_err(|error| FileVault::io(path, error))
+        crate::perm::state_dir(path).map_err(|error| FileVault::io(path, error))
     }
 
     fn remove(&self, path: &Path) -> Result<(), Fault> {

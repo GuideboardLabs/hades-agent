@@ -23,6 +23,7 @@ use crate::fault::Fault;
 use crate::fence::fenced;
 use crate::frontmatter::{Field, Frontmatter};
 use crate::note::relative_posix;
+use crate::perm;
 use crate::seams::NoteStore;
 use crate::sha256;
 use crate::topic::Category;
@@ -412,13 +413,21 @@ impl SqliteStore {
     pub fn open(db: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Self, Fault> {
         let db = db.as_ref();
         let root = root.as_ref();
+        // The modes are set here, not taken from the caller's umask: this store owns the database and
+        // the tree, and a store pointed at `HADES_HOME=/tmp/x` (or opened by a library user) has no 0700
+        // home above it to carry the protection.
         if let Some(parent) = db.parent() {
-            fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
+            perm::state_dir(parent).map_err(|error| io(parent, error))?;
         }
-        fs::create_dir_all(root).map_err(|error| io(root, error))?;
+        perm::state_dir(root).map_err(|error| io(root, error))?;
         let root = fs::canonicalize(root).map_err(|error| io(root, error))?;
 
+        // Created empty and 0600 before SQLite opens it, so the record is not group-readable for even
+        // the moment between creation and a `chmod`. An existing database is tightened here for the same
+        // reason: the audit measured a live `mneme.db` at 0644, and this store owns the file.
+        perm::create_private(db).map_err(|error| io(db, error))?;
         let conn = Connection::open(db).map_err(|error| io(db, error))?;
+        perm::private_file(db).map_err(|error| io(db, error))?;
         conn.busy_timeout(Duration::from_millis(5_000))
             .map_err(|error| io(db, error))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
@@ -1032,7 +1041,7 @@ impl SqliteStore {
         // The six areas exist even when empty: a person opening the vault expects its doors.
         for area in Area::ALL {
             let folder = target.join(area.folder());
-            fs::create_dir_all(&folder).map_err(|error| io(&folder, error))?;
+            perm::state_dir(&folder).map_err(|error| io(&folder, error))?;
         }
         for path in self.note_paths(None)? {
             let Some((area, slug)) = note_path(&self.root, &path) else {
@@ -1045,7 +1054,7 @@ impl SqliteStore {
             let rendered_hash = sha256::hex(rendered.as_bytes());
             let out = target.join(area.folder()).join(format!("{slug}.md"));
             if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
+                perm::state_dir(parent).map_err(|error| io(parent, error))?;
             }
 
             if let Ok(bytes) = fs::read(&out) {
@@ -1066,7 +1075,7 @@ impl SqliteStore {
                 }
             }
 
-            fs::write(&out, &rendered).map_err(|error| io(&out, error))?;
+            write_private(&out, &rendered)?;
             self.set_exported_hash(area, &slug, &rendered_hash)?;
             report.written += 1;
         }
@@ -1083,7 +1092,7 @@ impl SqliteStore {
         let rendered = self.render(area, slug, &stored)?;
         let hash = sha256::hex(rendered.as_bytes());
         if let Some(parent) = out.parent() {
-            fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
+            perm::state_dir(parent).map_err(|error| io(parent, error))?;
         }
         if let Ok(bytes) = fs::read(out)
             && bytes != rendered.as_bytes()
@@ -1094,7 +1103,7 @@ impl SqliteStore {
                     .to_string(),
             });
         }
-        fs::write(out, &rendered).map_err(|error| io(out, error))?;
+        write_private(out, &rendered)?;
         self.set_exported_hash(area, slug, &hash)?;
         Ok(())
     }
@@ -1187,7 +1196,7 @@ impl NoteStore for SqliteStore {
     fn write(&self, path: &Path, text: &str) -> Result<(), Fault> {
         match note_path(&self.root, path) {
             Some((area, slug)) => self.store_note(area, &slug, text),
-            None => fs::write(path, text).map_err(|error| io(path, error)),
+            None => write_private(path, text),
         }
     }
 
@@ -1205,7 +1214,7 @@ impl NoteStore for SqliteStore {
             // The area itself is a logical row plus a folder that `export` creates.
             return Ok(());
         }
-        fs::create_dir_all(path).map_err(|error| io(path, error))
+        perm::state_dir(path).map_err(|error| io(path, error))
     }
 
     fn remove(&self, path: &Path) -> Result<(), Fault> {
@@ -1274,6 +1283,13 @@ fn io(path: &Path, detail: impl std::fmt::Display) -> Fault {
         path: path.display().to_string(),
         detail: detail.to_string(),
     }
+}
+
+/// Write a file the record owns, and make it 0600. A note is the same content as a row in the database,
+/// so it gets the same mode; `fs::write` on an existing file keeps whatever mode that file already had.
+fn write_private(path: &Path, text: &str) -> Result<(), Fault> {
+    fs::write(path, text).map_err(|error| io(path, error))?;
+    perm::private_file(path).map_err(|error| io(path, error))
 }
 
 /// Fill the fields the path already knows, then refuse a note that still breaks its area's rule.
@@ -1493,6 +1509,82 @@ mod tests {
             SqliteStore::open(dir.join("mneme.db"), &root).expect("reopen"),
             root,
         )
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::symlink_metadata(path)
+            .expect("a path")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// The record is private because it made itself private, not because `~/.hades` is 0700. A store
+    /// pointed at a fresh directory under `umask 002` used to leave the database 0664 and the tree 0775,
+    /// which is the whole memory store readable by the group on any path that is not the default home.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_is_private_even_under_a_permissive_umask() {
+        let dir = clean("private-modes");
+        let home = dir.join("home");
+        let db = home.join("state/mneme.db");
+        let root = home.join("state/vault");
+
+        // SAFETY: the umask is process-wide; this test sets it for the length of one open and restores it
+        // before it asserts. The window only makes files another test creates tighter, never looser.
+        let old = unsafe { libc::umask(0o002) };
+        let opened = SqliteStore::open(&db, &root);
+        let found = (mode(&home.join("state")), mode(&db), mode(&root));
+        unsafe { libc::umask(old) };
+
+        let store = opened.expect("open");
+        assert_eq!(
+            found.0, 0o700,
+            "the database's directory took the caller's umask, so the record is group-readable"
+        );
+        assert_eq!(
+            found.1, 0o600,
+            "the database took the caller's umask, so every note in it is group-readable"
+        );
+        assert_eq!(
+            found.2, 0o700,
+            "the six-area tree took the caller's umask, so every note file in it is group-readable"
+        );
+
+        // A file the store writes is private too: `charter.md` measured 0664 on a live install.
+        let written = root.join("charter.md");
+        store
+            .write(&written, "# who this is for\n")
+            .expect("a written file");
+        assert_eq!(
+            mode(&written),
+            0o600,
+            "the record wrote a group-readable file"
+        );
+    }
+
+    /// The twin of the test above: a database an earlier version created at the umask is tightened when
+    /// this one opens it, because the store owns the file and the audit measured a live 0644.
+    #[cfg(unix)]
+    #[test]
+    fn opening_the_record_tightens_a_database_an_earlier_version_left_open() {
+        let dir = clean("private-modes-existing");
+        let db = dir.join("state/mneme.db");
+        let root = dir.join("state/vault");
+        drop(SqliteStore::open(&db, &root).expect("open"));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&db, fs::Permissions::from_mode(0o644))
+                .expect("loosen the database");
+        }
+        drop(SqliteStore::open(&db, &root).expect("reopen"));
+        assert_eq!(
+            mode(&db),
+            0o600,
+            "an existing database was left at the mode an earlier version gave it"
+        );
     }
 
     fn note(text: &str, topics: &[&str], extra: &[(&str, Field)]) -> String {
