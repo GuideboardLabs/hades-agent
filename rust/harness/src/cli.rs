@@ -3528,7 +3528,8 @@ fn pack_find(args: &[String]) -> Result<(String, i32), String> {
 /// `hades pack add <id>`: one command from the shelf to a plan, and `--yes` from the plan to a write.
 ///
 /// The digest is checked against the menu before the archive is read, so a pack that changed under the same
-/// URL is refused rather than inspected. Without `--yes` nothing is written beyond the cache.
+/// URL is refused rather than inspected. Without `--yes` nothing is applied: a data pack stops at the plan
+/// (the archive it read stays in the cache as evidence), and a connector writes nothing at all.
 fn pack_add(args: &[String]) -> Result<(String, i32), String> {
     let flags = parse_with(args, &["state", "digest"], &["yes"])?;
     let name = flags.positional.first().ok_or_else(|| {
@@ -3539,30 +3540,9 @@ fn pack_add(args: &[String]) -> Result<(String, i32), String> {
     let home = hades_home()?;
     // A path that exists is a file somebody sent. Anything else is an id to look up on the shelf.
     let file = Path::new(name);
-    // A connector archive is a different artifact with a different trust story: whole-tree digests,
-    // an entrypoint, and install under the state directory. It arrives through the same verb.
-    if file.is_file() && crate::connector_pack::looks_like_connector(file) {
-        let (target, manifest) = crate::connector_pack::install_tar(&state, file)?;
-        if let Some(want) = flags.named.get("digest") {
-            let (_, binary) = crate::connector_pack::resolve(&state, &manifest.id)?;
-            let got = crate::connector_pack::digest_for(&binary)?;
-            if !got.eq_ignore_ascii_case(want) {
-                let _ = crate::connector_pack::remove(&state, &manifest.id);
-                return Err(format!(
-                    "the connector's entrypoint hashes to {got}, not the {want} you pinned; removed it"
-                ));
-            }
-        }
-        return Ok((
-            format!(
-                "installed connector {} {}\n  {}\n",
-                manifest.id,
-                manifest.version,
-                target.display()
-            ),
-            0,
-        ));
-    }
+    // A connector archive arrives through the same verb, and it takes the same installer the shelf path
+    // uses. A branch of its own here was the defect: it installed without `--yes`, without a required
+    // digest and before any re-hash, so one artifact class had two trust stories.
     let text = if file.is_file() {
         crate::packs_install::add_file(
             file,

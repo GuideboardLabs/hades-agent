@@ -226,8 +226,41 @@ pub fn add_file(
         ));
     }
     let said = path.display().to_string();
+    // A connector archive is code, not content, so a plan for one writes nothing at all, not even the
+    // cache: the person is deciding whether to install a binary. The shelf path reaches the same gate
+    // inside `install`; this one is earlier only so the decision costs no bytes on disk.
+    if !yes && crate::connector_pack::looks_like_connector(path) {
+        return Ok(format!("sha256: {digest}\n{}", connector_plan(&said)));
+    }
     let text = install(&bytes, &said, &digest, home, state, yes)?;
     Ok(format!("sha256: {digest}\n{text}"))
+}
+
+/// The plan line for a connector archive, shared by both front halves so the words cannot drift.
+fn connector_plan(origin: &str) -> String {
+    format!(
+        "{origin} is a connector, not a data pack. `hades pack add <id> --yes` installs it; nothing was \
+         written.\n"
+    )
+}
+
+/// The bytes that were hashed and the bytes about to be parsed, checked against each other.
+///
+/// Both installers write the verified bytes to a staging file and then hand that path to a parser (`tar`
+/// for a connector, `Pack::open` for data), so the file on disk is the thing being trusted, not the
+/// buffer that was hashed. A write through that path is what this refuses.
+fn unchanged(path: &Path, digest: &str) -> Result<(), String> {
+    let again = fs::read(path)
+        .map(|bytes| mneme::sha256::hex(&bytes))
+        .unwrap_or_default();
+    if again == digest {
+        return Ok(());
+    }
+    Err(format!(
+        "refused: the archive staged at {} is not the bytes that were verified ({digest}). Nothing was \
+         installed.",
+        path.display()
+    ))
 }
 
 fn install(
@@ -279,10 +312,12 @@ fn install(
     if crate::connector_pack::looks_like_connector(&staging) {
         if !yes {
             let _ = fs::remove_file(&staging);
-            return Ok(format!(
-                "{origin} is a connector, not a data pack. `hades pack add <id> --yes` installs it; nothing \
-                 was written.\n"
-            ));
+            return Ok(connector_plan(origin));
+        }
+        // The digest came from the bytes that arrived; this is the file `tar` is about to read.
+        if let Err(said) = unchanged(&staging, digest) {
+            let _ = fs::remove_file(&staging);
+            return Err(said);
         }
         let (target, manifest) = match crate::connector_pack::install_tar(state, &staging) {
             Ok(found) => found,
@@ -291,6 +326,14 @@ fn install(
                 return Err(error);
             }
         };
+        // Parsing ran against the staged file, so a file that changed under it means the tree that was
+        // validated is not the tree that was approved. Take it back out rather than leave it installed,
+        // the same order the data path uses between parsing and applying a plan.
+        if let Err(said) = unchanged(&staging, digest) {
+            let _ = crate::connector_pack::remove(state, &manifest.id);
+            let _ = fs::remove_file(&staging);
+            return Err(said);
+        }
         let _ = fs::remove_file(&staging);
         return Ok(format!(
             "installed connector {} {} ({})\n  {}\n  then `hades connector service {}` and start the unit\n",
@@ -313,16 +356,10 @@ fn install(
             ));
         }
     };
-    let again = fs::read(&staging)
-        .map(|bytes| mneme::sha256::hex(&bytes))
-        .unwrap_or_default();
-    if again != digest {
+    let again = unchanged(&staging, digest);
+    if let Err(said) = again {
         let _ = fs::remove_file(&staging);
-        return Err(format!(
-            "refused: the archive staged at {} is not the bytes that were verified ({digest}). Nothing was \
-             installed.",
-            staging.display()
-        ));
+        return Err(said);
     }
     let id = pack.manifest.id.clone();
     let version = pack.manifest.version.clone();
@@ -523,5 +560,33 @@ mod tests {
             std::env::remove_var("HADES_PACKS_ALLOW_PRIVATE");
             std::env::remove_var("HADES_PACKS_URL");
         }
+    }
+
+    /// The staged file is what the parser reads, so the digest taken from the bytes that arrived is
+    /// checked against the file, not assumed to still describe it. A test of the check itself, because
+    /// the window it guards is between two lines no fixture can widen.
+    #[test]
+    fn a_staged_archive_that_changed_after_the_hash_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "hades-staged-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let staged = dir.join("incoming.hadepack");
+        std::fs::write(&staged, b"the bytes that arrived").expect("staged");
+        let digest = mneme::sha256::hex(b"the bytes that arrived");
+        assert!(
+            unchanged(&staged, &digest).is_ok(),
+            "the verified bytes were refused"
+        );
+        std::fs::write(&staged, b"the bytes that were written later").expect("tampered");
+        let said = unchanged(&staged, &digest).expect_err("changed bytes were trusted");
+        assert!(said.contains("not the bytes that were verified"), "{said}");
+        assert!(said.contains("Nothing was installed"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
