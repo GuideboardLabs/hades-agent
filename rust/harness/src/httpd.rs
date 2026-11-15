@@ -16,11 +16,11 @@
 //! Stated limits, because a surface is only worth what it excludes:
 //!
 //! - No TLS and no CORS. A browser on another origin cannot read a response, so a command center proxies
-//!   server-side or is served from this origin later. A non-loopback deployment belongs behind a
-//!   TLS-terminating proxy, not in this process.
-//! - On loopback with no token, any local process can call the API. That is the same trust the unix socket
-//!   already has: the socket is a file only this machine can reach.
-//! - A token is compared in constant time over equal-length byte strings; the length itself is observable.
+//!   server-side or is served from this origin later. A non-loopback bind is refused unless
+//!   `--behind-proxy` says a TLS-terminating proxy fronts this port.
+//! - A token is mandatory on every bind, loopback included: a page the browser visits can POST to
+//!   127.0.0.1, so loopback is not a trust boundary. The token is compared in constant time over
+//!   equal-length byte strings; the length itself is observable.
 //! - The API never returns a secret and never reads `~/.hades/.env`.
 //! - `Connection: close` only: no keep-alive, no pipelining, no chunked bodies.
 //! - A request past its cap gets an error and the connection closes; nothing is half-read and acted on.
@@ -58,6 +58,23 @@ const ACTIVITY_LIMIT_MAX: usize = 1000;
 /// count is also the thread count: a local process that opens a thousand idle sockets would otherwise cost
 /// a thousand stacks and a thousand descriptors that never time out.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 32;
+
+/// Whether this process may bind this address.
+///
+/// It speaks plain HTTP and authenticates with a bearer token, so on a public interface the token is a
+/// credential on the wire. A non-loopback bind is refused unless the operator says a TLS-terminating
+/// proxy fronts this port: the address cannot express that, and the flag is the sentence a person
+/// writes. Loopback needs no flag, because the token already covers the local page that could POST.
+pub fn check_bind(bind: &SocketAddr, behind_proxy: bool) -> Result<(), String> {
+    if bind.ip().is_loopback() || behind_proxy {
+        return Ok(());
+    }
+    Err(format!(
+        "refused: `--bind {bind}` is not a loopback address. This process speaks plain HTTP with no TLS, \
+         so a public bind belongs behind a TLS-terminating proxy; pass `--behind-proxy` once that proxy \
+         is in front of it. Nothing was bound."
+    ))
+}
 
 /// A count of connections in flight, with a way to wait for one.
 struct Permits {
@@ -1060,6 +1077,22 @@ mod tests {
         assert!(!valid_session("a/b"));
         assert!(!valid_session("a.b"));
         assert!(!valid_session(&"a".repeat(65)));
+    }
+
+    /// Plain HTTP on a public interface puts the bearer token on the wire, so the address alone is not
+    /// consent: the operator has to say a TLS proxy is in front of it.
+    #[test]
+    fn a_public_bind_needs_the_proxy_flag() {
+        let public: SocketAddr = "0.0.0.0:8787".parse().expect("an address");
+        let said = check_bind(&public, false).expect_err("a public bind without a proxy");
+        assert!(said.contains("TLS"), "{said}");
+        assert!(said.contains("--behind-proxy"), "{said}");
+        assert!(
+            check_bind(&public, true).is_ok(),
+            "the flag did not allow it"
+        );
+        let loopback: SocketAddr = "127.0.0.1:8787".parse().expect("an address");
+        assert!(check_bind(&loopback, false).is_ok(), "loopback was refused");
     }
 
     #[test]

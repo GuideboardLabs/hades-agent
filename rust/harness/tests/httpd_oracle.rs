@@ -464,7 +464,9 @@ fn a_token_is_the_whole_gate() {
 #[test]
 fn a_non_loopback_bind_also_needs_a_token() {
     let state = scratch("bind");
-    let server = Http::start_on(&state, "0.0.0.0:0", &[], &[]);
+    // Plain HTTP on a public interface needs the operator to say a TLS proxy fronts it; the token is
+    // still mandatory on top of that.
+    let server = Http::start_on(&state, "0.0.0.0:0", &["--behind-proxy"], &[]);
     // The helper would add its own token, so ask without one directly.
     let anonymous = request(
         server.address,
@@ -473,6 +475,48 @@ fn a_non_loopback_bind_also_needs_a_token() {
     assert_eq!(
         anonymous.status, 401,
         "loopback or not, there is no open mode"
+    );
+}
+
+/// The refusal is a real command's behaviour, not only a predicate: without the flag the process exits
+/// before it binds and names the proxy it needs. The wait is bounded so a regression that binds anyway
+/// fails as an assertion instead of sitting in `accept` forever.
+#[test]
+fn a_public_bind_without_the_proxy_flag_is_refused() {
+    let state = scratch("bind-refused");
+    let mut child = Command::new(binary())
+        .args(["http", "--state"])
+        .arg(&state)
+        .args(["--bind", "0.0.0.0:0", "--once"])
+        .env("HADES_HOME", isolated_home())
+        .env("HADES_HTTP_TOKEN", TEST_TOKEN)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("wait on the binary") {
+            Some(status) => break status,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("a public bind without --behind-proxy was accepted and kept listening");
+            }
+        }
+    };
+    let mut said = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut said);
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut said);
+    }
+    assert!(!status.success(), "a public bind was accepted");
+    assert!(
+        said.contains("not a loopback address") && said.contains("TLS-terminating proxy"),
+        "the refusal did not name the proxy it needs: {said}"
     );
 }
 

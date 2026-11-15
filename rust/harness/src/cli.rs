@@ -326,12 +326,14 @@ hades — the harness, one turn or a whole graph
   hades daemon [--state <dir>] [--socket <path>]
       own the sessions under one state directory, in the foreground
 
-  hades http [--bind 127.0.0.1:8787] [--state <dir>] [--token-file <path>] [--once]
-      [--max-connections n]
+  hades http [--bind 127.0.0.1:8787] [--behind-proxy] [--state <dir>] [--token-file <path>]
+      [--once] [--max-connections n]
       one read-and-control API over the daemon, for a local client. Every bind needs a
       token: HADES_HTTP_TOKEN, --token-file, or one generated at <state>/http.token and
       reused on restart. The token is never taken as an argument because argv is visible
-      in `ps`; the generated file is 0600
+      in `ps`; the generated file is 0600. A non-loopback bind is refused unless
+      --behind-proxy says a TLS-terminating proxy fronts this port, because this process
+      speaks plain HTTP
 
   hades status [--state <dir>]
       what the daemon knows, or what the logs say when none is running
@@ -7721,7 +7723,7 @@ fn http(args: &[String]) -> Result<(String, i32), String> {
     let flags = parse_with(
         args,
         &["bind", "state", "token-file", "max-connections"],
-        &["once"],
+        &["once", "behind-proxy"],
     )?;
     let state = state_of(&flags)?;
     let bind = match flags.named.get("bind") {
@@ -7733,6 +7735,9 @@ fn http(args: &[String]) -> Result<(String, i32), String> {
         })?,
         None => std::net::SocketAddr::from(([127, 0, 0, 1], 8787)),
     };
+    // A public interface is refused here, before a token is read or a port is taken: plain HTTP on a
+    // public address puts the bearer token on the wire, and only a person can say a proxy is in front.
+    crate::httpd::check_bind(&bind, switched(&flags, "behind-proxy"))?;
     // Mandatory on every bind, loopback included: a page the browser visits can POST to 127.0.0.1, so
     // loopback is not a trust boundary. A missing token is generated once and reused, so a restart does
     // not break every client.
