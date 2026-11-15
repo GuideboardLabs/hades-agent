@@ -21,7 +21,7 @@
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -522,12 +522,85 @@ fn curl_args(timeout: Duration, config: &std::path::Path) -> Vec<String> {
 /// `TMPDIR` belongs to whatever launched the process, and under the live install that is the install's own
 /// cache. A harness that keeps its secrets in another system's cache has crossed the boundary it draws.
 fn private_path(name: &str) -> PathBuf {
-    let base = match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join(".hades/tmp"),
-        Err(_) => std::env::temp_dir(),
+    // Before the first file is written, once per process: a run that was killed could not run its `Drop`,
+    // and what it left behind is a 0600 file holding a bearer key with nobody left to remove it.
+    sweep_once();
+    private_base().join(name)
+}
+
+/// The directory the short-lived files live in, under this process's home.
+fn private_base() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => private_base_in(Path::new(&home)),
+        None => std::env::temp_dir(),
+    }
+}
+
+/// The directory under one home, created `0700` the way every other state directory is.
+///
+/// A bare `create_dir_all` gives the directory the process umask, which on a desktop is `0775`: every user
+/// on the machine could list the files while a call was in flight, and the header file is a provider key.
+/// `scratch::state_dir` is the one creator for that reason, and it also brings an existing directory back to
+/// `0700` rather than trusting one an older build made.
+fn private_base_in(home: &Path) -> PathBuf {
+    let base = home.join(".hades/tmp");
+    let _ = crate::scratch::state_dir(&base);
+    base
+}
+
+/// Remove the header files whose process is gone.
+///
+/// The naming scheme already says whose a file is (`headers-<pid>-<nanos>.conf`), so the rule is the pid and
+/// nothing else: if that process no longer exists, the file is residue from a killed run and goes. A pid the
+/// kernel has recycled keeps an orphan alive until its new owner exits, which is the price of a rule that
+/// does not have to trust a clock or a boot time. Files this module did not write are left alone.
+///
+/// It runs on every private write rather than once at startup: a gateway that has been up for a week is the
+/// process most likely to be sharing the directory with a run that got killed, and the readdir costs less
+/// than the file it is about to create.
+fn sweep_once() {
+    sweep_in(&private_base());
+}
+
+fn sweep_in(base: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
     };
-    let _ = fs::create_dir_all(&base);
-    base.join(name)
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(owner) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(header_owner)
+        else {
+            continue;
+        };
+        if owner == std::process::id() || alive(owner) {
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// The pid in a `headers-<pid>-<nanos>.conf` name, when the name has the shape this module writes.
+fn header_owner(name: &str) -> Option<u32> {
+    name.strip_prefix("headers-")?
+        .strip_suffix(".conf")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether a pid names a process that exists. A process owned by somebody else counts as alive, because it
+/// is: `EPERM` is an answer, not an absence.
+fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 is the existence probe; it is not delivered.
+    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if status == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// A file with the secret in it, removed when it goes out of scope.
@@ -784,6 +857,85 @@ mod tests {
         )
         .expect_err("cleartext to a remote host");
         assert!(streaming.detail().contains("cleartext"), "{streaming:?}");
+    }
+
+    /// The directory that holds a provider key is not world-readable, whether it existed or not.
+    ///
+    /// `create_dir_all` gives the directory the process umask, which on a desktop is `0775`. Measured on the
+    /// host this was written for: the directory was `0775` with 63 header files in it, one of which held a
+    /// real bearer key.
+    #[test]
+    fn the_private_directory_is_0700_even_when_it_was_not() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = scratch("private-mode");
+        let base = home.join(".hades/tmp");
+        std::fs::create_dir_all(&base).expect("a directory");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o775))
+            .expect("permissive");
+        let returned = private_base_in(&home);
+        assert_eq!(returned, base);
+        let mode = std::fs::metadata(&base)
+            .expect("the directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "an existing directory kept mode {mode:o}");
+        assert!(!private_base_in(&home).join("never").exists());
+
+        // And a directory this creates is 0700 from the start, not only after an earlier build made it wrong.
+        let fresh = scratch("private-fresh");
+        let created = private_base_in(&fresh);
+        let mode = std::fs::metadata(&created)
+            .expect("the directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "a new directory was made mode {mode:o}");
+    }
+
+    /// A file left by a killed run goes; a file whose process is alive stays.
+    ///
+    /// The `Drop` that removes a header file cannot run when the process is SIGKILLed, so the sweep is the
+    /// only thing that can remove what is left. The rule is the pid in the name, because a killed run leaves
+    /// no record anywhere else.
+    #[test]
+    fn the_sweep_removes_an_orphan_and_keeps_a_live_one() {
+        let base = scratch("private-sweep");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("a short-lived process");
+        let dead = child.id();
+        child.wait().expect("reaped");
+
+        let orphan = base.join(format!("headers-{dead}-1.conf"));
+        let live = base.join(format!("headers-{}-2.conf", std::process::id()));
+        let foreign = base.join("something-else.conf");
+        for path in [&orphan, &live, &foreign] {
+            std::fs::write(path, "header = \"Authorization: Bearer key\"\n").expect("a file");
+        }
+        sweep_in(&base);
+        assert!(!orphan.exists(), "the orphan survived the sweep");
+        assert!(live.exists(), "a live process's file was removed");
+        assert!(
+            foreign.exists(),
+            "a file this module did not write was removed"
+        );
+
+        // And the wiring: the sweep is what a private write runs, so a gateway that has been up for a week
+        // cleans up after a sibling that was killed rather than waiting for its own restart.
+        let real = private_base();
+        let orphan = real.join(format!("headers-{dead}-3.conf"));
+        std::fs::write(&orphan, "url = \"https://example.invalid/\"\n").expect("a file");
+        let _ = private_path("probe.conf");
+        assert!(
+            !orphan.exists(),
+            "a private write did not sweep the directory it writes in"
+        );
+    }
+
+    /// A directory of this test's own, under the crate's scratch root.
+    fn scratch(name: &str) -> PathBuf {
+        crate::scratch::unique(name)
     }
 
     #[test]
