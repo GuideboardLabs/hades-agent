@@ -53,8 +53,12 @@ pub fn post(
 ) -> Result<Reply, Fault> {
     let target = Target::parse(url)?;
     match target.scheme.as_str() {
+        "http" if !target.loopback() => Err(Fault::model(format!(
+            "{} is plain http and not this machine, so the key would travel in cleartext; use https",
+            target.display()
+        ))),
         "http" => direct(&target, body, headers, timeout),
-        "https" => curl(&target, body, headers, timeout),
+        "https" => curl(url, &target, body, headers, timeout),
         other => Err(Fault::model(format!(
             "the endpoint scheme {other:?} is neither http nor https, and this client speaks nothing else"
         ))),
@@ -125,6 +129,22 @@ impl Target {
         } else {
             format!("{}://{}:{}{}", self.scheme, self.host, self.port, self.path)
         }
+    }
+
+    /// Whether this endpoint is this machine.
+    ///
+    /// The only place plain HTTP is allowed, because plain HTTP sends every header, including a bearer key,
+    /// in cleartext: anything on the path can read it and a redirect can move it. A name is not loopback
+    /// unless it says so, so `localhost` counts and nothing else does; a hostname that resolves to a
+    /// loopback address does not, because the resolution is the thing an attacker would control.
+    pub fn loopback(&self) -> bool {
+        if self.host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        let bare = self.host.trim_start_matches('[').trim_end_matches(']');
+        bare.parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
     }
 }
 
@@ -298,31 +318,22 @@ pub fn stream(
             target.scheme
         )));
     }
-    let secret = if headers.is_empty() {
-        None
-    } else {
-        let mut text = String::new();
-        for (name, value) in headers {
-            text.push_str("header = \"");
-            text.push_str(
-                &format!("{name}: {value}")
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\""),
-            );
-            text.push_str("\"\n");
-        }
-        Some(Private::write(&text)?)
-    };
+    // A local model server is plain HTTP on the loopback and that is the case this transport exists for.
+    // Anywhere else the key would be readable on the way, so the request is refused before it is made.
+    if target.scheme == "http" && !target.loopback() {
+        return Err(Fault::model(format!(
+            "{} is plain http and not this machine, so the key would travel in cleartext; use https",
+            target.display()
+        )));
+    }
+    let secret = Private::for_request(url, headers)?;
 
     let mut command = Command::new("curl");
     command.args(stream_args(timeout));
     command.args(["-X", "POST", "--data-binary", "@-"]);
-    if let Some(secret) = &secret {
-        command.arg("-K");
-        command.arg(secret.path());
-    }
+    command.arg("-K");
+    command.arg(secret.path());
     command.args(["--header", "Content-Type: application/json"]);
-    command.arg(target.display());
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -377,9 +388,9 @@ pub fn stream(
             Some(said) => said,
             None => stderr.lines().next().unwrap_or("").to_string(),
         };
-        return Err(Fault::model(format!(
+        return Err(Fault::model(redact(&format!(
             "the model stream ended badly: {said}"
-        )));
+        ))));
     }
     Ok(())
 }
@@ -392,6 +403,9 @@ fn stream_args(timeout: Duration) -> Vec<String> {
     let stall = timeout.as_secs().max(1);
     let ceiling = stall.saturating_mul(8);
     vec![
+        // First, because curl honours it only in position zero: a `.curlrc` that named a proxy would
+        // otherwise decide where a provider key goes.
+        "-q".to_string(),
         "-sS".to_string(),
         "--no-buffer".to_string(),
         "--fail-with-body".to_string(),
@@ -407,35 +421,21 @@ fn stream_args(timeout: Duration) -> Vec<String> {
 }
 
 fn curl(
+    url: &str,
     target: &Target,
     body: &str,
     headers: &[(&str, String)],
     timeout: Duration,
 ) -> Result<Reply, Fault> {
-    // The header lines go through a config file so the key never becomes an argument. The file is created
-    // private and removed by the guard, including when curl fails or panics out.
-    let secret = if headers.is_empty() {
-        None
-    } else {
-        let mut text = String::new();
-        for (name, value) in headers {
-            text.push_str("header = \"");
-            text.push_str(
-                &format!("{name}: {value}")
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\""),
-            );
-            text.push_str("\"\n");
-        }
-        Some(Private::write(&text)?)
-    };
+    // The URL and the header lines go through one config file so neither becomes an argument. A URL can
+    // carry a credential by the provider's own design (Telegram's `/bot<token>/method`), and the process
+    // table is readable while the call is in flight, so "the endpoint is not secret" is not a distinction
+    // this client is willing to make. The file is created private and removed by the guard, including when
+    // curl fails or panics out.
+    let secret = Private::for_request(url, headers)?;
 
     let mut command = Command::new("curl");
-    command.args(curl_args(
-        target,
-        timeout,
-        secret.as_ref().map(|secret| secret.path()),
-    ));
+    command.args(curl_args(timeout, secret.path()));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -465,10 +465,12 @@ fn curl(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() && stdout.trim().is_empty() {
-        return Err(Fault::model(format!(
+        // Redacted at the boundary: curl's own sentence and this module's target both describe a request
+        // whose path can be a credential, and a fault is written to the session log.
+        return Err(Fault::model(redact(&format!(
             "curl could not reach {}: {stderr}",
             target.display()
-        )));
+        ))));
     }
 
     let (body, status) = match stdout.rsplit_once('\n') {
@@ -477,16 +479,28 @@ fn curl(
         }
         _ => (stdout, 0),
     };
+    // A zero status means curl never got an HTTP answer: the only thing on stdout is the write-out line. That
+    // is the transport failure this module's doc speaks of, and calling it a reply lost curl's own sentence
+    // and handed the caller an empty body to misread as a parse error.
+    if status == 0 {
+        return Err(Fault::model(redact(&format!(
+            "curl could not reach {}: {stderr}",
+            target.display()
+        ))));
+    }
     Ok(Reply { status, body })
 }
 
 /// The arguments curl is given, apart from the pipes.
 ///
 /// A function rather than four inline arg calls, because the one rule that matters here is a rule about
-/// this list: nothing in it may be a credential. The key travels in the config file named by `-K`, so this
-/// list can be printed, tested, and read in a process table without leaking anything.
-fn curl_args(target: &Target, timeout: Duration, secret: Option<&std::path::Path>) -> Vec<String> {
-    let mut args = vec![
+/// this list: nothing in it may be a credential, and that includes a URL whose path carries one. The URL and
+/// every header travel in the config file named by `-K`, so this list can be printed, tested, and read in a
+/// process table without leaking anything. `-q` comes first because curl honours it only in position zero,
+/// and a `.curlrc` that named a proxy would otherwise decide where a provider key goes.
+fn curl_args(timeout: Duration, config: &std::path::Path) -> Vec<String> {
+    vec![
+        "-q".to_string(),
         "-sS".to_string(),
         "--max-time".to_string(),
         timeout.as_secs().max(1).to_string(),
@@ -497,19 +511,14 @@ fn curl_args(target: &Target, timeout: Duration, secret: Option<&std::path::Path
         // The status is asked for after the body, and read back off the last line.
         "--write-out".to_string(),
         "\n%{http_code}".to_string(),
-    ];
-    if let Some(path) = secret {
-        args.push("-K".to_string());
-        args.push(path.display().to_string());
-    }
-    args.push("--header".to_string());
-    args.push("Content-Type: application/json".to_string());
-    args.push(target.display());
-    args
+        "-K".to_string(),
+        config.display().to_string(),
+        "--header".to_string(),
+        "Content-Type: application/json".to_string(),
+    ]
 }
 
 /// Where a short-lived file goes: Hades' own directory, never the machine's temp directory.
-///
 /// `TMPDIR` belongs to whatever launched the process, and under the live install that is the install's own
 /// cache. A harness that keeps its secrets in another system's cache has crossed the boundary it draws.
 fn private_path(name: &str) -> PathBuf {
@@ -522,11 +531,28 @@ fn private_path(name: &str) -> PathBuf {
 }
 
 /// A file with the secret in it, removed when it goes out of scope.
-struct Private {
+pub(crate) struct Private {
     path: PathBuf,
 }
 
 impl Private {
+    /// The config file for one curl call: the URL first, then the header lines.
+    ///
+    /// Both halves are secret for the same reason. A key in argv is readable in the process table, and a URL
+    /// whose path carries a token (Telegram's `/bot<token>/method`) is a key in argv one level up. Putting
+    /// the URL here too means no caller has to remember which of the two its endpoint is: the argument list
+    /// carries a file name and the request, and nothing else.
+    fn for_request(url: &str, headers: &[(&str, String)]) -> Result<Private, Fault> {
+        let mut text = format!("url = \"{}\"\n", quoted(url));
+        for (name, value) in headers {
+            text.push_str(&format!(
+                "header = \"{}\"\n",
+                quoted(&format!("{name}: {value}"))
+            ));
+        }
+        Private::write(&text)
+    }
+
     fn write(text: &str) -> Result<Private, Fault> {
         let path = private_path(&format!(
             "headers-{}-{}.conf",
@@ -553,9 +579,45 @@ impl Private {
         Ok(Private { path })
     }
 
-    fn path(&self) -> &std::path::Path {
+    pub(crate) fn path(&self) -> &std::path::Path {
         &self.path
     }
+}
+
+/// A private config file that names a URL and nothing else, for a caller that must keep it out of argv.
+pub(crate) fn secret_url(url: &str) -> Result<Private, Fault> {
+    Private::for_request(url, &[])
+}
+
+/// One value inside a curl config file, quoted and escaped: curl reads the file with its own quoting rules,
+/// and a value with a quote in it would otherwise end the string early.
+fn quoted(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Remove a bot token from any text that is about to be logged, chatted or faulted.
+///
+/// Telegram puts the credential in the URL's path (`/bot<token>/method`, `/file/bot<token>/path`), so this is
+/// keyed to that shape and not to a guess at what a token looks like: everything between `/bot` and the next
+/// `/` goes. It is applied where the fault is built, because the message that leaks is always the one path
+/// nobody enumerated.
+pub fn redact(text: &str) -> String {
+    const MARK: &str = "/bot";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        out.push_str(&rest[..at]);
+        out.push_str("/bot<redacted>");
+        let after = &rest[at + MARK.len()..];
+        // The token runs to the next separator; keeping the separator leaves `/bot<redacted>/method`
+        // readable as a URL rather than as a word.
+        match after.find('/') {
+            Some(slash) => rest = &after[slash..],
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 impl Drop for Private {
@@ -602,12 +664,12 @@ mod tests {
     #[test]
     fn no_argument_to_curl_is_ever_a_credential() {
         // The whole point of the secret file: the argument list can be read by any process on the machine,
-        // so nothing secret may be in it.
+        // so nothing secret may be in it, and the URL is in that file too because a provider can put a
+        // credential in a URL's path.
         let sentinel = "Bearer sentinel-token-that-must-not-appear";
         let file =
             Private::write(&format!("header = \"Authorization: {sentinel}\"\n")).expect("a file");
-        let target = Target::parse("https://example.invalid/v1/chat/completions").expect("parses");
-        let args = curl_args(&target, Duration::from_secs(5), Some(file.path()));
+        let args = curl_args(Duration::from_secs(5), file.path());
         let joined = args.join(" ");
         assert!(!joined.contains("sentinel"), "{joined}");
         assert!(!joined.contains("Bearer"), "{joined}");
@@ -616,14 +678,112 @@ mod tests {
             "{joined}: the key has to be passed by file or not at all"
         );
         assert!(
-            joined.contains("https://example.invalid/v1/chat/completions"),
-            "{joined}"
+            !joined.contains("://"),
+            "a URL in the argument list is a credential for any provider that puts one in the path: \
+             {joined}"
+        );
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("-q"),
+            "curl reads .curlrc unless -q is the first argument: {joined}"
         );
         // And the file it names is private and goes away when the value does.
         let path = file.path().to_path_buf();
         assert!(path.exists());
         drop(file);
         assert!(!path.exists(), "the header file outlived the call");
+    }
+
+    #[test]
+    fn a_bot_url_never_reaches_a_fault_or_an_argument() {
+        // Telegram's token is in the URL by design, so `format!("{}/bot{}/{method}")` makes every message
+        // about the request a message about the token. It reached the process table as an argument and the
+        // session log as "curl could not reach https://api.telegram.org/bot<token>/sendMessage".
+        let token = "123456:SECRET-sentinel";
+        let url = format!("https://127.0.0.1:1/bot{token}/sendMessage");
+        let config = Private::for_request(&url, &[]).expect("a config");
+        let args = curl_args(Duration::from_secs(5), config.path());
+        let joined = args.join(" ");
+        assert!(
+            !joined.contains(token),
+            "the token is an argument: {joined}"
+        );
+        assert!(
+            !joined.contains("/bot"),
+            "the bot path is an argument: {joined}"
+        );
+        // The file carries it instead, which is the one place the process table cannot read.
+        let text = std::fs::read_to_string(config.path()).expect("the config");
+        assert!(text.contains(&url), "{text}");
+
+        // Nothing listens on port 1, so this fails at the transport, which is the path that prints it.
+        let fault = post(&url, "{}", &[], Duration::from_secs(5)).expect_err("nothing listens");
+        let detail = fault.detail();
+        // The URL keeps its shape and loses the token, which is what a reader needs to act on the failure.
+        assert!(!detail.contains(token), "{detail}");
+        assert!(detail.contains("/bot<redacted>/sendMessage"), "{detail}");
+        assert!(
+            detail.contains("could not reach"),
+            "the failure is still reported: {detail}"
+        );
+        assert!(detail.contains("<redacted>"), "{detail}");
+
+        // And the helper on its own, because a fault or a log line is built from text this module did not
+        // construct: the token is whatever sits between `/bot` and the next `/`.
+        assert_eq!(
+            redact("GET https://api.telegram.org/bot123456:SECRET/getMe failed"),
+            "GET https://api.telegram.org/bot<redacted>/getMe failed"
+        );
+        assert_eq!(
+            redact("https://api.telegram.org/file/bot123456:SECRET/photos/x.jpg"),
+            "https://api.telegram.org/file/bot<redacted>/photos/x.jpg"
+        );
+        assert_eq!(redact("nothing to hide"), "nothing to hide");
+    }
+
+    #[test]
+    fn plain_http_is_loopback_only() {
+        // The comment said "loopback only" and nothing enforced it. A POST to any http host would have sent
+        // the bearer key in cleartext, so the scheme is refused for every host that is not this machine and
+        // kept for the one that is.
+        let refused = post(
+            "http://example.com/v1/chat/completions",
+            "{}",
+            &[("Authorization", "Bearer secret".to_string())],
+            Duration::from_secs(2),
+        )
+        .expect_err("cleartext to a remote host");
+        assert!(refused.detail().contains("cleartext"), "{refused:?}");
+
+        // The twin: the loopback is allowed through to the transport, which then fails because nothing is
+        // listening. The failure names the connection, not the scheme.
+        let local = post(
+            "http://127.0.0.1:1/v1/chat/completions",
+            "{}",
+            &[],
+            Duration::from_secs(2),
+        )
+        .expect_err("nothing listens");
+        assert!(
+            !local.detail().contains("cleartext"),
+            "the loopback was refused by the scheme rule: {local:?}"
+        );
+        assert!(
+            local.detail().contains("nothing is listening")
+                || local.detail().contains("does not resolve"),
+            "{local:?}"
+        );
+
+        // And the streaming path, which is where a local model actually attaches.
+        let streaming = stream(
+            "http://example.com/v1/chat/completions",
+            "{}",
+            &[],
+            Duration::from_secs(2),
+            &mut |_| {},
+        )
+        .expect_err("cleartext to a remote host");
+        assert!(streaming.detail().contains("cleartext"), "{streaming:?}");
     }
 
     #[test]

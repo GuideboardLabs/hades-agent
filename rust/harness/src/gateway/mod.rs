@@ -2569,7 +2569,10 @@ impl Runtime {
                         ) {
                             let _ = worker.send(
                                 &update.chat,
-                                &clip(&format!("the run failed: {said}"), worker.limit()),
+                                &clip(
+                                    &crate::http::redact(&format!("the run failed: {said}")),
+                                    worker.limit(),
+                                ),
                                 &[],
                             );
                         }

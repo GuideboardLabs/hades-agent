@@ -314,7 +314,7 @@ pub fn get(
     };
     let mut error = [0 as c_char; 512];
     let url = CString::new(url).ok()?;
-    let agent = CString::new("Mozilla/5.0 (compatible; Hades/0.21)").ok()?;
+    let agent = CString::new(crate::fetch::user_agent()).ok()?;
     let protocols = CString::new("http,https").ok()?;
 
     // The pin: per transfer, host spelled as the URL spelled it.

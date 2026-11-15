@@ -4,9 +4,10 @@
 //! and the gateway already runs as a local process beside the daemon. The cost is a held connection and
 //! a 50-second timeout, which is cheaper than the surface a webhook would add.
 //!
-//! The token appears in the URL by Telegram's design, so it is visible in the curl process's arguments
-//! while a call is in flight. Nothing here prints it, and the URL is never put in a log line or a chat
-//! message; that is the most this client can do without a proxy.
+//! The token is in the URL by Telegram's design, which makes the URL itself a credential. Nothing here puts
+//! a URL in an argument list: `http::post` carries it in the private 0600 config file curl reads with `-K`,
+//! and the two downloads below do the same. Nothing here prints it either, and every failure that could
+//! carry it is passed through `http::redact` before it becomes a `String`.
 
 use std::time::Duration;
 
@@ -47,7 +48,7 @@ impl Telegram {
             &[("Content-Type", "application/json".to_string())],
             Duration::from_secs(timeout),
         )
-        .map_err(|fault| fault.detail().to_string())?;
+        .map_err(|fault| http::redact(fault.detail()))?;
         let value: Value = serde_json::from_str(&reply.body)
             .map_err(|error| format!("telegram's answer would not read: {error}"))?;
         if value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -143,40 +144,76 @@ impl Transport for Telegram {
     }
     /// Telegram keeps the bytes; getFile names a path, and the file endpoint serves it. curl is used rather
     /// than the JSON client because the answer is binary and http::post is a string client.
+    ///
+    /// Both URLs carry the token, so neither is an argument: each goes into a private 0600 config file and
+    /// curl is pointed at that with `-K`. `-q` is first because curl honours it only in position zero; a
+    /// `.curlrc` can name a proxy, a second URL or a relaxed TLS check, and none of that may decide where a
+    /// token goes. `--proto =https` refuses a redirect or a config that downgrades the scheme, and
+    /// `--max-filesize` bounds what a hostile answer can write to this process's memory; Telegram's own
+    /// limit for a bot download is 20 MB.
     fn file(&self, file_id: &str) -> Result<Vec<u8>, String> {
         use std::process::Command;
+        const LIMIT: &str = "20971520";
         let meta_url = format!(
             "{}/bot{}/getFile?file_id={}",
             self.base,
             self.token,
             urlencode(file_id)
         );
+        let meta_config =
+            http::secret_url(&meta_url).map_err(|fault| http::redact(fault.detail()))?;
         let meta = Command::new("curl")
-            .arg("-sS")
-            .arg("--max-time")
-            .arg("30")
-            .arg(&meta_url)
+            .args([
+                "-q",
+                "-sS",
+                "--proto",
+                "=https",
+                "--max-filesize",
+                LIMIT,
+                "--max-time",
+                "30",
+            ])
+            .arg("-K")
+            .arg(meta_config.path())
             .output()
             .map_err(|error| format!("could not name the file: {error}"))?;
         if !meta.status.success() {
-            return Err(String::from_utf8_lossy(&meta.stderr).trim().to_string());
+            let stderr = String::from_utf8_lossy(&meta.stderr);
+            return Err(http::redact(&format!(
+                "could not name the file: {}",
+                stderr.trim()
+            )));
         }
         let parsed: Value = serde_json::from_slice(&meta.stdout)
             .map_err(|error| format!("telegram answered with something else: {error}"))?;
         let path = parsed
             .pointer("/result/file_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("telegram refused the file: {}", parsed))?;
+            .ok_or_else(|| http::redact(&format!("telegram refused the file: {parsed}")))?;
         let file_url = format!("{}/file/bot{}/{}", self.base, self.token, path);
+        let file_config =
+            http::secret_url(&file_url).map_err(|fault| http::redact(fault.detail()))?;
         let file = Command::new("curl")
-            .arg("-sS")
-            .arg("--max-time")
-            .arg("120")
-            .arg(&file_url)
+            .args([
+                "-q",
+                "-sS",
+                "--proto",
+                "=https",
+                "--max-filesize",
+                LIMIT,
+                "--max-time",
+                "120",
+            ])
+            .arg("-K")
+            .arg(file_config.path())
             .output()
             .map_err(|error| format!("could not download the file: {error}"))?;
         if !file.status.success() {
-            return Err(String::from_utf8_lossy(&file.stderr).trim().to_string());
+            let stderr = String::from_utf8_lossy(&file.stderr);
+            return Err(http::redact(&format!(
+                "could not download the file: {}",
+                stderr.trim()
+            )));
         }
         if file.stdout.is_empty() {
             return Err("telegram sent an empty file".to_string());

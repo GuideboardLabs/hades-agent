@@ -730,18 +730,7 @@ fn call_with(
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    for variable in [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "NO_PROXY",
-        "no_proxy",
-    ] {
-        command.env_remove(variable);
-    }
+    scrub_environment(&mut command);
     let output = command
         .output()
         .map_err(|error| format!("could not run curl: {error}"))?;
@@ -878,6 +867,36 @@ enum Outcome {
     Redirect(String),
 }
 
+/// The environment variables curl reads, which a fetch that chooses its own route and its own trust must
+/// not inherit: every spelling of a proxy, the CA bundle and directory (a widened trust store would make a
+/// forged certificate acceptable), and `CURL_HOME`, which decides whether a `.curlrc` is read at all.
+const SCRUBBED: &[&str] = &[
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    // Trust, not route: a bundle or directory set by whoever launched the process would widen what a page
+    // is allowed to present, and the fixture's certificate pin is the point of `--cacert`.
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    // Where curl looks for `.curlrc`. `-q` already makes the file irrelevant, and the variable that points
+    // at it goes too, so there is one reason a config cannot apply rather than two.
+    "CURL_HOME",
+];
+
+/// Every curl invocation this module makes goes through here, so a variable added to the list reaches all
+/// of them at once. Two copies of the list was how the second call site kept a hole the first one closed.
+fn scrub_environment(command: &mut std::process::Command) {
+    for variable in SCRUBBED {
+        command.env_remove(variable);
+    }
+}
+
 /// One curl call: no `-L`, protocols restricted on both the primary and the redirects, redirect
 /// following off (`--max-redirs 0`, curl's own counter agreeing with the driver), the body capped
 /// before transfer, both files inside one `0700` directory that `Drop` removes however the call
@@ -908,19 +927,7 @@ fn call(
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    // A proxy variable would re-route a drive that pins addresses, so every spelling of one goes.
-    for variable in [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "NO_PROXY",
-        "no_proxy",
-    ] {
-        command.env_remove(variable);
-    }
+    scrub_environment(&mut command);
     let output = command.output().map_err(|error| {
         // A static musl build cannot dlopen libcurl, so this path is not a fallback there: it is the only
         // transport, and the missing piece has a name and a fix. Say both.
@@ -1059,7 +1066,7 @@ fn curl_args(input: CallArgs<'_>) -> Vec<String> {
         "--max-filesize".to_string(),
         limit.to_string(),
         "-A".to_string(),
-        "Mozilla/5.0 (compatible; Hades/0.21)".to_string(),
+        user_agent(),
         "-D".to_string(),
         headers.display().to_string(),
         "-o".to_string(),
@@ -1078,6 +1085,18 @@ fn curl_args(input: CallArgs<'_>) -> Vec<String> {
         args.push(ca.display().to_string());
     }
     args
+}
+
+/// The user agent this build sends.
+///
+/// It said `Hades/0.21` in a 0.6.x binary, which is a claim about the client that nothing kept true: a page
+/// that keys behaviour on it is being told the wrong version. The crate's own version is the only one that
+/// cannot drift.
+pub(crate) fn user_agent() -> String {
+    format!(
+        "Mozilla/5.0 (compatible; Hades/{})",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// What the header file says about continuing. `Some` is one of the five followed 3xx codes with a
@@ -2376,5 +2395,62 @@ mod tests {
                 let _ = stream.flush();
             }
         })
+    }
+
+    /// The environment a fetch's curl inherits, and the one claim it makes about itself.
+    ///
+    /// Two variables decide where a request goes (the proxy spellings) and three decide what it is willing
+    /// to trust (`CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`), and `CURL_HOME` decides whether curl
+    /// reads a `.curlrc` at all. A drive that pins the address and chooses the certificate cannot let any of
+    /// them be set by whoever launched the process, so the list is asserted here, and both curl call sites
+    /// go through the same function that applies it.
+    #[test]
+    fn the_environment_a_fetch_hands_curl_is_a_passlist() {
+        for needed in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "CURL_CA_BUNDLE",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_HOME",
+        ] {
+            assert!(
+                SCRUBBED.contains(&needed),
+                "{needed} reaches curl, and nothing here would say so: {SCRUBBED:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_user_agent_is_the_build_it_is() {
+        let agent = user_agent();
+        assert!(
+            agent.contains(env!("CARGO_PKG_VERSION")),
+            "the agent claims a version this build is not: {agent}"
+        );
+        // The value hard-coded in a 0.6.x build.
+        assert!(!agent.contains("Hades/0.21"), "{agent}");
+        let target = Target::parse("https://example.invalid/").expect("parses");
+        let header_file = std::path::PathBuf::from("/nonexistent/headers");
+        let body_file = std::path::PathBuf::from("/nonexistent/body");
+        let args = curl_args(CallArgs {
+            target: &target,
+            url: "https://example.invalid/",
+            address: "127.0.0.1".parse().expect("an address"),
+            max_time: 5,
+            headers: &header_file,
+            body: &body_file,
+            ca: None,
+            limit: 1024,
+        });
+        let at = args.iter().position(|arg| arg == "-A").expect("-A");
+        assert_eq!(args[at + 1], agent, "curl is sent a different agent");
+        assert!(!args.join(" ").contains("Hades/0.21"), "{args:?}");
     }
 }
