@@ -674,9 +674,13 @@ impl<S: NoteStore, C: Clock> Vault<S, C> {
 
     /// Find notes by topic or project. Both filters, when given, must match. With neither, nothing is
     /// returned: the vault never dumps itself, and a caller that wants everything walks it.
+    ///
+    /// The fence is the default one, because recall is knowledge and a person-type note is not: an empty
+    /// list here returned `People` by topic, which is the bypass the audit measured. A caller that wants
+    /// other fences calls [`Vault::iter_notes`] with its own.
     pub fn recall(&self, topic: Option<&str>, project: Option<&str>) -> Result<Vec<Note>, Fault> {
         let mut found: Vec<Note> = Vec::new();
-        for note in self.iter_notes(None, &[])? {
+        for note in self.iter_notes(None, &crate::fence::default_fences())? {
             // Recall is knowledge: research, projects and products. The Inbox is a queue, the Outbox is
             // a channel nothing reads yet, and a topic is a door, not a finding.
             let area = crate::sqlite::note_path(&self.root, &note.path).map(|(area, _)| area);

@@ -70,7 +70,7 @@ pub use charter::Charter;
 pub use clock::SystemClock;
 pub use date::Date;
 pub use fault::Fault;
-pub use fence::fenced;
+pub use fence::{FENCE_DEFAULT, default_fences, fenced};
 pub use frontmatter::{Field, Frontmatter};
 pub use index::INDEX_NAME;
 pub use note::{Note, relative_posix, slugify};

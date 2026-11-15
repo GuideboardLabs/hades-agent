@@ -32,8 +32,9 @@ pub use timestamp::{SystemTimestamp, Timestamp};
 use mneme::Area;
 
 /// The fences a vault runs with unless it is told otherwise: the personal areas, fenced out of every
-/// read and every index.
-pub const FENCE_DEFAULT: [&str; 3] = ["2-Areas", "3-Resources/People", "People"];
+/// read and every index. The list itself lives beside the predicate that applies it
+/// (`mneme::FENCE_DEFAULT`), so the two cannot drift apart.
+pub use mneme::FENCE_DEFAULT;
 
 /// A note may be filed into these and stay memory. Every other area is a queue or a hub.
 pub const DURABLE_AREAS: [Area; 2] = [Area::Research, Area::Projects];

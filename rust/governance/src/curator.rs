@@ -43,11 +43,7 @@ pub struct Curator<S: NoteStore, C: Clock, T: Timestamp> {
 impl<S: NoteStore, C: Clock, T: Timestamp> Curator<S, C, T> {
     /// A curator over a vault, fenced with [`crate::FENCE_DEFAULT`].
     pub fn new(vault: Vault<S, C>, timestamp: T) -> Self {
-        let fences = crate::FENCE_DEFAULT
-            .iter()
-            .map(|fence| fence.to_string())
-            .collect();
-        Curator::with_fences(vault, timestamp, fences)
+        Curator::with_fences(vault, timestamp, mneme::default_fences())
     }
 
     pub fn with_fences(vault: Vault<S, C>, timestamp: T, fences: Vec<String>) -> Self {

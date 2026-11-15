@@ -4929,13 +4929,13 @@ fn audit(args: &[String]) -> Result<(String, i32), String> {
         let refreshed = !explicit && (empty || switched(&flags, "refresh"));
         if explicit || refreshed {
             store
-                .import_tree_lenient(&root, &[])
+                .import_tree_lenient(&root, &mneme::default_fences())
                 .map_err(|fault| fault.to_string())?;
         }
         let vault = mneme::Vault::new(root.clone(), store, mneme::SystemClock);
         if refreshed {
             vault
-                .write_index(None, &[])
+                .write_index(None, &mneme::default_fences())
                 .map_err(|fault| fault.to_string())?;
         }
         let curator = governance::Curator::new(vault, governance::SystemTimestamp);
@@ -6115,13 +6115,13 @@ fn mneme(args: &[String]) -> Result<(String, i32), String> {
             let source = guarded(Path::new(source))?;
             let report = vault
                 .store()
-                .import_tree(&source, &[])
+                .import_tree(&source, &mneme::default_fences())
                 .map_err(|fault| fault.to_string())?;
             // The index is a view of the record. An import that did not refresh it would leave a
             // vault that audits correctly and reads as empty, which is the drift the map exists to
-            // prevent.
+            // prevent. The same fences the import used, so the view cannot list what was fenced out.
             vault
-                .write_index(None, &[])
+                .write_index(None, &mneme::default_fences())
                 .map_err(|fault| fault.to_string())?;
             let mut text = format!("imported: {} from {}\n", report.imported, source.display());
             text.push_str(&format!("fenced: {}\n", report.fenced.len()));
@@ -8733,5 +8733,85 @@ mod journal_cli_tests {
         assert!(text.contains("no journal for run `nobody`"), "{text}");
         assert!(text.contains("journal"), "{text}");
         assert!(!text.contains("hades tui"), "not a usage dump: {text}");
+    }
+}
+
+/// The two commands that read a tree from outside: `mneme import` and `audit --vault`. Both used to be
+/// handed an empty fence list, so a copy of somebody's vault (one without the `.obsidian` marker, which
+/// the boundary guard looks for) imported every person-type note into the record.
+#[cfg(test)]
+mod mneme_cli_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        crate::scratch::unique(name)
+    }
+
+    fn run(args: &[&str]) -> (String, i32) {
+        let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let mut input: &[u8] = b"";
+        let code = run_with(&owned, &mut out, &mut input);
+        (String::from_utf8_lossy(&out).to_string(), code)
+    }
+
+    /// A note in a fenced area and an ordinary one beside it, with the frontmatter a research note needs.
+    fn seed(source: &Path) {
+        for (at, title, body) in [
+            (
+                "20 Research/People/alice.md",
+                "Alice",
+                "A person the agent was told about.",
+            ),
+            (
+                "20 Research/systems/ledger.md",
+                "Ledger",
+                "The ledger appends one line per decided action.",
+            ),
+        ] {
+            let path = source.join(at);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a folder");
+            std::fs::write(
+                path,
+                format!(
+                    "---\ntitle: {title}\ntopic: systems\nprovenance: a conversation\nsummary: {body}\n---\n{body}\n"
+                ),
+            )
+            .expect("a note");
+        }
+    }
+
+    #[test]
+    fn importing_a_tree_reports_and_skips_a_fenced_note() {
+        let dir = scratch("cli-mneme-fence");
+        let source = dir.join("copy-of-a-vault");
+        let vault = dir.join("vault");
+        let db = dir.join("mneme.db");
+        seed(&source);
+
+        let (text, code) = run(&[
+            "mneme",
+            "import",
+            &source.display().to_string(),
+            "--vault",
+            &vault.display().to_string(),
+            "--db",
+            &db.display().to_string(),
+        ]);
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("imported: 1"), "{text}");
+        assert!(text.contains("fenced: 1"), "{text}");
+        assert!(text.contains("People/alice.md"), "{text}");
+
+        // A fence is not a line in a report: the note is not a row, so a recall cannot return it.
+        let store = mneme::SqliteStore::open(&db, &vault).expect("the record");
+        assert!(
+            !store.exists(&vault.join("20 Research/People/alice.md")),
+            "a fenced note became a row in the record"
+        );
+        assert!(
+            store.exists(&vault.join("20 Research/systems/ledger.md")),
+            "the ordinary note beside it did not import"
+        );
     }
 }

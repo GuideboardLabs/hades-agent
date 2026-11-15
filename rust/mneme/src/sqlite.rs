@@ -1587,6 +1587,31 @@ mod tests {
         );
     }
 
+    /// Recall is knowledge, and the fence is what keeps a person-type note out of it. `Vault::recall`
+    /// walked every area with an empty fence list, so a note filed under `People` came back by topic.
+    #[test]
+    fn recall_never_returns_a_fenced_note() {
+        let (store, root) = fresh("recall-fence");
+        for (at, title) in [("People/alice", "Alice"), ("systems/ledger", "Ledger")] {
+            let path = root.join(Area::Research.folder()).join(format!("{at}.md"));
+            store
+                .write(
+                    &path,
+                    &format!(
+                        "---\ntitle: {title}\ntopic: systems\nprovenance: a conversation\nsummary: {title}\n---\nbody\n"
+                    ),
+                )
+                .expect("a note");
+        }
+        let vault = crate::Vault::new(root.clone(), store, crate::SystemClock);
+        let found = vault.recall(Some("systems"), None).expect("recall");
+        let titles: Vec<&str> = found
+            .iter()
+            .map(|note| note.frontmatter.title.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(titles, vec!["Ledger"], "{titles:?}");
+    }
+
     fn note(text: &str, topics: &[&str], extra: &[(&str, Field)]) -> String {
         let frontmatter = Frontmatter {
             title: Some("A, [bracket]".to_string()),

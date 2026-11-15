@@ -7,6 +7,22 @@
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
+/// The fences a vault runs with unless it is told otherwise: the personal areas, fenced out of every
+/// read, every import and every index.
+///
+/// This list lives beside the predicate that applies it, because the two have to agree: a default list in
+/// another crate is a second copy of a safety rule, and the three call sites that passed an empty list
+/// were the drift the audit found.
+pub const FENCE_DEFAULT: [&str; 3] = ["2-Areas", "3-Resources/People", "People"];
+
+/// [`FENCE_DEFAULT`] as the owned list every reader takes.
+pub fn default_fences() -> Vec<String> {
+    FENCE_DEFAULT
+        .iter()
+        .map(|fence| fence.to_string())
+        .collect()
+}
+
 /// True when every part of a fence is a part of the path.
 ///
 /// Matching is by path part, never by substring, so a fence of `2-Areas/Family` does not fence
