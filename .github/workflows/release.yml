@@ -17,9 +17,12 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          # The tag is a snapshot of the action; the toolchain is the version this repository pins in
+          # rust-toolchain.toml, named here because a SHA checkout has no ref for the action to read.
+          toolchain: 1.99.1
           components: clippy, rustfmt
       - name: The version the docs claim is the version in the manifest
         run: bash rust/scripts/check-claims.sh
@@ -59,9 +62,10 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: 1.99.1
           targets: aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl
       # Neither build is a container job: the cross toolchains and qemu are staged under the cache with
       # `apt-get download` and `dpkg-deb -x`, because registering binfmt needs root the runner does not give us.
@@ -83,7 +87,7 @@ jobs:
       # undiagnosable. When the build fails, its own output is attached as an artifact instead.
       - name: Keep the ARM64 build log when it fails
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: arm64-build-log
           path: /tmp/arm64-build.log
@@ -95,7 +99,7 @@ jobs:
         run: |
           message=$(tail -5 /tmp/arm64-build.log 2>/dev/null | tr '\n' ' ' | cut -c1-900)
           echo "::error title=ARM64 build failed::${message:-no build log was written}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-arm64
           path: |
@@ -107,14 +111,14 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Both builds run in the image they target, exactly as they do locally. A container job cannot nest a
       # second container, and `actions/checkout` has no musl build, so the container is driven from the runner.
       - name: Build for glibc 2.30
         run: bash rust/scripts/portable-build.sh --flavour gnu --out dist
       - name: Build the static musl binary
         run: bash rust/scripts/portable-build.sh --flavour musl --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries
           path: |
@@ -126,10 +130,10 @@ jobs:
     needs: [artifacts, arm64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Both artifact sets, merged: the four binaries are verified from the bytes that will be published,
       # not from the build directory they were copied out of.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: binaries*
           merge-multiple: true
@@ -167,8 +171,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: binaries*
           merge-multiple: true

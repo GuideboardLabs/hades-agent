@@ -33,7 +33,20 @@ OUT=$(cd "$OUT" && pwd -P)
 
 # A build script is run from wherever the caller stands; the workspace is beside this script.
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/rust/target}
+CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
 MANIFEST=$ROOT/rust/Cargo.toml
+
+# A released artifact must not name the machine that built it. rustc embeds the checkout, CARGO_HOME
+# (every dependency's registry source) and CARGO_TARGET_DIR, which is where the build paths came from.
+# Remap all three to stable names for both flavours; `assert-no-build-paths.sh` at the end of this script
+# is the check, and it scans the artifact this run produced rather than whatever dist/ already held.
+REMAPPED="--remap-path-prefix=$ROOT=/hades/src --remap-path-prefix=$CARGO_HOME=/hades/cargo --remap-path-prefix=$CARGO_TARGET_DIR=/hades/target"
+
+# The musl.cc tarball is not versioned: its filename is the current build, not a release. Pinning the
+# bytes is the only pin available, so the sha256 of the tarball served on 2026-11-15 is recorded here and
+# a mismatch fails the build instead of compiling a different toolchain than the one measured. When
+# musl.cc rebuilds, update this value deliberately.
+MUSL_CC_SHA256=c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38
 
 rustup target list --installed | grep -qx aarch64-unknown-linux-gnu ||
   rustup target add aarch64-unknown-linux-gnu
@@ -132,7 +145,7 @@ build_gnu() {
     CC_aarch64_unknown_linux_gnu=$PREFIX/bin/cc \
     AR_aarch64_unknown_linux_gnu=$PREFIX/bin/ar \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$PREFIX/bin/cc \
-    RUSTFLAGS="${RUSTFLAGS:-} -L native=$PREFIX/bullseye/lib/aarch64-linux-gnu -L native=$PREFIX/bullseye/usr/lib/aarch64-linux-gnu" \
+    RUSTFLAGS="${RUSTFLAGS:-} $REMAPPED -L native=$PREFIX/bullseye/lib/aarch64-linux-gnu -L native=$PREFIX/bullseye/usr/lib/aarch64-linux-gnu" \
     "$CARGO" build --release --locked --manifest-path "$MANIFEST" -p harness --target aarch64-unknown-linux-gnu
   cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/hades" "$OUT/$name"
   chmod 755 "$OUT/$name"
@@ -182,7 +195,17 @@ WRAPPER
   else
     mkdir -p "$PREFIX"
     echo "staging the aarch64 musl toolchain from musl.cc"
-    if curl -sSL --max-time 90 https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C "$PREFIX"; then
+    archive=$PREFIX/aarch64-linux-musl-cross.tgz
+    if curl -sSL --max-time 300 https://musl.cc/aarch64-linux-musl-cross.tgz -o "$archive"; then
+      got=$(sha256sum "$archive" | awk '{print $1}')
+      if [ "$got" != "$MUSL_CC_SHA256" ]; then
+        echo "FAIL the musl.cc tarball is not the pinned one: sha256 $got, this script pins $MUSL_CC_SHA256" >&2
+        echo "musl.cc rebuilt its unversioned tarball; measure the new toolchain, then update MUSL_CC_SHA256" >&2
+        rm -f "$archive"
+        exit 1
+      fi
+      tar xzf "$archive" -C "$PREFIX"
+      rm -f "$archive"
       rm -rf "$musl"
       mv "$PREFIX/aarch64-linux-musl-cross" "$musl"
       cc=$musl/bin/aarch64-linux-musl-gcc
@@ -198,7 +221,7 @@ WRAPPER
   CC_aarch64_unknown_linux_musl=$cc \
     AR_aarch64_unknown_linux_musl=$ar \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$cc \
-    RUSTFLAGS="${RUSTFLAGS:-} $flags" \
+    RUSTFLAGS="${RUSTFLAGS:-} $REMAPPED $flags" \
     "$CARGO" build --release --locked --manifest-path "$MANIFEST" -p harness --target aarch64-unknown-linux-musl
   cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/hades" "$OUT/$name"
   chmod 755 "$OUT/$name"
@@ -221,6 +244,15 @@ case "$FLAVOUR" in
     build_musl
     ;;
 esac
+
+# Only the artifacts this run produced: a scan of dist/ would pass on an old clean file while this build
+# leaked its own directory.
+case "$FLAVOUR" in
+  gnu) built=("$OUT/hades-arm64-gnu") ;;
+  musl) built=("$OUT/hades-arm64-musl") ;;
+  both) built=("$OUT/hades-arm64-gnu" "$OUT/hades-arm64-musl") ;;
+esac
+"$HERE/assert-no-build-paths.sh" "${built[@]}"
 
 echo "ARM64 artifacts in $OUT:"
 ls -l "$OUT"/hades-arm64-*

@@ -23,6 +23,10 @@ export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 WANT=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SRC/harness/Cargo.toml" | head -1)
 [ -n "$WANT" ] || { echo "no version in $SRC/harness/Cargo.toml"; exit 2; }
 
+# The compiler this repository pins in rust-toolchain.toml, not whatever `stable` means on the day the
+# image is built.
+WANT_TOOLCHAIN=1.99.1
+
 if command -v apk >/dev/null 2>&1; then
   apk add --no-cache curl bash build-base pkgconf ca-certificates >/dev/null 2>&1 || { echo APK_FAILED; exit 3; }
 else
@@ -31,8 +35,27 @@ else
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null || { echo RUSTUP_FAILED; exit 3; }
+  # A pipeline into `sh` cannot be checked before it runs, so the installer is a file. rustup publishes a
+  # sha256 beside each rustup-init; a mismatch stops here rather than installing something else. The
+  # checksum travels over the same channel as the binary, so this catches a truncated or swapped download,
+  # not a compromised server: that limit is stated rather than hidden.
+  case "$(uname -m)" in
+    x86_64) rustup_target=x86_64-unknown-linux-gnu ;;
+    aarch64 | arm64) rustup_target=aarch64-unknown-linux-gnu ;;
+    *) echo "RUSTUP_NO_TARGET"; exit 3 ;;
+  esac
+  base="https://static.rust-lang.org/rustup/dist/$rustup_target"
+  curl --proto "=https" --tlsv1.2 -sSf "$base/rustup-init" -o /tmp/rustup-init || { echo RUSTUP_FAILED; exit 3; }
+  want=$(curl --proto "=https" --tlsv1.2 -sSf "$base/rustup-init.sha256" | awk '{print $1}') || {
+    echo RUSTUP_CHECKSUM_MISSING; exit 3;
+  }
+  got=$(sha256sum /tmp/rustup-init | awk '{print $1}')
+  [ -n "$want" ] && [ "$want" = "$got" ] || { echo RUSTUP_CHECKSUM_MISMATCH; exit 3; }
+  chmod +x /tmp/rustup-init
+  /tmp/rustup-init -y --profile minimal --default-toolchain "$WANT_TOOLCHAIN" >/dev/null || {
+    echo RUSTUP_FAILED; exit 3;
+  }
+  rm -f /tmp/rustup-init
 fi
 
 mkdir -p "$OUT"

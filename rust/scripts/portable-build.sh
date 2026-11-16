@@ -92,3 +92,8 @@ case "$FLAVOUR" in
   gnu) "$HERE/assert-floor.sh" "$OUT/$NAME" --max-glibc 2.30 || exit 1 ;;
   musl) "$HERE/assert-floor.sh" "$OUT/$NAME" --static || exit 1 ;;
 esac
+
+# The artifact this build produced must not name the machine behind it. A container build has no host
+# paths to leak; this is the check that keeps it that way, and it scans the bytes just written rather
+# than whatever dist/ already held.
+"$HERE/assert-no-build-paths.sh" "$OUT/$NAME"

@@ -37,7 +37,24 @@ export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 apt-get update -qq >/dev/null
 apt-get install -y -qq curl build-essential pkg-config ca-certificates >/dev/null
 if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+  # The installer is checked against the sha256 rustup publishes before it runs, and the toolchain is the
+  # one rust-toolchain.toml pins rather than `stable`. Same limit as any checksum: it catches a bad
+  # download, not a compromised server.
+  case "$(uname -m)" in
+    x86_64) rustup_target=x86_64-unknown-linux-gnu ;;
+    aarch64 | arm64) rustup_target=aarch64-unknown-linux-gnu ;;
+    *) echo "no rustup-init target for $(uname -m)"; exit 3 ;;
+  esac
+  base="https://static.rust-lang.org/rustup/dist/$rustup_target"
+  curl --proto "=https" --tlsv1.2 -sSf "$base/rustup-init" -o /tmp/rustup-init
+  want=$(curl --proto "=https" --tlsv1.2 -sSf "$base/rustup-init.sha256")
+  want=${want%% *}
+  got=$(sha256sum /tmp/rustup-init)
+  got=${got%% *}
+  [ -n "$want" ] && [ "$want" = "$got" ] || { echo "rustup-init checksum mismatch"; exit 3; }
+  chmod +x /tmp/rustup-init
+  /tmp/rustup-init -y --profile minimal --default-toolchain 1.99.1 >/dev/null
+  rm -f /tmp/rustup-init
 fi
 rustup component add clippy rustfmt >/dev/null 2>&1 || true
 cd /src/rust
