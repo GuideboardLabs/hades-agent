@@ -73,6 +73,13 @@ This release touched nothing between the query and the page, so the standing mea
 rather than retaken; the measuring build is still `unrecorded` until a live `--save` runs, which is a
 defect the 0.6 line already owned.
 
+### Still not fixed
+
+- **The live browser suite on this machine fails two context tests against the host's current Chromium**
+  (`a_browser_context_isolates_its_tab`, `a_popup_becomes_a_tab_the_model_can_switch_to`). Measured at
+  the 0.6.18 base commit with the same browser: the same two fail there too, plus the headed test — so
+  the drift is the browser, not this line, and it is named here rather than shipped as silence.
+
 ```
 read-eval gold 1d9233b12b2529c5 measured-by unrecorded
 | class | rows | found | state% | recall | clean | unchecked | boiler |
