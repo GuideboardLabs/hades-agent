@@ -18,8 +18,8 @@ governance = { path = "../governance" }
 # Entry payloads are JSON, which is the format the session tree already writes.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_28"] }
 crossterm = "0.28"
 unicode-width = "0.2"
 # The Landlock syscalls, with the per-architecture numbers libc already knows. The cage used raw x86-64
