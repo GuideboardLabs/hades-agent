@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::approval::ApprovalBroker as _;
+
 pub use chat::Chat;
 
 /// The default per-message character budget, used by a surface that does not declare its own. Telegram
@@ -927,6 +929,17 @@ fn pre(text: &str) -> String {
     format!("<pre>{}</pre>", esc(text.trim_end()))
 }
 
+/// How an approval question reads on every surface that renders one. One wording, because a run's
+/// question and a conversation's question are the same question and must not describe themselves
+/// differently.
+fn permission_prompt(action: &str, reason: &str) -> String {
+    format!(
+        "<b>Permission needed</b>\n{}\n<i>{}</i>",
+        pre(action),
+        esc(reason)
+    )
+}
+
 /// A tool's name as a heading a person reads.
 fn title(tool: &str) -> &'static str {
     match tool {
@@ -1169,14 +1182,7 @@ fn follow<T: Transport + Clone + Send + 'static>(
                 asked = true;
                 match pending_save(state, id, &chat, Some((goal, session))) {
                     Ok(()) => {
-                        let text = clip(
-                            &format!(
-                                "<b>Permission needed</b>\n{}\n<i>{}</i>",
-                                pre(action),
-                                esc(reason)
-                            ),
-                            transport.limit(),
-                        );
+                        let text = clip(&permission_prompt(action, reason), transport.limit());
                         if !transport.buttons() {
                             // A surface with no buttons cannot answer this question. Saying so and stopping
                             // is better than parking a run behind a prompt that can never be pressed; the
@@ -1495,10 +1501,10 @@ fn chat<T: Transport + Clone + Send + 'static>(
     halt: Option<&AtomicBool>,
     mcp: &Arc<crate::mcp::Mcp>,
 ) -> Result<(), String> {
-    let _ = state;
     let client = client_for(settings, &effective.model, effective.reasoning.as_deref())?;
     let mut history = load_chat(state, &update.chat);
     let workspace = PathBuf::from(&effective.root);
+    let surface: Arc<Mutex<T>> = Arc::new(Mutex::new(transport.clone()));
     let mut world = world_for(
         settings,
         state,
@@ -1507,11 +1513,20 @@ fn chat<T: Transport + Clone + Send + 'static>(
         &format!("chat:{}", update.chat),
         mcp,
     );
+    // A guarded conversation is handed the same approval record a run has, so the hard floor asks instead
+    // of refusing into the model's result. `open` keeps the older reading: nothing asks, and the floor's
+    // refusal is the whole answer. A surface whose record cannot be opened asks nobody, which is the same
+    // safe direction.
+    if effective.policy == "guarded"
+        && let Some(desk) = chat_desk(state, &update.chat, Arc::clone(&surface))
+    {
+        world.questions = Some(desk);
+    }
     // A reaction is a reply. The hook is bound to this message before the model sees it, so the
     // model chooses the face and nothing else: not the chat, not the message.
     let reacted: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
-        let surface = Arc::new(Mutex::new(transport.clone()));
+        let surface = Arc::clone(&surface);
         let chat = update.chat.clone();
         let message = update.id;
         let seen = Arc::clone(&reacted);
@@ -2378,10 +2393,127 @@ fn world_for(
         inbox: None,
         mcp: Arc::clone(mcp),
         allowance: crate::agent::Allowance::new(64),
-        // A gateway chat has a person behind it, but no ask bar yet: the floor refuses rather than waits.
+        // A chat has a person behind it but no ask bar: `chat` installs a desk under `policy: guarded`,
+        // and under `open` the floor still refuses rather than waits. A scheduled job keeps `None`:
+        // nobody is sitting in the chat it would ask.
         questions: None,
         react: None,
     }
+}
+
+/// A conversation's approval desk, backed by the daemon's own record.
+///
+/// The question is written to `approvals.jsonl` on the shared state directory, so a press resolves it
+/// through the daemon's `answer` op exactly as a run's question does. What this wrapper adds is the
+/// message: the chat loop has no run stream to narrate, so the question is sent here with the same
+/// Allow/Deny buttons, and a pending record bound to this chat says where the press belongs.
+struct ChatDesk<T> {
+    inner: crate::approval::OnDisk,
+    chat: Chat,
+    state: PathBuf,
+    surface: Arc<Mutex<T>>,
+}
+
+impl<T: Transport + Send> crate::approval::ApprovalBroker for ChatDesk<T> {
+    fn request_ask(
+        &self,
+        session: &str,
+        action: &str,
+        reason: &str,
+        ask: Option<crate::question::Ask>,
+    ) -> Result<crate::approval::ApprovalRequest, crate::fault::Fault> {
+        // The buttons are Allow and Deny. A choice question with other options would be answered as if it
+        // offered two, which would record something the question never asked.
+        if ask
+            .as_ref()
+            .is_some_and(|ask| ask.kind == crate::question::AskKind::Choice)
+        {
+            return Err(crate::fault::Fault::harness(
+                "this surface can hold an Allow/Deny question, not a choice".to_string(),
+            ));
+        }
+        let request = self.inner.request_ask(session, action, reason, ask)?;
+        let mut surface = self.surface.lock().map_err(|_| {
+            crate::fault::Fault::harness("the chat surface is unavailable".to_string())
+        })?;
+        // A surface with no buttons cannot answer this question. Saying so lets the floor refuse at once
+        // instead of parking the conversation on a prompt nobody can press.
+        if !surface.buttons() {
+            return Err(crate::fault::Fault::harness(
+                "this surface cannot render Allow/Deny buttons".to_string(),
+            ));
+        }
+        pending_save(&self.state, request.id.0, &self.chat, None)
+            .map_err(crate::fault::Fault::harness)?;
+        let text = clip(&permission_prompt(action, reason), surface.limit());
+        let buttons = [
+            Button {
+                label: "Allow".to_string(),
+                data: format!("a:{}:1", request.id.0),
+            },
+            Button {
+                label: "Deny".to_string(),
+                data: format!("a:{}:0", request.id.0),
+            },
+        ];
+        surface
+            .send(&self.chat, &text, &buttons)
+            .map_err(crate::fault::Fault::harness)?;
+        Ok(request)
+    }
+
+    fn questions(&self) -> Result<Vec<crate::approval::Question>, crate::fault::Fault> {
+        self.inner.questions()
+    }
+
+    fn answer(
+        &self,
+        id: crate::approval::PendingId,
+    ) -> Result<Option<crate::approval::Answer>, crate::fault::Fault> {
+        self.inner.answer(id)
+    }
+
+    fn standing(
+        &self,
+        session: &str,
+        action: &str,
+    ) -> Result<Option<crate::approval::Standing>, crate::fault::Fault> {
+        self.inner.standing(session, action)
+    }
+
+    fn resolve_answer(
+        &self,
+        id: crate::approval::PendingId,
+        decision: crate::policy::Decision,
+        scope: crate::approval::Scope,
+        option: Option<&str>,
+        note: Option<&str>,
+        by: &str,
+    ) -> Result<crate::approval::Answer, crate::fault::Fault> {
+        self.inner
+            .resolve_answer(id, decision, scope, option, note, by)
+    }
+}
+
+/// The desk a guarded conversation reaches its person through. `None` when the record cannot be opened:
+/// with no record there is nobody to ask, and the floor's refusal is the safe direction.
+fn chat_desk<T: Transport + Send + 'static>(
+    state: &Path,
+    chat: &Chat,
+    surface: Arc<Mutex<T>>,
+) -> Option<Arc<crate::question::Desk>> {
+    let inner = crate::approval::OnDisk::open(state.join("approvals.jsonl")).ok()?;
+    Some(crate::question::Desk::new(
+        Arc::new(ChatDesk {
+            inner,
+            chat: chat.clone(),
+            state: state.to_path_buf(),
+            surface,
+        }),
+        // No model question budget: the buttons are Allow and Deny, so a fork with options belongs in a
+        // work channel's ask bar, not here. Permissions do not spend this budget.
+        0,
+    ))
 }
 
 fn scheduled(
@@ -3500,6 +3632,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Fake {
         sent: Arc<Mutex<Vec<(String, String, usize)>>>,
+        edits: Arc<Mutex<Vec<String>>>,
         acks: Arc<Mutex<Vec<String>>>,
     }
 
@@ -3519,6 +3652,10 @@ mod tests {
                 .iter()
                 .map(|(_, text, _)| text.clone())
                 .collect()
+        }
+
+        fn edits(&self) -> Vec<String> {
+            self.edits.lock().expect("the edits").clone()
         }
     }
 
@@ -3545,9 +3682,10 @@ mod tests {
             &mut self,
             _chat: &Chat,
             _message: i64,
-            _text: &str,
+            text: &str,
             _buttons: &[Button],
         ) -> Result<(), String> {
+            self.edits.lock().expect("the edits").push(text.to_string());
             Ok(())
         }
 
@@ -3749,6 +3887,217 @@ mod tests {
         assert_eq!(seen[1]["op"], json!("submit"), "{:?}", seen[1]);
         assert_eq!(seen[1]["goal"], json!("the goal"));
         assert_eq!(seen[1]["session"], json!("tg-99"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A model endpoint that answers each call with one scripted SSE body, in order. Requests are kept
+    /// so a test can see what the second call was told.
+    struct ModelStub {
+        url: String,
+        bodies: Arc<Mutex<Vec<Value>>>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Value {
+        use std::io::Read;
+        let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("a header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).expect("a body");
+        serde_json::from_slice(&body).expect("a request")
+    }
+
+    fn model_stub(frames: Vec<String>) -> ModelStub {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().expect("an address")
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("a nonblocking listener");
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&bodies);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for frame in frames {
+                let mut served = None;
+                while served.is_none() && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => served = Some(stream),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("the stub could not accept: {error}"),
+                    }
+                }
+                let Some(mut stream) = served else {
+                    return;
+                };
+                seen.lock()
+                    .expect("the bodies")
+                    .push(read_http_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{frame}",
+                    frame.len()
+                )
+                .expect("a response");
+            }
+        });
+        ModelStub {
+            url,
+            bodies,
+            server,
+        }
+    }
+
+    fn tool_call_frame(tool: &str, arguments: &Value) -> String {
+        let delta = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {"name": tool, "arguments": arguments.to_string()},
+                }]},
+                "finish_reason": "tool_calls",
+            }]
+        });
+        format!("data: {delta}\n\ndata: [DONE]\n\n")
+    }
+
+    fn content_frame(text: &str) -> String {
+        let delta = json!({"choices": [{"delta": {"content": text}}]});
+        format!("data: {delta}\n\ndata: [DONE]\n\n")
+    }
+
+    /// Answer the first question the chat records, and return its id. Bounded: a chat that never asks
+    /// returns `None` before the floor's own deadline, so a red test fails instead of stalling.
+    fn answer_the_question(
+        state: &Path,
+        decision: crate::policy::Decision,
+    ) -> std::thread::JoinHandle<Option<u64>> {
+        let state = state.to_path_buf();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                let Ok(broker) = crate::approval::OnDisk::open(state.join("approvals.jsonl"))
+                else {
+                    return None;
+                };
+                let asked = broker.questions().ok().and_then(|questions| {
+                    questions
+                        .into_iter()
+                        .find(|question| question.answer.is_none())
+                });
+                if let Some(question) = asked {
+                    let id = question.request.id.0;
+                    let _ = broker.resolve_answer(
+                        question.request.id,
+                        decision,
+                        crate::approval::Scope::Once,
+                        None,
+                        None,
+                        "test",
+                    );
+                    return Some(id);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        })
+    }
+
+    fn message(from: &str, chat: Chat, text: &str) -> Update {
+        Update {
+            id: 1,
+            from: from.to_string(),
+            chat,
+            text: text.to_string(),
+            callback: None,
+            photo: None,
+            mention: None,
+            direct: None,
+        }
+    }
+
+    /// `policy: guarded` on an ordinary message means the floor asks, not that the command runs while the
+    /// config says the person decides. The question travels the same record and the same buttons a run's
+    /// question does, and the action waits for the answer.
+    #[test]
+    fn a_guarded_chat_asks_the_floor_before_a_mutating_command() {
+        let state = scratch("guarded-chat");
+        let root = state.join("work");
+        std::fs::create_dir_all(&root).expect("a workspace");
+        let stub = model_stub(vec![
+            tool_call_frame("shell", &json!({"command": "rm -rf /tmp/hades-floor-test"})),
+            content_frame("nothing ran"),
+        ]);
+        let mut settings = settings();
+        settings.policy = "guarded".to_string();
+        settings.root = root.display().to_string();
+        settings.provider = Some(json!({
+            "endpoint": stub.url,
+            "model": "stub",
+            "key_env": null
+        }));
+        let answerer = answer_the_question(&state, crate::policy::Decision::Deny);
+
+        let mut fake = Fake::default();
+        handle_with(
+            &message("7", Chat::telegram(7), "clean up the build directory"),
+            &settings,
+            &state.join("daemon.sock"),
+            &state,
+            &mut fake,
+            &Signals::default(),
+            &Arc::new(crate::mcp::Mcp::empty()),
+        )
+        .expect("the message is answered");
+
+        let id = answerer.join().expect("the answerer");
+        let id = id.expect("a guarded chat has to raise a question, not run the command");
+        let held = pending_load(&state, id).expect("the question is held by the gateway");
+        assert_eq!(held.chat, Some(Chat::telegram(7)), "{held:?}");
+        assert!(
+            held.resume.is_none(),
+            "a chat question resumes nothing: {held:?}"
+        );
+        let asked = fake
+            .sent
+            .lock()
+            .expect("the sends")
+            .iter()
+            .find(|(_, text, buttons)| text.contains("Permission needed") && *buttons == 2)
+            .cloned();
+        assert!(
+            asked.is_some(),
+            "the question must reach the chat with both buttons: {:?}",
+            fake.texts()
+        );
+        assert!(
+            fake.edits().iter().any(|text| text.contains("nothing ran")),
+            "the conversation continued after the answer: {:?}",
+            fake.edits()
+        );
+        let first = stub.bodies.lock().expect("the bodies")[0].clone();
+        assert!(
+            first["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("chat")),
+            "the chat's own prompt was sent: {first:?}"
+        );
+        stub.server.join().expect("the model stub");
         let _ = std::fs::remove_dir_all(&state);
     }
 }
