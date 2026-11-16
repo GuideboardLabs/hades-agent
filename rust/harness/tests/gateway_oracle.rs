@@ -497,9 +497,13 @@ fn a_mention_only_surface_still_answers_the_button_it_holds() {
     let dir = scratch("mention-button");
     let pending = dir.join("gateway").join("pending");
     std::fs::create_dir_all(&pending).expect("the pending directory");
+    // The record is written in the shape the gateway's own writer produces, chat key and all: since the
+    // chat was recorded, a press from any other conversation is refused, and a record without a chat is
+    // refused outright, so a fixture that hand-wrote the old shape fails closed exactly like the real thing.
+    let asked = Chat::new("telegram", "-100123");
     std::fs::write(
         pending.join("42.json"),
-        json!({"goal": "make the stats file", "session": "tg-1"}).to_string(),
+        json!({"goal": "make the stats file", "session": "tg-1", "chat": asked.key()}).to_string(),
     )
     .expect("a held goal");
 
