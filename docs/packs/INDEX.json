@@ -41,8 +41,8 @@
       "version": "0.4.5"
     },
     {
-      "archive": "dist/llama-cpp-pack-2.2.1.hadepack",
-      "bytes": 74290,
+      "archive": "dist/llama-cpp-pack-2.2.2.hadepack",
+      "bytes": 74292,
       "capabilities": {
         "code": false,
         "network": false,
@@ -76,14 +76,14 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.2.0,<0.3",
-      "sha256": "a322bd592cec5cfbdbda90c70625c083e7cea8746980526715915ba36b82f01b",
+      "requires_hades": ">=0.2.0,<0.8",
+      "sha256": "5145f287f4f285af4cd5b240b815e880ba2245e17573254d8d3306813fe8798b",
       "summary": "Take a GGUF from a file on disk to a tuned, pre-tested, served model on a consumer gaming GPU: probe the box, choose the backend by silicon, do the VRAM maths, tune, smoke-test and write the unit. `--choice` answers the other question, six intents with three seats each so speed and depth can be traded deliberately. Every number carries the measurement that produced it, and every tool refuses the action that would produce a lie.",
       "title": "llama.cpp serving",
-      "version": "2.2.1"
+      "version": "2.2.2"
     },
     {
-      "archive": "dist/plan-a-change-1.0.1.hadepack",
+      "archive": "dist/plan-a-change-1.0.2.hadepack",
       "bytes": 1619,
       "capabilities": {
         "code": false,
@@ -108,15 +108,15 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.1.0,<0.3",
-      "sha256": "aa30fe514413e43fa4085255d15e088e5d71bed278542cfa25c079937ed10644",
+      "requires_hades": ">=0.1.0,<0.8",
+      "sha256": "acb594aa30bb62445119d04382226668f084e25c7c795b993101289f02c89766",
       "summary": "Break a change into steps a check can prove, before any file is touched.",
       "title": "Plan a change",
-      "version": "1.0.1"
+      "version": "1.0.2"
     },
     {
-      "archive": "dist/research-with-sources-1.0.1.hadepack",
-      "bytes": 1687,
+      "archive": "dist/research-with-sources-1.0.2.hadepack",
+      "bytes": 1691,
       "capabilities": {
         "code": false,
         "network": true,
@@ -140,15 +140,15 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.1.0,<0.3",
-      "sha256": "a105d8b12a16c48a02467b4a676a3656a6e50aa4e92c8d324d4a1b02c4d5cc81",
+      "requires_hades": ">=0.1.0,<0.8",
+      "sha256": "6fb8b46b3c58f9971d3df0efcd0a5fb665276c7d244703e4a5f535e9f975cbfb",
       "summary": "Answer a question from primary sources, with the quote and the date attached to every claim.",
       "title": "Research with sources",
-      "version": "1.0.1"
+      "version": "1.0.2"
     },
     {
-      "archive": "dist/review-a-diff-1.0.1.hadepack",
-      "bytes": 1700,
+      "archive": "dist/review-a-diff-1.0.2.hadepack",
+      "bytes": 1702,
       "capabilities": {
         "code": false,
         "network": false,
@@ -172,11 +172,11 @@
         "skill"
       ],
       "license": "MIT",
-      "requires_hades": ">=0.1.0,<0.3",
-      "sha256": "08d2bed8deb9ca4ad80fd94437e80574cf7f074441f6551cba3136a213ee70b1",
+      "requires_hades": ">=0.1.0,<0.8",
+      "sha256": "275d2696da1729172034b72cbbd7be6339eb423579b1fdd8fe2e2cbaaffdf596",
       "summary": "Read a change as a reviewer: what it does, what it breaks, what it leaves untested.",
       "title": "Review a diff",
-      "version": "1.0.1"
+      "version": "1.0.2"
     }
   ]
 }
