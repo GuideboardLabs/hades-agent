@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::approval::ApprovalBroker as _;
+use crate::approval::ApprovalBroker;
 
 pub use chat::Chat;
 
@@ -2414,7 +2414,7 @@ struct ChatDesk<T> {
     surface: Arc<Mutex<T>>,
 }
 
-impl<T: Transport + Send> crate::approval::ApprovalBroker for ChatDesk<T> {
+impl<T: Transport + Send> ApprovalBroker for ChatDesk<T> {
     fn request_ask(
         &self,
         session: &str,
