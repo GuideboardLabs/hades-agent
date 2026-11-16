@@ -821,12 +821,17 @@ fn save_offset(state: &Path, offset: i64) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// A question the gateway is holding: the goal it belongs to, and the session whose standing answer
-/// will let the resumed attempt through.
+/// A question the gateway is holding: where it was asked, and what an allow resumes.
+///
+/// The chat is recorded because a press is an answer only in the place the question was asked. It is
+/// `None` for a record written before the chat was held; such a press is refused rather than guessed at,
+/// because guessing is the whole defect this field closes.
 #[derive(Debug, Clone)]
 struct Pending {
-    goal: String,
-    session: String,
+    chat: Option<Chat>,
+    /// The goal and session a `run` question resumes. `None` for a question raised inside a conversation:
+    /// allowing it lets the waiting tool call proceed, and there is nothing to submit to the daemon.
+    resume: Option<(String, String)>,
 }
 
 fn pending_path(state: &Path, id: u64) -> PathBuf {
@@ -836,23 +841,40 @@ fn pending_path(state: &Path, id: u64) -> PathBuf {
         .join(format!("{id}.json"))
 }
 
-fn pending_save(state: &Path, id: u64, goal: &str, session: &str) -> Result<(), String> {
+fn pending_save(
+    state: &Path,
+    id: u64,
+    chat: &Chat,
+    resume: Option<(&str, &str)>,
+) -> Result<(), String> {
     let path = pending_path(state, id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("{}: {error}", parent.display()))?;
     }
-    std::fs::write(&path, json!({"goal": goal, "session": session}).to_string())
+    let mut record = json!({ "chat": chat.key() });
+    if let Some((goal, session)) = resume {
+        record["goal"] = json!(goal);
+        record["session"] = json!(session);
+    }
+    std::fs::write(&path, record.to_string())
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn pending_load(state: &Path, id: u64) -> Option<Pending> {
     let text = std::fs::read_to_string(pending_path(state, id)).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    Some(Pending {
-        goal: value.get("goal")?.as_str()?.to_string(),
-        session: value.get("session")?.as_str()?.to_string(),
-    })
+    let chat = value
+        .get("chat")
+        .and_then(|held| serde_json::from_value(held.clone()).ok());
+    let resume = match (
+        value.get("goal").and_then(Value::as_str),
+        value.get("session").and_then(Value::as_str),
+    ) {
+        (Some(goal), Some(session)) => Some((goal.to_string(), session.to_string())),
+        _ => None,
+    };
+    Some(Pending { chat, resume })
 }
 
 fn pending_remove(state: &Path, id: u64) {
@@ -1145,7 +1167,7 @@ fn follow<T: Transport + Clone + Send + 'static>(
                 let goal = request.get("goal").and_then(Value::as_str).unwrap_or("");
                 let session = request.get("session").and_then(Value::as_str).unwrap_or("");
                 asked = true;
-                match pending_save(state, id, goal, session) {
+                match pending_save(state, id, &chat, Some((goal, session))) {
                     Ok(()) => {
                         let text = clip(
                             &format!(
@@ -1792,6 +1814,15 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
     let effective = settings.effective_for(&update.chat, &update.from);
     if let Some(callback) = &update.callback {
         let by = format!("{}:{}", update.chat.surface_name(), update.from);
+        // A press grants the mutation the asking run was blocked on, so it is the operator's to press.
+        // `permits` admits a room to talk and must never answer for the person who asked: under
+        // `allowed_users: ["*"]` the bystander who presses is not the operator who ran the goal.
+        if !settings.is_operator(&update.from) {
+            return transport.ack(
+                &callback.id,
+                "only an operator may answer a question this surface is holding",
+            );
+        }
         let parts: Vec<&str> = callback.data.split(':').collect();
         let (id, allow) = match parts.as_slice() {
             ["a", id, allow] if *allow == "1" || *allow == "0" => match id.parse::<u64>() {
@@ -1803,6 +1834,20 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
         let Some(held) = pending_load(state, id) else {
             return transport.ack(&callback.id, "that question is not waiting on this machine");
         };
+        // The question belongs to the chat that asked it. A press from another chat is a different
+        // conversation's message, and answering it here would resolve a question nobody in this room can
+        // see. A record from before the chat was held cannot be bound, so it is refused rather than
+        // answered from wherever the press landed.
+        let Some(asked_in) = &held.chat else {
+            return transport.ack(
+                &callback.id,
+                "this question was recorded before its chat was, so answer it with `hades answer`",
+            );
+        };
+        if *asked_in != update.chat {
+            return transport.ack(&callback.id, "this question was asked in another chat");
+        }
+        let resumed = held.resume.clone();
         let decision = if allow { "allow" } else { "deny" };
         // Session scope, not once: the answer has to survive the run that asked ending in `awaiting`, or
         // the next attempt asks the same question and no answer ever lets work through.
@@ -1826,15 +1871,26 @@ pub fn handle_with<T: Transport + Clone + Send + 'static>(
         pending_remove(state, id);
         if !allow {
             transport.ack(&callback.id, "denied")?;
-            transport.send(&update.chat, "<b>Denied.</b> The run stays stopped.", &[])?;
+            let line = if resumed.is_some() {
+                "<b>Denied.</b> The run stays stopped."
+            } else {
+                "<b>Denied.</b> That action was not taken."
+            };
+            transport.send(&update.chat, line, &[])?;
             return Ok(());
         }
         transport.ack(&callback.id, "allowed, continuing")?;
+        // A conversation question held the tool call that asked it, and the daemon's answer is what
+        // releases it: there is no goal to submit. Only a `run` question resumes as a run.
+        let Some((goal, session)) = resumed else {
+            transport.send(&update.chat, "<b>Allowed.</b> Continuing.", &[])?;
+            return Ok(());
+        };
         let request = json!({
             "op": "submit",
             "state": state.display().to_string(),
-            "goal": held.goal,
-            "session": held.session,
+            "goal": goal,
+            "session": session,
             "policy": effective.policy,
             "verify": effective.verify,
         });
@@ -3437,5 +3493,262 @@ mod tests {
             "the old file is copied, never moved"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A surface that records instead of sending. Buttons are advertised because the approval path is
+    /// what these tests exercise, and a surface with no buttons refuses to ask at all.
+    #[derive(Clone, Default)]
+    struct Fake {
+        sent: Arc<Mutex<Vec<(String, String, usize)>>>,
+        acks: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Fake {
+        fn acks(&self) -> Vec<String> {
+            self.acks.lock().expect("the acks").clone()
+        }
+
+        fn last_ack(&self) -> String {
+            self.acks().last().cloned().unwrap_or_default()
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .expect("the sends")
+                .iter()
+                .map(|(_, text, _)| text.clone())
+                .collect()
+        }
+    }
+
+    impl Transport for Fake {
+        fn updates(&mut self, _offset: Option<i64>, _timeout: u64) -> Result<Vec<Update>, String> {
+            Ok(Vec::new())
+        }
+
+        fn send(
+            &mut self,
+            chat: &Chat,
+            text: &str,
+            buttons: &[Button],
+        ) -> Result<Option<i64>, String> {
+            self.sent.lock().expect("the sends").push((
+                chat.key(),
+                text.to_string(),
+                buttons.len(),
+            ));
+            Ok(Some(1))
+        }
+
+        fn edit(
+            &mut self,
+            _chat: &Chat,
+            _message: i64,
+            _text: &str,
+            _buttons: &[Button],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn typing(&mut self, _chat: &Chat) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn ack(&mut self, _callback: &str, text: &str) -> Result<(), String> {
+            self.acks.lock().expect("the acks").push(text.to_string());
+            Ok(())
+        }
+
+        fn buttons(&self) -> bool {
+            true
+        }
+    }
+
+    fn press(from: &str, chat: Chat, data: &str) -> Update {
+        Update {
+            id: 1,
+            from: from.to_string(),
+            chat,
+            text: String::new(),
+            callback: Some(Callback {
+                id: "press".to_string(),
+                data: data.to_string(),
+            }),
+            photo: None,
+            mention: None,
+            direct: None,
+        }
+    }
+
+    fn press_with(fake: &mut Fake, settings: &Settings, state: &Path, update: &Update) {
+        handle_with(
+            update,
+            settings,
+            &state.join("daemon.sock"),
+            state,
+            fake,
+            &Signals::default(),
+            &Arc::new(crate::mcp::Mcp::empty()),
+        )
+        .expect("the press is handled");
+    }
+
+    /// A room opened with `"*"` lets people talk. It does not let a bystander press Allow on the question
+    /// an operator's `/run` is blocked on: `permits` is the door to the conversation, not to the grant.
+    #[test]
+    fn a_press_from_a_permitted_bystander_is_refused() {
+        let state = scratch("press-bystander");
+        let mut settings = settings();
+        settings.allowed = vec!["*".to_string()];
+        settings.operators = Vec::new();
+        pending_save(&state, 11, &Chat::telegram(99), Some(("the goal", "tg-99")))
+            .expect("a held question");
+
+        let mut fake = Fake::default();
+        press_with(
+            &mut fake,
+            &settings,
+            &state,
+            &press("8", Chat::telegram(99), "a:11:1"),
+        );
+        assert!(
+            fake.last_ack().contains("operator"),
+            "a wildcard room must not answer for the operator: {:?}",
+            fake.acks()
+        );
+        assert!(
+            pending_path(&state, 11).exists(),
+            "a refused press must not consume the question"
+        );
+        assert!(
+            !fake.texts().iter().any(|text| text.contains("Allowed")),
+            "nothing was allowed: {:?}",
+            fake.texts()
+        );
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A question is a message in one chat. An operator pressing the same button in another chat is not
+    /// answering the question that chat can see.
+    #[test]
+    fn a_press_in_another_chat_is_refused() {
+        let state = scratch("press-elsewhere");
+        let settings = settings();
+        pending_save(&state, 12, &Chat::telegram(99), Some(("the goal", "tg-99")))
+            .expect("a held question");
+
+        let mut fake = Fake::default();
+        press_with(
+            &mut fake,
+            &settings,
+            &state,
+            &press("7", Chat::telegram(100), "a:12:1"),
+        );
+        assert!(
+            fake.last_ack().contains("another chat"),
+            "{:?}",
+            fake.acks()
+        );
+        assert!(pending_path(&state, 12).exists(), "the question stays held");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A record written before the chat was recorded cannot be bound to a place. Refusing it is the only
+    /// answer that does not guess, and `hades answer` still resolves it.
+    #[test]
+    fn a_record_written_before_the_chat_was_held_is_refused() {
+        let state = scratch("press-legacy");
+        let settings = settings();
+        let path = pending_path(&state, 13);
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("pending dir");
+        std::fs::write(&path, r#"{"goal":"an older goal","session":"tg-99"}"#)
+            .expect("an old record");
+
+        let mut fake = Fake::default();
+        press_with(
+            &mut fake,
+            &settings,
+            &state,
+            &press("7", Chat::telegram(99), "a:13:1"),
+        );
+        assert!(
+            fake.last_ack().contains("hades answer"),
+            "{:?}",
+            fake.acks()
+        );
+        assert!(path.exists(), "the question is left for the command");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A daemon stub on a unix socket: the answer, then the submit a `run` question resumes with.
+    fn daemon_stub(socket: &Path) -> std::thread::JoinHandle<Vec<Value>> {
+        let listener = std::os::unix::net::UnixListener::bind(socket).expect("a stub socket");
+        listener
+            .set_nonblocking(true)
+            .expect("a nonblocking listener");
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while seen.len() < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().expect("a clone"))
+                            .read_line(&mut line)
+                            .expect("a request line");
+                        seen.push(serde_json::from_str::<Value>(line.trim()).expect("a request"));
+                        if seen.len() == 1 {
+                            writeln!(
+                                stream,
+                                "{}",
+                                json!({"ok": true, "id": 14, "decision": "allow",
+                                       "scope": "session", "by": "telegram:7"})
+                            )
+                            .expect("an answer");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("the stub could not accept: {error}"),
+                }
+            }
+            seen
+        })
+    }
+
+    /// The legitimate press still resolves: the answer reaches the daemon, the record is consumed, and a
+    /// `run` question resumes the goal it was holding.
+    #[test]
+    fn an_operator_press_in_the_asking_chat_resumes_the_run() {
+        let state = scratch("press-legit");
+        std::fs::create_dir_all(&state).expect("a state directory");
+        let settings = settings();
+        pending_save(&state, 14, &Chat::telegram(99), Some(("the goal", "tg-99")))
+            .expect("a held question");
+        let stub = daemon_stub(&state.join("daemon.sock"));
+
+        let mut fake = Fake::default();
+        press_with(
+            &mut fake,
+            &settings,
+            &state,
+            &press("7", Chat::telegram(99), "a:14:1"),
+        );
+        assert_eq!(fake.last_ack(), "allowed, continuing", "{:?}", fake.acks());
+        assert!(
+            !pending_path(&state, 14).exists(),
+            "an answered question is consumed"
+        );
+        let seen = stub.join().expect("the daemon stub");
+        assert_eq!(seen.len(), 2, "an answer and a submit: {seen:?}");
+        assert_eq!(seen[0]["op"], json!("answer"), "{:?}", seen[0]);
+        assert_eq!(seen[0]["id"], json!(14));
+        assert_eq!(seen[0]["decision"], json!("allow"));
+        assert_eq!(seen[1]["op"], json!("submit"), "{:?}", seen[1]);
+        assert_eq!(seen[1]["goal"], json!("the goal"));
+        assert_eq!(seen[1]["session"], json!("tg-99"));
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
