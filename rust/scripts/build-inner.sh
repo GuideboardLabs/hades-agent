@@ -40,10 +40,20 @@ if ! command -v cargo >/dev/null 2>&1; then
   # checksum travels over the same channel as the binary, so this catches a truncated or swapped download,
   # not a compromised server: that limit is stated rather than hidden.
   case "$(uname -m)" in
-    x86_64) rustup_target=x86_64-unknown-linux-gnu ;;
-    aarch64 | arm64) rustup_target=aarch64-unknown-linux-gnu ;;
+    x86_64) rustup_host=x86_64 ;;
+    aarch64 | arm64) rustup_host=aarch64 ;;
     *) echo "RUSTUP_NO_TARGET"; exit 3 ;;
   esac
+  # The glibc rustup-init cannot exec on a musl host — Alpine has no ELF loader for it, and the shell
+  # reports that as `not found`. The musl build is static and runs anywhere, so the installer that
+  # matches the HOST libc is the right one on both. `apk` is the signal this file already uses for the
+  # package manager; it is the musl signal too. The old `curl | sh` hid this by re-downloading in script
+  # mode, which is exactly the path the checksum gate exists to close.
+  if command -v apk >/dev/null 2>&1; then
+    rustup_target="$rustup_host-unknown-linux-musl"
+  else
+    rustup_target="$rustup_host-unknown-linux-gnu"
+  fi
   base="https://static.rust-lang.org/rustup/dist/$rustup_target"
   curl --proto "=https" --tlsv1.2 -sSf "$base/rustup-init" -o /tmp/rustup-init || { echo RUSTUP_FAILED; exit 3; }
   want=$(curl --proto "=https" --tlsv1.2 -sSf "$base/rustup-init.sha256" | awk '{print $1}') || {
