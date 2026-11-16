@@ -22,6 +22,8 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+use crate::boundary;
+
 /// The five categories. One name, one stable action string, one place to change either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -782,15 +784,24 @@ fn written_path(path: &str, root: &Path) -> Option<Floor> {
 /// The workspace wins: in a default install the agent's root is `~/.hades/work`, and every write inside it would
 /// otherwise be its own state. A path is protected when it is under one of those directories **and** outside
 /// the root the tool was given, which is the same shape as the rule the `audit`/`init` guard already uses.
+///
+/// Both questions are asked of a resolved path, never of its spelling. A symlink inside the workspace that
+/// leads to another agent's home or into a notes vault is outside the workspace, and `boundary::foreign` is
+/// the one predicate that already says so for the CLI, the TUI and the vision reader. Comparing text against
+/// the root's made that link read as inside, so the floor missed what the path policy refused a moment later.
+/// The two directories left below are the ones the boundary does not judge: Hades' own state and the keys.
 pub(crate) fn protected(path: &str, root: &Path) -> Option<String> {
-    let full = normalize(&expand(path, root));
-    let root = normalize(root);
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = boundary::resolve(&home, Path::new("/"));
+    let full = boundary::resolve(&expand(path, root), &home);
+    if let Some(reason) = boundary::foreign(&full, &home) {
+        return Some(reason.to_string());
+    }
+    let root = boundary::resolve(root, &home);
     if full.starts_with(&root) {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let checks = [
-        (".hermes", "the file belongs to another agent's install"),
         (".hades", "the file is the agent's own state"),
         (".ssh", "the file is a key or its configuration"),
     ];
@@ -802,9 +813,9 @@ pub(crate) fn protected(path: &str, root: &Path) -> Option<String> {
     None
 }
 
-/// `~` and `$HOME`, then the workspace for a relative path, then `.` and `..` folded away. Lexical on
-/// purpose: the file may not exist yet, so `canonicalize` cannot answer, and a `..` that escapes the root is
-/// exactly the case this check exists to see.
+/// `~` and `$HOME`, then the workspace for a relative path. The result is a spelling, not a location:
+/// [`boundary::resolve`] is what turns it into the path the kernel would open, so `..` and a symlink are
+/// both answered there. Lexical here on purpose, because the file may not exist yet.
 fn expand(path: &str, root: &Path) -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let raw = if path == "~" {
@@ -827,20 +838,6 @@ fn expand(path: &str, root: &Path) -> PathBuf {
     } else {
         root.join(raw)
     }
-}
-
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// The words a page uses when a click, a keystroke or a script is about to reach a person. A page is
@@ -1044,6 +1041,69 @@ mod tests {
         )
         .expect("a key list");
         assert_eq!(floor.category(), Category::Access);
+    }
+
+    /// The two path predicates have to agree. `protected` compared the spelling of a path against the
+    /// workspace root, so a symlink inside the workspace that led to another agent's home or into a notes
+    /// vault counted as inside it, while `boundary::foreign` (the CLI, the TUI, the vision reader) resolved
+    /// the link and refused it. Defense in depth saved this; one predicate answers both questions now.
+    #[test]
+    fn a_symlink_out_of_the_workspace_is_protected() {
+        use std::os::unix::fs::symlink;
+        let _held = crate::test_env::hold();
+        let base = crate::scratch::unique("floor-symlink");
+        let home = base.join("home");
+        let root = home.join(".hades/work");
+        std::fs::create_dir_all(root.join("src")).expect("a workspace");
+        std::fs::create_dir_all(home.join(".hermes")).expect("another agent's home");
+        std::fs::write(home.join(".hermes/config.yaml"), "x").expect("a config");
+        let notes = base.join("notes");
+        std::fs::create_dir_all(notes.join(".obsidian")).expect("a vault marker");
+        std::fs::create_dir_all(notes.join("2-Areas")).expect("a fenced area");
+
+        let old = std::env::var_os("HOME");
+        // SAFETY: `test_env::hold` keeps every other test that rewrites the process environment out of this
+        // window, and HOME is put back before the assertions run.
+        unsafe { std::env::set_var("HOME", &home) };
+        let foreign = symlink(home.join(".hermes"), root.join("their"));
+        let vault = symlink(&notes, root.join("notes"));
+        let found = (
+            protected("their/config.yaml", &root),
+            protected("notes/2-Areas/alice.md", &root),
+            protected("src/main.rs", &root),
+            protected("../escape.txt", &root),
+        );
+        match old {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        foreign.expect("the symlink to another agent's home");
+        vault.expect("the symlink into a vault");
+
+        assert!(
+            found
+                .0
+                .as_ref()
+                .is_some_and(|reason| reason.contains("another agent")),
+            "a link to another agent's home read as inside the workspace: {:?}",
+            found.0
+        );
+        assert!(
+            found
+                .1
+                .as_ref()
+                .is_some_and(|reason| reason.contains("notes vault")),
+            "a link into a notes vault read as inside the workspace: {:?}",
+            found.1
+        );
+        assert_eq!(
+            found.2, None,
+            "an ordinary file inside the workspace must stay the agent's to write"
+        );
+        assert!(
+            found.3.is_some(),
+            "a `..` escape out of the workspace must still be the agent's own state"
+        );
     }
 
     #[test]
