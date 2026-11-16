@@ -98,6 +98,7 @@ pub mod scoreboard;
 /// tests are separate crates and need the same root as the unit tests.
 pub mod scratch;
 pub mod searcheval;
+mod secret;
 pub mod service;
 pub mod shadow;
 pub mod skills;

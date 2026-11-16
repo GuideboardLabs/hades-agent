@@ -190,10 +190,12 @@ fn append(state: &Path, line: &Line) -> Result<(), String> {
         "at": line.at,
         "actor": line.actor,
         "layer": line.layer,
-        "action": clip(&line.action, CLIP),
+        // Redacted before it is clipped, so a token cut in half is still a token removed. The whole line
+        // is redacted, not only the command: a URL in the artifact column carries a token just as often.
+        "action": clip(&crate::secret::redact(&line.action), CLIP),
         "decision": line.decision,
-        "reason": clip(&line.reason, CLIP),
-        "artifact": line.artifact,
+        "reason": clip(&crate::secret::redact(&line.reason), CLIP),
+        "artifact": crate::secret::redact(&line.artifact),
     });
     let mut text = body.to_string();
     text.push('\n');
@@ -367,5 +369,47 @@ mod tests {
         let said = action("shell", &json!({ "command": long }));
         assert!(said.chars().count() <= CLIP + 7, "{}", said.chars().count());
         assert!(said.ends_with('…'), "{said}");
+    }
+
+    /// A pasted token is the common way a secret reaches a file: the ledger wrote the command verbatim, so
+    /// `git push https://ghp_...@github.com/x/y` put the token in `activity.jsonl` for as long as the file
+    /// lives. The placeholders are the same shapes `distill::gate` refuses.
+    #[test]
+    fn a_secret_in_a_command_is_redacted_before_it_reaches_the_ledger() {
+        let state = scratch("secret");
+        // Built rather than written as one literal, so the source holds no token-shaped string of its own.
+        let token = format!("ghp_{}", "fake-token-value-1234567890");
+        let said = action(
+            "shell",
+            &json!({ "command": format!("git push https://{token}@github.com/x/y") }),
+        );
+        record(
+            &state,
+            &Line {
+                action: said,
+                artifact: format!("https://example.test/x?token={token}"),
+                ..line(1)
+            },
+        )
+        .expect("a record");
+
+        let text = std::fs::read_to_string(path(&state)).expect("the ledger");
+        assert!(!text.contains(&token), "{text}");
+        assert!(!text.contains("ghp_fake"), "{text}");
+        assert!(text.contains("«redacted»"), "{text}");
+
+        // Benign content round-trips unchanged, in both columns.
+        record(
+            &state,
+            &Line {
+                action: action("shell", &json!({ "command": "cargo test -p mneme" })),
+                artifact: "/work/note.md".to_string(),
+                ..line(2)
+            },
+        )
+        .expect("a record");
+        let text = std::fs::read_to_string(path(&state)).expect("the ledger");
+        assert!(text.contains("shell: cargo test -p mneme"), "{text}");
+        assert!(text.contains("/work/note.md"), "{text}");
     }
 }

@@ -384,7 +384,7 @@ pub fn gate(name: &str, runbook: &str, check: &str) -> Result<(), String> {
             return Err(format!("the runbook contains `{forbidden}`"));
         }
     }
-    for secret in ["sk-", "ghp_", "xoxb-", "xoxp-", "AKIA", "-----BEGIN"] {
+    for secret in crate::secret::SHAPES {
         if text.contains(secret) {
             return Err("the runbook contains a secret-shaped token".to_string());
         }
