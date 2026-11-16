@@ -389,14 +389,15 @@ pub fn recorded_measured_by(baseline: &serde_json::Value) -> Option<&str> {
 
 /// A digest of the shipped gold set, so a baseline taken against a different fixture cannot pass.
 fn gold_digest() -> String {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/read-gold.jsonl");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return "missing".to_string();
-    };
+    // The gold set ships inside the binary. A path built from `CARGO_MANIFEST_DIR` names the build
+    // machine — an ARM64 artifact built on this host was caught by the build-paths assertion exactly
+    // this way — and a binary run away from its source tree would read `missing` and hold the notes
+    // to a digest nobody measured. `include_str!` resolves at compile time relative to this file,
+    // so neither the path nor the absence can happen.
+    const GOLD: &str = include_str!("../tests/fixtures/read-gold.jsonl");
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= byte as u64;
+    for byte in GOLD.as_bytes() {
+        hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
