@@ -3819,8 +3819,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// A daemon stub on a unix socket: the answer, then the submit a `run` question resumes with.
-    fn daemon_stub(socket: &Path) -> std::thread::JoinHandle<Vec<Value>> {
+    /// A daemon stub on a unix socket: it reads `answers` requests and answers the first one. A `run`
+    /// question sends a submit after the answer; a conversation question sends nothing.
+    fn daemon_stub(socket: &Path, answers: usize) -> std::thread::JoinHandle<Vec<Value>> {
         let listener = std::os::unix::net::UnixListener::bind(socket).expect("a stub socket");
         listener
             .set_nonblocking(true)
@@ -3828,7 +3829,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut seen = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(3);
-            while seen.len() < 2 && Instant::now() < deadline {
+            while seen.len() < answers && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let mut line = String::new();
@@ -3865,7 +3866,7 @@ mod tests {
         let settings = settings();
         pending_save(&state, 14, &Chat::telegram(99), Some(("the goal", "tg-99")))
             .expect("a held question");
-        let stub = daemon_stub(&state.join("daemon.sock"));
+        let stub = daemon_stub(&state.join("daemon.sock"), 2);
 
         let mut fake = Fake::default();
         press_with(
@@ -3887,6 +3888,39 @@ mod tests {
         assert_eq!(seen[1]["op"], json!("submit"), "{:?}", seen[1]);
         assert_eq!(seen[1]["goal"], json!("the goal"));
         assert_eq!(seen[1]["session"], json!("tg-99"));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A question a conversation asked has no goal to resume: the daemon's answer releases the tool call
+    /// that is waiting in this process, and the press must not submit a run behind its back.
+    #[test]
+    fn an_allowed_chat_question_does_not_submit_a_run() {
+        let state = scratch("press-conversation");
+        std::fs::create_dir_all(&state).expect("a state directory");
+        let settings = settings();
+        pending_save(&state, 15, &Chat::telegram(99), None).expect("a held question");
+        let stub = daemon_stub(&state.join("daemon.sock"), 1);
+
+        let mut fake = Fake::default();
+        press_with(
+            &mut fake,
+            &settings,
+            &state,
+            &press("7", Chat::telegram(99), "a:15:1"),
+        );
+        assert_eq!(fake.last_ack(), "allowed, continuing", "{:?}", fake.acks());
+        assert!(
+            fake.texts().iter().any(|text| text.contains("Allowed.")),
+            "the chat is told the answer landed: {:?}",
+            fake.texts()
+        );
+        assert!(
+            !pending_path(&state, 15).exists(),
+            "the question is consumed"
+        );
+        let seen = stub.join().expect("the daemon stub");
+        assert_eq!(seen.len(), 1, "one answer and no submit: {seen:?}");
+        assert_eq!(seen[0]["op"], json!("answer"), "{:?}", seen[0]);
         let _ = std::fs::remove_dir_all(&state);
     }
 
