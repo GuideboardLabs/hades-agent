@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange?logo=rust"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.6.18-blue">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1354%20passing-brightgreen">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.7.0-blue">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1392%20passing-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="Status" src="https://img.shields.io/badge/status-active-brightgreen">
 </p>
@@ -52,7 +52,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 
 | | |
 |---|---|
-| **Version** | 0.6.18 |
+| **Version** | 0.7.0 |
 | **Language** | Rust 2024 |
 | **Shape** | One `hades` binary, four crates |
 | **State** | `~/.hades`: config, sessions, memory, jobs, approvals, activity, taste |
@@ -62,7 +62,7 @@ reading of it: the same shape, with the loop, the permissions and the evidence t
 | **Memory** | SQLite record with a markdown export and FTS5 recall |
 | **Interfaces** | Native TUI, CLI, ACP over stdio, HTTP read/control surface, Telegram gateway |
 | **Browser** | Native Chrome DevTools Protocol client over Chromium's pipe |
-| **Tests** | 1354 passing, 15 ignored (12 live browser) |
+| **Tests** | 1392 passing, 15 ignored (12 live browser) |
 
 ---
 
@@ -138,9 +138,11 @@ a safety-floor category.
 
 - **Landlock** denies reads outside the workspace and the state scratch. The process cannot browse the
   rest of the filesystem just because it has a shell. `--cage on` is the default and keeps `/run` readable;
-  `--cage strict` drops it, which is the only way to close a Docker socket on a kernel whose Landlock
-  cannot refuse a Unix-socket connect (ABI 8 and below). `hades doctor` names the ABI, every socket it can
-  reach, and the one flag that would close it.
+  `--cage strict` drops it, and the chat shell takes strict. No kernel before Landlock ABI 9 can refuse a
+  Unix-socket connect by path, so every cage also refuses `socket(AF_UNIX)` outright — pathname and
+  abstract sockets alike — and `Cage::allow_unix_sockets` is the explicit way to take that back.
+  `hades doctor` names the ABI, every control socket on the machine, and whether this account is in the
+  group that owns it.
 - **The floor** refuses permanent deletes, money movement, credential changes, new security access and
   outbound messages before a tool runs. It reads the tool name and its arguments as text, and the receipt
   says so: `floor: command-text heuristic (not a sandbox)`. It cannot see a button, a command assembled at
@@ -750,7 +752,9 @@ plan and writes nothing; with it, the plan is applied and the pack is active.
 
 A pack that arrives as a file is added the same way: `hades pack add ./thing.hadepack --digest <sha256>
 --yes`. The digest is optional, and when it is given the file must hash to it; when it is not, the file's own
-digest is printed so it can be compared with what the sender said. `hades pack menu` reads the copy this
+digest is printed so it can be compared with what the sender said. A connector archive takes the same gate
+from either side: `--yes` before anything is written, the digest checked before the file is read, and the
+staged bytes re-hashed after the plan. `hades pack menu` reads the copy this
 build ships unless this machine has cached a live one, and says how old a cached shelf is; `--refresh` reads
 it again. `HADES_PACKS_URL` points the
 shelf at a mirror, and `HADES_PACKS_ALLOW_PRIVATE=1` is what lets that mirror be a local address.
@@ -800,7 +804,7 @@ which is where the deadline lives: 1800 seconds, `HADES_TEST_TIMEOUT` to overrid
 timeout, so a test that parks would otherwise hold the command until something outside killed it, and a
 hang prints no test name; under the deadline the run ends with a `the suite timed out` line instead.
 
-Current state: **1354 passing, 0 failing, 15 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model; the last two are the live search and live read probes, which need the network and are run by hand. A `check-claims.sh` rule now holds this sentence to the suite's own ignored count.
+Current state: **1392 passing, 0 failing, 15 ignored** across the workspace. Twelve of the ignored are the live browser suite and pass with a browser and a display; the thirteenth waits on a local model; the last two are the live search and live read probes, which need the network and are run by hand. A `check-claims.sh` rule now holds this sentence to the suite's own ignored count.
 
 The ignored tests start a real Chromium and exercise live browser behavior. Run them on a machine with a
 browser installed:

@@ -1,3 +1,91 @@
+## 0.7.0
+
+### The Kerberos Release: every boundary the audit named, enforced in code
+
+Kerberos is the hound at the gate of the underworld, and this line is the gate. A three-seat security
+audit of 0.6.18 found one critical boundary that was prose and a dozen smaller ones that were habits:
+the cage's `/run` grant, the bot token in curl's argv, the connector file path that skipped the install
+gate, the daemon socket that answered anyone, the guarded policy the chat loop never asked, and the
+release pipeline that pinned none of its inputs. Every finding below was verified against source before
+it was fixed, and every fix has a test that was red first.
+
+**1392 tests, 15 ignored.**
+
+### What changed
+
+- **The cage refuses Unix sockets outright.** Measured before choosing the mechanism: on this ABI-8
+  kernel, Landlock path rules cannot refuse a `connect()` to `/run/docker.sock` at all — the strict
+  cage, `/run` dropped, still connected 5/5, and this account is in the `docker` group, so a
+  prompt-injected `curl --unix-socket` was host root. The boundary moved to `socket(2)`: a seccomp
+  filter refuses `socket(AF_UNIX, ...)` for every cage, closed by default, pathname and abstract
+  sockets alike, with `Cage::allow_unix_sockets` the documented way back. The chat shell takes the
+  strict path list, name lookup still resolves through the resolver sockets strict mode keeps by name,
+  and `hades doctor` names the ABI, every control socket on the machine, and whether this account is
+  in the group that owns it.
+- **A bot token is never an argument and never a fault.** The Telegram API URL rides in the same
+  private `0600` config-file channel the bearer header uses, the two download curls take
+  `-q --proto =https --max-filesize`, and a redaction at the fault boundary erases `/bot<token>/` from
+  every failure path — the module doc's "nothing here prints it" now holds on the path it broke on. A
+  killed run leaves no key behind either: the private directory is `0700` by construction, and a
+  startup sweep removes the header files a crash orphaned. Plain `http` is refused off loopback, the
+  CA-bundle environment variables are scrubbed alongside the proxy ones, and the user agent names the
+  build it is.
+- **One install gate for every trust path.** A connector archive handed over as a file now takes the
+  same discipline the shelf path already had: plan first, `--yes` before anything is written, the
+  digest checked before the file is read, and the staged bytes re-hashed after the parse. The two
+  halves call one installer, so they cannot drift apart again.
+- **The daemon socket is this user's.** `0600` on bind before `accept`, a parent the daemon creates
+  at `0700`, a `SO_PEERCRED` uid check before a byte is read, and session ids validated where they
+  reach a path — the same rule the HTTP surface already applied, now shared in one place.
+- **A public HTTP bind needs the proxy flag**, the error names the TLS-terminating proxy it requires,
+  and the doc stops claiming an open mode that was never there.
+- **Memory is private by mode, not by parent directory.** The record and session stores set
+  `0700`/`0600` themselves at creation and tighten what an earlier version left open. The fence
+  applies on import and on recall, not only on filing, so a copy of a vault without its marker cannot
+  smuggle a fenced area back in. The activity ledger redacts a token in a tool argument before it is
+  written, through the same shape list the distiller uses. And the floor and the boundary ask the same
+  question about a path, so a symlink out of the workspace is foreign to both.
+- **A chat shell can propose a skill but cannot install one.** The cage grants `skills/proposed/`
+  only, the live loader skips the reserved name, and the promote path a person drives is unchanged:
+  a model can no longer persist instructions into its own future prompts by writing a `SKILL.md`
+  through the shell.
+- **A button press needs the operator and the chat that asked.** Pending questions record the chat
+  they were asked in; a press from another conversation is refused with a name, a record older than
+  the field fails closed, and a permitted bystander is not an operator. A guarded chat now asks the
+  person instead of refusing or running: the conversation installs the same approval desk `/run`
+  uses, and an Allow answers the question without submitting anything.
+- **The release pipeline pins every input and names no machine.** `--remap-path-prefix` in the ARM64
+  build so no host path reaches the shipped bytes, with a strings assertion on every artifact the
+  build scripts produce; every workflow action pinned to a commit SHA, the moving `@stable` toolchain
+  ref replaced; the musl.cc cross-tarball and the rustup installers verified by sha256 before they
+  run; bundled SQLite moved to 3.54.1; ratatui's `lru` patched and `paste` gone from the graph.
+
+### What the audit found safe, and left alone
+
+The fetch SSRF gate (schemeful allowlist, every resolved answer classified, per-hop pinning),
+the environment passlist, the one-writer rule, the journal's refusal to open secret-named files, and
+the guardrail parser that refuses a `pack.json` naming `roles`, `floor`, `cage` or `policy`: each was
+verified with evidence rather than assumed, and none needed a change.
+
+### The measurement
+
+This release touched nothing between the query and the page, so the standing measurement is restated
+rather than retaken; the measuring build is still `unrecorded` until a live `--save` runs, which is a
+defect the 0.6 line already owned.
+
+```
+read-eval gold 1d9233b12b2529c5 measured-by unrecorded
+| class | rows | found | state% | recall | clean | unchecked | boiler |
+|---|---|---|---|---|---|---|---|
+| docs | 8 | 8 | 100% | 100.0% | 83% | 2 | 1% |
+| forum | 4 | 3 | 75% | 75.0% | 0% | 4 | 0% |
+| js-shell | 3 | 0 | 100% | 0.0% | 0% | 3 | 0% |
+| news | 6 | 3 | 83% | 50.0% | 75% | 2 | 0% |
+| pdf | 3 | 2 | 67% | 66.7% | 0% | 2 | 0% |
+| reference | 6 | 6 | 100% | 100.0% | 33% | 0 | 1% |
+| all | 30 | 22 | 90% | 73.3% | 10/17 | 13 | 0% |
+```
+
 ## 0.6.18
 
 ### The Aletheia Tetarton Release: the check looked at the wrong table
